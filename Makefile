@@ -7,7 +7,7 @@ export PATH := $(HOME)/.cargo/bin:$(HOME)/.local/share/vite-plus/bin:$(PATH)
 WEB := apps/web
 GEN := $(WEB)/src/gen
 
-.PHONY: help check check-rust check-web gen gen-check fmt build dev-server dev-web install
+.PHONY: help check check-rust check-web gen gen-check fmt build dev-server dev-web install e2e
 
 help: ## list targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | sed -E 's/:.*## /\t/' | column -t -s "$$(printf '\t')"
@@ -47,3 +47,9 @@ dev-server: ## run the server with the mock runner on 127.0.0.1:4680
 
 dev-web: ## run the web dev server, proxying /api to the server
 	cd $(WEB) && vp dev
+
+e2e: ## browser end-to-end checks against the built binary with the mock runner (needs a Chromium-family browser)
+	cd $(WEB) && vp build
+	cargo build -q -p calin-cli
+	cd e2e && vp install && node run.mjs ../target/debug/calin
+

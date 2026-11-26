@@ -20,6 +20,7 @@ Everything goes through `make`, which puts the toolchains on `PATH` itself. Do n
 | `make dev-server` | Server with the mock runner on `127.0.0.1:4680` |
 | `make dev-web` | Vite dev server, proxying `/api` to the server |
 | `make build` | Web app, then the release binary that embeds it |
+| `make e2e` | Drives the built binary in a headless browser with the mock runner. Exit 2 means no browser was found, which is not a pass. |
 
 `make check` must pass before any commit. If you need a narrower loop, run the underlying command
 with the same `PATH` the Makefile exports.
@@ -36,6 +37,7 @@ with the same `PATH` the Makefile exports.
 | `crates/calin-server` | axum routes, the WebSocket, static assets | Routes live under `/api/v1` and match the table in `calin-proto/src/api.rs` exactly. Handlers stay thin and call `calin-core`. |
 | `crates/calin-cli` | The `calin` binary | Argument parsing and wiring only. |
 | `apps/web` | The SolidJS app | See "Web app" below. |
+| `e2e` | Browser end-to-end scenarios and their harness | Runs against the real binary in dry run. A change to a user-visible flow updates its scenario in the same commit. |
 | `docs/specs` | Dated design specs and diagrams | A feature that changes behavior starts or updates a spec. |
 | `fixtures` | Recorded agent transcripts | Never edited by hand; re-record instead. |
 

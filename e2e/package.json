@@ -1,0 +1,17 @@
+{
+  "name": "calin-e2e",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Browser end-to-end checks against the real calin binary with the mock runner.",
+  "dependencies": {
+    "playwright-core": "^1.50.0"
+  },
+  "devEngines": {
+    "packageManager": {
+      "name": "bun",
+      "version": "1.4.5",
+      "onFail": "download"
+    }
+  }
+}

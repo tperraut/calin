@@ -24,7 +24,6 @@ Known gaps carried forward:
 - Stopping a session leaves its running items open; the web app should show them as interrupted.
 - Log lines are flushed but not fsynced: they survive a crash of the process, not a power cut.
 - Replay loads a session's whole backlog into memory.
-- There is no browser end-to-end suite in the repo yet; the run above was scripted by hand.
 - The graph layout spike moved to the start of M3, where its result is used.
 
 ## M1: One session, real agent, real repos (in progress, branch `m1`)
