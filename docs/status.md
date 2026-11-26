@@ -27,12 +27,22 @@ Known gaps carried forward:
 - There is no browser end-to-end suite in the repo yet; the run above was scripted by hand.
 - The graph layout spike moved to the start of M3, where its result is used.
 
-## M1: One session, one repo
+## M1: One session, real agent, real repos (in progress, branch `m1`)
 
-- [ ] Claude Code runner over stream-json, with recorded fixtures
-- [ ] Session worktree, stop and continue
-- [ ] Permission requests answered from the UI
-- [ ] Diff view, editor, terminal
+Sessions take a repo set from the start, so M1 already creates one worktree per attached repo and
+shows changes grouped by repo. What stays in M2 is the home repo's repo list, attaching a repo
+mid-session, and pull requests.
+
+- [x] Contract: repos, repo set, permissions, interrupt, changes, diffs, files, terminal socket
+- [ ] `calin-git`: worktrees, changes against a base, file diff, tree, safe file read and write
+- [ ] `calin-term`: pseudo-terminal library
+- [ ] `calin-agents`: Claude Code runner over stream-json, tested against the recorded fixtures;
+      mock runner asks for permission
+- [ ] Core and server: repo registry, repo set and worktrees, permission flow, interrupt, continue
+      after stop or failure, file-change events, all new routes, terminal socket
+- [ ] Web: repo picker, permission mode, permission cards, interrupt
+- [ ] Web: Changes with diff view, Files with editor, Terminal
+- [ ] End to end with the mock runner, then a real Claude Code session in a real repo
 
 ## Later
 

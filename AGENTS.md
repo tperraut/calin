@@ -30,6 +30,8 @@ with the same `PATH` the Makefile exports.
 | --- | --- | --- |
 | `crates/calin-proto` | Every type that crosses the network: REST bodies, WebSocket frames, events | The single source of truth. Change a shape here first, run `make gen`, then use it. Never edit `apps/web/src/gen/` by hand. New fields on existing types are optional so old logs still parse. |
 | `crates/calin-core` | Sessions, the store (SQLite index + NDJSON logs), the event bus, the session manager | No HTTP and no process spawning here. The log is the source of truth; the index must be rebuildable from it. |
+| `crates/calin-git` | Everything that runs `git` or touches a checkout: worktrees, changes, diffs, directory listings, file reads and writes | A blocking library: callers use `spawn_blocking`. Shells out to the `git` CLI. Every path from outside goes through its one path-safety function. Never deletes a branch. |
+| `crates/calin-term` | Pseudo-terminals for the built-in terminal | No HTTP here; the server bridges a terminal to its socket. |
 | `crates/calin-agents` | The runner interface and its implementations (`mock`, later `claude`, `acp`) | Nothing runner-specific leaks past the interface. Every runner emits `calin_proto::EventBody` only. A runner is tested against recorded fixtures in `fixtures/`. |
 | `crates/calin-server` | axum routes, the WebSocket, static assets | Routes live under `/api/v1` and match the table in `calin-proto/src/api.rs` exactly. Handlers stay thin and call `calin-core`. |
 | `crates/calin-cli` | The `calin` binary | Argument parsing and wiring only. |
@@ -75,8 +77,9 @@ with the same `PATH` the Makefile exports.
 - Bun is the package manager, through `vp install` / `vp add`. Add a dependency only when the
   task needs it, and check that it supports Solid 2 before adding it.
 - Wire types are imported from `src/gen/`. Never restate one by hand.
-- All server state arrives over REST and the one WebSocket (`src/api/`). Components do not call
-  `fetch` or open sockets themselves.
+- All server state arrives over REST and the one event WebSocket. Each open terminal has its own
+  socket. Both kinds are opened only from `src/api/`; components do not call `fetch` or open
+  sockets themselves.
 - Phone first: every screen must work at 360 px wide, with touch targets of at least 44 px.
   Light and dark themes follow the system setting.
 
@@ -91,3 +94,4 @@ than restating it. Commit messages lead with what changed.
 - `docs/status.md`: milestone progress.
 - `crates/calin-proto/src/api.rs`: the REST route table.
 - `crates/calin-proto/src/ws.rs`: the WebSocket protocol.
+- `crates/calin-proto/src/terminal.rs`: the terminal socket.

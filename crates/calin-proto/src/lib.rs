@@ -14,11 +14,17 @@
 mod api;
 mod event;
 mod model;
+mod permission;
+mod repo;
+mod terminal;
 mod ws;
 
 pub use api::*;
 pub use event::*;
 pub use model::*;
+pub use permission::*;
+pub use repo::*;
+pub use terminal::*;
 pub use ws::*;
 
 /// Topic carrying [`ServerMsg::SessionUpserted`] for every session.

@@ -1,7 +1,10 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-use crate::{Agent, AgentStatus, SessionStatus};
+use crate::{
+    Agent, AgentStatus, DecisionSource, FileOp, PermissionDecision, PermissionRequest, SessionRepo,
+    SessionStatus,
+};
 
 /// One entry in a session's append-only log.
 ///
@@ -70,6 +73,31 @@ pub enum EventBody {
         #[ts(type = "number")]
         tokens_out: u64,
     },
+    /// A repo joined the session's repo set.
+    RepoAttached {
+        repo: SessionRepo,
+    },
+    /// An agent asked to use a tool and waits for a decision.
+    PermissionRequested {
+        request: PermissionRequest,
+    },
+    /// A permission request was answered. `agent_id` is the agent that asked.
+    PermissionResolved {
+        request_id: String,
+        decision: PermissionDecision,
+        by: DecisionSource,
+        message: Option<String>,
+    },
+    /// A file in one of the session's repos changed. Emitted when an edit tool
+    /// call completes (`agent_id` is the agent) and when the user saves a file
+    /// in the editor (`agent_id` is absent).
+    FileChanged {
+        /// Absent when the path is outside every attached repo.
+        session_repo_id: Option<String>,
+        /// Relative to the repo root when `session_repo_id` is set, absolute otherwise.
+        path: String,
+        op: FileOp,
+    },
     /// Something went wrong that the user should see in the transcript.
     Error {
         message: String,
@@ -114,6 +142,9 @@ pub enum ItemContent {
         title: String,
         input: serde_json::Value,
         output: Option<String>,
+        /// Absolute paths of the files this call reads or writes, when known.
+        #[serde(default)]
+        locations: Vec<String>,
     },
 }
 

@@ -13,4 +13,8 @@ parent_agent_id: string | null, kind: AgentKind,
 /**
  * Free-form role: `lead`, `worker`, `reviewer`, or a subagent type name.
  */
-role: string, runner: string, model: string | null, status: AgentStatus, cost_usd: number, tokens_in: number, tokens_out: number, };
+role: string, runner: string, model: string | null, 
+/**
+ * The runner's own conversation id, used to resume the agent after a restart.
+ */
+native_session_id: string | null, status: AgentStatus, cost_usd: number, tokens_in: number, tokens_out: number, };

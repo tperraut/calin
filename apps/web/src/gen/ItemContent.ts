@@ -10,4 +10,8 @@ name: string, tool_kind: ToolKind,
 /**
  * One line describing this call, for example the command or the file path.
  */
-title: string, input: JsonValue, output: string | null, };
+title: string, input: JsonValue, output: string | null, 
+/**
+ * Absolute paths of the files this call reads or writes, when known.
+ */
+locations: Array<string>, };

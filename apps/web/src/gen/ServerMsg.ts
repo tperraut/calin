@@ -9,4 +9,8 @@ export type ServerMsg = { "op": "subscribed", topic: string,
 /**
  * Newest sequence number at the time of the subscription. 0 for `sessions`.
  */
-head_seq: number, } | { "op": "event", topic: string, event: Event, } | { "op": "session_upserted", session: Session, } | { "op": "pong" } | { "op": "error", message: string, };
+head_seq: number, } | { "op": "event", topic: string, event: Event, } | { "op": "session_upserted", session: Session, } | { "op": "pong" } | { "op": "error", message: string, 
+/**
+ * The topic of the refused `subscribe` or `unsubscribe`, when there is one.
+ */
+topic?: string, };

@@ -43,7 +43,8 @@ pub enum ServerMsg {
         topic: String,
         event: Event,
     },
-    /// A session was created or changed, on `sessions`.
+    /// A session was created or changed, on `sessions`. Sent on every status
+    /// change, and at most about once a second while events are arriving.
     SessionUpserted {
         session: Session,
     },
@@ -51,5 +52,9 @@ pub enum ServerMsg {
     /// The last client frame could not be handled. The connection stays open.
     Error {
         message: String,
+        /// The topic of the refused `subscribe` or `unsubscribe`, when there is one.
+        #[serde(default)]
+        #[ts(optional)]
+        topic: Option<String>,
     },
 }

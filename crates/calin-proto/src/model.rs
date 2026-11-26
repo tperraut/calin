@@ -35,6 +35,20 @@ impl SessionStatus {
     }
 }
 
+/// Who answers when an agent asks to use a tool.
+#[derive(Serialize, Deserialize, TS, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum PermissionMode {
+    /// Every request waits for the user.
+    #[default]
+    Ask,
+    /// File edits inside the session's repos are allowed; everything else waits for the user.
+    AcceptEdits,
+    /// Every request is allowed by policy. Each one is still recorded.
+    Autonomous,
+}
+
 /// A unit of work started by the user (or dispatched by an agent).
 #[derive(Serialize, Deserialize, TS, Clone, Debug, PartialEq)]
 #[ts(export)]
@@ -45,6 +59,9 @@ pub struct Session {
     pub status: SessionStatus,
     /// Runner id of the lead agent, for example `mock` or `claude`.
     pub runner: String,
+    /// How tool permission requests are answered. Absent in logs written before M1.
+    #[serde(default)]
+    pub permission_mode: PermissionMode,
     /// Branch name used in every attached repo. Set once worktrees exist.
     pub branch: Option<String>,
     pub parent_session_id: Option<String>,
@@ -96,6 +113,9 @@ pub struct Agent {
     pub role: String,
     pub runner: String,
     pub model: Option<String>,
+    /// The runner's own conversation id, used to resume the agent after a restart.
+    #[serde(default)]
+    pub native_session_id: Option<String>,
     pub status: AgentStatus,
     pub cost_usd: f64,
     #[ts(type = "number")]
