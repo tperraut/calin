@@ -6,3 +6,5 @@ dist
 # archify run receipts (the diagrams and their sources are tracked)
 docs/specs/diagrams/.receipts
 docs/specs/diagrams/*.delivery.json
+# raw agent recordings: contain local paths and account details, never committed
+fixtures/raw/
