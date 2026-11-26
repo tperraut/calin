@@ -1,6 +1,6 @@
 # Calin: design spec
 
-Status: draft for review · 2026-11-26
+Status: accepted, in implementation · 2026-11-26 · progress in [status.md](../status.md)
 
 Calin is a self-hosted orchestrator for coding agents, inspired by
 [cezar](https://github.com/open-mercato/cezar). It runs as one small server on a VPS, is used from
@@ -15,7 +15,7 @@ It differs from cezar in three ways, which are the reason to build it:
 3. **The workbench is built in.** Editor, diff, terminal and search are part of the app, so a
    session can be reviewed and corrected from a phone without another tool.
 
-Nothing is implemented yet. This document is the design to agree on before the first commit.
+Implementation follows the milestones in section 11.
 
 ## Contents
 
@@ -31,7 +31,7 @@ Nothing is implemented yet. This document is the design to agree on before the f
 10. [Repository layout and development method](#10-repository-layout-and-development-method)
 11. [Milestones](#11-milestones)
 12. [Risks and things to verify](#12-risks-and-things-to-verify)
-13. [Open questions](#13-open-questions)
+13. [Decisions and open questions](#13-decisions-and-open-questions)
 
 ## 1. Goals and non-goals
 
@@ -88,7 +88,7 @@ One Rust process contains everything. It runs on the VPS, or inside the desktop 
 | Index | SQLite in WAL mode | Cross-repo and graph queries without a database server |
 | Event store | One append-only NDJSON file per session | Cheap to write, trivially replayable, readable with standard tools |
 | Wire types | Defined in Rust, generated to TypeScript | The server and the web app cannot disagree; drift fails the build |
-| Web app | SolidJS, Vite+ (`vp`), Bun as package manager | Small bundles and fine-grained updates suit long live transcripts on a phone |
+| Web app | SolidJS 2, Vite+ (`vp`), Bun as package manager | Small bundles and fine-grained updates suit long live transcripts on a phone |
 | Styling | Tailwind v4 and Kobalte | Accessible unstyled components that exist for Solid |
 | Editor and diff | CodeMirror 6 | Works with touch input and loads on demand; Monaco is not usable on a phone |
 | Terminal | xterm.js over a server PTY | Standard, and already proven in cezar |
@@ -110,7 +110,6 @@ One Rust process contains everything. It runs on the VPS, or inside the desktop 
   calin.db                     SQLite index, rebuilt from the logs if missing
   sessions/<id>/
     events.ndjson              the session's event log
-    home/                      worktree of the home repo (the agent's working directory)
     api/  web/  ...            one worktree per attached repo
 
 <home repo>/.calin/            versioned with your other configuration
@@ -152,10 +151,11 @@ clone it finds under the scan roots.
 ### Repo set
 
 - A session has a repo set: one `session_repo` row per attached repo. The home repo is one of them.
-- Each attached repo gets a worktree inside the session folder. The branch name is stored once on
+- Each attached repo gets a worktree inside the session folder. The home repo is the exception:
+  it is attached as the live checkout unless the session asks for a worktree of it. The branch name is stored once on
   the session and used in every repo, so related branches are easy to find.
-- The agent's working directory is the home worktree, so skills and rules load as they do today.
-  The other worktrees are granted as additional directories.
+- The agent's working directory is the home repo, so a session starts where you would start
+  Claude by hand. The worktrees are granted as additional directories.
 - A repo can be attached in three ways: chosen at start (one by one or as a named set), added by you
   mid-session, or requested by the agent through the `attach_repo` tool when it discovers it needs it.
 - Attach modes: `write` (a worktree, the default), `read` (the main checkout, edits denied) and
@@ -270,8 +270,9 @@ Common behavior:
   so the picture does not jump while agents work.
 
 The renderer is written for Calin in Solid on SVG, with a canvas fallback for large graphs. The
-Solid port of xyflow targets Solid 2.0 and is not stable yet, so it is not a dependency. It is worth
-re-evaluating for the workflow *editor* in M4, where drag-and-connect matters more than animation.
+Solid port of xyflow was pre-release when this was written, so it is not a dependency. Check its
+status at M3, and again for the workflow *editor* in M4, where drag-and-connect matters more than
+animation.
 
 ## 6. Built-in workbench
 
@@ -307,8 +308,10 @@ The built-in workflow needs no file: run the agent on the prompt, then stop at r
 A Calin server gives whoever signs in a shell and agents with a shell. Access control is therefore
 part of the first network-reachable milestone, not a later addition.
 
-- Sign-in with a passkey, then a same-site session cookie. Device tokens for the desktop app and CLI.
-- TLS from Caddy with a public domain, or from Tailscale with no public exposure at all.
+- Sign-in through OpenID Connect (Auth0, or any provider that speaks it), then a same-site session
+  cookie. Only identities on an allow-list are admitted; an empty allow-list admits nobody.
+- Device tokens for the desktop app and the CLI, issued after a browser sign-in.
+- TLS from Caddy on a public domain.
 - Every state-changing request is checked for origin. There is no cross-origin API.
 - On loopback (desktop local mode) there is no sign-in; requests are checked against DNS rebinding.
 - Each agent's MCP token is valid for its own session tree only.
@@ -399,35 +402,42 @@ Each milestone ends with something usable. No dates are attached.
 | M2 | Multi-repo | A session started from the home repo attaches repos at start and on demand, shows unified changes and opens linked draft PRs |
 | M3 | Graph | Agents dispatch children and message each other through MCP; the session graph and timeline are live and replayable |
 | M4 | Workflows | YAML graphs run with per-repo checks, gates, queue and budgets; the ACP runner works with one more agent |
-| M5 | Everywhere | Passkey sign-in, `calin server install`, the PWA with push, and the desktop app in local and remote mode |
+| M5 | Everywhere | OpenID Connect sign-in, `calin server install`, the PWA with push, and the desktop app in local and remote mode |
 | M6 | Integrations | GitHub issues, PR and CI watch, schedules and triggers, usage and cost |
 
-M0 also settles three technical unknowns, listed next.
+Section 12 lists the technical unknowns and the milestone that settles each.
 
 ## 12. Risks and things to verify
 
 | Risk | How it is settled |
 | --- | --- |
-| Vite+ with the Solid plugin and Bun is an unverified combination | M0 spike. Fallback: plain Vite with Bun, which is known to work. |
+| Vite+ with the Solid plugin and Bun | Settled in M0: the scaffold builds, type-checks and lints with Vite+ 1.8, Solid 2.0 and Bun 1.4. |
 | The Claude stream-json protocol is not a versioned public contract | Golden fixtures per CLI version; the runner refuses unknown CLI versions loudly instead of guessing |
 | Granting a new directory to a running Claude session | M2 spike. Fallback: resume the same conversation with the extra `--add-dir`. |
-| A custom graph renderer is real work | M0 spike: 200 nodes laid out and animated on a phone. Fallback: adopt the xyflow port when it is stable. |
+| A custom graph renderer is real work | Spike at the start of M3: 200 nodes laid out and animated on a phone. Fallback: adopt the xyflow port if it is stable by then. |
 | Disk use: a worktree and dependencies per repo per session | `setup` commands, idle reclamation, and a disk view from M2 |
-| A public server that hands out shells | Sign-in ships with M5 before any non-loopback bind is allowed; Tailscale is the recommended default |
+| A public server that hands out shells | The server refuses any non-loopback bind until sign-in ships in M5 |
 | Scope: cezar is a large product | The feature map is the cut. Every milestone is usable on its own. |
 | Subscription logins on a headless server | Verify that `claude` login and token refresh work unattended on the VPS in M1 |
 
-## 13. Open questions
+## 13. Decisions and open questions
 
-1. **Home repo in a session.** A worktree (isolated, the default here) or the live checkout? A
-   worktree does not contain git-ignored files, so local settings would be copied in.
-2. **How your docs name sibling repos.** By relative path such as `../api`, or by name? Worktrees
-   are siblings inside the session folder, which preserves relative paths only if your repos are
-   siblings of the home repo today.
-3. **Other agents.** Which CLIs besides Claude Code do you use? This sets when the ACP runner is due.
-4. **Reach.** Tailscale only, or a public domain with passkey sign-in?
-5. **Tickets.** Which tracker: GitHub Issues, Linear, another?
-6. **Parallel agents.** Is a child session with its own worktrees the right default, or do you
+Decided on 2026-11-26:
+
+- **The home repo** does not exist yet. It will be the repo every session is launched from. It holds
+  `.calin/repos.yaml` and the workflows, plus a script that links its skills and instructions into
+  the host's global Claude configuration. Skills therefore load in every session regardless of the
+  working directory, and docs refer to other repos by their name in `repos.yaml`, not by path.
+- **The home repo in a session** is attached in `live` mode by default: the agent works in the
+  home checkout itself, as when launching Claude there by hand. A session can opt into a private
+  worktree of it instead. Every other repo defaults to `write` (a worktree).
+- **Reach**: a public domain with OpenID Connect sign-in (Auth0 or another provider).
+
+Still open:
+
+1. **Other agents.** Which CLIs besides Claude Code do you use? This sets when the ACP runner is due.
+2. **Tickets.** Which tracker: GitHub Issues, Linear, another?
+3. **Parallel agents.** Is a child session with its own worktrees the right default, or do you
    mostly want several agents working in one shared set of worktrees?
 
 ## References

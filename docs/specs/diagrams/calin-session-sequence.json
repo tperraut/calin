@@ -100,7 +100,7 @@
       "from": "server",
       "to": "git",
       "y": 221,
-      "label": "worktrees: home, api, web",
+      "label": "worktrees: api, web",
       "note": "One branch name in every repo, each tree under the same session folder."
     },
     {
@@ -238,8 +238,8 @@
       "dot": "cyan",
       "title": "One session, several repos",
       "items": [
-        "The agent's working directory is the home repo worktree, so your skills and rules load as usual.",
-        "Every other repo is a worktree beside it, on the same branch name.",
+        "The agent's working directory is the home repo, where you would start Claude by hand.",
+        "Every other repo is a worktree in the session folder, on the same branch name.",
         "A repo can be attached at start, by you mid-session, or by the agent when it finds it needs one."
       ]
     },

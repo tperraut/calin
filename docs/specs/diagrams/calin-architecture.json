@@ -21,7 +21,7 @@
         146,
         64
       ],
-      "explanation": "One SolidJS single-page app, built with Vite+ and served as static files embedded in the calin binary. Installed on a phone as a PWA with web push for 'needs you' notifications. It contains the transcript, the multi-root editor and diff (CodeMirror 6), the terminal (xterm.js) and the graph views."
+      "explanation": "One SolidJS 2 single-page app, built with Vite+ and served as static files embedded in the calin binary. Installed on a phone as a PWA with web push for 'needs you' notifications. It contains the transcript, the multi-root editor and diff (CodeMirror 6), the terminal (xterm.js) and the graph views."
     },
     {
       "id": "desktop",
@@ -42,7 +42,7 @@
       "id": "edge",
       "type": "security",
       "label": "HTTPS + sign-in",
-      "sublabel": "TLS · passkey session",
+      "sublabel": "TLS · OpenID Connect",
       "pos": [
         280,
         220
@@ -51,7 +51,7 @@
         146,
         64
       ],
-      "explanation": "Only on the network path. TLS is terminated by Caddy or Tailscale; calin itself enforces sign-in (a passkey, then a session cookie; device tokens for the desktop app and CLI). A local desktop profile skips this and talks to loopback."
+      "explanation": "Only on the network path. TLS is terminated by Caddy on a public domain. Calin enforces sign-in itself through OpenID Connect (Auth0 or another provider) with an allow-list of identities, then a same-site session cookie; the desktop app and CLI use device tokens. A local desktop profile skips this and talks to loopback."
     },
     {
       "id": "api",
@@ -211,7 +211,7 @@
         146,
         64
       ],
-      "explanation": "One folder per session. Inside it, a worktree of the home repo (the agent's working directory, so your skills and rules load) and one worktree per attached repo, all on the same branch name."
+      "explanation": "One folder per session holding a worktree per attached repo, all on the same branch name. The home repo is attached too, by default as the live checkout rather than a worktree, and it is the agent's working directory."
     },
     {
       "id": "github",
