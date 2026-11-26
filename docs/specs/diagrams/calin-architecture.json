@@ -1,0 +1,413 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Calin system architecture",
+    "locale": "en",
+    "output": "calin/docs/specs/diagrams/calin-architecture.html",
+    "quality_profile": "showcase"
+  },
+  "components": [
+    {
+      "id": "pwa",
+      "type": "frontend",
+      "label": "Web app / PWA",
+      "sublabel": "SolidJS · browser or phone",
+      "pos": [
+        40,
+        220
+      ],
+      "size": [
+        146,
+        64
+      ],
+      "explanation": "One SolidJS single-page app, built with Vite+ and served as static files embedded in the calin binary. Installed on a phone as a PWA with web push for 'needs you' notifications. It contains the transcript, the multi-root editor and diff (CodeMirror 6), the terminal (xterm.js) and the graph views."
+    },
+    {
+      "id": "desktop",
+      "type": "frontend",
+      "label": "Desktop app",
+      "sublabel": "Tauri 2 · local or remote",
+      "pos": [
+        280,
+        380
+      ],
+      "size": [
+        146,
+        64
+      ],
+      "explanation": "A Tauri 2 shell around the same web app. A connection profile decides where the server is: Local starts the calin core inside the app process, bound to loopback; Remote points at a calin server URL with a device token."
+    },
+    {
+      "id": "edge",
+      "type": "security",
+      "label": "HTTPS + sign-in",
+      "sublabel": "TLS · passkey session",
+      "pos": [
+        280,
+        220
+      ],
+      "size": [
+        146,
+        64
+      ],
+      "explanation": "Only on the network path. TLS is terminated by Caddy or Tailscale; calin itself enforces sign-in (a passkey, then a session cookie; device tokens for the desktop app and CLI). A local desktop profile skips this and talks to loopback."
+    },
+    {
+      "id": "api",
+      "type": "backend",
+      "label": "API gateway",
+      "sublabel": "REST + one WebSocket",
+      "pos": [
+        540,
+        220
+      ],
+      "size": [
+        146,
+        64
+      ],
+      "explanation": "axum. REST under /api/v1 for commands and queries, and one WebSocket per client carrying topic subscriptions, event replay by sequence number and terminal bytes. Wire types are defined in Rust and generated to TypeScript, so the two sides cannot drift."
+    },
+    {
+      "id": "orch",
+      "type": "backend",
+      "label": "Orchestrator",
+      "sublabel": "sessions · queue · workflows",
+      "pos": [
+        790,
+        220
+      ],
+      "size": [
+        146,
+        64
+      ],
+      "explanation": "Owns sessions and their repo sets, the queue and parallel limit, the session lifecycle and the workflow graph engine (agent steps, checks, loops, human gates). It reads skills, workflows and the repo list from the home repo.",
+      "drilldowns": [
+        {
+          "href": "calin-session-sequence.html",
+          "label": "Multi-repo session sequence",
+          "diagram_type": "sequence"
+        },
+        {
+          "href": "calin-session-lifecycle.html",
+          "label": "Session lifecycle",
+          "diagram_type": "lifecycle"
+        }
+      ]
+    },
+    {
+      "id": "mcp",
+      "type": "backend",
+      "label": "Calin MCP tools",
+      "sublabel": "dispatch · message · ask",
+      "pos": [
+        1040,
+        220
+      ],
+      "size": [
+        146,
+        64
+      ],
+      "explanation": "An MCP endpoint served by calin and handed to every agent it starts, scoped by a per-session token. It is how an agent talks back to the orchestrator: dispatch a child, message another agent, attach a repo, ask the user, report a result, request a permission decision."
+    },
+    {
+      "id": "bus",
+      "type": "messagebus",
+      "label": "Event bus",
+      "sublabel": "append · project · push",
+      "pos": [
+        540,
+        380
+      ],
+      "size": [
+        146,
+        64
+      ],
+      "explanation": "Every normalized event passes through here in order: appended to the session log first, then projected into the index, then pushed to subscribed clients. Each event carries its parent, which is what the graph views are drawn from."
+    },
+    {
+      "id": "runners",
+      "type": "backend",
+      "label": "Agent runners",
+      "sublabel": "Claude · ACP · mock",
+      "pos": [
+        790,
+        380
+      ],
+      "size": [
+        146,
+        64
+      ],
+      "explanation": "One runner interface. The Claude Code runner drives the claude CLI in print mode with stream-json on stdin and stdout. The ACP runner speaks the Agent Client Protocol over stdio and covers other agents. The mock runner replays recorded fixtures so tests and demos need no login."
+    },
+    {
+      "id": "ws",
+      "type": "backend",
+      "label": "Repo services",
+      "sublabel": "git worktrees · diff · files · terminal · pull requests",
+      "pos": [
+        540,
+        60
+      ],
+      "size": [
+        396,
+        64
+      ],
+      "explanation": "Everything that touches a checkout: creating one worktree per attached repo, computing the unified diff, the file API and watcher behind the editor, the PTY behind the terminal, and opening draft pull requests through gh."
+    },
+    {
+      "id": "log",
+      "type": "database",
+      "label": "Event logs",
+      "sublabel": "NDJSON · source of truth",
+      "pos": [
+        280,
+        540
+      ],
+      "size": [
+        146,
+        64
+      ]
+    },
+    {
+      "id": "db",
+      "type": "database",
+      "label": "SQLite index",
+      "sublabel": "rebuildable projection",
+      "pos": [
+        540,
+        540
+      ],
+      "size": [
+        146,
+        64
+      ],
+      "href": "calin-data-model.html"
+    },
+    {
+      "id": "agents",
+      "type": "external",
+      "label": "Agent CLIs",
+      "sublabel": "claude, or any ACP agent, as local processes under your own login",
+      "pos": [
+        790,
+        540
+      ],
+      "size": [
+        396,
+        64
+      ]
+    },
+    {
+      "id": "trees",
+      "type": "database",
+      "label": "Session worktrees",
+      "sublabel": "home + N repos, 1 branch",
+      "pos": [
+        1290,
+        300
+      ],
+      "size": [
+        146,
+        64
+      ],
+      "explanation": "One folder per session. Inside it, a worktree of the home repo (the agent's working directory, so your skills and rules load) and one worktree per attached repo, all on the same branch name."
+    },
+    {
+      "id": "github",
+      "type": "cloud",
+      "label": "GitHub",
+      "sublabel": "PRs · CI · issues",
+      "pos": [
+        1290,
+        60
+      ],
+      "size": [
+        146,
+        64
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "calin: one Rust process, on the VPS or inside the desktop app",
+      "wraps": [
+        "ws",
+        "api",
+        "orch",
+        "mcp",
+        "bus",
+        "runners"
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "pwa-edge",
+      "from": "pwa",
+      "to": "edge",
+      "label": "HTTPS + WSS",
+      "variant": "emphasis"
+    },
+    {
+      "id": "desktop-edge",
+      "from": "desktop",
+      "to": "edge",
+      "label": "remote profile",
+      "fromSide": "top",
+      "toSide": "bottom"
+    },
+    {
+      "id": "desktop-api",
+      "from": "desktop",
+      "to": "api",
+      "label": "local: in-process",
+      "variant": "dashed",
+      "fromSide": "right",
+      "toSide": "left"
+    },
+    {
+      "id": "edge-api",
+      "from": "edge",
+      "to": "api",
+      "label": "signed-in only",
+      "variant": "security"
+    },
+    {
+      "id": "api-orch",
+      "from": "api",
+      "to": "orch",
+      "label": "commands"
+    },
+    {
+      "id": "orch-runners",
+      "from": "orch",
+      "to": "runners",
+      "label": "start / steer",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "runners-bus",
+      "from": "runners",
+      "to": "bus",
+      "label": "events"
+    },
+    {
+      "id": "bus-api",
+      "from": "bus",
+      "to": "api",
+      "label": "live push",
+      "variant": "dashed",
+      "fromSide": "top",
+      "toSide": "bottom"
+    },
+    {
+      "id": "api-ws",
+      "from": "api",
+      "to": "ws",
+      "label": "editor · terminal",
+      "fromSide": "top",
+      "toSide": "bottom"
+    },
+    {
+      "id": "orch-ws",
+      "from": "orch",
+      "to": "ws",
+      "label": "attach repo",
+      "fromSide": "top",
+      "toSide": "bottom"
+    },
+    {
+      "id": "mcp-orch",
+      "from": "mcp",
+      "to": "orch",
+      "label": "requests"
+    },
+    {
+      "id": "agents-mcp",
+      "from": "agents",
+      "to": "mcp",
+      "label": "tool calls",
+      "fromSide": "top",
+      "toSide": "bottom"
+    },
+    {
+      "id": "runners-agents",
+      "from": "runners",
+      "to": "agents",
+      "label": "stdio JSON stream",
+      "variant": "emphasis",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "bus-db",
+      "from": "bus",
+      "to": "db",
+      "label": "project",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "bus-log",
+      "from": "bus",
+      "to": "log",
+      "label": "append",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "ws-github",
+      "from": "ws",
+      "to": "github",
+      "label": "draft PRs"
+    },
+    {
+      "id": "ws-trees",
+      "from": "ws",
+      "to": "trees",
+      "label": "worktree per repo",
+      "fromSide": "right",
+      "toSide": "left"
+    },
+    {
+      "id": "agents-trees",
+      "from": "agents",
+      "to": "trees",
+      "label": "read · edit · run",
+      "fromSide": "right",
+      "toSide": "bottom"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Two ways to run it",
+      "items": [
+        "Server: the calin binary runs on your VPS; phone and laptops reach it over HTTPS.",
+        "Desktop local: the same core runs inside the Tauri app, bound to loopback.",
+        "Desktop remote: the Tauri app is only a window onto a calin server."
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "Storage",
+      "items": [
+        "Each session's event log is the source of truth and is append-only.",
+        "The SQLite index is a projection of those logs and can be rebuilt from them.",
+        "Skills, rules, workflows and the repo list stay in your home repo, under git."
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Agents",
+      "items": [
+        "Agents run as local CLI processes with your own login; no API key is needed.",
+        "They work directly in the session worktrees and reach Calin through its MCP tools.",
+        "Everything they emit is normalized to one event format before it is stored."
+      ]
+    }
+  ]
+}

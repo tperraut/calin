@@ -1,0 +1,8 @@
+/target
+node_modules
+dist
+*.local
+.DS_Store
+# archify run receipts (the diagrams and their sources are tracked)
+docs/specs/diagrams/.receipts
+docs/specs/diagrams/*.delivery.json

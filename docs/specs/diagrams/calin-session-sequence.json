@@ -1,0 +1,265 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "A multi-repo session, from start to review",
+    "locale": "en",
+    "output": "calin/docs/specs/diagrams/calin-session-sequence.html",
+    "quality_profile": "showcase",
+    "parentHref": "calin-architecture.html"
+  },
+  "participants": [
+    {
+      "id": "you",
+      "type": "external",
+      "label": "You",
+      "sublabel": "phone or laptop"
+    },
+    {
+      "id": "ui",
+      "type": "frontend",
+      "label": "Calin UI",
+      "sublabel": "web app / PWA"
+    },
+    {
+      "id": "server",
+      "type": "backend",
+      "label": "Calin server",
+      "sublabel": "API + orchestrator"
+    },
+    {
+      "id": "git",
+      "type": "backend",
+      "label": "Git service",
+      "sublabel": "worktrees"
+    },
+    {
+      "id": "lead",
+      "type": "external",
+      "label": "Lead agent",
+      "sublabel": "Claude Code process"
+    },
+    {
+      "id": "child",
+      "type": "external",
+      "label": "Child agent",
+      "sublabel": "dispatched session"
+    },
+    {
+      "id": "store",
+      "type": "database",
+      "label": "Log + index",
+      "sublabel": "NDJSON · SQLite"
+    }
+  ],
+  "segments": [
+    {
+      "from": 150,
+      "to": 342,
+      "label": "Start from the home repo"
+    },
+    {
+      "from": 354,
+      "to": 439,
+      "label": "Work and stream"
+    },
+    {
+      "from": 451,
+      "to": 536,
+      "label": "Attach a repo on demand"
+    },
+    {
+      "from": 548,
+      "to": 728,
+      "label": "Delegate"
+    },
+    {
+      "from": 740,
+      "to": 798,
+      "label": "Hand back"
+    }
+  ],
+  "messages": [
+    {
+      "id": "new-session",
+      "from": "you",
+      "to": "ui",
+      "y": 165,
+      "label": "new session, pick api + web"
+    },
+    {
+      "id": "create",
+      "from": "ui",
+      "to": "server",
+      "y": 193,
+      "label": "POST /sessions",
+      "variant": "emphasis"
+    },
+    {
+      "id": "make-trees",
+      "from": "server",
+      "to": "git",
+      "y": 221,
+      "label": "worktrees: home, api, web",
+      "note": "One branch name in every repo, each tree under the same session folder."
+    },
+    {
+      "id": "trees-ready",
+      "from": "git",
+      "to": "server",
+      "y": 300,
+      "label": "paths + base refs",
+      "variant": "return"
+    },
+    {
+      "id": "spawn-lead",
+      "from": "server",
+      "to": "lead",
+      "y": 328,
+      "label": "spawn in home, --add-dir api web",
+      "variant": "emphasis"
+    },
+    {
+      "id": "lead-events",
+      "from": "lead",
+      "to": "server",
+      "y": 369,
+      "label": "text + tool events",
+      "variant": "dashed"
+    },
+    {
+      "id": "append",
+      "from": "server",
+      "to": "store",
+      "y": 397,
+      "label": "append, then project"
+    },
+    {
+      "id": "push-events",
+      "from": "server",
+      "to": "ui",
+      "y": 425,
+      "label": "WebSocket: events by seq",
+      "variant": "dashed"
+    },
+    {
+      "id": "attach-call",
+      "from": "lead",
+      "to": "server",
+      "y": 466,
+      "label": "MCP attach_repo(design-system)"
+    },
+    {
+      "id": "attach-tree",
+      "from": "server",
+      "to": "git",
+      "y": 494,
+      "label": "add worktree"
+    },
+    {
+      "id": "attach-ok",
+      "from": "server",
+      "to": "lead",
+      "y": 522,
+      "label": "path granted",
+      "variant": "return"
+    },
+    {
+      "id": "dispatch-call",
+      "from": "lead",
+      "to": "server",
+      "y": 563,
+      "label": "MCP dispatch(brief, repos: web)"
+    },
+    {
+      "id": "spawn-child",
+      "from": "server",
+      "to": "child",
+      "y": 591,
+      "label": "spawn child session",
+      "variant": "emphasis",
+      "note": "Own worktree forked from the parent branch. Its budget is carved out of the parent's."
+    },
+    {
+      "id": "child-report",
+      "from": "child",
+      "to": "server",
+      "y": 682,
+      "label": "events + report",
+      "variant": "dashed"
+    },
+    {
+      "id": "deliver-report",
+      "from": "server",
+      "to": "lead",
+      "y": 714,
+      "label": "deliver report",
+      "variant": "return"
+    },
+    {
+      "id": "to-review",
+      "from": "server",
+      "to": "ui",
+      "y": 755,
+      "label": "status: review, unified diff",
+      "variant": "dashed"
+    },
+    {
+      "id": "notify",
+      "from": "ui",
+      "to": "you",
+      "y": 783,
+      "label": "push: needs you",
+      "variant": "return"
+    }
+  ],
+  "activations": [
+    {
+      "participant": "server",
+      "from": 193,
+      "to": 760,
+      "type": "backend"
+    },
+    {
+      "participant": "lead",
+      "from": 328,
+      "to": 720,
+      "type": "external"
+    },
+    {
+      "participant": "child",
+      "from": 591,
+      "to": 688,
+      "type": "external"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "One session, several repos",
+      "items": [
+        "The agent's working directory is the home repo worktree, so your skills and rules load as usual.",
+        "Every other repo is a worktree beside it, on the same branch name.",
+        "A repo can be attached at start, by you mid-session, or by the agent when it finds it needs one."
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "Everything is an event",
+      "items": [
+        "Spawns, messages, tool calls and file changes are all appended to the session log.",
+        "Each event names its parent, so the graph and the timeline are replays of the log.",
+        "A client that reconnects asks for events after its last sequence number."
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Delegation stays visible",
+      "items": [
+        "A child is a session of its own, nested under its parent.",
+        "Its report lands in the parent agent's conversation.",
+        "Nothing merges on its own: the session ends at review."
+      ]
+    }
+  ]
+}

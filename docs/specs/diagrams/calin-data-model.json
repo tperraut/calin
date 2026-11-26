@@ -1,0 +1,171 @@
+{
+  "schema_version": 1,
+  "diagram_type": "erd",
+  "meta": {
+    "title": "Calin data model: multi-repo sessions",
+    "locale": "en",
+    "output": "calin/docs/specs/diagrams/calin-data-model.html",
+    "quality_profile": "standard",
+    "views": [
+      { "id": "repo-set", "label": "A session's repo set", "focus": ["session", "session_repo", "repo", "pull_request"], "note": "session_repo is the join: one row, one worktree and at most one PR per attached repo." },
+      { "id": "graph", "label": "What the graph is drawn from", "focus": ["agent", "message", "event"], "note": "Agents are nodes; parent links and messages are the edges; events order them in time." },
+      { "id": "attribution", "label": "Who changed what, where", "focus": ["file_change", "event", "session_repo", "agent"], "note": "Each file change points at the event that made it and the repo it landed in." }
+    ]
+  },
+  "layout": { "mode": "grid", "gapX": 76, "gapY": 40 },
+  "entities": [
+    {
+      "id": "workspace", "label": "workspace", "tag": "workspace", "row": 0, "col": 0,
+      "attributes": [
+        { "name": "id", "type": "TEXT", "key": "pk" },
+        { "name": "name", "type": "TEXT" },
+        { "name": "scan_roots", "type": "TEXT json" },
+        { "name": "max_parallel", "type": "INTEGER" },
+        { "name": "created_at", "type": "INTEGER" }
+      ]
+    },
+    {
+      "id": "repo", "label": "repo", "tag": "workspace", "row": 1, "col": 0,
+      "attributes": [
+        { "name": "id", "type": "TEXT", "key": "pk" },
+        { "name": "workspace_id", "type": "TEXT", "key": "fk", "references": "workspace.id" },
+        { "name": "name", "type": "TEXT", "key": "uk" },
+        { "name": "role", "type": "TEXT home|code" },
+        { "name": "remote_url", "type": "TEXT" },
+        { "name": "local_path", "type": "TEXT" },
+        { "name": "default_branch", "type": "TEXT" },
+        { "name": "checks", "type": "TEXT json" }
+      ]
+    },
+    {
+      "id": "session", "label": "session", "tag": "session", "row": 0, "col": 1,
+      "attributes": [
+        { "name": "id", "type": "TEXT", "key": "pk" },
+        { "name": "workspace_id", "type": "TEXT", "key": "fk", "references": "workspace.id" },
+        { "name": "parent_session_id", "type": "TEXT", "key": "fk", "references": "session.id" },
+        { "name": "root_session_id", "type": "TEXT", "key": "fk", "references": "session.id" },
+        { "name": "title", "type": "TEXT" },
+        { "name": "prompt", "type": "TEXT" },
+        { "name": "status", "type": "TEXT" },
+        { "name": "branch", "type": "TEXT" },
+        { "name": "workflow", "type": "TEXT" },
+        { "name": "ticket_ref", "type": "TEXT" },
+        { "name": "budget_usd", "type": "REAL" },
+        { "name": "created_at", "type": "INTEGER" }
+      ]
+    },
+    {
+      "id": "session_repo", "label": "session_repo", "tag": "session", "row": 1, "col": 1,
+      "attributes": [
+        { "name": "id", "type": "TEXT", "key": "pk" },
+        { "name": "session_id", "type": "TEXT", "key": "fk", "references": "session.id" },
+        { "name": "repo_id", "type": "TEXT", "key": "fk", "references": "repo.id" },
+        { "name": "mode", "type": "TEXT write|read|live" },
+        { "name": "worktree_path", "type": "TEXT" },
+        { "name": "base_ref", "type": "TEXT" },
+        { "name": "head_sha", "type": "TEXT" },
+        { "name": "attached_by", "type": "TEXT user|agent" },
+        { "name": "attached_at", "type": "INTEGER" }
+      ]
+    },
+    {
+      "id": "pull_request", "label": "pull_request", "tag": "session", "row": 2, "col": 1,
+      "attributes": [
+        { "name": "id", "type": "TEXT", "key": "pk" },
+        { "name": "session_repo_id", "type": "TEXT", "key": "fk", "references": "session_repo.id" },
+        { "name": "number", "type": "INTEGER" },
+        { "name": "url", "type": "TEXT", "key": "uk" },
+        { "name": "state", "type": "TEXT" },
+        { "name": "ci_state", "type": "TEXT" },
+        { "name": "review_state", "type": "TEXT" },
+        { "name": "updated_at", "type": "INTEGER" }
+      ]
+    },
+    {
+      "id": "event", "label": "event", "tag": "event log", "row": 0, "col": 2,
+      "attributes": [
+        { "name": "id", "type": "TEXT ulid", "key": "pk" },
+        { "name": "session_id", "type": "TEXT", "key": "fk", "references": "session.id" },
+        { "name": "agent_id", "type": "TEXT", "key": "fk", "references": "agent.id" },
+        { "name": "parent_event_id", "type": "TEXT", "key": "fk", "references": "event.id" },
+        { "name": "seq", "type": "INTEGER" },
+        { "name": "kind", "type": "TEXT" },
+        { "name": "item_id", "type": "TEXT" },
+        { "name": "log_offset", "type": "INTEGER" },
+        { "name": "ts", "type": "INTEGER" }
+      ]
+    },
+    {
+      "id": "file_change", "label": "file_change", "tag": "event log", "row": 1, "col": 2,
+      "attributes": [
+        { "name": "id", "type": "TEXT", "key": "pk" },
+        { "name": "event_id", "type": "TEXT", "key": "fk", "references": "event.id" },
+        { "name": "session_repo_id", "type": "TEXT", "key": "fk", "references": "session_repo.id" },
+        { "name": "path", "type": "TEXT" },
+        { "name": "op", "type": "TEXT" },
+        { "name": "added", "type": "INTEGER" },
+        { "name": "removed", "type": "INTEGER" }
+      ]
+    },
+    {
+      "id": "agent", "label": "agent", "tag": "agents", "row": 0, "col": 3,
+      "attributes": [
+        { "name": "id", "type": "TEXT", "key": "pk" },
+        { "name": "session_id", "type": "TEXT", "key": "fk", "references": "session.id" },
+        { "name": "parent_agent_id", "type": "TEXT", "key": "fk", "references": "agent.id" },
+        { "name": "kind", "type": "TEXT process|subagent" },
+        { "name": "role", "type": "TEXT" },
+        { "name": "runner", "type": "TEXT" },
+        { "name": "model", "type": "TEXT" },
+        { "name": "native_session_id", "type": "TEXT" },
+        { "name": "status", "type": "TEXT" },
+        { "name": "cost_usd", "type": "REAL" },
+        { "name": "tokens_in", "type": "INTEGER" },
+        { "name": "tokens_out", "type": "INTEGER" }
+      ]
+    },
+    {
+      "id": "message", "label": "message", "tag": "agents", "row": 1, "col": 3,
+      "attributes": [
+        { "name": "id", "type": "TEXT", "key": "pk" },
+        { "name": "from_agent_id", "type": "TEXT", "key": "fk", "references": "agent.id" },
+        { "name": "to_agent_id", "type": "TEXT", "key": "fk", "references": "agent.id" },
+        { "name": "in_reply_to", "type": "TEXT", "key": "fk", "references": "message.id" },
+        { "name": "kind", "type": "TEXT" },
+        { "name": "body", "type": "TEXT" },
+        { "name": "created_at", "type": "INTEGER" }
+      ]
+    }
+  ],
+  "relationships": [
+    { "id": "repo_workspace", "from": "repo", "to": "workspace", "fromCardinality": "many", "toCardinality": "one" },
+    { "id": "session_workspace", "from": "session", "to": "workspace", "fromCardinality": "many", "toCardinality": "one" },
+    { "id": "session_repo_session", "from": "session_repo", "to": "session", "label": "repo set", "fromCardinality": "many", "toCardinality": "one" },
+    { "id": "session_repo_repo", "from": "session_repo", "to": "repo", "fromCardinality": "many", "toCardinality": "one" },
+    { "id": "pr_session_repo", "from": "pull_request", "to": "session_repo", "fromCardinality": "many", "fromOptional": true, "toCardinality": "one" },
+    { "id": "event_session", "from": "event", "to": "session", "fromCardinality": "many", "toCardinality": "one" },
+    { "id": "event_agent", "from": "event", "to": "agent", "label": "emitted by", "fromCardinality": "many", "toCardinality": "one" },
+    { "id": "file_change_event", "from": "file_change", "to": "event", "fromCardinality": "many", "fromOptional": true, "toCardinality": "one" },
+    { "id": "file_change_session_repo", "from": "file_change", "to": "session_repo", "label": "lands in", "fromCardinality": "many", "fromOptional": true, "toCardinality": "one" },
+    { "id": "message_agent", "from": "message", "to": "agent", "label": "from / to", "fromCardinality": "many", "fromOptional": true, "toCardinality": "one" }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "Multi-repo", "items": [
+      "A session never belongs to one repo. Its repo set is the session_repo rows, and the home repo is one of them.",
+      "branch is stored once on the session and used in every attached repo.",
+      "mode: write is a worktree, read is the main checkout without edits, live edits the main checkout in place.",
+      "A child session points at its parent and its root, so changes and cost roll up over the whole tree."
+    ] },
+    { "dot": "violet", "title": "Graph", "items": [
+      "agent.parent_agent_id records who spawned whom, for separate processes and for an agent's own subagents.",
+      "A message with a null from or to agent is from or to you.",
+      "event.parent_event_id is causality: the tool call that produced a spawn, the message that woke an agent."
+    ] },
+    { "dot": "amber", "title": "Reading this schema", "items": [
+      "This is the SQLite index. Event bodies live in the per-session NDJSON log; log_offset points into it.",
+      "seq is unique per session and is what clients replay from.",
+      "Self-references (session tree, agent tree, event parent, reply chain) and the agent's session are shown as columns, not lines.",
+      "repo.local_path is per machine; name and remote_url come from the home repo's repo list."
+    ] }
+  ]
+}

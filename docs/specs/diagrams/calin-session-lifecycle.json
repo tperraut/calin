@@ -1,0 +1,192 @@
+{
+  "schema_version": 3,
+  "diagram_type": "lifecycle",
+  "meta": {
+    "title": "Calin session lifecycle",
+    "locale": "en",
+    "output": "calin/docs/specs/diagrams/calin-session-lifecycle.html",
+    "quality_profile": "showcase",
+    "parentHref": "calin-architecture.html"
+  },
+  "mainPath": [
+    "queued",
+    "preparing",
+    "running",
+    "review",
+    "shipping",
+    "done"
+  ],
+  "states": [
+    {
+      "id": "queued",
+      "type": "start",
+      "label": "Queued",
+      "sublabel": "waiting for a slot",
+      "step": "01"
+    },
+    {
+      "id": "preparing",
+      "type": "active",
+      "label": "Preparing",
+      "sublabel": "worktree per repo",
+      "step": "02"
+    },
+    {
+      "id": "running",
+      "type": "active",
+      "label": "Running",
+      "sublabel": "agents at work",
+      "step": "03"
+    },
+    {
+      "id": "review",
+      "type": "decision",
+      "label": "Review",
+      "sublabel": "you read the diff",
+      "step": "04"
+    },
+    {
+      "id": "shipping",
+      "type": "waiting",
+      "label": "Shipping",
+      "sublabel": "PRs open · CI watched",
+      "step": "05"
+    },
+    {
+      "id": "done",
+      "type": "success",
+      "label": "Done",
+      "sublabel": "PRs settled",
+      "step": "06"
+    },
+    {
+      "id": "waiting",
+      "type": "waiting",
+      "label": "Waiting on you",
+      "sublabel": "question · approval · gate"
+    },
+    {
+      "id": "failed",
+      "type": "failure",
+      "label": "Failed",
+      "sublabel": "crash, setup or budget"
+    },
+    {
+      "id": "cancelled",
+      "type": "neutral",
+      "label": "Cancelled",
+      "sublabel": "stopped or discarded"
+    }
+  ],
+  "transitions": [
+    {
+      "id": "queued-preparing",
+      "from": "queued",
+      "to": "preparing",
+      "label": "start"
+    },
+    {
+      "id": "preparing-running",
+      "from": "preparing",
+      "to": "running",
+      "label": "ready"
+    },
+    {
+      "id": "running-review",
+      "from": "running",
+      "to": "review",
+      "label": "finished"
+    },
+    {
+      "id": "review-shipping",
+      "from": "review",
+      "to": "shipping",
+      "label": "open PRs"
+    },
+    {
+      "id": "shipping-done",
+      "from": "shipping",
+      "to": "done",
+      "label": "merged"
+    },
+    {
+      "id": "running-waiting",
+      "from": "running",
+      "to": "waiting",
+      "label": "needs input",
+      "variant": "dashed"
+    },
+    {
+      "id": "waiting-running",
+      "from": "waiting",
+      "to": "running",
+      "label": "answered"
+    },
+    {
+      "id": "review-running",
+      "from": "review",
+      "to": "running",
+      "label": "send notes back"
+    },
+    {
+      "id": "shipping-running",
+      "from": "shipping",
+      "to": "running",
+      "label": "CI or review fails"
+    },
+    {
+      "id": "running-failed",
+      "from": "running",
+      "to": "failed",
+      "label": "error",
+      "variant": "security"
+    },
+    {
+      "id": "failed-running",
+      "from": "failed",
+      "to": "running",
+      "label": "continue"
+    },
+    {
+      "id": "running-cancelled",
+      "from": "running",
+      "to": "cancelled",
+      "label": "stop"
+    },
+    {
+      "id": "review-cancelled",
+      "from": "review",
+      "to": "cancelled",
+      "label": "discard"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Main path",
+      "items": [
+        "A session holds a queue slot only while it is Preparing or Running.",
+        "Review is always a human step: nothing opens a PR or merges on its own.",
+        "Shipping tracks one PR per changed repo and ends when all of them settle."
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Waiting",
+      "items": [
+        "A question, a permission request or a workflow gate parks the session.",
+        "A parked session sends a push notification, keeps its worktrees and frees its queue slot.",
+        "Autonomous mode answers permissions itself, so it only waits on explicit gates."
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Ways back in",
+      "items": [
+        "Notes from Review, a red CI run and a failed run all return to Running.",
+        "Continue resumes the agent's own conversation in the same worktrees.",
+        "Cancelled keeps the branches, so nothing is lost by stopping."
+      ]
+    }
+  ]
+}

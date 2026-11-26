@@ -1,0 +1,34 @@
+# Status
+
+Milestones are defined in [the design spec](specs/2026-11-26-calin-design.md#11-milestones).
+Update this file in the same commit that finishes an item.
+
+## M0: Skeleton (in progress)
+
+- [x] Rust workspace, toolchain pin, Makefile with the validation gate
+- [x] `calin-proto`: wire types, REST and WebSocket contract, TypeScript generation
+- [x] Web app scaffold: Solid 2, Vite+, Bun (the combination builds and checks cleanly)
+- [ ] `calin-core`: store (SQLite index + NDJSON logs), event bus, session manager
+- [ ] `calin-agents`: runner interface and the mock runner
+- [ ] `calin-server` and `calin-cli`: REST, WebSocket with replay, embedded web app, `calin serve`
+- [ ] Web app: session list, new session, live transcript with reconnect and replay
+- [ ] End to end: a mock session streams to the browser and survives a reload
+- [ ] Spike: lay out and animate a 200-node graph on a phone-sized viewport
+
+## M1: One session, one repo
+
+- [ ] Claude Code runner over stream-json, with recorded fixtures
+- [ ] Session worktree, stop and continue
+- [ ] Permission requests answered from the UI
+- [ ] Diff view, editor, terminal
+
+## Later
+
+M2 multi-repo · M3 graph · M4 workflows · M5 sign-in, server install, PWA, desktop · M6 integrations
+
+## Decisions since the spec
+
+- 2026-11-26: Solid 2.0 is the current stable line and is what the scaffold installs.
+- 2026-11-26: Sign-in will be OpenID Connect (Auth0 or another provider) rather than passkeys.
+- 2026-11-26: The home repo does not exist yet. It will hold the repo list and workflows, and a
+  script that links its skills and instructions into the host's global Claude configuration.
