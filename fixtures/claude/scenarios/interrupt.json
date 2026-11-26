@@ -1,0 +1,7 @@
+{
+  "turns": [
+    "Run this exact shell command with the Bash tool and nothing else: python3 -c \"import time; time.sleep(60)\"",
+    "Reply with the single word ok."
+  ],
+  "interrupt": { "turn": 1, "after_tool_use": "Bash", "delay": 4.0 }
+}

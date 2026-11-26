@@ -1,30 +1,40 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::claude::{ClaudeConfig, ClaudeRunner};
 use crate::mock::{MockConfig, MockRunner};
 use crate::runner::Runner;
+
+/// The CLI version the Claude runner's fixtures were recorded with.
+const CLAUDE_TESTED_VERSION: &str = "2.1.332";
 
 /// Set to `1` to run every agent on the mock runner.
 const ENV_DRY_RUN: &str = "CALIN_DRY_RUN";
 /// Milliseconds the mock runner waits before each chunk.
 const ENV_MOCK_DELAY_MS: &str = "CALIN_MOCK_DELAY_MS";
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RegistryConfig {
     /// Resolve every runner id to the mock runner.
     pub dry_run: bool,
     pub mock: MockConfig,
+    /// How to run Claude Code. `None` leaves the Claude runner out, which is
+    /// what keeps a default registry independent of the machine it is on.
+    pub claude: Option<ClaudeConfig>,
 }
 
 impl RegistryConfig {
-    /// Reads `CALIN_DRY_RUN` and `CALIN_MOCK_DELAY_MS`. Only the binary calls
-    /// this; everything else receives a config, so tests never touch the
-    /// process environment.
+    /// Reads `CALIN_DRY_RUN`, `CALIN_MOCK_DELAY_MS` and `CALIN_CLAUDE_BIN`.
+    /// Only the binary calls this; everything else receives a config, so
+    /// tests never touch the process environment.
     pub fn from_env() -> Self {
-        Self::from_values(
-            std::env::var(ENV_DRY_RUN).ok().as_deref(),
-            std::env::var(ENV_MOCK_DELAY_MS).ok().as_deref(),
-        )
+        Self {
+            claude: Some(ClaudeConfig::from_env()),
+            ..Self::from_values(
+                std::env::var(ENV_DRY_RUN).ok().as_deref(),
+                std::env::var(ENV_MOCK_DELAY_MS).ok().as_deref(),
+            )
+        }
     }
 
     fn from_values(dry_run: Option<&str>, mock_delay_ms: Option<&str>) -> Self {
@@ -49,15 +59,33 @@ pub struct RunnerRegistry {
 }
 
 impl RunnerRegistry {
-    /// A registry holding the mock runner, which is the default until real
-    /// runners are registered ahead of it.
+    /// A registry holding the mock runner and, outside dry run, the Claude
+    /// runner when its CLI can be run. Claude is then the default; without
+    /// it the mock is. Probing the CLI blocks for a few milliseconds.
     pub fn new(config: RegistryConfig) -> Self {
         let mock: Arc<dyn Runner> = Arc::new(MockRunner::new(config.mock));
-        Self {
+        let mut registry = Self {
             dry_run: config.dry_run,
             runners: vec![Arc::clone(&mock)],
             mock,
+        };
+        if let Some(claude) = config.claude.filter(|_| !config.dry_run) {
+            let runner = ClaudeRunner::new(claude);
+            match runner.probe() {
+                Some(version) => {
+                    if version != CLAUDE_TESTED_VERSION {
+                        tracing::warn!(
+                            %version,
+                            tested = CLAUDE_TESTED_VERSION,
+                            "claude is not the version the runner was tested with"
+                        );
+                    }
+                    registry.runners.insert(0, Arc::new(runner));
+                }
+                None => tracing::info!("claude is not available; the mock runner is the default"),
+            }
         }
+        registry
     }
 
     /// Adds a runner after the existing ones, replacing one with the same id.
@@ -93,6 +121,9 @@ impl RunnerRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::claude::CLAUDE_RUNNER_ID;
+    #[cfg(unix)]
+    use crate::claude::testing::FakeClaude;
     use crate::mock::MOCK_RUNNER_ID;
     use crate::runner::{AgentHandle, RunnerError, StartParams};
 
@@ -135,6 +166,53 @@ mod tests {
         });
         registry.register(Arc::new(Other));
         for id in [None, Some("mock"), Some("other"), Some("claude")] {
+            assert_eq!(registry.resolve(id).unwrap().id(), MOCK_RUNNER_ID);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_available_claude_becomes_the_default() {
+        let fake = FakeClaude::new(&[]);
+        let registry = RunnerRegistry::new(RegistryConfig {
+            claude: Some(fake.config()),
+            ..RegistryConfig::default()
+        });
+        assert_eq!(registry.ids(), [CLAUDE_RUNNER_ID, MOCK_RUNNER_ID]);
+        assert_eq!(registry.resolve(None).unwrap().id(), CLAUDE_RUNNER_ID);
+        assert_eq!(
+            registry.resolve(Some("claude")).unwrap().id(),
+            CLAUDE_RUNNER_ID
+        );
+        assert_eq!(registry.resolve(Some("mock")).unwrap().id(), MOCK_RUNNER_ID);
+        assert!(registry.resolve(Some("acp")).is_none());
+    }
+
+    #[test]
+    fn a_missing_claude_leaves_the_mock_as_the_default() {
+        let registry = RunnerRegistry::new(RegistryConfig {
+            claude: Some(ClaudeConfig {
+                bin: Some("/nonexistent/calin/claude".into()),
+                ..ClaudeConfig::default()
+            }),
+            ..RegistryConfig::default()
+        });
+        assert_eq!(registry.ids(), [MOCK_RUNNER_ID]);
+        assert_eq!(registry.resolve(None).unwrap().id(), MOCK_RUNNER_ID);
+        assert!(registry.resolve(Some("claude")).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dry_run_does_not_even_look_for_claude() {
+        let fake = FakeClaude::new(&[]);
+        let registry = RunnerRegistry::new(RegistryConfig {
+            dry_run: true,
+            claude: Some(fake.config()),
+            ..RegistryConfig::default()
+        });
+        assert_eq!(registry.ids(), [MOCK_RUNNER_ID]);
+        for id in [None, Some("mock"), Some("claude")] {
             assert_eq!(registry.resolve(id).unwrap().id(), MOCK_RUNNER_ID);
         }
     }

@@ -1,0 +1,14 @@
+{"native_session":{"id":"uuid-0001","model":"claude-haiku-5-5"}}
+{"event":{"item":{"content":{"input":{"content":"alpha\n","file_path":"/work/made.txt"},"kind":"tool","locations":["/work/made.txt"],"name":"Write","output":null,"title":"made.txt","tool_kind":"edit"},"id":"toolu-0001","status":"running"},"type":"item_started"}}
+{"permission_request":{"id":"uuid-0006","input":{"content":"alpha\n","file_path":"/work/made.txt"},"item_id":"toolu-0001","title":"made.txt","tool_kind":"edit","tool_name":"Write"}}
+{"event":{"item":{"content":{"input":{"content":"alpha\n","file_path":"/work/made.txt"},"kind":"tool","locations":["/work/made.txt"],"name":"Write","output":"File created successfully at: /work/made.txt (file state is current in your context — no need to Read it back)","title":"made.txt","tool_kind":"edit"},"id":"toolu-0001","status":"completed"},"type":"item_completed"}}
+{"event":{"item":{"content":{"kind":"text","text":""},"id":"claude-7-1","status":"running"},"type":"item_started"}}
+{"event":{"item":{"content":{"kind":"text","text":"done"},"id":"claude-7-1","status":"completed"},"type":"item_completed"}}
+{"event":{"cost_usd":0.00369768,"tokens_in":54233,"tokens_out":184,"type":"usage"}}
+"turn_ended"
+{"event":{"item":{"content":{"input":{"command":"sleep 30","description":"Sleep for 30 seconds"},"kind":"tool","locations":[],"name":"Bash","output":null,"title":"sleep 30","tool_kind":"execute"},"id":"toolu-0002","status":"running"},"type":"item_started"}}
+{"event":{"item":{"content":{"input":{"command":"sleep 30","description":"Sleep for 30 seconds"},"kind":"tool","locations":[],"name":"Bash","output":"<tool_use_error>Blocked: standalone sleep 30. To wait for a condition, use Monitor with an until-loop (e.g. `until <check>; do sleep 2; done`). To wait for a command you started, use run_in_background: true. Do not chain shorter sleeps to work around this block.</tool_use_error>","title":"sleep 30","tool_kind":"execute"},"id":"toolu-0002","status":"failed"},"type":"item_completed"}}
+{"event":{"item":{"content":{"kind":"text","text":""},"id":"claude-7-2","status":"running"},"type":"item_started"}}
+{"event":{"item":{"content":{"kind":"text","text":"The `sleep 30` command was blocked by the sandbox. The error says standalone sleeps aren't allowed and suggests Monitor or background jobs for waiting on a condition. I haven't run it again, split it into shorter sleeps, or used another workaround, since the block is an explicit policy. If you want the 30-second pause, you can run `sleep 30` yourself in your terminal, or tell me to proceed another way."},"id":"claude-7-2","status":"completed"},"type":"item_completed"}}
+{"event":{"cost_usd":0.005931820000000001,"tokens_in":127728,"tokens_out":576,"type":"usage"}}
+"turn_ended"

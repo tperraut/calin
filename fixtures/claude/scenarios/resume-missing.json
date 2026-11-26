@@ -1,0 +1,4 @@
+{
+  "args": ["--resume", "00000000-0000-4000-8000-000000000000"],
+  "turns": ["Reply with the single word ok."]
+}

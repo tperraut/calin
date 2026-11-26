@@ -1,0 +1,5 @@
+{
+  "files": { "notes.txt": "The quick brown fox\njumps over the lazy dgo.\n" },
+  "turns": ["Fix the typo in notes.txt with the Edit tool, then reply with one short sentence."],
+  "persist": true
+}

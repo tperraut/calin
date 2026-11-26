@@ -1,0 +1,16 @@
+{"native_session":{"id":"uuid-0001","model":"claude-haiku-5-5"}}
+{"event":{"item":{"content":{"input":{"file_path":"/work/note.txt"},"kind":"tool","locations":["/work/note.txt"],"name":"Read","output":null,"title":"note.txt","tool_kind":"read"},"id":"toolu-0001","status":"running"},"type":"item_started"}}
+{"event":{"item":{"content":{"input":{"file_path":"/work/note.txt"},"kind":"tool","locations":["/work/note.txt"],"name":"Read","output":"1\tCalin fixture note.\n2\tSecond line.\n3\t","title":"note.txt","tool_kind":"read"},"id":"toolu-0001","status":"completed"},"type":"item_completed"}}
+{"event":{"item":{"content":{"input":{"command":"ls -la .","description":"List all files in current directory"},"kind":"tool","locations":[],"name":"Bash","output":null,"title":"ls -la .","tool_kind":"execute"},"id":"toolu-0002","status":"running"},"type":"item_started"}}
+{"event":{"item":{"content":{"input":{"command":"ls -la .","description":"List all files in current directory"},"kind":"tool","locations":[],"name":"Bash","output":"total 4\ndrwxr-xr-x. 2 user user 60 Nov 26 23:48 .\ndrwxr-xr-x. 4 user user 80 Nov 26 23:48 ..\n-rw-r--r--. 1 user user 33 Nov 26 23:48 note.txt","title":"ls -la .","tool_kind":"execute"},"id":"toolu-0002","status":"completed"},"type":"item_completed"}}
+{"event":{"item":{"content":{"kind":"text","text":""},"id":"claude-7-2","status":"running"},"type":"item_started"}}
+{"event":{"delta":{"kind":"text","text":"The directory ho"},"item_id":"claude-7-2","type":"item_delta"}}
+{"event":{"delta":{"kind":"text","text":"lds only `note.t"},"item_id":"claude-7-2","type":"item_delta"}}
+{"event":{"delta":{"kind":"text","text":"xt` (33 bytes), "},"item_id":"claude-7-2","type":"item_delta"}}
+{"event":{"delta":{"kind":"text","text":"which reads \"Cal"},"item_id":"claude-7-2","type":"item_delta"}}
+{"event":{"delta":{"kind":"text","text":"in fixture note."},"item_id":"claude-7-2","type":"item_delta"}}
+{"event":{"delta":{"kind":"text","text":"\" followed by \"S"},"item_id":"claude-7-2","type":"item_delta"}}
+{"event":{"delta":{"kind":"text","text":"econd line.\""},"item_id":"claude-7-2","type":"item_delta"}}
+{"event":{"item":{"content":{"kind":"text","text":"The directory holds only `note.txt` (33 bytes), which reads \"Calin fixture note.\" followed by \"Second line.\""},"id":"claude-7-2","status":"completed"},"type":"item_completed"}}
+{"event":{"cost_usd":0.00434934,"tokens_in":54131,"tokens_out":360,"type":"usage"}}
+"turn_ended"

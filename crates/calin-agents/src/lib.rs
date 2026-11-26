@@ -5,10 +5,12 @@
 //! assigns event ids, sequence numbers or timestamps: that is the
 //! orchestrator's job (`calin-core`).
 
+mod claude;
 mod mock;
 mod registry;
 mod runner;
 
+pub use claude::{CLAUDE_RUNNER_ID, ClaudeConfig, ClaudeRunner};
 pub use mock::{MOCK_RUNNER_ID, MockConfig, MockRunner};
 pub use registry::{RegistryConfig, RunnerRegistry};
 pub use runner::{

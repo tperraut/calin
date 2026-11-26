@@ -1,0 +1,7 @@
+{
+  "turns": [
+    "Create a file named made.txt containing the word alpha using the Write tool. If you are not allowed to, say so in one short sentence and stop."
+  ],
+  "permissions": ["deny"],
+  "deny_message": "Not in this directory."
+}

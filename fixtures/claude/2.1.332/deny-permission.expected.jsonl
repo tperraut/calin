@@ -1,0 +1,30 @@
+{"native_session":{"id":"uuid-0001","model":"claude-haiku-5-5"}}
+{"event":{"item":{"content":{"input":{"content":"alpha\n","file_path":"/work/made.txt"},"kind":"tool","locations":["/work/made.txt"],"name":"Write","output":null,"title":"made.txt","tool_kind":"edit"},"id":"toolu-0001","status":"running"},"type":"item_started"}}
+{"permission_request":{"id":"uuid-0030","input":{"content":"alpha\n","file_path":"/work/made.txt"},"item_id":"toolu-0001","title":"made.txt","tool_kind":"edit","tool_name":"Write"}}
+{"event":{"item":{"content":{"input":{"content":"alpha\n","file_path":"/work/made.txt"},"kind":"tool","locations":["/work/made.txt"],"name":"Write","output":"Not in this directory.","title":"made.txt","tool_kind":"edit"},"id":"toolu-0001","status":"declined"},"type":"item_completed"}}
+{"event":{"item":{"content":{"input":{"content":"alpha\n","file_path":"made.txt"},"kind":"tool","locations":["/work/made.txt"],"name":"Write","output":null,"title":"made.txt","tool_kind":"edit"},"id":"toolu-0002","status":"running"},"type":"item_started"}}
+{"permission_request":{"id":"uuid-0049","input":{"content":"alpha\n","file_path":"/work/made.txt"},"item_id":"toolu-0002","title":"made.txt","tool_kind":"edit","tool_name":"Write"}}
+{"event":{"item":{"content":{"input":{"content":"alpha\n","file_path":"made.txt"},"kind":"tool","locations":["/work/made.txt"],"name":"Write","output":"Not in this directory.","title":"made.txt","tool_kind":"edit"},"id":"toolu-0002","status":"declined"},"type":"item_completed"}}
+{"event":{"item":{"content":{"kind":"text","text":""},"id":"claude-7-3","status":"running"},"type":"item_started"}}
+{"event":{"delta":{"kind":"text","text":"I couldn't cre"},"item_id":"claude-7-3","type":"item_delta"}}
+{"event":{"delta":{"kind":"text","text":"ate made.txt. "},"item_id":"claude-7-3","type":"item_delta"}}
+{"event":{"delta":{"kind":"text","text":"The Write tool"},"item_id":"claude-7-3","type":"item_delta"}}
+{"event":{"delta":{"kind":"text","text":" rejected both"},"item_id":"claude-7-3","type":"item_delta"}}
+{"event":{"delta":{"kind":"text","text":" the absolute "},"item_id":"claude-7-3","type":"item_delta"}}
+{"event":{"delta":{"kind":"text","text":"path inside th"},"item_id":"claude-7-3","type":"item_delta"}}
+{"event":{"delta":{"kind":"text","text":"e working dire"},"item_id":"claude-7-3","type":"item_delta"}}
+{"event":{"delta":{"kind":"text","text":"ctory and the "},"item_id":"claude-7-3","type":"item_delta"}}
+{"event":{"delta":{"kind":"text","text":"relative path "},"item_id":"claude-7-3","type":"item_delta"}}
+{"event":{"delta":{"kind":"text","text":"with \"Not in t"},"item_id":"claude-7-3","type":"item_delta"}}
+{"event":{"delta":{"kind":"text","text":"his directory."},"item_id":"claude-7-3","type":"item_delta"}}
+{"event":{"delta":{"kind":"text","text":"\" I haven't tr"},"item_id":"claude-7-3","type":"item_delta"}}
+{"event":{"delta":{"kind":"text","text":"ied another lo"},"item_id":"claude-7-3","type":"item_delta"}}
+{"event":{"delta":{"kind":"text","text":"cation, so I c"},"item_id":"claude-7-3","type":"item_delta"}}
+{"event":{"delta":{"kind":"text","text":"an't tell whet"},"item_id":"claude-7-3","type":"item_delta"}}
+{"event":{"delta":{"kind":"text","text":"her this is a "},"item_id":"claude-7-3","type":"item_delta"}}
+{"event":{"delta":{"kind":"text","text":"path restricti"},"item_id":"claude-7-3","type":"item_delta"}}
+{"event":{"delta":{"kind":"text","text":"on or a permis"},"item_id":"claude-7-3","type":"item_delta"}}
+{"event":{"delta":{"kind":"text","text":"sion setting."},"item_id":"claude-7-3","type":"item_delta"}}
+{"event":{"item":{"content":{"kind":"text","text":"I couldn't create made.txt. The Write tool rejected both the absolute path inside the working directory and the relative path with \"Not in this directory.\" I haven't tried another location, so I can't tell whether this is a path restriction or a permission setting."},"id":"claude-7-3","status":"completed"},"type":"item_completed"}}
+{"event":{"cost_usd":0.005709489999999999,"tokens_in":94157,"tokens_out":737,"type":"usage"}}
+"turn_ended"

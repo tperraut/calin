@@ -9,11 +9,12 @@ Usage:
     scripts/scrub-fixture.py RAW.jsonl OUT.jsonl --workdir /abs/path/used/as/cwd
 
 Input lines are either bare CLI output objects, or records written by
-fixtures/raw/*/drive.py: {"dir": "in" | "out", "msg": {...}}. Output lines are
+scripts/record-claude.py: {"dir": "in" | "out", "msg": {...}}. Output lines are
 always {"dir": ..., "msg": ...}; a bare input line is treated as "out".
 
 The script fails, and writes nothing, if the scrubbed text still contains the
-user name, the home directory or the original working directory.
+user name, the host name, the home directory or the original working directory,
+spelled as a path or as the CLI spells a directory in its own file names.
 """
 
 import argparse
@@ -21,6 +22,7 @@ import getpass
 import json
 import os
 import re
+import socket
 import sys
 
 # Keys of `system/init` that describe the protocol rather than the machine.
@@ -69,9 +71,16 @@ DROP_KEYS = {
     "product_feedback_disabled",
 }
 
+# The CLI's per-user temporary directory, named after the numeric user id.
+TEMP_ROOT_RE = re.compile(r"/tmp/claude-\d+\b")
 UUID_RE = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b")
 TIMESTAMP_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\b")
 OPAQUE_ID_RE = re.compile(r"\b(msg|req|toolu)_[0-9A-Za-z]{10,}\b")
+
+
+def slug(path: str) -> str:
+    """A directory as the CLI names it inside its own storage: every other character a dash."""
+    return re.sub(r"[^A-Za-z0-9]", "-", path)
 
 
 class Scrubber:
@@ -79,7 +88,12 @@ class Scrubber:
         self.workdir = workdir.rstrip("/")
         self.home = os.path.expanduser("~")
         self.user = getpass.getuser()
+        self.host = socket.gethostname()
         self.ids: dict[str, str] = {}
+
+    def forbidden(self) -> set[str]:
+        """Strings that must not survive scrubbing."""
+        return {self.user, self.host, self.home, self.workdir, slug(self.home), slug(self.workdir)} - {""}
 
     def stable(self, kind: str, value: str) -> str:
         """Map each distinct id to a small stable placeholder, so references still line up."""
@@ -91,7 +105,10 @@ class Scrubber:
 
     def text(self, s: str) -> str:
         s = s.replace(self.workdir, "/work")
+        s = s.replace(slug(self.workdir), "-work")
         s = s.replace(self.home, "/home/user")
+        s = s.replace(slug(self.home), "-home-user")
+        s = TEMP_ROOT_RE.sub("/tmp/claude", s)
         # What is left is the bare user name, for example the owner column of `ls -l`.
         s = s.replace(self.user, "user")
         s = UUID_RE.sub(lambda m: self.stable("uuid", m.group(0)), s)
@@ -209,8 +226,7 @@ def main() -> int:
             lines.append(json.dumps({"dir": direction, "msg": scrubbed}, ensure_ascii=False, sort_keys=True))
 
     text = "\n".join(lines) + "\n"
-    forbidden = {scrubber.user, scrubber.home, scrubber.workdir}
-    leaks = sorted(w for w in forbidden if w and w in text)
+    leaks = sorted(w for w in scrubber.forbidden() if w in text)
     if leaks:
         print(f"error: scrubbed output still contains: {', '.join(leaks)}", file=sys.stderr)
         return 1

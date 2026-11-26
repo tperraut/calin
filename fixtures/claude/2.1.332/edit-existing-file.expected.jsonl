@@ -1,0 +1,17 @@
+{"native_session":{"id":"uuid-0001","model":"claude-haiku-5-5"}}
+{"event":{"item":{"content":{"input":{"file_path":"/work/notes.txt"},"kind":"tool","locations":["/work/notes.txt"],"name":"Read","output":null,"title":"notes.txt","tool_kind":"read"},"id":"toolu-0001","status":"running"},"type":"item_started"}}
+{"event":{"item":{"content":{"input":{"file_path":"/work/notes.txt"},"kind":"tool","locations":["/work/notes.txt"],"name":"Read","output":"1\tThe quick brown fox\n2\tjumps over the lazy dgo.\n3\t","title":"notes.txt","tool_kind":"read"},"id":"toolu-0001","status":"completed"},"type":"item_completed"}}
+{"event":{"item":{"content":{"input":{"file_path":"/work/notes.txt","new_string":"lazy dog.","old_string":"lazy dgo.","replace_all":false},"kind":"tool","locations":["/work/notes.txt"],"name":"Edit","output":null,"title":"notes.txt","tool_kind":"edit"},"id":"toolu-0002","status":"running"},"type":"item_started"}}
+{"permission_request":{"id":"uuid-0063","input":{"file_path":"/work/notes.txt","new_string":"lazy dog.","old_string":"lazy dgo.","replace_all":false},"item_id":"toolu-0002","title":"notes.txt","tool_kind":"edit","tool_name":"Edit"}}
+{"event":{"item":{"content":{"input":{"file_path":"/work/notes.txt","new_string":"lazy dog.","old_string":"lazy dgo.","replace_all":false},"kind":"tool","locations":["/work/notes.txt"],"name":"Edit","output":"The file /work/notes.txt has been updated successfully. (file state is current in your context — no need to Read it back)","title":"notes.txt","tool_kind":"edit"},"id":"toolu-0002","status":"completed"},"type":"item_completed"}}
+{"event":{"item":{"content":{"kind":"text","text":""},"id":"claude-7-3","status":"running"},"type":"item_started"}}
+{"event":{"delta":{"kind":"text","text":"Fixed the "},"item_id":"claude-7-3","type":"item_delta"}}
+{"event":{"delta":{"kind":"text","text":"typo in no"},"item_id":"claude-7-3","type":"item_delta"}}
+{"event":{"delta":{"kind":"text","text":"tes.txt: \""},"item_id":"claude-7-3","type":"item_delta"}}
+{"event":{"delta":{"kind":"text","text":"dgo\" is no"},"item_id":"claude-7-3","type":"item_delta"}}
+{"event":{"delta":{"kind":"text","text":"w \"dog\" in"},"item_id":"claude-7-3","type":"item_delta"}}
+{"event":{"delta":{"kind":"text","text":" \"the lazy"},"item_id":"claude-7-3","type":"item_delta"}}
+{"event":{"delta":{"kind":"text","text":" dog.\""},"item_id":"claude-7-3","type":"item_delta"}}
+{"event":{"item":{"content":{"kind":"text","text":"Fixed the typo in notes.txt: \"dgo\" is now \"dog\" in \"the lazy dog.\""},"id":"claude-7-3","status":"completed"},"type":"item_completed"}}
+{"event":{"cost_usd":0.00549549,"tokens_in":91140,"tokens_out":429,"type":"usage"}}
+"turn_ended"

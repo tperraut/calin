@@ -1,0 +1,8 @@
+{"native_session":{"id":"uuid-0001","model":"claude-haiku-5-5"}}
+{"event":{"item":{"content":{"kind":"text","text":""},"id":"claude-7-1","status":"running"},"type":"item_started"}}
+{"event":{"delta":{"kind":"text","text":"I changed \"dgo\""},"item_id":"claude-7-1","type":"item_delta"}}
+{"event":{"delta":{"kind":"text","text":" to \"dog\" in \"t"},"item_id":"claude-7-1","type":"item_delta"}}
+{"event":{"delta":{"kind":"text","text":"he lazy dog.\""},"item_id":"claude-7-1","type":"item_delta"}}
+{"event":{"item":{"content":{"kind":"text","text":"I changed \"dgo\" to \"dog\" in \"the lazy dog.\""},"id":"claude-7-1","status":"completed"},"type":"item_completed"}}
+{"event":{"cost_usd":0.00624962,"tokens_in":129881,"tokens_out":453,"type":"usage"}}
+"turn_ended"

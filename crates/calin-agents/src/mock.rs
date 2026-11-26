@@ -2,10 +2,12 @@
 //! `CALIN_DRY_RUN=1`.
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use calin_proto::{
-    EventBody, Item, ItemContent, ItemDelta, ItemStatus, PlanEntry, PlanStatus, ToolKind,
+    EventBody, Item, ItemContent, ItemDelta, ItemStatus, PermissionDecision, PermissionMode,
+    PermissionRequest, PlanEntry, PlanStatus, ToolKind,
 };
 use serde_json::json;
 use tokio::sync::mpsc::error::TryRecvError;
@@ -15,6 +17,11 @@ use crate::runner::{
 };
 
 pub const MOCK_RUNNER_ID: &str = "mock";
+
+const MOCK_MODEL: &str = "mock-1";
+
+/// The file the scripted edit claims to change, relative to the working directory.
+const EDITED_FILE: &str = "src/lib.rs";
 
 const DEFAULT_DELAY: Duration = Duration::from_millis(40);
 
@@ -58,26 +65,35 @@ impl Runner for MockRunner {
     }
 
     fn model(&self) -> Option<String> {
-        Some("mock-1".to_owned())
+        Some(MOCK_MODEL.to_owned())
     }
 
     fn start(&self, params: StartParams) -> Result<AgentHandle, RunnerError> {
         let (handle, io) = AgentHandle::channel();
+        let native_session = params
+            .resume
+            .unwrap_or_else(|| format!("mock-{}", params.agent_id));
         let agent = MockAgent {
             io,
             delay: self.config.delay,
             start_seq: params.start_seq,
+            permission_mode: params.permission_mode,
+            // `locations` are absolute by contract; without a real directory there are none.
+            edited: Some(params.cwd.join(EDITED_FILE)).filter(|path| path.is_absolute()),
             items: 0,
             turns: 0,
+            open: None,
             queued: VecDeque::new(),
         };
-        tokio::spawn(agent.run(params.prompt));
+        tokio::spawn(agent.run(native_session, params.prompt));
         Ok(handle)
     }
 }
 
 /// Why a turn ended early.
-enum Interrupt {
+enum Cut {
+    /// The orchestrator asked for the turn to end; the agent lives on.
+    Interrupted,
     /// The orchestrator asked for a stop.
     Stopped,
     /// The orchestrator dropped the handle; nobody is listening.
@@ -88,25 +104,37 @@ struct MockAgent {
     io: AgentIo,
     delay: Duration,
     start_seq: u64,
+    permission_mode: PermissionMode,
+    /// The file the scripted edit touches, when the working directory is known.
+    edited: Option<PathBuf>,
     items: u64,
     turns: u64,
-    /// Messages that arrived mid-turn. The orchestrator does not send any,
-    /// but a queue costs less than a lost message.
+    /// The item being streamed, as far as it got. Completed when the turn is cut short.
+    open: Option<Item>,
+    /// Messages that arrived mid-turn; each starts a turn of its own.
     queued: VecDeque<String>,
 }
 
 impl MockAgent {
-    async fn run(mut self, prompt: String) {
+    async fn run(mut self, native_session: String, prompt: String) {
+        let announced = RunnerOutput::NativeSession {
+            id: native_session,
+            model: Some(MOCK_MODEL.to_owned()),
+        };
+        if self.io.outputs.send(announced).await.is_err() {
+            return;
+        }
         let mut next = Some(prompt);
         while let Some(text) = next.take() {
-            match self.turn(&text).await {
-                Ok(()) => {
-                    if self.io.outputs.send(RunnerOutput::TurnEnded).await.is_err() {
-                        return;
-                    }
-                }
-                Err(Interrupt::Stopped) => break,
-                Err(Interrupt::Detached) => return,
+            let cut = self.turn(&text).await.err();
+            if matches!(cut, Some(Cut::Detached)) || !self.close_open_item().await {
+                return;
+            }
+            if matches!(cut, Some(Cut::Stopped)) {
+                break;
+            }
+            if self.io.outputs.send(RunnerOutput::TurnEnded).await.is_err() {
+                return;
             }
             next = self.next_message().await;
         }
@@ -115,16 +143,34 @@ impl MockAgent {
 
     /// The next user message, or `None` on a stop request or a dropped handle.
     async fn next_message(&mut self) -> Option<String> {
-        if let Some(text) = self.queued.pop_front() {
-            return Some(text);
-        }
-        match self.io.inputs.recv().await? {
-            RunnerInput::UserMessage(text) => Some(text),
-            RunnerInput::Stop => None,
+        loop {
+            if let Some(text) = self.queued.pop_front() {
+                return Some(text);
+            }
+            match self.io.inputs.recv().await? {
+                RunnerInput::UserMessage(text) => return Some(text),
+                RunnerInput::Stop => return None,
+                // Nothing to interrupt and nothing waiting between turns.
+                RunnerInput::Interrupt | RunnerInput::PermissionDecision { .. } => {}
+            }
         }
     }
 
-    async fn turn(&mut self, user_text: &str) -> Result<(), Interrupt> {
+    /// Completes the item a cut turn left running: a tool call as failed,
+    /// prose with what was written. False when nobody is listening.
+    async fn close_open_item(&mut self) -> bool {
+        let Some(mut item) = self.open.take() else {
+            return true;
+        };
+        item.status = match item.content {
+            ItemContent::Tool { .. } => ItemStatus::Failed,
+            ItemContent::Text { .. } | ItemContent::Reasoning { .. } => ItemStatus::Completed,
+        };
+        let completed = RunnerOutput::Event(EventBody::ItemCompleted { item });
+        self.io.outputs.send(completed).await.is_ok()
+    }
+
+    async fn turn(&mut self, user_text: &str) -> Result<(), Cut> {
         self.turns += 1;
         let quote = quote(user_text);
 
@@ -156,6 +202,7 @@ impl MockAgent {
             ToolKind::Execute,
             "cargo test -q",
             json!({ "command": "cargo test -q" }),
+            Vec::new(),
             &[
                 "running 3 tests\n",
                 "...\n",
@@ -165,15 +212,21 @@ impl MockAgent {
         .await?;
         self.plan(1).await?;
 
+        let locations: Vec<String> = self
+            .edited
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
         self.tool(
             "Edit",
             ToolKind::Edit,
-            "src/lib.rs",
+            EDITED_FILE,
             json!({
-                "file_path": "src/lib.rs",
+                "file_path": EDITED_FILE,
                 "old_string": "todo!()",
                 "new_string": "Ok(())",
             }),
+            locations,
             &[],
         )
         .await?;
@@ -201,79 +254,158 @@ impl MockAgent {
     }
 
     /// A text or reasoning item streamed chunk by chunk.
-    async fn streamed(&mut self, prose: Prose, chunks: &[&str]) -> Result<(), Interrupt> {
+    async fn streamed(&mut self, prose: Prose, chunks: &[&str]) -> Result<(), Cut> {
         let id = self.next_item_id();
-        self.emit(EventBody::ItemStarted {
-            item: Item {
-                id: id.clone(),
-                status: ItemStatus::Running,
-                content: prose.content(String::new()),
-            },
+        self.start_item(Item {
+            id: id.clone(),
+            status: ItemStatus::Running,
+            content: prose.content(String::new()),
         })
         .await?;
         for chunk in chunks {
-            self.emit(EventBody::ItemDelta {
-                item_id: id.clone(),
-                delta: prose.delta((*chunk).to_owned()),
-            })
-            .await?;
+            self.delta(prose.delta((*chunk).to_owned())).await?;
         }
-        self.emit(EventBody::ItemCompleted {
-            item: Item {
-                id,
-                status: ItemStatus::Completed,
-                content: prose.content(chunks.concat()),
-            },
-        })
-        .await
+        self.complete_item(ItemStatus::Completed).await
     }
 
-    /// A tool call whose output arrives in `output` chunks.
+    /// A tool call whose output arrives in `output` chunks. Depending on the
+    /// permission mode it first asks, and completes as declined on a denial.
     async fn tool(
         &mut self,
         name: &str,
         tool_kind: ToolKind,
         title: &str,
         input: serde_json::Value,
+        locations: Vec<String>,
         output: &[&str],
-    ) -> Result<(), Interrupt> {
+    ) -> Result<(), Cut> {
         let id = self.next_item_id();
-        let content = |output: Option<String>| ItemContent::Tool {
-            name: name.to_owned(),
-            tool_kind,
-            title: title.to_owned(),
-            input: input.clone(),
-            output,
-        };
-        self.emit(EventBody::ItemStarted {
-            item: Item {
-                id: id.clone(),
-                status: ItemStatus::Running,
-                content: content(None),
+        self.start_item(Item {
+            id: id.clone(),
+            status: ItemStatus::Running,
+            content: ItemContent::Tool {
+                name: name.to_owned(),
+                tool_kind,
+                title: title.to_owned(),
+                input: input.clone(),
+                output: None,
+                locations,
             },
         })
         .await?;
+        if self.asks_before(tool_kind) {
+            let request = PermissionRequest {
+                id: format!("{id}-permission"),
+                tool_name: name.to_owned(),
+                tool_kind,
+                title: title.to_owned(),
+                input,
+                item_id: Some(id),
+            };
+            if let (PermissionDecision::Deny, message) = self.ask(request).await? {
+                if let Some(Item {
+                    content: ItemContent::Tool { output, .. },
+                    ..
+                }) = &mut self.open
+                {
+                    *output = message;
+                }
+                return self.complete_item(ItemStatus::Declined).await;
+            }
+        }
         for chunk in output {
-            self.emit(EventBody::ItemDelta {
-                item_id: id.clone(),
-                delta: ItemDelta::Output {
-                    text: (*chunk).to_owned(),
-                },
+            self.delta(ItemDelta::Output {
+                text: (*chunk).to_owned(),
             })
             .await?;
         }
-        self.emit(EventBody::ItemCompleted {
-            item: Item {
-                id,
-                status: ItemStatus::Completed,
-                content: content(Some(output.concat())),
-            },
+        if let Some(Item {
+            content: ItemContent::Tool { output, .. },
+            ..
+        }) = &mut self.open
+        {
+            // A completed call always has an output, even an empty one.
+            output.get_or_insert_default();
+        }
+        self.complete_item(ItemStatus::Completed).await
+    }
+
+    fn asks_before(&self, tool_kind: ToolKind) -> bool {
+        match self.permission_mode {
+            PermissionMode::Ask => matches!(tool_kind, ToolKind::Execute | ToolKind::Edit),
+            PermissionMode::AcceptEdits => tool_kind == ToolKind::Execute,
+            PermissionMode::Autonomous => false,
+        }
+    }
+
+    /// Sends a permission request and waits for its decision, however long it takes.
+    async fn ask(
+        &mut self,
+        request: PermissionRequest,
+    ) -> Result<(PermissionDecision, Option<String>), Cut> {
+        let id = request.id.clone();
+        self.io
+            .outputs
+            .send(RunnerOutput::PermissionRequest(request))
+            .await
+            .map_err(|_| Cut::Detached)?;
+        loop {
+            match self.io.inputs.recv().await.ok_or(Cut::Detached)? {
+                RunnerInput::PermissionDecision {
+                    request_id,
+                    decision,
+                    message,
+                } if request_id == id => return Ok((decision, message)),
+                other => self.cut_by(other)?,
+            }
+        }
+    }
+
+    async fn start_item(&mut self, item: Item) -> Result<(), Cut> {
+        self.emit(EventBody::ItemStarted { item: item.clone() })
+            .await?;
+        self.open = Some(item);
+        Ok(())
+    }
+
+    /// Sends a chunk of the open item and appends it to what a cut turn would complete with.
+    async fn delta(&mut self, delta: ItemDelta) -> Result<(), Cut> {
+        let Some(item) = &mut self.open else {
+            return Ok(());
+        };
+        let item_id = item.id.clone();
+        self.emit(EventBody::ItemDelta {
+            item_id,
+            delta: delta.clone(),
         })
-        .await
+        .await?;
+        if let Some(item) = &mut self.open {
+            match (&mut item.content, delta) {
+                (ItemContent::Text { text }, ItemDelta::Text { text: chunk })
+                | (ItemContent::Reasoning { text }, ItemDelta::Reasoning { text: chunk }) => {
+                    text.push_str(&chunk);
+                }
+                (ItemContent::Tool { output, .. }, ItemDelta::Output { text: chunk }) => {
+                    output.get_or_insert_default().push_str(&chunk);
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    async fn complete_item(&mut self, status: ItemStatus) -> Result<(), Cut> {
+        let Some(mut item) = self.open.clone() else {
+            return Ok(());
+        };
+        item.status = status;
+        self.emit(EventBody::ItemCompleted { item }).await?;
+        self.open = None;
+        Ok(())
     }
 
     /// The full plan with the first `done` steps completed and the next one in progress.
-    async fn plan(&mut self, done: usize) -> Result<(), Interrupt> {
+    async fn plan(&mut self, done: usize) -> Result<(), Cut> {
         let entries = PLAN
             .iter()
             .enumerate()
@@ -289,23 +421,23 @@ impl MockAgent {
         self.emit(EventBody::PlanUpdated { entries }).await
     }
 
-    async fn emit(&mut self, body: EventBody) -> Result<(), Interrupt> {
+    async fn emit(&mut self, body: EventBody) -> Result<(), Cut> {
         self.pause().await?;
         self.io
             .outputs
             .send(RunnerOutput::Event(body))
             .await
-            .map_err(|_| Interrupt::Detached)
+            .map_err(|_| Cut::Detached)
     }
 
-    /// Waits out the delay, ending early on a stop request.
-    async fn pause(&mut self) -> Result<(), Interrupt> {
+    /// Waits out the delay, ending early on an interrupt or a stop request.
+    async fn pause(&mut self) -> Result<(), Cut> {
         if self.delay.is_zero() {
             loop {
                 match self.io.inputs.try_recv() {
-                    Ok(input) => self.interrupted_by(input)?,
+                    Ok(input) => self.cut_by(input)?,
                     Err(TryRecvError::Empty) => return Ok(()),
-                    Err(TryRecvError::Disconnected) => return Err(Interrupt::Detached),
+                    Err(TryRecvError::Disconnected) => return Err(Cut::Detached),
                 }
             }
         }
@@ -315,20 +447,24 @@ impl MockAgent {
             tokio::select! {
                 () = &mut sleep => return Ok(()),
                 input = self.io.inputs.recv() => match input {
-                    Some(input) => self.interrupted_by(input)?,
-                    None => return Err(Interrupt::Detached),
+                    Some(input) => self.cut_by(input)?,
+                    None => return Err(Cut::Detached),
                 },
             }
         }
     }
 
-    fn interrupted_by(&mut self, input: RunnerInput) -> Result<(), Interrupt> {
+    /// What an input received in the middle of a turn does to the turn.
+    fn cut_by(&mut self, input: RunnerInput) -> Result<(), Cut> {
         match input {
             RunnerInput::UserMessage(text) => {
                 self.queued.push_back(text);
                 Ok(())
             }
-            RunnerInput::Stop => Err(Interrupt::Stopped),
+            // Not the request the turn waits for, if it waits at all.
+            RunnerInput::PermissionDecision { .. } => Ok(()),
+            RunnerInput::Interrupt => Err(Cut::Interrupted),
+            RunnerInput::Stop => Err(Cut::Stopped),
         }
     }
 
@@ -380,16 +516,23 @@ mod tests {
 
     const TIMEOUT: Duration = Duration::from_secs(5);
 
-    fn start(delay: Duration, prompt: &str) -> AgentHandle {
+    fn start_in(mode: PermissionMode, delay: Duration, prompt: &str) -> AgentHandle {
         MockRunner::new(MockConfig { delay })
             .start(StartParams {
                 session_id: "s1".into(),
                 agent_id: "a1".into(),
                 prompt: prompt.into(),
-                resume: false,
+                cwd: "/work".into(),
+                permission_mode: mode,
                 start_seq: 3,
+                ..StartParams::default()
             })
             .unwrap()
+    }
+
+    /// An agent that never asks, so a turn runs to its end unattended.
+    fn start(delay: Duration, prompt: &str) -> AgentHandle {
+        start_in(PermissionMode::Autonomous, delay, prompt)
     }
 
     async fn next(handle: &mut AgentHandle) -> Option<RunnerOutput> {
@@ -398,19 +541,44 @@ mod tests {
             .expect("the mock agent went quiet")
     }
 
-    /// Collects the events of one turn, up to `TurnEnded`.
-    async fn collect_turn(handle: &mut AgentHandle) -> Vec<EventBody> {
-        let mut events = Vec::new();
+    /// One turn, with every permission request answered by `answer`.
+    struct Turn {
+        events: Vec<EventBody>,
+        requests: Vec<PermissionRequest>,
+    }
+
+    async fn run_turn(
+        handle: &mut AgentHandle,
+        mut answer: impl FnMut(&PermissionRequest) -> (PermissionDecision, Option<String>),
+    ) -> Turn {
+        let mut turn = Turn {
+            events: Vec::new(),
+            requests: Vec::new(),
+        };
         loop {
             match next(handle).await {
-                Some(RunnerOutput::Event(body)) => events.push(body),
-                Some(RunnerOutput::TurnEnded) => return events,
+                Some(RunnerOutput::Event(body)) => turn.events.push(body),
+                Some(RunnerOutput::PermissionRequest(request)) => {
+                    let (decision, message) = answer(&request);
+                    handle
+                        .resolve_permission(request.id.clone(), decision, message)
+                        .unwrap();
+                    turn.requests.push(request);
+                }
+                Some(RunnerOutput::NativeSession { .. }) => {}
+                Some(RunnerOutput::TurnEnded) => return turn,
                 other => panic!("unexpected output {other:?}"),
             }
         }
     }
 
-    /// Checks the item lifecycle of a turn and returns its completed items in order.
+    /// Collects the events of one turn, up to `TurnEnded`. The turn must not ask.
+    async fn collect_turn(handle: &mut AgentHandle) -> Vec<EventBody> {
+        let turn = run_turn(handle, |request| panic!("unexpected request {request:?}")).await;
+        turn.events
+    }
+
+    /// Checks the item lifecycle of a turn and returns its finished items in order.
     fn check_turn(events: &[EventBody]) -> Vec<Item> {
         let mut open: HashMap<String, String> = HashMap::new();
         let mut completed = Vec::new();
@@ -438,14 +606,16 @@ mod tests {
                     let streamed = open
                         .remove(&item.id)
                         .unwrap_or_else(|| panic!("item {} completed but never started", item.id));
-                    assert_eq!(item.status, ItemStatus::Completed);
-                    let final_text = match &item.content {
-                        ItemContent::Text { text } | ItemContent::Reasoning { text } => {
-                            text.clone()
-                        }
-                        ItemContent::Tool { output, .. } => output.clone().unwrap_or_default(),
-                    };
-                    assert_eq!(streamed, final_text, "deltas of {} do not add up", item.id);
+                    assert_ne!(item.status, ItemStatus::Running);
+                    if item.status == ItemStatus::Completed {
+                        let final_text = match &item.content {
+                            ItemContent::Text { text } | ItemContent::Reasoning { text } => {
+                                text.clone()
+                            }
+                            ItemContent::Tool { output, .. } => output.clone().unwrap_or_default(),
+                        };
+                        assert_eq!(streamed, final_text, "deltas of {} do not add up", item.id);
+                    }
                     completed.push(item.clone());
                 }
                 EventBody::PlanUpdated { entries } => assert_eq!(entries.len(), PLAN.len()),
@@ -455,6 +625,16 @@ mod tests {
         }
         assert!(open.is_empty(), "items never completed: {open:?}");
         completed
+    }
+
+    fn tool_items(items: &[Item]) -> Vec<(ToolKind, ItemStatus)> {
+        items
+            .iter()
+            .filter_map(|item| match &item.content {
+                ItemContent::Tool { tool_kind, .. } => Some((*tool_kind, item.status)),
+                _ => None,
+            })
+            .collect()
     }
 
     fn usage(events: &[EventBody]) -> (f64, u64, u64) {
@@ -468,11 +648,20 @@ mod tests {
         }
     }
 
+    fn allow(_: &PermissionRequest) -> (PermissionDecision, Option<String>) {
+        (PermissionDecision::Allow, None)
+    }
+
     #[tokio::test]
     async fn a_turn_is_well_formed() {
         let mut handle = start(Duration::ZERO, "Fix the flaky login test\nsecond line");
         let events = collect_turn(&mut handle).await;
         let items = check_turn(&events);
+        assert!(
+            items
+                .iter()
+                .all(|item| item.status == ItemStatus::Completed)
+        );
 
         let kinds: Vec<&str> = items
             .iter()
@@ -535,6 +724,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_edit_names_the_file_it_touches() {
+        let mut handle = start(Duration::ZERO, "edit");
+        let items = check_turn(&collect_turn(&mut handle).await);
+        let locations: Vec<&Vec<String>> = items
+            .iter()
+            .filter_map(|item| match &item.content {
+                ItemContent::Tool { locations, .. } => Some(locations),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(locations, [&vec![], &vec!["/work/src/lib.rs".to_owned()]]);
+    }
+
+    #[tokio::test]
+    async fn the_conversation_id_is_announced_first_and_kept_on_resume() {
+        let mut handle = start(Duration::ZERO, "hello");
+        assert_eq!(
+            next(&mut handle).await,
+            Some(RunnerOutput::NativeSession {
+                id: "mock-a1".into(),
+                model: Some("mock-1".into()),
+            })
+        );
+
+        let mut resumed = MockRunner::new(MockConfig {
+            delay: Duration::ZERO,
+        })
+        .start(StartParams {
+            agent_id: "a1".into(),
+            resume: Some("earlier".into()),
+            ..StartParams::default()
+        })
+        .unwrap();
+        assert_eq!(
+            next(&mut resumed).await,
+            Some(RunnerOutput::NativeSession {
+                id: "earlier".into(),
+                model: Some("mock-1".into()),
+            })
+        );
+    }
+
+    #[tokio::test]
     async fn item_ids_are_unique_across_turns_and_usage_grows() {
         let mut handle = start(Duration::ZERO, "first");
         let first = collect_turn(&mut handle).await;
@@ -565,10 +797,217 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ask_mode_asks_before_the_command_and_before_the_edit() {
+        let mut handle = start_in(PermissionMode::Ask, Duration::ZERO, "ask");
+        let turn = run_turn(&mut handle, allow).await;
+        let items = check_turn(&turn.events);
+
+        let asked: Vec<(ToolKind, &str)> = turn
+            .requests
+            .iter()
+            .map(|request| (request.tool_kind, request.title.as_str()))
+            .collect();
+        assert_eq!(
+            asked,
+            [
+                (ToolKind::Execute, "cargo test -q"),
+                (ToolKind::Edit, "src/lib.rs")
+            ]
+        );
+        // Each request points at its tool item, and its id is its own.
+        let tool_ids: Vec<Option<String>> = items
+            .iter()
+            .filter(|item| matches!(item.content, ItemContent::Tool { .. }))
+            .map(|item| Some(item.id.clone()))
+            .collect();
+        let pointed: Vec<Option<String>> =
+            turn.requests.iter().map(|r| r.item_id.clone()).collect();
+        assert_eq!(pointed, tool_ids);
+        assert_ne!(turn.requests[0].id, turn.requests[1].id);
+        assert_eq!(
+            turn.requests[0].input,
+            json!({ "command": "cargo test -q" })
+        );
+
+        // Allowed, the script is the one of an agent that never asks.
+        let mut unattended = start(Duration::ZERO, "ask");
+        assert_eq!(turn.events, collect_turn(&mut unattended).await);
+    }
+
+    #[tokio::test]
+    async fn accept_edits_asks_only_before_the_command() {
+        let mut handle = start_in(PermissionMode::AcceptEdits, Duration::ZERO, "edits");
+        let turn = run_turn(&mut handle, allow).await;
+        let kinds: Vec<ToolKind> = turn.requests.iter().map(|r| r.tool_kind).collect();
+        assert_eq!(kinds, [ToolKind::Execute]);
+        assert_eq!(
+            tool_items(&check_turn(&turn.events)),
+            [
+                (ToolKind::Execute, ItemStatus::Completed),
+                (ToolKind::Edit, ItemStatus::Completed)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_denied_call_is_declined_and_the_turn_goes_on() {
+        let mut handle = start_in(PermissionMode::Ask, Duration::ZERO, "deny the command");
+        let turn = run_turn(&mut handle, |request| match request.tool_kind {
+            ToolKind::Execute => (PermissionDecision::Deny, Some("not now".to_owned())),
+            _ => (PermissionDecision::Allow, None),
+        })
+        .await;
+        let items = check_turn(&turn.events);
+        assert_eq!(
+            tool_items(&items),
+            [
+                (ToolKind::Execute, ItemStatus::Declined),
+                (ToolKind::Edit, ItemStatus::Completed)
+            ]
+        );
+        let declined = items
+            .iter()
+            .find(|item| item.status == ItemStatus::Declined)
+            .unwrap();
+        assert!(matches!(
+            &declined.content,
+            ItemContent::Tool { output: Some(output), .. } if output == "not now"
+        ));
+        // A declined call produced no output chunks.
+        assert!(!turn.events.iter().any(|body| matches!(
+            body,
+            EventBody::ItemDelta {
+                delta: ItemDelta::Output { .. },
+                ..
+            }
+        )));
+        assert!(matches!(
+            &items.last().unwrap().content,
+            ItemContent::Text { text } if text.contains("deny the command")
+        ));
+        assert_eq!(usage(&turn.events), (0.0125, 1200, 350));
+    }
+
+    #[tokio::test]
+    async fn a_decision_for_another_request_is_ignored() {
+        let mut handle = start_in(PermissionMode::AcceptEdits, Duration::ZERO, "ids");
+        let request = loop {
+            match next(&mut handle).await {
+                Some(RunnerOutput::PermissionRequest(request)) => break request,
+                Some(_) => {}
+                None => panic!("the agent ended before asking"),
+            }
+        };
+        handle
+            .resolve_permission("someone-else", PermissionDecision::Deny, None)
+            .unwrap();
+        handle
+            .resolve_permission(request.id, PermissionDecision::Allow, None)
+            .unwrap();
+        let rest = collect_turn(&mut handle).await;
+        assert!(!rest.iter().any(|body| matches!(
+            body,
+            EventBody::ItemCompleted { item } if item.status == ItemStatus::Declined
+        )));
+    }
+
+    #[tokio::test]
+    async fn interrupt_ends_the_turn_and_the_agent_takes_the_next_one() {
+        let mut handle = start_in(PermissionMode::Ask, Duration::ZERO, "first");
+        // The turn parks on its first request: a fixed point to interrupt at.
+        let mut events = Vec::new();
+        let request = loop {
+            match next(&mut handle).await {
+                Some(RunnerOutput::Event(body)) => events.push(body),
+                Some(RunnerOutput::PermissionRequest(request)) => break request,
+                Some(RunnerOutput::NativeSession { .. }) => {}
+                other => panic!("unexpected output {other:?}"),
+            }
+        };
+        handle.interrupt().unwrap();
+        loop {
+            match next(&mut handle).await {
+                Some(RunnerOutput::Event(body)) => events.push(body),
+                Some(RunnerOutput::TurnEnded) => break,
+                other => panic!("unexpected output {other:?}"),
+            }
+        }
+        // The call that was waiting is closed as failed; nothing ran after it.
+        let items = check_turn(&events);
+        assert_eq!(
+            tool_items(&items),
+            [(ToolKind::Execute, ItemStatus::Failed)]
+        );
+        assert_eq!(items.last().unwrap().id, request.item_id.unwrap());
+
+        // The voided request's answer changes nothing, and the next turn is whole.
+        handle
+            .resolve_permission(request.id, PermissionDecision::Deny, None)
+            .unwrap();
+        handle.send_message("second").unwrap();
+        let second = run_turn(&mut handle, allow).await;
+        let items = check_turn(&second.events);
+        assert_eq!(items.len(), 5);
+        assert!(
+            items
+                .iter()
+                .all(|item| item.status == ItemStatus::Completed)
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupt_ends_a_slow_turn_promptly() {
+        // An hour per chunk: only the interrupt can end this turn in time.
+        let mut handle = start(Duration::from_secs(3600), "slow");
+        handle.interrupt().unwrap();
+        assert!(matches!(
+            next(&mut handle).await,
+            Some(RunnerOutput::NativeSession { .. })
+        ));
+        assert_eq!(next(&mut handle).await, Some(RunnerOutput::TurnEnded));
+        handle.stop().unwrap();
+        assert_eq!(
+            next(&mut handle).await,
+            Some(RunnerOutput::Exited(Exit::Ok))
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_closes_the_waiting_call_and_exits() {
+        let mut handle = start_in(PermissionMode::Ask, Duration::ZERO, "stop me");
+        let mut events = Vec::new();
+        loop {
+            match next(&mut handle).await {
+                Some(RunnerOutput::Event(body)) => events.push(body),
+                Some(RunnerOutput::PermissionRequest(_)) => break,
+                Some(RunnerOutput::NativeSession { .. }) => {}
+                other => panic!("unexpected output {other:?}"),
+            }
+        }
+        handle.stop().unwrap();
+        loop {
+            match next(&mut handle).await {
+                Some(RunnerOutput::Event(body)) => events.push(body),
+                Some(RunnerOutput::Exited(Exit::Ok)) => break,
+                other => panic!("unexpected output {other:?}"),
+            }
+        }
+        assert_eq!(
+            tool_items(&check_turn(&events)),
+            [(ToolKind::Execute, ItemStatus::Failed)]
+        );
+        assert_eq!(next(&mut handle).await, None);
+    }
+
+    #[tokio::test]
     async fn stop_ends_a_slow_turn_promptly() {
         // An hour per chunk: only the stop request can end this test in time.
         let mut handle = start(Duration::from_secs(3600), "slow");
         handle.stop().unwrap();
+        assert!(matches!(
+            next(&mut handle).await,
+            Some(RunnerOutput::NativeSession { .. })
+        ));
         assert_eq!(
             next(&mut handle).await,
             Some(RunnerOutput::Exited(Exit::Ok))

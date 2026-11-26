@@ -9,10 +9,16 @@ rust-version.workspace = true
 calin-proto = { version = "0.0.1", path = "../calin-proto" }
 serde_json = "1.0.154"
 thiserror = "2.0.21"
-tokio = { version = "1.54.1", features = ["sync", "time", "rt", "macros"] }
+tokio = { version = "1.54.1", features = ["sync", "time", "rt", "macros", "process", "io-util"] }
+tracing = "0.1.44"
+
+# Process groups: an agent is killed together with the tools it spawned.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.6", features = ["process"] }
 
 [lints]
 workspace = true
 
 [dev-dependencies]
+tempfile = "3.27.0"
 tokio = { version = "1.54.1", features = ["rt-multi-thread"] }

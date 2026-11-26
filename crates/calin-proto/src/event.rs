@@ -49,6 +49,12 @@ pub enum EventBody {
     AgentStatus {
         status: AgentStatus,
     },
+    /// The runner reported its own conversation id (and the model in use) for
+    /// the emitting agent. Recorded so the agent can be resumed after a restart.
+    AgentSession {
+        native_session_id: String,
+        model: Option<String>,
+    },
     /// An item (text, reasoning or tool call) began. Deltas for it follow.
     ItemStarted {
         item: Item,
