@@ -27,6 +27,23 @@ make dev-web     # web dev server
 
 `make help` lists every target. [AGENTS.md](AGENTS.md) describes the layout and the rules.
 
+## Running it
+
+```sh
+make build                       # web app, then the binary that embeds it
+CALIN_DRY_RUN=1 target/release/calin serve
+```
+
+Open <http://127.0.0.1:4680>. With `CALIN_DRY_RUN=1` every agent is simulated, so no agent CLI or
+login is needed. The server only listens on loopback addresses until sign-in exists.
+
+| Variable | Effect |
+| --- | --- |
+| `CALIN_HOME` | Data directory. Default `~/.calin`. `calin serve --home <dir>` overrides it. |
+| `CALIN_DRY_RUN=1` | Run every agent on the built-in mock runner. |
+| `CALIN_MOCK_DELAY_MS` | Delay between the mock runner's chunks. Default 40. |
+| `CALIN_LOG` | Log filter, for example `debug` or `calin_core=trace`. Default `info`. |
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

@@ -1,14 +1,16 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! The runner interface and its implementations.
+//!
+//! A runner starts an agent for a session and speaks in `calin_proto::EventBody`
+//! values plus a few lifecycle signals. It never touches the store and never
+//! assigns event ids, sequence numbers or timestamps: that is the
+//! orchestrator's job (`calin-core`).
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+mod mock;
+mod registry;
+mod runner;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub use mock::{MOCK_RUNNER_ID, MockConfig, MockRunner};
+pub use registry::{RegistryConfig, RunnerRegistry};
+pub use runner::{
+    AgentHandle, AgentIo, Exit, Runner, RunnerError, RunnerInput, RunnerOutput, StartParams,
+};
