@@ -1,9 +1,8 @@
 import { For } from "solid-js";
 import type { Session } from "../gen/Session";
 import { absoluteTime, relativeTime } from "../lib/format";
+import { sessionPath } from "../panels/registry";
 import { SessionStatusBadge } from "./Badge";
-
-export const sessionPath = (id: string): string => `/s/${encodeURIComponent(id)}`;
 
 /** The sessions as links, in the order given. `now` drives the relative times. */
 export function SessionList(props: { sessions: readonly Session[]; now: number }) {
@@ -12,11 +11,12 @@ export function SessionList(props: { sessions: readonly Session[]; now: number }
       <For each={props.sessions} keyed={(session) => session.id}>
         {(session) => (
           <li>
-            {/* The router marks the open session with aria-current. The focus ring is
-                drawn inside the row because the scrolling list clips what is outside. */}
+            {/* The router marks the open session: aria-current on its own address, data-active
+                on its panels' as well. The focus ring is drawn inside the row because the
+                scrolling list clips what is outside. */}
             <a
               href={sessionPath(session().id)}
-              class="flex min-h-11 flex-col gap-1 px-3 py-2.5 -outline-offset-2 hover:bg-sunken aria-[current=page]:bg-accent-soft"
+              class="flex min-h-11 flex-col gap-1 px-3 py-2.5 -outline-offset-2 hover:bg-sunken data-active:bg-accent-soft"
             >
               <span class="flex items-center justify-between gap-2">
                 <span class="truncate font-medium">{session().title}</span>

@@ -18,6 +18,22 @@ export function mount(ui: () => JSX.Element): HTMLElement {
 
 export function unmountAll(): void {
   for (const unmount of mounted.splice(0)) unmount();
+  setViewportWidth(WIDE);
+}
+
+const WIDE = 1024;
+export const PHONE = 360;
+
+/**
+ * Sizes the window, which decides between the phone and the wide layout. Call
+ * it before `mount`: happy-dom does not reliably tell a mounted page.
+ */
+export function setViewportWidth(width: number): void {
+  // happy-dom's own handle on the window; not part of the DOM typings.
+  const control = (
+    window as unknown as { happyDOM: { setViewport(size: { width: number }): void } }
+  ).happyDOM;
+  control.setViewport({ width });
 }
 
 /** The one element matching `selector` under `root`; fails the test when there is none. */
@@ -43,4 +59,30 @@ export function type(field: HTMLTextAreaElement | HTMLInputElement, value: strin
   field.value = value;
   field.dispatchEvent(new InputEvent("input", { bubbles: true }));
   flush();
+}
+
+export function choose(select: HTMLSelectElement, value: string): void {
+  select.value = value;
+  select.dispatchEvent(new Event("change", { bubbles: true }));
+  flush();
+}
+
+/** Clicks and lets the screen catch up, including what an awaited request then does. */
+export async function click(element: HTMLElement): Promise<void> {
+  element.click();
+  for (let turn = 0; turn < 5; turn += 1) await Promise.resolve();
+  flush();
+}
+
+/** The form control labelled by the `<label>` containing `text`: wrapped by it, or named by `for`. */
+export function control<T extends HTMLElement = HTMLInputElement>(
+  root: ParentNode,
+  text: string,
+): T {
+  const label = findByText<HTMLLabelElement>(root, "label", text);
+  const field =
+    label.querySelector<T>("input, select, textarea") ??
+    (label.htmlFor === "" ? null : (document.getElementById(label.htmlFor) as T | null));
+  if (!field) throw new Error(`the label "${text}" names no control`);
+  return field;
 }

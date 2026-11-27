@@ -20,7 +20,7 @@ export function PlanPanel(props: { entries: readonly PlanEntry[] }) {
         </span>
         <span class="truncate group-open:hidden">{current()}</span>
       </summary>
-      <ol class="max-h-48 space-y-1 overflow-y-auto px-3 pb-3 text-sm">
+      <ol class="relative max-h-48 space-y-1 overflow-y-auto px-3 pb-3 text-sm">
         <For each={props.entries} keyed={false}>
           {(entry) => (
             <li

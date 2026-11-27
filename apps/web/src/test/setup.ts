@@ -6,6 +6,8 @@ import { afterEach, beforeEach, expect, vi } from "vite-plus/test";
 let complaints: string[] = [];
 
 beforeEach(() => {
+  // What one test's composer remembered must not seed the next one's.
+  localStorage.clear();
   complaints = [];
   const record = (...args: unknown[]): void => {
     complaints.push(args.map(String).join(" "));

@@ -1,12 +1,15 @@
 import { createSignal, type Accessor } from "solid-js";
 import { HttpError, type Api } from "../api/http";
 import { sessionTopic, type SocketClient, type TopicHandler } from "../api/socket";
+import type { PermissionDecision } from "../gen/PermissionDecision";
+import type { ResolvePermissionRequest } from "../gen/ResolvePermissionRequest";
 import type { Session } from "../gen/Session";
 import type { SessionDetail } from "../gen/SessionDetail";
+import type { SessionRepo } from "../gen/SessionRepo";
 import type { SessionStatus } from "../gen/SessionStatus";
 import { errorMessage } from "../lib/errors";
 import { coalesce, type Schedule } from "../lib/schedule";
-import { applyEvent, emptySessionView, type SessionView } from "./sessionReducer";
+import { applyEvent, emptySessionView, mergeRepos, type SessionView } from "./sessionReducer";
 
 export type SessionLoad =
   | { status: "loading" }
@@ -21,12 +24,26 @@ export type SessionStore = {
   session: Accessor<Session | undefined>;
   status: Accessor<SessionStatus | undefined>;
   view: Accessor<SessionView>;
+  /** The repo set, primary first: the REST record's, kept current by `repo_attached` events. */
+  repos: Accessor<readonly SessionRepo[]>;
   /** True once the replay has caught up with the head of the log. */
   synced: Accessor<boolean>;
   /** True when the server keeps leaving the same gap; only a reload can help. */
   stalled: Accessor<boolean>;
+  /** The server's reason when it refused the session's topic; no live updates until it is retried. */
+  subscriptionError: Accessor<string | undefined>;
+  /** Asks for the topic again after a refusal. */
+  resubscribe(): void;
   send(text: string): Promise<void>;
+  /** Ends the current turn; the session goes to `review`. */
+  interrupt(): Promise<void>;
   stop(): Promise<void>;
+  /** Answers a pending permission request. `message` goes to the agent with a denial. */
+  resolvePermission(
+    requestId: string,
+    decision: PermissionDecision,
+    message?: string,
+  ): Promise<void>;
   reload(): void;
   /** Subscribes and loads; returns the function that undoes both. */
   start(): () => void;
@@ -52,6 +69,7 @@ export function createSessionStore(deps: SessionStoreDeps, id: string): SessionS
   const [view, setView] = createSignal<SessionView>(emptySessionView);
   const [synced, setSynced] = createSignal(false);
   const [stalled, setStalled] = createSignal(false);
+  const [subscriptionError, setSubscriptionError] = createSignal<string>();
 
   // The fold runs on plain values as frames arrive; signals follow once per frame.
   let current = emptySessionView;
@@ -59,6 +77,7 @@ export function createSessionStore(deps: SessionStoreDeps, id: string): SessionS
   // While a replay is on its way, frames still in flight from before it are expected.
   let replaying = true;
   let fruitlessResyncs = 0;
+  let refusal: string | undefined;
   let active = false;
   let failed = false;
   let stopListening = (): void => {};
@@ -67,6 +86,7 @@ export function createSessionStore(deps: SessionStoreDeps, id: string): SessionS
     setView(current);
     setSynced(caughtUp);
     setStalled(fruitlessResyncs >= MAX_FRUITLESS_RESYNCS);
+    setSubscriptionError(refusal);
   }, deps.schedule);
 
   function resync(): void {
@@ -92,7 +112,16 @@ export function createSessionStore(deps: SessionStoreDeps, id: string): SessionS
       } else if (result.outcome === "gap" && !replaying) {
         resync();
       }
+    } else if (msg.op === "error") {
+      // No replay is coming, so nothing in flight explains a later gap.
+      refusal = msg.message;
+      replaying = false;
+      publish();
     } else if (msg.op === "subscribed") {
+      if (refusal !== undefined) {
+        refusal = undefined;
+        publish();
+      }
       if (msg.head_seq > current.seq) {
         // The replay ended short of the head it announced.
         resync();
@@ -138,10 +167,22 @@ export function createSessionStore(deps: SessionStoreDeps, id: string): SessionS
     // Mid-replay the fold passes through every past status; the record is steadier.
     status: () => (synced() ? view().status : null) ?? session()?.status,
     view,
+    repos: () => mergeRepos(detail()?.repos ?? [], view().repos),
     synced,
     stalled,
+    subscriptionError,
+    resubscribe() {
+      replaying = true;
+      socket.resync(topic, current.seq);
+    },
     send: (text) => api.sendMessage(id, { text }),
+    interrupt: () => api.interruptSession(id),
     stop: () => api.stopSession(id),
+    resolvePermission(requestId, decision, message) {
+      const body: ResolvePermissionRequest = { decision };
+      if (message !== undefined && message.trim() !== "") body.message = message.trim();
+      return api.resolvePermission(id, requestId, body);
+    },
     reload() {
       setLoad({ status: "loading" });
       fetchDetail();

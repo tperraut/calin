@@ -4,11 +4,13 @@ import { isSubmitChord } from "./Composer";
 
 /**
  * The box that sends text to a session's lead agent. When `enabled` is false
- * the field shows `closedHint` instead of accepting input.
+ * the field shows `closedHint` instead of accepting input. With `resumes`, the
+ * message restarts a stopped or failed agent, and the button says so.
  */
 export function MessageBox(props: {
   enabled: boolean;
   closedHint: string;
+  resumes?: boolean;
   onSend: (text: string) => Promise<void>;
 }) {
   const [draft, setDraft] = createSignal("");
@@ -55,7 +57,13 @@ export function MessageBox(props: {
           id={fieldId}
           class="field min-h-11 flex-1 resize-none px-3 py-2"
           rows="2"
-          placeholder={props.enabled ? "Message the agent" : props.closedHint}
+          placeholder={
+            !props.enabled
+              ? props.closedHint
+              : props.resumes === true
+                ? "Message the agent to continue"
+                : "Message the agent"
+          }
           value={draft()}
           disabled={!props.enabled}
           aria-describedby={error() === undefined ? undefined : errorId}
@@ -69,11 +77,11 @@ export function MessageBox(props: {
         <button
           type="submit"
           class="btn btn-primary"
-          title="Send (Ctrl+Enter)"
+          title={props.resumes === true ? "Continue (Ctrl+Enter)" : "Send (Ctrl+Enter)"}
           aria-keyshortcuts="Control+Enter Meta+Enter"
           disabled={!props.enabled || busy()}
         >
-          {busy() ? "Sending…" : "Send"}
+          {busy() ? "Sending…" : props.resumes === true ? "Continue" : "Send"}
         </button>
       </div>
     </form>

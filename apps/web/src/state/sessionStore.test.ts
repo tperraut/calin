@@ -9,6 +9,7 @@ import {
   makeDetail,
   makeEvent,
   makeSession,
+  makeSessionRepo,
   notFound,
   settle,
   unreachable,
@@ -200,6 +201,83 @@ describe("session store", () => {
 
     expect(sendMessage).toHaveBeenCalledWith("s1", { text: "carry on" });
     expect(stopSession).toHaveBeenCalledWith("s1");
+  });
+
+  it("seeds the repo set from the record and keeps it current from events", async () => {
+    const seeded = [makeSessionRepo("api", { primary: true }), makeSessionRepo("web")];
+    const { socket, store } = setup({
+      getSession: () => Promise.resolve(makeDetail(makeSession("s1"), seeded)),
+    });
+    expect(store.repos()).toEqual([]);
+
+    await settle();
+    flush();
+    expect(store.repos()).toEqual(seeded);
+
+    const attach = (seq: number, repo: ReturnType<typeof makeSessionRepo>) =>
+      socket.emit(TOPIC, {
+        op: "event",
+        topic: TOPIC,
+        event: makeEvent(seq, { type: "repo_attached", repo }),
+      });
+    attach(1, makeSessionRepo("web", { branch: "calin/s1" }));
+    attach(2, makeSessionRepo("docs", { mode: "live" }));
+    flush();
+    expect(store.repos()).toEqual([
+      makeSessionRepo("api", { primary: true }),
+      makeSessionRepo("web", { branch: "calin/s1" }),
+      makeSessionRepo("docs", { mode: "live" }),
+    ]);
+  });
+
+  it("has the repo set from events alone when the record lists none", () => {
+    const { socket, store } = setup();
+    socket.emit(TOPIC, {
+      op: "event",
+      topic: TOPIC,
+      event: makeEvent(1, {
+        type: "repo_attached",
+        repo: makeSessionRepo("api", { primary: true }),
+      }),
+    });
+    flush();
+    expect(store.repos()).toEqual([makeSessionRepo("api", { primary: true })]);
+  });
+
+  it("marks the subscription failed when the server refuses the topic, until it is joined", () => {
+    const { socket, store, message, subscribed } = setup();
+    expect(store.subscriptionError()).toBeUndefined();
+
+    socket.emit(TOPIC, { op: "error", topic: TOPIC, message: "unknown session" });
+    flush();
+    expect(store.subscriptionError()).toBe("unknown session");
+    expect(store.synced()).toBe(false);
+
+    store.resubscribe();
+    expect(socket.resyncs).toEqual([{ topic: TOPIC, afterSeq: 0 }]);
+    message(1);
+    subscribed(1);
+    flush();
+    expect(store.subscriptionError()).toBeUndefined();
+    expect(store.synced()).toBe(true);
+  });
+
+  it("interrupts and answers permission requests for its own session", async () => {
+    const interruptSession = vi.fn<Api["interruptSession"]>().mockResolvedValue();
+    const resolvePermission = vi.fn<Api["resolvePermission"]>().mockResolvedValue();
+    const { store } = setup({ interruptSession, resolvePermission });
+
+    await store.interrupt();
+    await store.resolvePermission("p1", "allow");
+    await store.resolvePermission("p2", "deny", "  Not on main.  ");
+    await store.resolvePermission("p3", "deny", "   ");
+
+    expect(interruptSession).toHaveBeenCalledWith("s1");
+    expect(resolvePermission.mock.calls).toEqual([
+      ["s1", "p1", { decision: "allow" }],
+      ["s1", "p2", { decision: "deny", message: "Not on main." }],
+      ["s1", "p3", { decision: "deny" }],
+    ]);
   });
 
   it("unsubscribes and ignores late answers once stopped", async () => {

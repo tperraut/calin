@@ -1,6 +1,7 @@
+import { Show } from "solid-js";
 import type { ItemStatus } from "../gen/ItemStatus";
 import type { SessionStatus } from "../gen/SessionStatus";
-import { itemLook, sessionLook, type Look, type Tone } from "../lib/status";
+import { interruptedLook, itemLook, sessionLook, type Look, type Tone } from "../lib/status";
 
 const toneClass: Record<Tone, string> = {
   neutral: "text-tone-neutral",
@@ -32,11 +33,22 @@ export function SessionStatusBadge(props: { status: SessionStatus }) {
   return (
     <Badge
       look={sessionLook(props.status)}
-      pulse={props.status === "running" || props.status === "preparing"}
+      // `waiting` pulses too: it is the one status that needs the reader.
+      pulse={
+        props.status === "running" || props.status === "preparing" || props.status === "waiting"
+      }
     />
   );
 }
 
-export function ItemStatusBadge(props: { status: ItemStatus }) {
-  return <Badge look={itemLook(props.status)} pulse={props.status === "running"} />;
+/** `interrupted`: the item was still running when its turn ended (see the reducer). */
+export function ItemStatusBadge(props: { status: ItemStatus; interrupted?: boolean }) {
+  return (
+    <Show
+      when={props.interrupted === true}
+      fallback={<Badge look={itemLook(props.status)} pulse={props.status === "running"} />}
+    >
+      <Badge look={interruptedLook} />
+    </Show>
+  );
 }

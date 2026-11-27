@@ -3,8 +3,10 @@ import { HttpError, type Api } from "../api/http";
 import type { ConnectionState, Cursor, SocketClient, TopicHandler, TopicMsg } from "../api/socket";
 import type { Event } from "../gen/Event";
 import type { EventBody } from "../gen/EventBody";
+import type { Repo } from "../gen/Repo";
 import type { Session } from "../gen/Session";
 import type { SessionDetail } from "../gen/SessionDetail";
+import type { SessionRepo } from "../gen/SessionRepo";
 import type { Schedule } from "../lib/schedule";
 
 export function makeSession(id: string, createdAt = 1000, patch: Partial<Session> = {}): Session {
@@ -14,6 +16,7 @@ export function makeSession(id: string, createdAt = 1000, patch: Partial<Session
     prompt: "do the thing",
     status: "queued",
     runner: "mock",
+    permission_mode: "ask",
     branch: null,
     parent_session_id: null,
     root_session_id: id,
@@ -24,7 +27,37 @@ export function makeSession(id: string, createdAt = 1000, patch: Partial<Session
   };
 }
 
-export const makeDetail = (session: Session): SessionDetail => ({ session, agents: [] });
+export const makeDetail = (session: Session, repos: SessionRepo[] = []): SessionDetail => ({
+  session,
+  agents: [],
+  repos,
+});
+
+export function makeRepo(id: string, patch: Partial<Repo> = {}): Repo {
+  return {
+    id,
+    name: id,
+    path: `/code/${id}`,
+    default_branch: "main",
+    remote_url: null,
+    ...patch,
+  };
+}
+
+export function makeSessionRepo(id: string, patch: Partial<SessionRepo> = {}): SessionRepo {
+  return {
+    id,
+    session_id: "s1",
+    repo_id: `repo-${id}`,
+    name: id,
+    mode: "write",
+    path: `/sessions/s1/${id}`,
+    branch: null,
+    base_ref: null,
+    primary: false,
+    ...patch,
+  };
+}
 
 export function makeEvent(seq: number, body: EventBody, agentId: string | null = null): Event {
   return {
@@ -105,11 +138,16 @@ export function fakeApi(routes: Partial<Api> = {}): Api {
     Promise.reject(new Error(`fakeApi: ${name} was called but not stubbed`));
   return {
     health: missing("health"),
+    listRepos: missing("listRepos"),
+    registerRepo: missing("registerRepo"),
+    removeRepo: missing("removeRepo"),
     listSessions: missing("listSessions"),
     createSession: missing("createSession"),
     getSession: missing("getSession"),
     sendMessage: missing("sendMessage"),
+    interruptSession: missing("interruptSession"),
     stopSession: missing("stopSession"),
+    resolvePermission: missing("resolvePermission"),
     ...routes,
   };
 }
@@ -121,3 +159,16 @@ export const notFound = (): HttpError => new HttpError(404, "session not found",
 export async function settle(): Promise<void> {
   for (let turn = 0; turn < 5; turn += 1) await Promise.resolve();
 }
+
+/** A promise the test settles by hand, to look at the screen while a request is in flight. */
+export function deferred<T = void>() {
+  let resolve: (value: T) => void = () => {};
+  let reject: (reason: unknown) => void = () => {};
+  const promise = new Promise<T>((onResolve, onReject) => {
+    resolve = onResolve;
+    reject = onReject;
+  });
+  return { promise, resolve, reject };
+}
+
+export const conflict = (message: string): HttpError => new HttpError(409, message, true);

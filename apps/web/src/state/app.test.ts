@@ -7,6 +7,7 @@ import {
   FakeSocket,
   immediately,
   makeDetail,
+  makeRepo,
   makeSession,
   settle,
   unreachable,
@@ -68,9 +69,10 @@ describe("app state", () => {
     const { app, upsert, titles } = setup({ createSession });
     upsert("old", 100);
 
-    await expect(app.createSession({ prompt: "go", runner: "mock" })).resolves.toBe(created);
+    const request = { prompt: "go", runner: "mock", repos: [] };
+    await expect(app.createSession(request)).resolves.toBe(created);
 
-    expect(createSession).toHaveBeenCalledWith({ prompt: "go", runner: "mock" });
+    expect(createSession).toHaveBeenCalledWith(request);
     expect(titles()).toEqual(["Fresh", "Session old"]);
     // The socket's own report of it must not add a second row.
     upsert("new", 500, { title: "Fresh" });
@@ -156,5 +158,87 @@ describe("app state", () => {
     const { socket } = setup();
     for (const stop of stops.splice(0)) stop();
     expect(socket.subscriberCount("sessions")).toBe(0);
+  });
+
+  it("reads the repo registry on demand, sorted by name", async () => {
+    const listRepos = vi
+      .fn<Api["listRepos"]>()
+      .mockResolvedValue([makeRepo("web"), makeRepo("api")]);
+    const { app } = setup({ listRepos });
+    expect(app.repos()).toEqual({ status: "loading" });
+    await settle();
+    expect(listRepos).not.toHaveBeenCalled();
+
+    app.loadRepos();
+    await settle();
+    flush();
+    expect(app.repos()).toEqual({ status: "ready", repos: [makeRepo("api"), makeRepo("web")] });
+  });
+
+  it("adds a registered repo and drops a removed one without reading the list again", async () => {
+    const listRepos = vi.fn<Api["listRepos"]>().mockResolvedValue([makeRepo("web")]);
+    const registerRepo = vi.fn<Api["registerRepo"]>().mockResolvedValue(makeRepo("api"));
+    const removeRepo = vi.fn<Api["removeRepo"]>().mockResolvedValue();
+    const { app } = setup({ listRepos, registerRepo, removeRepo });
+    const names = () => {
+      flush();
+      const registry = app.repos();
+      return registry.status === "ready" ? registry.repos.map((repo) => repo.name) : registry;
+    };
+    app.loadRepos();
+    await settle();
+
+    await expect(app.registerRepo({ path: "/code/api" })).resolves.toEqual(makeRepo("api"));
+    expect(registerRepo).toHaveBeenCalledWith({ path: "/code/api" });
+    expect(names()).toEqual(["api", "web"]);
+
+    await app.removeRepo("web");
+    expect(removeRepo).toHaveBeenCalledWith("web");
+    expect(names()).toEqual(["api"]);
+    expect(listRepos).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the registry when a removal is refused", async () => {
+    const refusal = new Error("repo is attached to a running session");
+    const { app } = setup({
+      listRepos: () => Promise.resolve([makeRepo("api")]),
+      removeRepo: () => Promise.reject(refusal),
+    });
+    app.loadRepos();
+    await settle();
+
+    await expect(app.removeRepo("api")).rejects.toBe(refusal);
+    flush();
+    expect(app.repos()).toEqual({ status: "ready", repos: [makeRepo("api")] });
+  });
+
+  it("reports a registry that cannot be read, and reads it once the socket is back", async () => {
+    const listRepos = vi
+      .fn<Api["listRepos"]>()
+      .mockRejectedValueOnce(unreachable())
+      .mockResolvedValue([makeRepo("api")]);
+    const { app, socket } = setup({ listRepos });
+    app.loadRepos();
+    await settle();
+    flush();
+    expect(app.repos()).toEqual({ status: "error", message: "Cannot reach the server" });
+
+    socket.setState("open");
+    await settle();
+    flush();
+    expect(app.repos()).toEqual({ status: "ready", repos: [makeRepo("api")] });
+  });
+
+  it("says so when the server refuses the sessions topic, and asks again on retry", () => {
+    const { app, socket } = setup();
+    socket.emit("sessions", { op: "error", topic: "sessions", message: "not allowed" });
+    flush();
+    expect(app.sessionsError()).toBe("not allowed");
+
+    app.retry();
+    expect(socket.resyncs).toEqual([{ topic: "sessions", afterSeq: 0 }]);
+    socket.emit("sessions", { op: "subscribed", topic: "sessions", head_seq: 0 });
+    flush();
+    expect(app.sessionsError()).toBeUndefined();
   });
 });

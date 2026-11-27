@@ -3,4 +3,4 @@
 /**
  * Who answered a permission request.
  */
-export type DecisionSource = "user" | "policy";
+export type DecisionSource = "user" | "policy" | "expired";

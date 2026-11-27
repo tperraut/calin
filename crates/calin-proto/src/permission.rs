@@ -34,6 +34,9 @@ pub enum DecisionSource {
     User,
     /// The session's permission mode answered without asking.
     Policy,
+    /// Nobody answered before the turn ended, the agent exited or the session
+    /// was interrupted or stopped. Always paired with `deny`.
+    Expired,
 }
 
 #[derive(Serialize, Deserialize, TS, Clone, Debug, PartialEq)]

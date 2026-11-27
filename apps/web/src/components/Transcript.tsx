@@ -2,8 +2,10 @@ import { createEffect, createSignal, For, Match, onSettled, Show, Switch } from 
 import type { Item } from "../gen/Item";
 import type { ItemContent } from "../gen/ItemContent";
 import type { ItemStatus } from "../gen/ItemStatus";
-import type { TranscriptEntry } from "../state/sessionReducer";
-import { ItemStatusBadge } from "./Badge";
+import type { PermissionRequest } from "../gen/PermissionRequest";
+import { decisionSourceLabel, type Look } from "../lib/status";
+import type { PermissionOutcome, TranscriptEntry } from "../state/sessionReducer";
+import { Badge, ItemStatusBadge } from "./Badge";
 
 type ToolContent = Extract<ItemContent, { kind: "tool" }>;
 
@@ -29,35 +31,35 @@ function UserMessage(props: { text: string }) {
   );
 }
 
-function AgentText(props: { text: string; status: ItemStatus }) {
+function AgentText(props: { text: string; status: ItemStatus; interrupted: boolean }) {
   return (
     <div class={prose}>
       {props.text}
-      <Show when={props.status === "running"}>
+      <Show when={props.status === "running" && !props.interrupted}>
         <span aria-hidden="true" class="pulse text-muted">
           ▍
         </span>
       </Show>
-      <Show when={props.status === "failed"}>
+      <Show when={props.status === "failed" || props.interrupted}>
         <span class="ml-1 text-xs text-tone-danger">(interrupted)</span>
       </Show>
     </div>
   );
 }
 
-function Reasoning(props: { text: string; status: ItemStatus }) {
+function Reasoning(props: { text: string; status: ItemStatus; interrupted: boolean }) {
   return (
     <details class="group text-sm text-muted">
       <summary class="inline-flex min-h-11 items-center gap-1.5">
         <Chevron />
-        {props.status === "running" ? "Reasoning…" : "Reasoning"}
+        {props.status === "running" && !props.interrupted ? "Reasoning…" : "Reasoning"}
       </summary>
       <div class={["border-l-2 border-line pb-1 pl-3", prose]}>{props.text}</div>
     </details>
   );
 }
 
-function ToolCard(props: { content: ToolContent; status: ItemStatus }) {
+function ToolCard(props: { content: ToolContent; status: ItemStatus; interrupted: boolean }) {
   // Input and output are built only once the card is open: a long transcript
   // holds hundreds of these and most are never looked at.
   const [open, setOpen] = createSignal(false);
@@ -72,7 +74,7 @@ function ToolCard(props: { content: ToolContent; status: ItemStatus }) {
           {props.content.tool_kind}
         </span>
         <span class="min-w-0 flex-1 truncate font-mono text-sm">{props.content.title}</span>
-        <ItemStatusBadge status={props.status} />
+        <ItemStatusBadge status={props.status} interrupted={props.interrupted} />
       </summary>
       <Show when={open()}>
         <div class="space-y-2 border-t border-line p-3">
@@ -115,7 +117,45 @@ function ErrorRow(props: { message: string }) {
   );
 }
 
-function ItemRow(props: { item: Item }) {
+function permissionLook(outcome: PermissionOutcome): Look {
+  if (outcome.state === "pending") return { label: "Waiting for you", tone: "attention" };
+  if (outcome.state === "lapsed") return { label: "No longer needed", tone: "neutral" };
+  const by = decisionSourceLabel(outcome.by);
+  return outcome.decision === "allow"
+    ? { label: `Allowed by ${by}`, tone: "success" }
+    : { label: `Denied by ${by}`, tone: "danger" };
+}
+
+/** A permission request where it was asked, with what became of it. The pinned bar answers it. */
+function PermissionRow(props: { request: PermissionRequest; outcome: PermissionOutcome }) {
+  // What the agent was told with a denial, or why the request was closed unanswered.
+  const note = () =>
+    props.outcome.state === "lapsed" ||
+    (props.outcome.state === "resolved" && props.outcome.decision === "deny")
+      ? props.outcome.message
+      : null;
+  return (
+    <div class="rounded-md border border-line bg-surface px-3 py-2">
+      <div class="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
+        <span class="text-xs font-medium text-muted">Permission</span>
+        <span class="shrink-0 rounded border border-line px-1.5 py-0.5 font-mono text-xs text-muted">
+          {props.request.tool_kind}
+        </span>
+        <span class="min-w-0 flex-1 basis-40 truncate font-mono text-sm">
+          {props.request.title}
+        </span>
+        <Badge look={permissionLook(props.outcome)} pulse={props.outcome.state === "pending"} />
+      </div>
+      <Show when={note()}>
+        {(message) => (
+          <p class={["mt-1 border-l-2 border-line pl-3 text-sm text-muted", prose]}>{message()}</p>
+        )}
+      </Show>
+    </div>
+  );
+}
+
+function ItemRow(props: { item: Item; interrupted: boolean }) {
   const text = () => (props.item.content.kind === "text" ? props.item.content : undefined);
   const reasoning = () =>
     props.item.content.kind === "reasoning" ? props.item.content : undefined;
@@ -124,13 +164,31 @@ function ItemRow(props: { item: Item }) {
     // No fallback: an item kind this build does not know leaves an empty row.
     <Switch>
       <Match when={text()}>
-        {(content) => <AgentText text={content().text} status={props.item.status} />}
+        {(content) => (
+          <AgentText
+            text={content().text}
+            status={props.item.status}
+            interrupted={props.interrupted}
+          />
+        )}
       </Match>
       <Match when={reasoning()}>
-        {(content) => <Reasoning text={content().text} status={props.item.status} />}
+        {(content) => (
+          <Reasoning
+            text={content().text}
+            status={props.item.status}
+            interrupted={props.interrupted}
+          />
+        )}
       </Match>
       <Match when={tool()}>
-        {(content) => <ToolCard content={content()} status={props.item.status} />}
+        {(content) => (
+          <ToolCard
+            content={content()}
+            status={props.item.status}
+            interrupted={props.interrupted}
+          />
+        )}
       </Match>
     </Switch>
   );
@@ -138,12 +196,18 @@ function ItemRow(props: { item: Item }) {
 
 function EntryRow(props: { entry: TranscriptEntry }) {
   const user = () => (props.entry.kind === "user" ? props.entry : undefined);
-  const item = () => (props.entry.kind === "item" ? props.entry.item : undefined);
+  const item = () => (props.entry.kind === "item" ? props.entry : undefined);
+  const permission = () => (props.entry.kind === "permission" ? props.entry : undefined);
   const error = () => (props.entry.kind === "error" ? props.entry : undefined);
   return (
     <Switch>
       <Match when={user()}>{(entry) => <UserMessage text={entry().text} />}</Match>
-      <Match when={item()}>{(one) => <ItemRow item={one()} />}</Match>
+      <Match when={item()}>
+        {(entry) => <ItemRow item={entry().item} interrupted={entry().interrupted} />}
+      </Match>
+      <Match when={permission()}>
+        {(entry) => <PermissionRow request={entry().request} outcome={entry().outcome} />}
+      </Match>
       <Match when={error()}>{(entry) => <ErrorRow message={entry().message} />}</Match>
     </Switch>
   );
@@ -170,7 +234,8 @@ export function Transcript(props: { entries: readonly TranscriptEntry[]; synced:
   }
 
   function measure(): void {
-    if (!scroller) return;
+    // Nothing to learn while the transcript is hidden behind another panel.
+    if (!scroller || scroller.clientHeight === 0) return;
     pin(scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight <= PIN_SLACK);
   }
 

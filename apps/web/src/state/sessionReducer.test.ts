@@ -3,10 +3,14 @@ import type { Agent } from "../gen/Agent";
 import type { Event } from "../gen/Event";
 import type { EventBody } from "../gen/EventBody";
 import type { Item } from "../gen/Item";
+import type { PermissionRequest } from "../gen/PermissionRequest";
+import type { SessionStatus } from "../gen/SessionStatus";
+import { makeSessionRepo } from "../test/fakes";
 import {
   applyEvent,
   applyEvents,
   emptySessionView,
+  mergeRepos,
   type SessionView,
   type TranscriptEntry,
 } from "./sessionReducer";
@@ -44,6 +48,7 @@ const agent: Agent = {
   role: "lead",
   runner: "mock",
   model: null,
+  native_session_id: null,
   status: "starting",
   cost_usd: 0,
   tokens_in: 0,
@@ -66,8 +71,26 @@ const toolItem = (id: string, output: string | null, status: Item["status"] = "r
     title: "ls -la",
     input: { command: "ls -la" },
     output,
+    locations: [],
   },
 });
+
+const request = (id: string, patch: Partial<PermissionRequest> = {}): PermissionRequest => ({
+  id,
+  tool_name: "Bash",
+  tool_kind: "execute",
+  title: `run ${id}`,
+  input: { command: `run ${id}` },
+  item_id: null,
+  ...patch,
+});
+
+const status = (value: SessionStatus): [null, EventBody] => [
+  null,
+  { type: "session_status", status: value, reason: null },
+];
+
+const kinds = (view: SessionView): string[] => view.transcript.map((entry) => entry.kind);
 
 const items = (view: SessionView): Item[] =>
   view.transcript.flatMap((entry) => (entry.kind === "item" ? [entry.item] : []));
@@ -213,6 +236,45 @@ describe("applyEvent", () => {
     expect(view.usage).toEqual({ cost_usd: 0.03, tokens_in: 250, tokens_out: 60 });
   });
 
+  it("records the runner's own conversation id and model on the agent that reports them", () => {
+    const other: Agent = { ...agent, id: "a2", model: "haiku" };
+    const view = fold(
+      log(
+        [null, { type: "agent_spawned", agent }],
+        [null, { type: "agent_spawned", agent: other }],
+        { type: "agent_session", native_session_id: "conv-1", model: "opus" },
+        // A runner that does not know its model must not erase the one on record.
+        ["a2", { type: "agent_session", native_session_id: "conv-2", model: null }],
+      ),
+    );
+    expect(view.agents).toEqual([
+      { ...agent, native_session_id: "conv-1", model: "opus" },
+      { ...other, native_session_id: "conv-2", model: "haiku" },
+    ]);
+    // It is bookkeeping: nothing for the transcript.
+    expect(view.transcript).toEqual([]);
+    expect(view.seq).toBe(4);
+  });
+
+  it("follows a conversation id that changes when the agent is restarted", () => {
+    const view = fold(
+      log(
+        [null, { type: "agent_spawned", agent }],
+        { type: "agent_session", native_session_id: "conv-1", model: "opus" },
+        { type: "agent_session", native_session_id: "conv-2", model: "sonnet" },
+      ),
+    );
+    expect(view.agents).toEqual([{ ...agent, native_session_id: "conv-2", model: "sonnet" }]);
+  });
+
+  it("ignores a conversation id from an agent that was never announced", () => {
+    const view = fold(
+      log(["ghost", { type: "agent_session", native_session_id: "conv-9", model: "opus" }]),
+    );
+    expect(view.agents).toEqual([]);
+    expect(view.seq).toBe(1);
+  });
+
   it("sums usage across agents and has none before the first usage event", () => {
     expect(emptySessionView.usage).toBeNull();
     const view = fold(
@@ -267,7 +329,7 @@ describe("applyEvent", () => {
     // What a newer server could send: shapes this build has no type for.
     const fromTheFuture = {
       ...future,
-      body: { type: "repo_attached", repo: "api" },
+      body: { type: "pull_request_opened", url: "https://example.test/pr/1" },
     } as unknown as Event;
     const deltaFromTheFuture = {
       ...futureDelta,
@@ -375,6 +437,7 @@ describe("applyEvent", () => {
           status: "completed",
           content: { kind: "reasoning", text: "I should look first." },
         },
+        interrupted: false,
       },
       {
         kind: "item",
@@ -382,6 +445,7 @@ describe("applyEvent", () => {
         ts: 1011,
         agentId: AGENT,
         item: toolItem("t1", "README.md\nsrc\n", "completed"),
+        interrupted: false,
       },
       {
         kind: "item",
@@ -389,6 +453,7 @@ describe("applyEvent", () => {
         ts: 1016,
         agentId: AGENT,
         item: textItem("m1", "There are two entries.", "completed"),
+        interrupted: false,
       },
       { kind: "user", key: "event:e24", ts: 1023, text: "Now delete src." },
       {
@@ -397,6 +462,7 @@ describe("applyEvent", () => {
         ts: 1026,
         agentId: AGENT,
         item: toolItem("t2", null, "declined"),
+        interrupted: false,
       },
       {
         kind: "error",
@@ -411,6 +477,7 @@ describe("applyEvent", () => {
         ts: 1029,
         agentId: AGENT,
         item: textItem("m2", "I was not allowed to.", "completed"),
+        interrupted: false,
       },
     ];
     expect(view.transcript).toEqual(expected);
@@ -426,5 +493,416 @@ describe("applyEvent", () => {
     expect(events.every((event) => applyEvent(view, event).outcome === "duplicate")).toBe(true);
     // Folding the log in two halves, as a reconnect does, gives the same view.
     expect(fold(events.slice(20), fold(events.slice(0, 20)))).toEqual(view);
+  });
+});
+
+describe("repo set", () => {
+  it("collects attached repos with the primary one first", () => {
+    const view = fold(
+      log(
+        [null, { type: "repo_attached", repo: makeSessionRepo("web") }],
+        [null, { type: "repo_attached", repo: makeSessionRepo("api", { primary: true }) }],
+        [null, { type: "repo_attached", repo: makeSessionRepo("docs") }],
+      ),
+    );
+    expect(view.repos.map((repo) => repo.name)).toEqual(["api", "web", "docs"]);
+    // The repo set is not a transcript matter.
+    expect(view.transcript).toEqual([]);
+  });
+
+  it("updates a repo that is attached again, in place", () => {
+    const view = fold(
+      log(
+        [null, { type: "repo_attached", repo: makeSessionRepo("api", { primary: true }) }],
+        [null, { type: "repo_attached", repo: makeSessionRepo("web") }],
+        [
+          null,
+          {
+            type: "repo_attached",
+            repo: makeSessionRepo("api", { primary: true, branch: "calin/fix-login" }),
+          },
+        ],
+      ),
+    );
+    expect(view.repos).toEqual([
+      makeSessionRepo("api", { primary: true, branch: "calin/fix-login" }),
+      makeSessionRepo("web"),
+    ]);
+  });
+
+  it("seeds from the REST record and lets events update it", () => {
+    const seed = [makeSessionRepo("api", { primary: true }), makeSessionRepo("web")];
+    expect(mergeRepos(seed, [])).toBe(seed);
+
+    const attached = [
+      makeSessionRepo("web", { branch: "calin/fix-login" }),
+      makeSessionRepo("docs", { mode: "live" }),
+    ];
+    expect(mergeRepos(seed, attached)).toEqual([
+      makeSessionRepo("api", { primary: true }),
+      makeSessionRepo("web", { branch: "calin/fix-login" }),
+      makeSessionRepo("docs", { mode: "live" }),
+    ]);
+    // The seed is a signal's value: it must not change under its readers.
+    expect(seed).toEqual([makeSessionRepo("api", { primary: true }), makeSessionRepo("web")]);
+  });
+});
+
+describe("permissions", () => {
+  it("puts a request in the transcript where it was asked, pending", () => {
+    const view = fold(
+      log(
+        { type: "item_started", item: textItem("m1", "Let me run the tests.", "completed") },
+        { type: "permission_requested", request: request("p1") },
+        { type: "item_started", item: textItem("m2", "Meanwhile…") },
+      ),
+    );
+    expect(kinds(view)).toEqual(["item", "permission", "item"]);
+    expect(view.transcript[1]).toEqual({
+      kind: "permission",
+      key: "permission:p1",
+      ts: 1001,
+      agentId: AGENT,
+      request: request("p1"),
+      outcome: { state: "pending" },
+    });
+    expect(view.pendingPermissions).toEqual([
+      { request: request("p1"), agentId: AGENT, ts: 1001, seq: 2 },
+    ]);
+  });
+
+  it("lists every pending request of the session, oldest first", () => {
+    const view = fold(
+      log(
+        ["a1", { type: "permission_requested", request: request("p1") }],
+        ["a2", { type: "permission_requested", request: request("p2") }],
+        ["a1", { type: "permission_requested", request: request("p3") }],
+        [
+          "a2",
+          {
+            type: "permission_resolved",
+            request_id: "p2",
+            decision: "allow",
+            by: "user",
+            message: null,
+          },
+        ],
+      ),
+    );
+    expect(view.pendingPermissions.map((one) => one.request.id)).toEqual(["p1", "p3"]);
+    // The list is exactly the transcript's pending rows.
+    const pendingRows = view.transcript.flatMap((entry) =>
+      entry.kind === "permission" && entry.outcome.state === "pending" ? [entry.request.id] : [],
+    );
+    expect(pendingRows).toEqual(["p1", "p3"]);
+  });
+
+  it("records who allowed or denied a request, and why, in place", () => {
+    const view = fold(
+      log(
+        { type: "permission_requested", request: request("p1") },
+        { type: "permission_requested", request: request("p2") },
+        { type: "permission_requested", request: request("p3") },
+        {
+          type: "permission_resolved",
+          request_id: "p1",
+          decision: "allow",
+          by: "user",
+          message: null,
+        },
+        {
+          type: "permission_resolved",
+          request_id: "p2",
+          decision: "deny",
+          by: "user",
+          message: "Not on main.",
+        },
+        {
+          type: "permission_resolved",
+          request_id: "p3",
+          decision: "allow",
+          by: "policy",
+          message: null,
+        },
+      ),
+    );
+    const outcomes = view.transcript.map((entry) =>
+      entry.kind === "permission" ? entry.outcome : undefined,
+    );
+    expect(outcomes).toEqual([
+      { state: "resolved", decision: "allow", by: "user", message: null },
+      { state: "resolved", decision: "deny", by: "user", message: "Not on main." },
+      { state: "resolved", decision: "allow", by: "policy", message: null },
+    ]);
+    expect(view.transcript.map((entry) => entry.key)).toEqual([
+      "permission:p1",
+      "permission:p2",
+      "permission:p3",
+    ]);
+    expect(view.pendingPermissions).toEqual([]);
+  });
+
+  it("ignores an answer to a request it never saw", () => {
+    const before = fold(log({ type: "permission_requested", request: request("p1") }));
+    const [, answer] = log(
+      { type: "user_message", text: "placeholder" },
+      {
+        type: "permission_resolved",
+        request_id: "ghost",
+        decision: "deny",
+        by: "policy",
+        message: null,
+      },
+    );
+    const after = applyEvent(before, answer).view;
+    expect(after.transcript).toBe(before.transcript);
+    expect(after.pendingPermissions).toBe(before.pendingPermissions);
+    expect(after.seq).toBe(2);
+  });
+
+  it.each(["review", "failed", "cancelled", "done"] as const)(
+    "lets unanswered requests lapse when the session goes to %s",
+    (ended) => {
+      const view = fold(
+        log(
+          status("waiting"),
+          { type: "permission_requested", request: request("p1") },
+          status(ended),
+        ),
+      );
+      expect(view.pendingPermissions).toEqual([]);
+      expect(view.transcript[0]).toMatchObject({
+        kind: "permission",
+        outcome: { state: "lapsed", message: null },
+      });
+    },
+  );
+
+  const closedByServer: EventBody = {
+    type: "permission_resolved",
+    request_id: "p1",
+    decision: "deny",
+    by: "policy",
+    message: "The turn ended.",
+  };
+
+  it("reads the server closing a waiting request as no longer needed, not as a refusal", () => {
+    const view = fold(
+      log(
+        status("running"),
+        { type: "permission_requested", request: request("p1") },
+        status("waiting"),
+        closedByServer,
+        status("review"),
+      ),
+    );
+    expect(view.transcript[0]).toMatchObject({
+      kind: "permission",
+      outcome: { state: "lapsed", message: "The turn ended." },
+    });
+    expect(view.pendingPermissions).toEqual([]);
+  });
+
+  it("reads it the same way when the closure arrives after the turn is over", () => {
+    const view = fold(
+      log(
+        status("waiting"),
+        { type: "permission_requested", request: request("p1") },
+        status("cancelled"),
+        closedByServer,
+      ),
+    );
+    expect(view.transcript[0]).toMatchObject({
+      kind: "permission",
+      outcome: { state: "lapsed", message: "The turn ended." },
+    });
+  });
+
+  it("still records a refusal by policy that nobody was asked about", () => {
+    const view = fold(
+      log(
+        status("running"),
+        { type: "permission_requested", request: request("p1") },
+        { ...closedByServer, message: "Edits are not allowed in a read-only repo." },
+      ),
+    );
+    expect(view.transcript[0]).toMatchObject({
+      kind: "permission",
+      outcome: { state: "resolved", decision: "deny", by: "policy" },
+    });
+  });
+
+  it("keeps a denial by the reader a denial, even while the session waits", () => {
+    const view = fold(
+      log(
+        status("waiting"),
+        { type: "permission_requested", request: request("p1") },
+        { ...closedByServer, by: "user", message: "No." },
+      ),
+    );
+    expect(view.transcript[0]).toMatchObject({
+      kind: "permission",
+      outcome: { state: "resolved", decision: "deny", by: "user", message: "No." },
+    });
+  });
+
+  it("keeps requests pending through running and waiting", () => {
+    const view = fold(
+      log(
+        status("running"),
+        { type: "permission_requested", request: request("p1") },
+        status("waiting"),
+        status("running"),
+      ),
+    );
+    expect(view.pendingPermissions.map((one) => one.request.id)).toEqual(["p1"]);
+  });
+});
+
+describe("interrupted items", () => {
+  const interrupted = (view: SessionView): Array<[string, boolean]> =>
+    view.transcript.flatMap((entry): Array<[string, boolean]> =>
+      entry.kind === "item" ? [[entry.item.id, entry.interrupted]] : [],
+    );
+
+  it.each(["review", "failed", "cancelled"] as const)(
+    "marks what was still running when the session goes to %s",
+    (ended) => {
+      const view = fold(
+        log(
+          status("running"),
+          { type: "item_started", item: toolItem("t1", "ok", "completed") },
+          { type: "item_started", item: toolItem("t2", null) },
+          { type: "item_started", item: textItem("m1", "Half a sen") },
+          status(ended),
+        ),
+      );
+      expect(interrupted(view)).toEqual([
+        ["t1", false],
+        ["t2", true],
+        ["m1", true],
+      ]);
+      // The item itself is untouched: what the wire said stays what the wire said.
+      expect(items(view)[1]).toEqual(toolItem("t2", null));
+    },
+  );
+
+  it("does not mark items while the session is running or waiting", () => {
+    const view = fold(
+      log(
+        status("running"),
+        { type: "item_started", item: toolItem("t1", null) },
+        status("waiting"),
+        status("running"),
+      ),
+    );
+    expect(interrupted(view)).toEqual([["t1", false]]);
+  });
+
+  it("stays interrupted when the session continues, until the item itself reports", () => {
+    const stopped = fold(
+      log(
+        status("running"),
+        { type: "item_started", item: toolItem("t1", null) },
+        status("cancelled"),
+        [null, { type: "user_message", text: "carry on" }],
+        status("running"),
+        { type: "item_started", item: toolItem("t2", null) },
+      ),
+    );
+    expect(interrupted(stopped)).toEqual([
+      ["t1", true],
+      ["t2", false],
+    ]);
+
+    const [late] = log({ type: "item_completed", item: toolItem("t1", "done", "completed") });
+    const finished = applyEvent(stopped, { ...late, seq: stopped.seq + 1 }).view;
+    expect(interrupted(finished)).toEqual([
+      ["t1", false],
+      ["t2", false],
+    ]);
+  });
+});
+
+describe("changed files", () => {
+  const change = (
+    path: string,
+    op: "create" | "edit" | "delete" | "rename",
+    sessionRepoId: string | null = "sr1",
+  ): EventBody => ({ type: "file_changed", session_repo_id: sessionRepoId, path, op });
+
+  it("keeps one entry per file with its last operation, and counts every change", () => {
+    const view = fold(
+      log(
+        change("src/main.rs", "create"),
+        change("README.md", "edit"),
+        change("src/main.rs", "edit"),
+        change("README.md", "edit", "sr2"),
+        change("README.md", "delete"),
+      ),
+    );
+    expect(view.changedFiles.map((file) => [file.sessionRepoId, file.path, file.op])).toEqual([
+      ["sr1", "src/main.rs", "edit"],
+      ["sr1", "README.md", "delete"],
+      ["sr2", "README.md", "edit"],
+    ]);
+    expect(view.changesRevision).toBe(5);
+    // File changes are for the Changes panel, not the transcript.
+    expect(view.transcript).toEqual([]);
+  });
+
+  it("goes up by exactly one per change, and not at all for other events", () => {
+    const events = log(
+      change("a.txt", "create"),
+      { type: "user_message", text: "hi" },
+      change("a.txt", "edit"),
+      change("a.txt", "edit"),
+    );
+    const revisions: number[] = [];
+    let view = emptySessionView;
+    for (const event of events) {
+      view = applyEvent(view, event).view;
+      revisions.push(view.changesRevision);
+    }
+    expect(revisions).toEqual([1, 1, 2, 3]);
+  });
+
+  it("tells the agent's changes from the reader's own saves", () => {
+    const view = fold(
+      log(
+        ["a1", change("by-agent.ts", "edit")],
+        [null, change("by-you.ts", "edit")],
+        ["a1", change("/tmp/scratch.txt", "create", null)],
+      ),
+    );
+    expect(view.changedFiles).toEqual([
+      {
+        key: "sr1\nby-agent.ts",
+        sessionRepoId: "sr1",
+        path: "by-agent.ts",
+        op: "edit",
+        by: "agent",
+        agentId: "a1",
+        ts: 1000,
+      },
+      {
+        key: "sr1\nby-you.ts",
+        sessionRepoId: "sr1",
+        path: "by-you.ts",
+        op: "edit",
+        by: "user",
+        agentId: null,
+        ts: 1001,
+      },
+      {
+        key: "\n/tmp/scratch.txt",
+        sessionRepoId: null,
+        path: "/tmp/scratch.txt",
+        op: "create",
+        by: "agent",
+        agentId: "a1",
+        ts: 1002,
+      },
+    ]);
   });
 });

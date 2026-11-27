@@ -1,7 +1,7 @@
 import { useNavigate } from "@solidjs/router";
-import { Show, useContext } from "solid-js";
+import { onSettled, Show, useContext } from "solid-js";
 import { Composer } from "../components/Composer";
-import { sessionPath } from "../components/SessionList";
+import { sessionPath } from "../panels/registry";
 import { AppContext } from "../state/app";
 
 /** `/`: the composer. The sessions list beside (or above) it belongs to the shell. */
@@ -14,11 +14,16 @@ export default function HomePage() {
     return health.status === "ready" ? health.health.runners : [];
   };
 
+  onSettled(() => app.loadRepos());
   return (
-    <section class="border-t border-line bg-surface p-3 lg:mx-auto lg:mt-10 lg:w-full lg:max-w-2xl lg:rounded-md lg:border lg:p-4">
+    <section class="relative min-h-0 overflow-y-auto overscroll-contain border-t border-line bg-surface px-3 pt-3 lg:mx-auto lg:mt-10 lg:mb-4 lg:w-full lg:max-w-2xl lg:rounded-md lg:border lg:px-4 lg:pt-4">
       <Composer
         runners={runners()}
+        registry={app.repos()}
         disabled={app.health().status !== "ready"}
+        onRegisterRepo={(request) => app.registerRepo(request)}
+        onRemoveRepo={(id) => app.removeRepo(id)}
+        onRetryRepos={() => app.loadRepos()}
         onCreate={async (request) => {
           const session = await app.createSession(request);
           navigate(sessionPath(session.id));

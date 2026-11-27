@@ -8,8 +8,13 @@ export const sessionTopic = (sessionId: string): string => `session:${sessionId}
 
 export type ConnectionState = "connecting" | "open" | "reconnecting";
 
-/** Frames that belong to a topic; `pong` and `error` never reach a subscriber. */
-export type TopicMsg = Extract<ServerMsg, { op: "subscribed" | "event" | "session_upserted" }>;
+/** The server refused to `subscribe` this topic; nothing arrives on it until it is asked again. */
+export type TopicRefusal = Extract<ServerMsg, { op: "error" }> & { topic: string };
+
+/** Frames that belong to a topic; `pong` and an `error` that names no topic never reach a subscriber. */
+export type TopicMsg =
+  | Extract<ServerMsg, { op: "subscribed" | "event" | "session_upserted" }>
+  | TopicRefusal;
 export type TopicHandler = (msg: TopicMsg) => void;
 
 /** The last `seq` a subscriber applied, or `undefined` to replay from the start. */
@@ -35,7 +40,7 @@ export interface SocketOptions {
   backoffMaxMs?: number;
   /** Source of jitter, in [0, 1). */
   random?: () => number;
-  /** Called with the text of a server `error` frame. */
+  /** Called with the text of a server `error` frame that names no topic. */
   onServerError?: (message: string) => void;
 }
 
@@ -46,7 +51,7 @@ export interface SocketClient {
    * sends `unsubscribe`.
    */
   subscribe(topic: string, handler: TopicHandler, cursor?: Cursor): () => void;
-  /** Asks the server to replay `topic` again from `afterSeq`, after a gap. */
+  /** Asks the server to replay `topic` again from `afterSeq`, after a gap or a refusal. */
   resync(topic: string, afterSeq: number): void;
   state(): ConnectionState;
   onState(listener: (state: ConnectionState) => void): () => void;
@@ -84,6 +89,8 @@ export function createSocket(options: SocketOptions = {}): SocketClient {
   const random = options.random ?? Math.random;
 
   const topics = new Map<string, Set<Subscriber>>();
+  // Topics whose last `subscribe` was refused: the server holds nothing to leave.
+  const refused = new Set<string>();
   const stateListeners = new Set<(state: ConnectionState) => void>();
 
   let ws: WebSocketLike | null = null;
@@ -160,15 +167,28 @@ export function createSocket(options: SocketOptions = {}): SocketClient {
   function dispatch(msg: ServerMsg): void {
     switch (msg.op) {
       case "subscribed":
+        refused.delete(msg.topic);
+        for (const { handler } of topics.get(msg.topic) ?? []) handler(msg);
+        break;
       case "event":
         for (const { handler } of topics.get(msg.topic) ?? []) handler(msg);
         break;
       case "session_upserted":
         for (const { handler } of topics.get(TOPIC_SESSIONS) ?? []) handler(msg);
         break;
-      case "error":
-        options.onServerError?.(msg.message);
+      case "error": {
+        if (msg.topic === undefined) {
+          options.onServerError?.(msg.message);
+          break;
+        }
+        // A topic everyone has left since asking: the refusal concerns nobody anymore.
+        const subscribers = topics.get(msg.topic);
+        if (!subscribers) break;
+        refused.add(msg.topic);
+        const refusal: TopicRefusal = { op: "error", message: msg.message, topic: msg.topic };
+        for (const { handler } of subscribers) handler(refusal);
         break;
+      }
       case "pong":
       default:
         // `pong` only proves liveness; an op this build does not know is skipped.
@@ -184,6 +204,8 @@ export function createSocket(options: SocketOptions = {}): SocketClient {
     ws = socket;
     socket.onopen = () => {
       attempt = 0;
+      // A new connection, possibly to a server that now knows the topic.
+      refused.clear();
       setState("open");
       for (const [topic, subscribers] of topics) sendSubscribe(topic, cursorOf(subscribers));
       startHeartbeat();
@@ -222,13 +244,13 @@ export function createSocket(options: SocketOptions = {}): SocketClient {
         const current = topics.get(topic);
         if (!current?.delete(subscriber) || current.size > 0) return;
         topics.delete(topic);
-        send({ op: "unsubscribe", topic });
+        if (!refused.delete(topic)) send({ op: "unsubscribe", topic });
       };
     },
     resync(topic, afterSeq) {
       if (!topics.has(topic)) return;
       // Leaving first makes the server start one clean replay instead of two feeds.
-      send({ op: "unsubscribe", topic });
+      if (!refused.has(topic)) send({ op: "unsubscribe", topic });
       sendSubscribe(topic, afterSeq);
     },
     state: () => state,

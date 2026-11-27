@@ -32,6 +32,16 @@ function SessionsPanel() {
       <Match when={app.sessions().length > 0}>
         <SessionList sessions={app.sessions()} now={app.now()} />
       </Match>
+      <Match when={app.sessionsError()}>
+        {(message) => (
+          <div role="alert" class="flex flex-col items-start gap-2 p-3 text-sm">
+            <p>The server refused the session list: {message()}</p>
+            <button type="button" class="btn" onClick={() => app.retry()}>
+              Try again
+            </button>
+          </div>
+        )}
+      </Match>
       <Match when={!app.sessionsLoaded()}>
         <p class="p-3 text-sm text-muted">Loading sessions…</p>
       </Match>
@@ -65,7 +75,9 @@ function Shell(props: ParentProps) {
     app.health().status === "unreachable" && app.connection() !== "open";
 
   return (
-    <div class="pt-safe px-safe pb-safe flex h-dvh flex-col bg-bg text-fg">
+    // Positioned and clipped: screen-reader-only text is absolutely positioned, and
+    // inside a scrolling region it would otherwise stretch the page itself.
+    <div class="pt-safe px-safe pb-safe relative flex h-dvh flex-col overflow-clip bg-bg text-fg">
       <ConnectionIndicator />
       <Show when={dryRun()}>
         <p class="border-b border-line bg-attention-soft px-3 py-1 text-center text-xs">
@@ -92,7 +104,13 @@ function Shell(props: ParentProps) {
               <SessionsPanel />
             </nav>
           </aside>
-          <main class={["flex min-h-0 flex-col lg:flex-1", { "flex-1": !atHome() }]}>
+          {/* At home on a phone the composer shares the screen with the list above it. */}
+          <main
+            class={[
+              "flex min-h-0 flex-col lg:flex-1",
+              atHome() ? "max-h-[65dvh] lg:max-h-none" : "flex-1",
+            ]}
+          >
             {props.children}
           </main>
         </div>

@@ -399,4 +399,81 @@ describe("socket client", () => {
     vi.advanceTimersByTime(60_000);
     expect(FakeWebSocket.sockets).toHaveLength(2);
   });
+
+  it("hands a refused subscribe to the subscribers of its topic, not to the error log", () => {
+    const onServerError = vi.fn();
+    const client = connect({ onServerError });
+    const session: TopicMsg[] = [];
+    const sessions: TopicMsg[] = [];
+    client.subscribe("session:gone", (msg) => session.push(msg));
+    client.subscribe("sessions", (msg) => sessions.push(msg));
+    latest().accept();
+
+    latest().push({ op: "error", message: "unknown session", topic: "session:gone" });
+
+    expect(session).toEqual([{ op: "error", message: "unknown session", topic: "session:gone" }]);
+    expect(sessions).toEqual([]);
+    expect(onServerError).not.toHaveBeenCalled();
+    expect(client.state()).toBe("open");
+  });
+
+  it("drops a refusal that arrives after everyone has left the topic", () => {
+    const onServerError = vi.fn();
+    const client = connect({ onServerError });
+    const received: TopicMsg[] = [];
+    client.subscribe("sessions", (msg) => received.push(msg));
+    // The page learned over REST that the session does not exist, and left first.
+    client.subscribe("session:gone", (msg) => received.push(msg))();
+    latest().accept();
+
+    latest().push({ op: "error", message: "unknown session", topic: "session:gone" });
+
+    expect(received).toEqual([]);
+    expect(onServerError).not.toHaveBeenCalled();
+  });
+
+  it("asks again for a refused topic without leaving it first", () => {
+    const client = connect();
+    const unsubscribe = client.subscribe("session:s1", () => {});
+    latest().accept();
+    latest().take();
+    latest().push({ op: "error", message: "unknown session", topic: "session:s1" });
+
+    client.resync("session:s1", 0);
+    expect(latest().take()).toEqual([{ op: "subscribe", topic: "session:s1" }]);
+
+    // Still refused: there is nothing on the server to leave.
+    unsubscribe();
+    expect(latest().take()).toEqual([]);
+  });
+
+  it("treats a topic as joined again once the server confirms it", () => {
+    const client = connect();
+    const unsubscribe = client.subscribe("session:s1", () => {});
+    latest().accept();
+    latest().push({ op: "error", message: "not yet", topic: "session:s1" });
+    client.resync("session:s1", 0);
+    latest().push({ op: "subscribed", topic: "session:s1", head_seq: 0 });
+    latest().take();
+
+    unsubscribe();
+    expect(latest().take()).toEqual([{ op: "unsubscribe", topic: "session:s1" }]);
+  });
+
+  it("forgets a refusal when it reconnects", () => {
+    const client = connect();
+    client.subscribe("session:s1", () => {});
+    latest().accept();
+    latest().push({ op: "error", message: "unknown session", topic: "session:s1" });
+    latest().hangUp();
+    vi.advanceTimersByTime(100);
+    latest().accept();
+    expect(latest().take()).toEqual([{ op: "subscribe", topic: "session:s1" }]);
+
+    client.resync("session:s1", 3);
+    expect(latest().take()).toEqual([
+      { op: "unsubscribe", topic: "session:s1" },
+      { op: "subscribe", topic: "session:s1", after_seq: 3 },
+    ]);
+  });
 });

@@ -1,7 +1,7 @@
 import { createSignal, flush } from "solid-js";
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import type { Item } from "../gen/Item";
-import type { TranscriptEntry } from "../state/sessionReducer";
+import type { PermissionOutcome, TranscriptEntry } from "../state/sessionReducer";
 import { find, findByText, mount, unmountAll } from "../test/render";
 import { Transcript } from "./Transcript";
 
@@ -13,6 +13,7 @@ const itemEntry = (item: Item): TranscriptEntry => ({
   ts: 0,
   agentId: "a1",
   item,
+  interrupted: false,
 });
 
 const text = (id: string, value: string, status: Item["status"] = "completed"): TranscriptEntry =>
@@ -29,8 +30,28 @@ const tool = (output: string | null, status: Item["status"]): TranscriptEntry =>
       title: "cargo test",
       input: { command: "cargo test", timeout: 60 },
       output,
+      locations: [],
     },
   });
+
+const permission = (id: string, outcome: PermissionOutcome): TranscriptEntry => ({
+  kind: "permission",
+  key: `permission:${id}`,
+  ts: 0,
+  agentId: "a1",
+  request: {
+    id,
+    tool_name: "Bash",
+    tool_kind: "execute",
+    title: `git push ${id}`,
+    input: { command: `git push ${id}` },
+    item_id: null,
+  },
+  outcome,
+});
+
+const interrupted = (entry: TranscriptEntry): TranscriptEntry =>
+  entry.kind === "item" ? { ...entry, interrupted: true } : entry;
 
 const user: TranscriptEntry = { kind: "user", key: "event:e1", ts: 0, text: "Run the tests" };
 const failure: TranscriptEntry = {
@@ -236,5 +257,80 @@ describe("Transcript", () => {
 
     scrollTo(scroller, 440);
     expect(host.querySelector("button")).not.toBeNull();
+  });
+
+  it("shows a permission request where it was asked, with what became of it", () => {
+    const host = mount(() => (
+      <Transcript
+        entries={[
+          user,
+          permission("p1", { state: "pending" }),
+          permission("p2", { state: "resolved", decision: "allow", by: "user", message: null }),
+          permission("p3", { state: "resolved", decision: "allow", by: "policy", message: null }),
+          permission("p4", {
+            state: "resolved",
+            decision: "deny",
+            by: "user",
+            message: "Not on main.",
+          }),
+          permission("p5", { state: "resolved", decision: "deny", by: "policy", message: null }),
+          permission("p6", { state: "lapsed", message: "The turn ended." }),
+          text("m1", "Understood."),
+        ]}
+        synced={true}
+      />
+    ));
+    const rows = [...host.querySelectorAll("ol > li")].map((row) => row.textContent);
+    expect(rows).toHaveLength(8);
+    expect(rows[1]).toContain("Permission");
+    expect(rows[1]).toContain("execute");
+    expect(rows[1]).toContain("git push p1");
+    expect(rows[1]).toContain("Waiting for you");
+    expect(rows[2]).toContain("Allowed by you");
+    expect(rows[3]).toContain("Allowed by policy");
+    expect(rows[4]).toContain("Denied by you");
+    expect(rows[4]).toContain("Not on main.");
+    expect(rows[5]).toContain("Denied by policy");
+    // Closed by the end of the turn: not a refusal, and not by the reader.
+    expect(rows[6]).toContain("No longer needed");
+    expect(rows[6]).toContain("The turn ended.");
+    expect(rows[6]).not.toContain("Denied");
+    // The answer is given in the pinned bar; the row only records it.
+    expect(host.querySelector("ol button")).toBeNull();
+  });
+
+  it("updates a permission row in place when the answer arrives", () => {
+    const [entries, setEntries] = createSignal<TranscriptEntry[]>([
+      permission("p1", { state: "pending" }),
+    ]);
+    const host = mount(() => <Transcript entries={entries()} synced={true} />);
+    const row = find(host, "ol > li");
+
+    setEntries([
+      permission("p1", { state: "resolved", decision: "deny", by: "user", message: "No." }),
+    ]);
+    flush();
+    expect(find(host, "ol > li")).toBe(row);
+    expect(row.textContent).toContain("Denied by you");
+    expect(row.textContent).not.toContain("Waiting for you");
+  });
+
+  it("shows an item its turn left behind as interrupted instead of running", () => {
+    const [entries, setEntries] = createSignal<TranscriptEntry[]>([
+      tool(null, "running"),
+      text("m1", "Half a sen", "running"),
+    ]);
+    const host = mount(() => <Transcript entries={entries()} synced={true} />);
+    const [card, message] = host.querySelectorAll("ol > li");
+    expect(find(card, "summary").textContent).toContain("Running");
+    expect(message.querySelector(".pulse")).not.toBeNull();
+
+    setEntries(entries().map(interrupted));
+    flush();
+    expect(find(card, "summary").textContent).toContain("Interrupted");
+    expect(find(card, "summary").textContent).not.toContain("Running");
+    // Nothing keeps pulsing as if it were still going.
+    expect(host.querySelector(".pulse")).toBeNull();
+    expect(message.textContent).toContain("(interrupted)");
   });
 });
