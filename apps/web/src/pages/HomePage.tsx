@@ -14,13 +14,17 @@ export default function HomePage() {
     return health.status === "ready" ? health.health.runners : [];
   };
 
-  onSettled(() => app.loadRepos());
+  onSettled(() => {
+    app.loadRepos();
+    app.loadWorkflows();
+  });
   return (
     <section class="relative min-h-0 overflow-y-auto overscroll-contain border-t border-line bg-surface px-3 pt-3 lg:mx-auto lg:mt-10 lg:mb-4 lg:w-full lg:max-w-2xl lg:rounded-md lg:border lg:px-4 lg:pt-4">
       <Composer
         runners={runners()}
         registry={app.repos()}
         sets={app.repoSets()}
+        workflows={app.workflows()}
         disabled={app.health().status !== "ready"}
         onRegisterRepo={(request) => app.registerRepo(request)}
         onRemoveRepo={(id) => app.removeRepo(id)}

@@ -18,13 +18,25 @@ import { graphModel } from "./graph/model";
 import { Scrubber } from "./graph/Scrubber";
 import { laneViews } from "./graph/timelineModel";
 import { TimelineView, type TimelineSelection } from "./graph/TimelineView";
+import { runOverlay } from "./graph/workflowModel";
+import {
+  ACROSS_MIN_WIDTH,
+  inTranscript as keepsRows,
+  WorkflowHeader,
+  WorkflowNodeDetails,
+  WorkflowText,
+  WorkflowView,
+} from "./graph/WorkflowView";
 import type { PanelProps } from "./registry";
 
 /** From this width the tree is drawn in columns and the details sit beside it. */
 const WIDE_PANE = 720;
-const views: readonly { id: OrchestrationView; label: string }[] = [
+type PanelView = OrchestrationView | "workflow";
+
+const views: readonly { id: PanelView; label: string }[] = [
   { id: "graph", label: "Graph" },
   { id: "timeline", label: "Timeline" },
+  { id: "workflow", label: "Workflow" },
 ];
 
 function Problem(props: { what: string; message: string; onRetry: () => void }) {
@@ -52,7 +64,16 @@ function Problem(props: { what: string; message: string; onRetry: () => void }) 
 export default function GraphPanel(props: PanelProps) {
   const store = props.store;
   const data = createOrchestrationData(store.orchestration);
-  const [view, setView] = createSignal<OrchestrationView>("graph");
+  // What the reader chose; until they do, a session that runs a workflow opens on it.
+  const [chosenView, setView] = createSignal<PanelView>();
+  const hasWorkflow = (): boolean => store.workflow.known();
+  const view = (): PanelView => {
+    const chosen = chosenView();
+    if (chosen === "workflow" && !hasWorkflow()) return "graph";
+    return chosen ?? (hasWorkflow() ? "workflow" : "graph");
+  };
+  const shownViews = () => views.filter((one) => one.id !== "workflow" || hasWorkflow());
+  const [pickedNode, setPickedNode] = createSignal<string>();
   const [selection, setSelection] = createSignal<GraphSelection>();
   const [picked, setPicked] = createSignal<TimelineSelection>();
   const [now, setNow] = createSignal(Date.now());
@@ -78,10 +99,45 @@ export default function GraphPanel(props: PanelProps) {
     };
   });
   createEffect(
-    () => props.active && tabVisible(),
-    (visible) => data.setVisible(visible),
+    () => ({ visible: props.active && tabVisible(), view: view() }),
+    ({ visible, view: shown }) => {
+      // The workflow view reads its own route; the orchestration reads wait meanwhile.
+      data.setVisible(visible && shown !== "workflow");
+      store.workflow.setVisible(visible && shown === "workflow");
+    },
   );
-  createEffect(view, (shown) => data.setView(shown));
+  onSettled(() => () => store.workflow.setVisible(false));
+  createEffect(view, (shown) => {
+    if (shown !== "workflow") data.setView(shown);
+  });
+  const run = () => store.workflow.run();
+  const orientation = () => (width() > 0 && width() < ACROSS_MIN_WIDTH ? "down" : "across");
+  const pickedOverlay = createMemo(() => {
+    const id = pickedNode();
+    const known = run();
+    if (id === undefined || !known) return undefined;
+    return runOverlay(known).byId.get(id);
+  });
+  /** The newest transcript row of a node, for the kinds the transcript keeps rows of. */
+  const showNode = (): (() => void) | undefined => {
+    const node = pickedOverlay();
+    if (!node || !keepsRows(node.info.kind)) return undefined;
+    const row = store
+      .view()
+      .transcript.findLast(
+        (entry) =>
+          entry.kind === "workflow" &&
+          (entry.note.what === "node_started" || entry.note.what === "node_finished") &&
+          entry.note.nodeId === node.id,
+      );
+    return row ? () => props.links.showItem(row.key) : undefined;
+  };
+  // Announced once each time another node starts running.
+  const nowRunning = createMemo(() => {
+    const known = run();
+    const active = known?.nodes.find((node) => node.state === "active")?.id;
+    return active === undefined ? "" : `Now running: ${active}`;
+  });
   // A memo: an effect runs again whenever its sources do, even for an equal value,
   // and a session outside the tree must not cost a read.
   const revision = createMemo(() => `${store.view().seq}/${treeRevision(store.tree())}`);
@@ -128,7 +184,7 @@ export default function GraphPanel(props: PanelProps) {
     <div ref={(element) => (root = element)} class="orch flex min-h-0 min-w-0 flex-1 flex-col">
       <div class="flex shrink-0 items-center gap-2 border-b border-line bg-surface px-2 py-1">
         <div role="group" aria-label="View" class="flex gap-1">
-          <For each={views}>
+          <For each={shownViews()}>
             {(one) => (
               <button
                 type="button"
@@ -148,6 +204,54 @@ export default function GraphPanel(props: PanelProps) {
         </Show>
       </div>
       <Switch>
+        <Match when={view() === "workflow"}>
+          <p class="sr-only" role="status" aria-live="polite" data-part="now-running">
+            {nowRunning()}
+          </p>
+          <Show
+            when={run()}
+            fallback={
+              <Show
+                when={store.workflow.failure()}
+                fallback={<p class="p-3 text-sm text-muted">Loading the workflow…</p>}
+              >
+                {(message) => (
+                  <Problem
+                    what="The workflow could not be loaded"
+                    message={message()}
+                    onRetry={() => store.workflow.now()}
+                  />
+                )}
+              </Show>
+            }
+          >
+            {(known) => (
+              <>
+                <WorkflowHeader run={known()} />
+                <div class="relative flex min-h-0 flex-1">
+                  <WorkflowView
+                    run={known()}
+                    orientation={orientation()}
+                    selection={pickedNode()}
+                    onSelect={setPickedNode}
+                  />
+                  <Show when={pickedOverlay()}>
+                    {(node) => (
+                      <WorkflowNodeDetails
+                        run={known()}
+                        node={node()}
+                        wide={wide()}
+                        onSelect={setPickedNode}
+                        onShowInTranscript={showNode()}
+                      />
+                    )}
+                  </Show>
+                </div>
+                <WorkflowText run={known()} />
+              </>
+            )}
+          </Show>
+        </Match>
         <Match when={view() === "graph"}>
           {/* A failed read keeps the last graph on screen, under what went wrong. */}
           <Show when={data.graph() && data.graphError()}>

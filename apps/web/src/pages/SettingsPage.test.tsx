@@ -18,15 +18,18 @@ import {
   unreachable,
 } from "../test/fakes";
 import { click, control, find, findByText, mount, type, unmountAll } from "../test/render";
+import { quickWorkflow } from "../test/fakes";
+import { workflowInfo } from "../test/workflows";
 import SettingsPage from "./SettingsPage";
 
 afterEach(unmountAll);
 
-const unset: Settings = { home_repo: null, scan_roots: [], clone_root: null };
+const unset: Settings = { home_repo: null, scan_roots: [], clone_root: null, max_parallel: null };
 const stored: Settings = {
   home_repo: "/home/me/code/notes",
   scan_roots: ["/home/me/code", "/srv/git"],
   clone_root: null,
+  max_parallel: null,
 };
 const home = makeRepo("notes", { home: true, path: "/home/me/code/notes" });
 const catalog: Repo[] = [
@@ -93,7 +96,8 @@ describe("SettingsPage", () => {
 
   it("shows the clone root the server reports", async () => {
     const { form } = await open({
-      getSettings: () => Promise.resolve({ ...stored, clone_root: "/data/calin/repos" }),
+      getSettings: () =>
+        Promise.resolve({ ...stored, clone_root: "/data/calin/repos", max_parallel: null }),
     });
     expect(control(form(), "Clone root").value).toBe("/data/calin/repos");
   });
@@ -118,6 +122,7 @@ describe("SettingsPage", () => {
       home_repo: "/home/me/code/home",
       scan_roots: ["/srv/git", "/opt/src", "/mnt/work"],
       clone_root: "/data/clones",
+      max_parallel: null,
     };
     const putSettings = vi.fn<Api["putSettings"]>().mockResolvedValue(answer);
     const listRepos = vi.fn<Api["listRepos"]>().mockResolvedValue(catalog);
@@ -162,11 +167,15 @@ describe("SettingsPage", () => {
   });
 
   it("shows the form as the server stored it, and sends empty fields as not set", async () => {
-    const putSettings = vi
-      .fn<Api["putSettings"]>()
-      .mockResolvedValue({ home_repo: null, scan_roots: [], clone_root: "/var/lib/calin/repos" });
+    const putSettings = vi.fn<Api["putSettings"]>().mockResolvedValue({
+      home_repo: null,
+      scan_roots: [],
+      clone_root: "/var/lib/calin/repos",
+      max_parallel: null,
+    });
     const { form, roots, save } = await open({
-      getSettings: () => Promise.resolve({ ...stored, clone_root: "/data/clones" }),
+      getSettings: () =>
+        Promise.resolve({ ...stored, clone_root: "/data/clones", max_parallel: null }),
       putSettings,
     });
     type(control(form(), "Home repo"), "   ");
@@ -378,5 +387,92 @@ describe("SettingsPage", () => {
     flush();
     expect(summary().querySelector("pre")).toBeNull();
     expect(summary().textContent).toContain("Declared3 repos");
+  });
+});
+
+describe("SettingsPage: workflows and the queue", () => {
+  it("lists every workflow with its id, name and steps, and each problem of an invalid one", async () => {
+    const { host } = await open({
+      listWorkflows: () =>
+        Promise.resolve([
+          quickWorkflow,
+          workflowInfo("implement-test-review", { name: "Implement, test, review" }),
+          workflowInfo("nightly", {
+            name: "Nightly",
+            graph: null,
+            problem: "line 4: unknown key `prompts`\nnode `ship`: not reachable from start",
+          }),
+        ]),
+    });
+    const items = [...host.querySelectorAll<HTMLElement>('ul[aria-label="Workflows"] > li')];
+    expect(items.map((item) => item.getAttribute("data-workflow"))).toEqual([
+      "quick",
+      "implement-test-review",
+      "nightly",
+    ]);
+    expect(items[0].textContent).toContain("Quick");
+    expect(items[0].textContent).toContain("1 step");
+    expect(items[0].textContent).toContain("Built in");
+    expect(items[1].textContent).toContain("Implement, test, review");
+    expect(items[1].textContent).toContain("implement-test-review");
+    expect(items[1].textContent).toContain("7 steps");
+    expect(items[1].hasAttribute("data-invalid")).toBe(false);
+
+    expect(items[2].hasAttribute("data-invalid")).toBe(true);
+    expect(items[2].textContent).toContain("Has errors");
+    const problems = find(items[2], 'ul[aria-label="Problems in nightly"]');
+    expect(problems.className).toContain("font-mono");
+    expect([...problems.querySelectorAll("li")].map((line) => line.textContent)).toEqual([
+      "line 4: unknown key `prompts`",
+      "node `ship`: not reachable from start",
+    ]);
+  });
+
+  it("says when the workflows cannot be read, in the server's words, and tries again", async () => {
+    const listWorkflows = vi
+      .fn<Api["listWorkflows"]>()
+      .mockRejectedValueOnce(badRequest("the home repo cannot be read"))
+      .mockResolvedValue([quickWorkflow]);
+    const { host } = await open({ listWorkflows });
+    expect(host.textContent).toContain(
+      "The workflows could not be loaded: the home repo cannot be read",
+    );
+    await click(findByText(host, "button", "Retry"));
+    await settle();
+    flush();
+    expect(host.querySelectorAll('ul[aria-label="Workflows"] > li')).toHaveLength(1);
+  });
+
+  it("shows and saves how many sessions run at once, as a number", async () => {
+    const putSettings = vi
+      .fn<Api["putSettings"]>()
+      .mockImplementation((body) => Promise.resolve(body));
+    const { form, save } = await open({
+      getSettings: () => Promise.resolve({ ...stored, max_parallel: 4 }),
+      putSettings,
+    });
+    const field = control(form(), "Sessions running at once");
+    expect(field.value).toBe("4");
+    type(field, "6");
+    await save();
+    expect(putSettings.mock.calls[0][0].max_parallel).toBe(6);
+
+    type(field, "");
+    await save();
+    expect(putSettings.mock.calls[1][0].max_parallel).toBeNull();
+  });
+
+  it("shows a 400 about the limit at its field, in the server's words", async () => {
+    const message = "max_parallel must be between 1 and 64";
+    const { host, form, save } = await open({
+      putSettings: () => Promise.reject(badRequest(message)),
+    });
+    const field = control(form(), "Sessions running at once");
+    type(field, "0");
+    await save();
+    expect(field.getAttribute("aria-invalid")).toBe("true");
+    const alerts = [...host.querySelectorAll('[role="alert"]')];
+    expect(alerts.map((alert) => alert.textContent)).toEqual([message]);
+    expect(field.getAttribute("aria-describedby")?.split(" ")).toContain(alerts[0].id);
   });
 });

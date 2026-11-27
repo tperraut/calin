@@ -4,7 +4,11 @@ import type { Api } from "../api/http";
 import type { Graph } from "../gen/Graph";
 import type { Session } from "../gen/Session";
 import type { Timeline } from "../gen/Timeline";
-import { conflict, makeSession } from "../test/fakes";
+import type { WorkflowGraph } from "../gen/WorkflowGraph";
+import type { WorkflowNodeInfo } from "../gen/WorkflowNodeInfo";
+import type { WorkflowRun } from "../gen/WorkflowRun";
+import { startRun } from "../lib/workflow";
+import { conflict, makeDetail, makeSession } from "../test/fakes";
 import { makeEdge, makeGraph, makeTimeline, T0 } from "../test/orchestration";
 import { click, find, findByText, mount, unmountAll } from "../test/render";
 import { openWorkspace, type Workspace } from "../test/workspace";
@@ -680,6 +684,462 @@ describe("GraphPanel: the timeline", () => {
     });
     expect(find(refused.host, '[role="alert"]').textContent).toContain(
       "The timeline could not be loaded: no timeline for a deleted session",
+    );
+  });
+});
+
+const wfNode = (
+  id: string,
+  kind: string,
+  ports: Array<[string, boolean]>,
+  label = id,
+): WorkflowNodeInfo => ({
+  id,
+  kind,
+  label,
+  ports: ports.map(([name, failure]) => ({ name, failure })),
+});
+
+/** The spec's example (workflows spec, section 2). Edge indices are noted for the tests below. */
+const wfGraph: WorkflowGraph = {
+  nodes: [
+    wfNode("start", "start", [["next", false]], ""),
+    wfNode(
+      "implement",
+      "agent",
+      [
+        ["done", false],
+        ["failed", true],
+      ],
+      "{{task}}",
+    ),
+    wfNode(
+      "tests",
+      "check",
+      [
+        ["pass", false],
+        ["fail", true],
+      ],
+      "cargo test --workspace",
+    ),
+    wfNode(
+      "retry",
+      "loop",
+      [
+        ["repeat", false],
+        ["exhausted", true],
+      ],
+      "up to 3",
+    ),
+    wfNode(
+      "fix",
+      "agent",
+      [
+        ["done", false],
+        ["failed", true],
+      ],
+      "The checks failed",
+    ),
+    wfNode("review", "agent", [
+      ["approve", false],
+      ["changes", false],
+      ["failed", true],
+    ]),
+    wfNode(
+      "gate",
+      "gate",
+      [
+        ["approve", false],
+        ["reject", true],
+      ],
+      "Open pull requests?",
+    ),
+    wfNode(
+      "ship",
+      "ship",
+      [
+        ["done", false],
+        ["failed", true],
+      ],
+      "Draft pull requests",
+    ),
+    wfNode("ok", "end", [], ""),
+    wfNode("gave-up", "end", [], ""),
+  ],
+  edges: [
+    { from: "start", port: "next", to: "implement" }, // 0
+    { from: "implement", port: "done", to: "tests" }, // 1
+    { from: "tests", port: "pass", to: "review" }, // 2
+    { from: "tests", port: "fail", to: "retry" }, // 3
+    { from: "retry", port: "repeat", to: "fix" }, // 4
+    { from: "retry", port: "exhausted", to: "gave-up" }, // 5
+    { from: "fix", port: "done", to: "tests" }, // 6
+    { from: "review", port: "approve", to: "gate" }, // 7
+    { from: "review", port: "changes", to: "retry" }, // 8
+    { from: "gate", port: "approve", to: "ship" }, // 9
+    { from: "ship", port: "done", to: "ok" }, // 10
+  ],
+};
+
+const wfStarted = {
+  type: "workflow_started",
+  workflow_id: "implement",
+  name: "Implement, test, review",
+  graph: wfGraph,
+  budget_usd: 5,
+} as const;
+
+/** What `GET /sessions/{id}/workflow` adds: the loop's limit and the tree's cost. */
+const served: WorkflowRun = {
+  ...startRun(wfStarted),
+  cost_usd: 1.2,
+  nodes: startRun(wfStarted).nodes.map((one) =>
+    one.id === "retry" ? { ...one, max: 3, iteration: 0 } : one,
+  ),
+};
+
+const nodeStarts = (id: string) =>
+  ({ type: "workflow_node", node_id: id, phase: "started", port: null, outcome: null }) as const;
+const nodeEnds = (id: string, port: string, outcome: string | null = null) =>
+  ({ type: "workflow_node", node_id: id, phase: "finished", port, outcome }) as const;
+
+type WorkflowOpened = Opened & { getWorkflow: ReturnType<typeof vi.fn<Api["getWorkflow"]>> };
+
+async function openWorkflow(
+  options: {
+    /** What the server answers; a promise for a failure. */
+    workflowRun?: WorkflowRun | null | Promise<WorkflowRun | null>;
+    session?: Session;
+  } = {},
+): Promise<WorkflowOpened> {
+  const answer = options.workflowRun === undefined ? served : options.workflowRun;
+  // A rejection made once is handled by whoever reads it; each call gets its own promise.
+  if (answer instanceof Promise) answer.catch(() => {});
+  const getWorkflow = vi.fn<Api["getWorkflow"]>(() =>
+    answer instanceof Promise ? answer : Promise.resolve(answer),
+  );
+  const getGraph = vi.fn<Api["getGraph"]>(() => Promise.resolve(makeGraph({ at: T0 })));
+  const getTimeline = vi.fn<Api["getTimeline"]>(() => Promise.resolve(makeTimeline()));
+  const [sessions, setSessions] = createSignal<readonly Session[]>([]);
+  const routes: Partial<Api> = { getGraph, getTimeline, getWorkflow };
+  const session = options.session;
+  if (session) routes.getSession = () => Promise.resolve(makeDetail(session));
+  const workspace = await openWorkspace({ routes, sessions });
+  const host = mount(() => (
+    <GraphPanel store={workspace.store} active={workspace.active()} links={workspace.links} />
+  ));
+  await pass();
+  return {
+    ...workspace,
+    host,
+    getGraph,
+    getTimeline,
+    getWorkflow,
+    setSessions(next) {
+      setSessions(next);
+      flush();
+    },
+  };
+}
+
+/** Tests fail, the loop is taken, a fix, the tests fail again, the loop again, a fix, then the tests run. */
+async function loopTwice(opened: WorkflowOpened): Promise<void> {
+  const { emit, caughtUp } = opened;
+  emit(wfStarted, null); // e1
+  emit(nodeStarts("start"), null); // e2
+  emit(nodeEnds("start", "next"), null); // e3
+  emit(nodeStarts("implement"), null); // e4
+  emit(nodeEnds("implement", "done", "Added the check."), null); // e5
+  emit(nodeStarts("tests"), null); // e6
+  emit(nodeEnds("tests", "fail", "cargo test --workspace: 2 failed"), null); // e7
+  emit(nodeStarts("retry"), null); // e8
+  emit(nodeEnds("retry", "repeat"), null); // e9
+  emit(nodeStarts("fix"), null); // e10
+  emit(nodeEnds("fix", "done"), null); // e11
+  emit(nodeStarts("tests"), null); // e12
+  emit(nodeEnds("tests", "fail", "cargo test --workspace: 1 failed"), null); // e13
+  emit(nodeStarts("retry"), null); // e14
+  emit(nodeEnds("retry", "repeat"), null); // e15
+  emit(nodeStarts("fix"), null); // e16
+  emit(nodeEnds("fix", "done"), null); // e17
+  emit(nodeStarts("tests"), null); // e18
+  caughtUp();
+  await pass();
+}
+
+const wfNodeEl = (host: HTMLElement, id: string): SVGGElement =>
+  find<SVGGElement>(host, `g.wnode[data-node="${id}"]`);
+const corner = (host: HTMLElement, id: string): string =>
+  find(wfNodeEl(host, id), ".wcorner").textContent;
+const wfEdge = (host: HTMLElement, index: number): SVGGElement =>
+  find<SVGGElement>(host, `g.wedge[data-edge="${index}"]`);
+const viewButtons = (host: HTMLElement): Array<[string, string | null]> =>
+  [...find(host, '[role="group"][aria-label="View"]').querySelectorAll("button")].map((one) => [
+    one.textContent,
+    one.getAttribute("aria-pressed"),
+  ]);
+
+describe("GraphPanel: the workflow", () => {
+  it("offers no Workflow view to a session without a workflow", async () => {
+    const { host, getWorkflow } = await openWorkflow({ workflowRun: null });
+    expect(viewButtons(host)).toEqual([
+      ["Graph", "true"],
+      ["Timeline", "false"],
+    ]);
+    expect(getWorkflow).not.toHaveBeenCalled();
+  });
+
+  it("adds the Workflow view once a run starts, and opens on it", async () => {
+    const opened = await openWorkflow();
+    await loopTwice(opened);
+    const { host } = opened;
+    expect(viewButtons(host)).toEqual([
+      ["Graph", "false"],
+      ["Timeline", "false"],
+      ["Workflow", "true"],
+    ]);
+    expect(find(host, "svg.graph-canvas").getAttribute("aria-label")).toBe("Workflow graph");
+    // The other views still work, and the reader's choice holds.
+    await click(button(host, "Graph"));
+    await pass();
+    expect(find(host, "svg.graph-canvas").getAttribute("aria-label")).toBe("Session graph");
+    await click(button(host, "Timeline"));
+    await pass();
+    expect(viewButtons(host).find(([label]) => label === "Timeline")?.[1]).toBe("true");
+    await click(button(host, "Workflow"));
+    await pass();
+    expect(host.querySelectorAll("g.wnode")).toHaveLength(wfGraph.nodes.length);
+  });
+
+  it("opens on the run of a session whose record names a workflow, from the server alone", async () => {
+    const session = makeSession("s1", 1000, { status: "running", workflow: "implement" });
+    const { host, getWorkflow } = await openWorkflow({ session });
+    await pass();
+    expect(getWorkflow).toHaveBeenCalledWith("s1");
+    expect(viewButtons(host).at(-1)).toEqual(["Workflow", "true"]);
+    expect(find(host, '[data-part="workflow-header"]').textContent).toContain(
+      "Implement, test, review",
+    );
+  });
+
+  it("heads the drawing with the name, the status in words and the budget spent", async () => {
+    const opened = await openWorkflow();
+    await loopTwice(opened);
+    const header = () => find(opened.host, '[data-part="workflow-header"]');
+    expect(header().textContent).toContain("Implement, test, review");
+    expect(find(header(), "[data-status]").textContent).toBe("Running");
+    expect(header().textContent).toContain("spent $1.20 of $5.00");
+    opened.emit(nodeEnds("tests", "fail", "1 failed"), null);
+    opened.emit(nodeStarts("retry"), null);
+    opened.emit(nodeEnds("retry", "exhausted"), null);
+    opened.emit(
+      { type: "workflow_finished", status: "failed", reason: "retry left through exhausted" },
+      null,
+    );
+    await pass();
+    expect(find(header(), "[data-status]").textContent).toBe("Failed");
+    expect(header().textContent).toContain("retry left through exhausted");
+  });
+
+  it("says a finished run succeeded", async () => {
+    const opened = await openWorkflow();
+    opened.emit(wfStarted, null);
+    opened.emit({ type: "workflow_finished", status: "success", reason: null }, null);
+    opened.caughtUp();
+    await pass();
+    expect(find(opened.host, '[data-part="workflow-header"] [data-status]').textContent).toBe(
+      "Succeeded",
+    );
+  });
+
+  it("lays the run over the graph: each node's state, its last port, its runs, the loop's count", async () => {
+    const opened = await openWorkflow();
+    await loopTwice(opened);
+    const { host } = opened;
+    const state = (id: string) => wfNodeEl(host, id).getAttribute("data-state");
+    expect(state("tests")).toBe("active");
+    expect(corner(host, "tests")).toBe("Running");
+    expect(state("gate")).toBe("idle");
+    expect(corner(host, "gate")).toBe("");
+    expect(state("implement")).toBe("finished");
+    expect(corner(host, "implement")).toBe("→ done");
+    expect(corner(host, "fix")).toBe("→ done ×2");
+    // The limit comes from the server; the count from the events.
+    expect(corner(host, "retry")).toBe("2 of 3");
+    expect(wfNodeEl(host, "tests").getAttribute("aria-label")).toBe(
+      "tests, Check: Running now (run 3)",
+    );
+    // Left through a failure port: marked, and said with a cross, not only in color.
+    opened.emit(nodeEnds("tests", "fail", "boom"), null);
+    await pass();
+    expect(wfNodeEl(host, "tests").hasAttribute("data-failed")).toBe(true);
+    expect(corner(host, "tests")).toBe("✕ fail ×3");
+    expect(wfNodeEl(host, "implement").hasAttribute("data-failed")).toBe(false);
+  });
+
+  it("emphasizes the edges taken, with a count past one, and marks failure ports by line and label", async () => {
+    const opened = await openWorkflow();
+    await loopTwice(opened);
+    const { host } = opened;
+    expect(wfEdge(host, 1).hasAttribute("data-taken")).toBe(true);
+    expect(wfEdge(host, 1).querySelector(".wcount")).toBeNull();
+    expect(find(wfEdge(host, 3), ".wcount").textContent).toBe("×2");
+    expect(find(wfEdge(host, 6), ".wcount").textContent).toBe("×2");
+    for (const untaken of [2, 5, 7, 8, 9, 10]) {
+      expect(wfEdge(host, untaken).hasAttribute("data-taken")).toBe(false);
+    }
+    expect(wfEdge(host, 3).hasAttribute("data-failure")).toBe(true);
+    expect(find(wfEdge(host, 3), ".wport").textContent).toBe("✕ fail");
+    expect(wfEdge(host, 5).hasAttribute("data-failure")).toBe(true);
+    expect(wfEdge(host, 2).hasAttribute("data-failure")).toBe(false);
+    expect(find(wfEdge(host, 2), ".wport").textContent).toBe("pass");
+    // The two edges that close a cycle go around the outside.
+    expect(
+      [...host.querySelectorAll("g.wedge[data-back]")].map((one) => one.getAttribute("data-edge")),
+    ).toEqual(["6", "8"]);
+  });
+
+  it("announces the node now running once each time it changes", async () => {
+    const opened = await openWorkflow();
+    await loopTwice(opened);
+    const region = find(opened.host, '[data-part="now-running"]');
+    expect(region.getAttribute("aria-live")).toBe("polite");
+    expect(region.textContent).toBe("Now running: tests");
+    const said: string[] = [];
+    const observer = new MutationObserver(() => said.push(region.textContent));
+    observer.observe(region, { childList: true, characterData: true, subtree: true });
+    // Things that do not change which node runs say nothing.
+    opened.emit({ type: "usage", cost_usd: 0.4, tokens_in: 10, tokens_out: 5 });
+    opened.emit({ type: "user_message", text: "hurry" }, null);
+    await pass(1000);
+    expect(said).toEqual([]);
+    opened.emit(nodeEnds("tests", "pass"), null);
+    opened.emit(nodeStarts("review"), null);
+    await pass();
+    expect(region.textContent).toBe("Now running: review");
+    expect(said.at(-1)).toBe("Now running: review");
+    const before = said.length;
+    opened.emit({ type: "usage", cost_usd: 0.5, tokens_in: 12, tokens_out: 6 });
+    await pass(1000);
+    expect(said).toHaveLength(before);
+    observer.disconnect();
+  });
+
+  it("reads the run again a moment after a node moves, while the view is on screen", async () => {
+    const opened = await openWorkflow();
+    await loopTwice(opened);
+    const calls = opened.getWorkflow.mock.calls.length;
+    opened.emit(nodeEnds("tests", "pass"), null);
+    await pass(1000);
+    expect(opened.getWorkflow.mock.calls.length).toBeGreaterThan(calls);
+  });
+
+  it("opens a node's details: kind, label, state, runs, last port, outcome and ports", async () => {
+    const opened = await openWorkflow();
+    await loopTwice(opened);
+    const { host } = opened;
+    opened.emit(nodeEnds("tests", "fail", "cargo test --workspace: 1 failed\nat src/lib.rs"), null);
+    await pass();
+    await tap(wfNodeEl(host, "tests"));
+    expect(find(details(host), "h2").textContent).toBe("tests");
+    expect(facts(host)).toEqual({
+      Kind: "✓ Check",
+      Label: "cargo test --workspace",
+      State: "Finished through fail, 3 runs",
+      Runs: "3",
+      "Last port": "fail",
+      Outcome: "cargo test --workspace: 1 failed\nat src/lib.rs",
+    });
+    const ports = [...find(details(host), 'ul[aria-label="Ports"]').querySelectorAll("li")].map(
+      (one) => one.textContent,
+    );
+    expect(ports).toEqual(["pass leads to review", "fail leads to retry"]);
+    expect(wfNodeEl(host, "tests").getAttribute("aria-pressed")).toBe("true");
+    // A port's target is one tap away.
+    await click(button(details(host), "fail leads to retry"));
+    await pass();
+    expect(find(details(host), "h2").textContent).toBe("retry");
+    expect(facts(host).Loop).toBe("2 of 3");
+    await click(find(host, 'button[aria-label="Close details"]'));
+    await pass();
+    expect(host.querySelector('section[aria-label="Details"]')).toBeNull();
+  });
+
+  it("shows a node's newest row in the transcript, for the kinds that have rows", async () => {
+    const opened = await openWorkflow();
+    await loopTwice(opened);
+    const { host } = opened;
+    await tap(wfNodeEl(host, "tests"));
+    await click(button(details(host), "Show in transcript"));
+    // e18: the third start of `tests`, its newest row.
+    expect(opened.shownItems).toEqual(["workflow:e18"]);
+    await tap(wfNodeEl(host, "fix"));
+    await click(button(details(host), "Show in transcript"));
+    expect(opened.shownItems.at(-1)).toBe("workflow:e16");
+    // A loop's and a ship's work leave no row of theirs to show.
+    await tap(wfNodeEl(host, "retry"));
+    expect(details(host).textContent).not.toContain("Show in transcript");
+    await tap(wfNodeEl(host, "ship"));
+    expect(details(host).textContent).not.toContain("Show in transcript");
+    // Not run yet: no row either.
+    await tap(wfNodeEl(host, "gate"));
+    expect(details(host).textContent).not.toContain("Show in transcript");
+    expect(facts(host).State).toBe("Not run yet");
+  });
+
+  it("selects a focused node with Enter, and lets go with Escape", async () => {
+    const opened = await openWorkflow();
+    await loopTwice(opened);
+    const { host } = opened;
+    const first = wfNodeEl(host, "start");
+    expect(first.getAttribute("tabindex")).toBe("0");
+    expect(wfNodeEl(host, "tests").getAttribute("tabindex")).toBe("-1");
+    first.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true }));
+    await pass();
+    const implement = wfNodeEl(host, "implement");
+    expect(implement.getAttribute("tabindex")).toBe("0");
+    implement.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    await pass();
+    expect(find(details(host), "h2").textContent).toBe("implement");
+    implement.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    await pass();
+    expect(host.querySelector('section[aria-label="Details"]')).toBeNull();
+  });
+
+  it("says the whole run in text: every node with its state and ports, and the path taken", async () => {
+    const opened = await openWorkflow();
+    await loopTwice(opened);
+    const text = find(opened.host, '[data-part="workflow-text"]');
+    expect(text.classList.contains("sr-only")).toBe(true);
+    const items = [...text.querySelectorAll("ol > li")].map((one) => one.textContent);
+    expect(items).toHaveLength(wfGraph.nodes.length);
+    expect(items[2]).toBe(
+      'tests: Check "cargo test --workspace". Running now (run 3). pass leads to review; fail leads to retry.',
+    );
+    expect(items[3]).toContain("Loop 2 of 3.");
+    expect(items[6]).toBe(
+      'gate: Gate "Open pull requests?". Not run yet. approve leads to ship; reject ends the run as failed.',
+    );
+    expect(find(text, "p").textContent).toBe(
+      "Path taken: start → implement → tests → retry → fix → tests → retry → fix → tests.",
+    );
+  });
+
+  it("says why the run could not be read when the events have not told it either", async () => {
+    const session = makeSession("s1", 1000, { status: "running", workflow: "implement" });
+    const opened = await openWorkflow({
+      session,
+      workflowRun: Promise.reject(conflict("the workflow log is unreadable")),
+    });
+    await pass();
+    expect(find(opened.host, '[role="alert"]').textContent).toContain(
+      "The workflow could not be loaded: the workflow log is unreadable",
+    );
+    opened.getWorkflow.mockResolvedValue(served);
+    await click(button(opened.host, "Try again"));
+    await pass();
+    expect(find(opened.host, '[data-part="workflow-header"]').textContent).toContain(
+      "Implement, test, review",
     );
   });
 });

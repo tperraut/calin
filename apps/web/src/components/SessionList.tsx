@@ -29,6 +29,13 @@ function SessionLink(props: { session: Session; now: number; child: boolean }) {
         >
           {relativeTime(props.session.created_at, props.now)}
         </time>
+        {/* api.rs, "The queue": a root session that is queued waits for a free slot. */}
+        <Show when={props.session.status === "queued" && !props.child}>
+          <span aria-hidden="true">·</span>
+          <span data-part="queued" class="min-w-0 truncate font-medium">
+            Queued: waiting for a free slot
+          </span>
+        </Show>
         {/* The list knows a session's status only: `shipping` is pull requests still in play. */}
         <Show when={props.session.status === "shipping"}>
           <span aria-hidden="true">·</span>

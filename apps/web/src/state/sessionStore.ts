@@ -7,6 +7,7 @@ import type {
   TerminalHandlers,
   TerminalRequest,
 } from "../api/terminal";
+import type { AnswerQuestionRequest } from "../gen/AnswerQuestionRequest";
 import type { AttachRepoRequest } from "../gen/AttachRepoRequest";
 import type { EventBody } from "../gen/EventBody";
 import type { FileContent } from "../gen/FileContent";
@@ -24,11 +25,13 @@ import type { SessionStatus } from "../gen/SessionStatus";
 import type { ShipRequest } from "../gen/ShipRequest";
 import type { Timeline } from "../gen/Timeline";
 import type { TreeEntry } from "../gen/TreeEntry";
+import type { WorkflowRun } from "../gen/WorkflowRun";
 import type { WriteFileRequest } from "../gen/WriteFileRequest";
 import { mergePullRequests, shipPlan } from "../lib/delivery";
 import { errorMessage } from "../lib/errors";
 import { createRefresher, type Refresher } from "../lib/refresher";
 import { coalesce, type Schedule } from "../lib/schedule";
+import { mergeRun } from "../lib/workflow";
 import { applyEvent, emptySessionView, mergeRepos, type SessionView } from "./sessionReducer";
 import { sessionTreeOf, type SessionTree } from "./sessionTree";
 
@@ -118,7 +121,9 @@ export type SessionStore = {
    * Answers a question an agent asked. Nothing changes here: the question is
    * over when its `question_answered` event arrives. Rejects with the server's reason.
    */
-  answerQuestion(questionId: string, answer: string): Promise<void>;
+  answerQuestion(questionId: string, answer: string, comment?: string): Promise<void>;
+  /** The session's workflow run (see `WorkflowFeed`). */
+  workflow: WorkflowFeed;
   /**
    * The sessions of this session's tree (same `root_session_id`), from the
    * sessions list, so it follows every `session_upserted`.
@@ -138,6 +143,25 @@ export type SessionStore = {
   start(): () => void;
   /** The session's repos on disk, for the workspace panels. Paths are relative to a repo's root. */
   workspace: SessionWorkspace;
+};
+
+/**
+ * The workflow run: folded from the events, so it is live, with what only
+ * `GET /sessions/{id}/workflow` tells (loop limits, the tree's cost). That is
+ * read once the session is known to run a workflow, and again, a moment after
+ * a node moves or usage is reported, while the Workflow view is on screen.
+ */
+export type WorkflowFeed = {
+  /** `undefined` while the session is not known to run a workflow. */
+  run: Accessor<WorkflowRun | undefined>;
+  /** True once the record or the events say the session runs a workflow. */
+  known: Accessor<boolean>;
+  /** The server's reason when the last read failed. */
+  failure: Accessor<string | undefined>;
+  /** The Workflow view is on screen, or no longer is. */
+  setVisible(visible: boolean): void;
+  /** Reads at once. */
+  now(): void;
 };
 
 export type Orchestration = {
@@ -249,6 +273,30 @@ export function createSessionStore(deps: SessionStoreDeps, id: string): SessionS
   const [changesRefreshing, setChangesRefreshing] = createSignal(false);
   // Lives from `start` to its undoing: nothing is read for a session nobody looks at.
   let changesRefresher: Refresher | undefined;
+
+  const [servedRun, setServedRun] = createSignal<WorkflowRun>();
+  const [workflowFailure, setWorkflowFailure] = createSignal<string>();
+  let workflowRefresher: Refresher | undefined;
+  let workflowSeeded = false;
+  let workflowShown = false;
+
+  async function readWorkflow(): Promise<void> {
+    try {
+      const loaded = await api.getWorkflow(id);
+      if (!active) return;
+      setServedRun(loaded ?? undefined);
+      setWorkflowFailure(undefined);
+    } catch (error) {
+      if (active) setWorkflowFailure(errorMessage(error));
+    }
+  }
+
+  /** The first read, once the session is known to run a workflow; later ones follow the view. */
+  function seedWorkflow(): void {
+    if (workflowSeeded || !active) return;
+    workflowSeeded = true;
+    void readWorkflow();
+  }
 
   async function readChanges(): Promise<void> {
     // What was folded before the question is in the answer; later events may not be.
@@ -387,6 +435,13 @@ export function createSessionStore(deps: SessionStoreDeps, id: string): SessionS
         }
         // Live only as well: a replayed pull request is not this ship's.
         if (caughtUp && shipWatch) watchShip(shipWatch, msg.event.body);
+        if (current.workflow && caughtUp) {
+          seedWorkflow();
+          const type = msg.event.body.type;
+          if (type === "workflow_node" || type === "workflow_finished" || type === "usage") {
+            workflowRefresher?.request();
+          }
+        }
         publish();
       } else if (result.outcome === "gap" && !replaying) {
         resync();
@@ -407,6 +462,7 @@ export function createSessionStore(deps: SessionStoreDeps, id: string): SessionS
       } else {
         replaying = false;
         caughtUp = true;
+        if (current.workflow) seedWorkflow();
         publish();
       }
     }
@@ -419,6 +475,9 @@ export function createSessionStore(deps: SessionStoreDeps, id: string): SessionS
         failed = false;
         loadedDetail = loaded;
         setDetail(loaded);
+        if (loaded.session.workflow !== null && loaded.session.workflow !== undefined) {
+          seedWorkflow();
+        }
         setLoad({ status: "ready" });
       },
       (error: unknown) => {
@@ -465,8 +524,26 @@ export function createSessionStore(deps: SessionStoreDeps, id: string): SessionS
       if (message !== undefined && message.trim() !== "") body.message = message.trim();
       return api.resolvePermission(id, requestId, body);
     },
-    answerQuestion: (questionId, answer) =>
-      api.answerQuestion(id, questionId, { answer: answer.trim() }),
+    answerQuestion(questionId, answer, comment) {
+      const body: AnswerQuestionRequest = { answer: answer.trim() };
+      if (comment !== undefined && comment.trim() !== "") body.comment = comment.trim();
+      return api.answerQuestion(id, questionId, body);
+    },
+    workflow: {
+      run: () => mergeRun(view().workflow, servedRun()),
+      known: () =>
+        view().workflow !== null ||
+        servedRun() !== undefined ||
+        (session()?.workflow ?? null) !== null,
+      failure: workflowFailure,
+      setVisible(visible) {
+        workflowShown = visible;
+        // Asked while still hidden, so becoming visible reads once rather than twice.
+        if (visible) workflowRefresher?.now();
+        workflowRefresher?.setVisible(visible && document.visibilityState === "visible");
+      },
+      now: () => workflowRefresher?.now(),
+    },
     tree: () => sessionTreeOf(deps.sessions?.() ?? NO_SESSIONS, session()),
     orchestration: {
       graph: (at) => api.getGraph(id, at),
@@ -508,8 +585,14 @@ export function createSessionStore(deps: SessionStoreDeps, id: string): SessionS
       active = true;
       const refresher = createRefresher(readChanges);
       changesRefresher = refresher;
+      const workflowReads = createRefresher(readWorkflow);
+      workflowRefresher = workflowReads;
       // Nothing is read for a page in a background tab; what was missed is read on the way back.
-      const onVisibility = (): void => refresher.setVisible(document.visibilityState === "visible");
+      const onVisibility = (): void => {
+        const visible = document.visibilityState === "visible";
+        refresher.setVisible(visible);
+        workflowReads.setVisible(visible && workflowShown);
+      };
       document.addEventListener("visibilitychange", onVisibility);
       onVisibility();
       const unsubscribe = socket.subscribe(topic, onFrame, () => current.seq);
@@ -528,6 +611,8 @@ export function createSessionStore(deps: SessionStoreDeps, id: string): SessionS
         document.removeEventListener("visibilitychange", onVisibility);
         refresher.dispose();
         changesRefresher = undefined;
+        workflowReads.dispose();
+        workflowRefresher = undefined;
         endShip();
       };
     },

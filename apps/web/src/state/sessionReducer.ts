@@ -13,6 +13,9 @@ import type { PullRequest } from "../gen/PullRequest";
 import type { Question } from "../gen/Question";
 import type { SessionRepo } from "../gen/SessionRepo";
 import type { SessionStatus } from "../gen/SessionStatus";
+import type { WorkflowRun } from "../gen/WorkflowRun";
+import type { WorkflowStatus } from "../gen/WorkflowStatus";
+import { finishRun, foldNode, isFailurePort, startRun } from "../lib/workflow";
 
 /** Running totals, in the shape of the `usage` event. */
 export type Usage = Omit<Extract<EventBody, { type: "usage" }>, "type">;
@@ -41,6 +44,32 @@ export type QuestionOutcome =
   | { state: "pending" }
   | { state: "answered"; answer: string; by: Answerer }
   | { state: "expired" };
+
+/**
+ * What a workflow run did, as one light transcript row (workflows spec, section 6).
+ * A node's row says what it is about; a finished node has a row only when its
+ * result is news: a failure port, a verdict, a gate's decision, nothing to commit.
+ */
+export type WorkflowNote =
+  | { what: "started"; name: string }
+  | {
+      what: "node_started";
+      nodeId: string;
+      nodeKind: string;
+      label: string;
+      /** Which start of the node this is, from 1. */
+      run: number;
+    }
+  | {
+      what: "node_finished";
+      nodeId: string;
+      nodeKind: string;
+      label: string;
+      port: string;
+      outcome: string | null;
+      failure: boolean;
+    }
+  | { what: "finished"; status: WorkflowStatus; reason: string | null };
 
 /** One row of the transcript. `key` is stable for the life of the row. */
 export type TranscriptEntry =
@@ -104,7 +133,8 @@ export type TranscriptEntry =
       question: Question;
       outcome: QuestionOutcome;
     }
-  | { kind: "error"; key: string; ts: number; agentId: string | null; message: string };
+  | { kind: "error"; key: string; ts: number; agentId: string | null; message: string }
+  | { kind: "workflow"; key: string; ts: number; agentId: null; note: WorkflowNote };
 
 /** A question an agent asked that nobody has answered yet. */
 export type OpenQuestion = {
@@ -172,6 +202,11 @@ export type SessionView = {
   readonly subagentCalls: Readonly<Record<string, string>>;
   /** Event id to item id, for the delegation (`task`) tool calls: what an `agent_spawned` may name as its cause. */
   readonly taskStarts: Readonly<Record<string, string>>;
+  /**
+   * The workflow run, as its events tell it; `null` when the session runs none.
+   * Loop limits and the tree's cost are not in the events: the store adds them.
+   */
+  readonly workflow: WorkflowRun | null;
 };
 
 export const emptySessionView: SessionView = {
@@ -192,6 +227,7 @@ export const emptySessionView: SessionView = {
   openQuestions: [],
   subagentCalls: {},
   taskStarts: {},
+  workflow: null,
 };
 
 /**
@@ -606,6 +642,66 @@ function putPullRequest(
   return { ...view, pullRequests, transcript };
 }
 
+/** Whether a finished node's result is worth a row of its own (see `WorkflowNote`). */
+function finishIsNews(kind: string, port: string, failure: boolean): boolean {
+  if (failure) return true;
+  if (kind === "agent") return port !== "done";
+  return kind === "gate" || (kind === "commit" && port === "nothing");
+}
+
+function applyWorkflow(
+  view: SessionView,
+  event: Event,
+  body: Extract<EventBody, { type: `workflow_${string}` }>,
+): SessionView {
+  const note = (next: WorkflowNote): TranscriptEntry => ({
+    kind: "workflow",
+    key: `workflow:${event.id}`,
+    ts: event.ts,
+    agentId: null,
+    note: next,
+  });
+  if (body.type === "workflow_started") {
+    const run = startRun(body);
+    return {
+      ...view,
+      workflow: run,
+      transcript: [...view.transcript, note({ what: "started", name: run.name })],
+    };
+  }
+  const run = view.workflow;
+  // A node or an end without a start this log showed has nothing to update.
+  if (!run) return view;
+  if (body.type === "workflow_finished") {
+    const reason = body.reason ?? null;
+    return {
+      ...view,
+      workflow: finishRun(run, { ...body, reason }),
+      transcript: [...view.transcript, note({ what: "finished", status: body.status, reason })],
+    };
+  }
+  const next = foldNode(run, body);
+  const info = run.graph.nodes.find((node) => node.id === body.node_id);
+  if (next === run || !info || info.kind === "start" || info.kind === "end") {
+    return { ...view, workflow: next };
+  }
+  const common = { nodeId: info.id, nodeKind: info.kind, label: info.label };
+  if (body.phase === "started") {
+    const runs = next.nodes.find((node) => node.id === info.id)?.runs ?? 1;
+    return {
+      ...view,
+      workflow: next,
+      transcript: [...view.transcript, note({ what: "node_started", ...common, run: runs })],
+    };
+  }
+  const port = body.port;
+  if (port === null) return { ...view, workflow: next };
+  const failure = isFailurePort(info, port);
+  if (!finishIsNews(info.kind, port, failure)) return { ...view, workflow: next };
+  const row = note({ what: "node_finished", ...common, port, outcome: body.outcome, failure });
+  return { ...view, workflow: next, transcript: [...view.transcript, row] };
+}
+
 function applyBody(view: SessionView, event: Event): SessionView {
   // Widened on purpose: a frame without a body must not throw in the fold.
   const body = event.body as EventBody | null | undefined;
@@ -686,6 +782,10 @@ function applyBody(view: SessionView, event: Event): SessionView {
       return askQuestion(view, event, body.question);
     case "question_answered":
       return answerQuestion(view, body);
+    case "workflow_started":
+    case "workflow_node":
+    case "workflow_finished":
+      return applyWorkflow(view, event, body);
     case "error": {
       const entry: TranscriptEntry = {
         kind: "error",

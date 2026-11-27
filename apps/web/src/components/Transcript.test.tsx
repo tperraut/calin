@@ -782,3 +782,108 @@ describe("Transcript: pull requests", () => {
     expect(line.querySelector("a")).toBeNull();
   });
 });
+
+describe("Transcript: workflow rows", () => {
+  const note = (
+    key: string,
+    value: Extract<TranscriptEntry, { kind: "workflow" }>["note"],
+  ): TranscriptEntry => ({ kind: "workflow", key, ts: 0, agentId: null, note: value });
+
+  const run: TranscriptEntry[] = [
+    note("workflow:e1", { what: "started", name: "Implement, test, review" }),
+    note("workflow:e2", {
+      what: "node_started",
+      nodeId: "implement",
+      nodeKind: "agent",
+      label: "Add a badge",
+      run: 1,
+    }),
+    note("workflow:e3", {
+      what: "node_started",
+      nodeId: "tests",
+      nodeKind: "check",
+      label: "cargo test",
+      run: 1,
+    }),
+    note("workflow:e4", {
+      what: "node_finished",
+      nodeId: "tests",
+      nodeKind: "check",
+      label: "cargo test",
+      port: "fail",
+      outcome: "1 test failed",
+      failure: true,
+    }),
+    note("workflow:e5", {
+      what: "node_started",
+      nodeId: "retry",
+      nodeKind: "loop",
+      label: "",
+      run: 2,
+    }),
+    note("workflow:e6", { what: "finished", status: "failed", reason: "retry ran out" }),
+  ];
+
+  it("says what the run did in light one-line rows, with the loop's limit when known", () => {
+    const host = mount(() => (
+      <Transcript
+        synced={true}
+        entries={run}
+        loopLimit={(nodeId) => (nodeId === "retry" ? 3 : null)}
+      />
+    ));
+    const rows = [...host.querySelectorAll<HTMLElement>("[data-workflow]")];
+    expect(rows.map((row) => row.textContent)).toEqual([
+      "◆Workflow: Implement, test, review",
+      "✦Agent step: implement · Add a badge",
+      "✓Check: cargo test",
+      "✓Check failed: tests · 1 test failed",
+      "↻Loop: attempt 2 of 3",
+      "◆Workflow failed · retry ran out",
+    ]);
+    // Lighter than agent output: one small line, never a bordered card.
+    for (const row of rows) {
+      expect(row.tagName).toBe("P");
+      expect(row.className).toContain("text-xs");
+      expect(row.className).not.toContain("border");
+    }
+    expect(rows[3].getAttribute("data-tone")).toBe("danger");
+  });
+
+  it("can bring a workflow row into view by its key", () => {
+    const [reveal, setReveal] = createSignal<{ itemId: string; seq: number }>();
+    const host = mount(() => <Transcript synced={true} entries={run} reveal={reveal()} />);
+    setReveal({ itemId: "workflow:e4", seq: 1 });
+    flush();
+    const marked = find(host, "[data-revealed]");
+    expect(marked.getAttribute("data-item")).toBe("workflow:e4");
+    expect(marked.textContent).toContain("Check failed: tests");
+  });
+
+  it("labels a gate as the workflow's, not the agent's question", () => {
+    const host = mount(() => (
+      <Transcript
+        synced={true}
+        entries={[
+          {
+            kind: "question",
+            key: "question:g1",
+            ts: 0,
+            agentId: null,
+            question: {
+              id: "g1",
+              text: "Open pull requests?",
+              options: ["approve", "reject"],
+              gate: true,
+            },
+            outcome: { state: "answered", answer: "approve", by: "user" },
+          },
+        ]}
+      />
+    ));
+    const row = find(host, "[data-question]");
+    expect(row.textContent).toContain("Workflow gate");
+    expect(row.textContent).not.toContain("Question for you");
+    expect(row.textContent).toContain("Answer: approve");
+  });
+});

@@ -32,6 +32,7 @@ import {
   type Tone,
 } from "../lib/status";
 import { entryAgent, transcriptRows, type TranscriptRow } from "../lib/transcriptRows";
+import { kindIcon, noteWords } from "../lib/workflow";
 import type { FileTarget } from "../panels/registry";
 import type { PermissionAnswers } from "../state/permissionAnswers";
 import type {
@@ -39,6 +40,7 @@ import type {
   QuestionOutcome,
   ToolPermission,
   TranscriptEntry,
+  WorkflowNote,
 } from "../state/sessionReducer";
 import { Badge, ItemStatusBadge } from "./Badge";
 import { Markdown } from "./Markdown";
@@ -55,6 +57,8 @@ type Surroundings = {
   openFile: () => ((target: FileTarget) => void) | undefined;
   /** Names who sent and who received a message. */
   speaker: () => Speaker;
+  /** A loop node's limit, when the server has said it. */
+  loopLimit: (nodeId: string) => number | null;
 };
 
 const SurroundingsContext = createContext<Surroundings>();
@@ -429,6 +433,40 @@ function MessageRow(props: { message: AgentMessage; direction: "sent" | "receive
   );
 }
 
+/**
+ * What a workflow run did: one light line, never a card, so the agent's own
+ * output stays what the eye lands on. An icon and a word say what the node is.
+ */
+function WorkflowRow(props: { note: WorkflowNote }) {
+  const around = useContext(SurroundingsContext);
+  const words = () =>
+    noteWords(
+      props.note,
+      props.note.what === "node_started" ? around.loopLimit(props.note.nodeId) : null,
+    );
+  const icon = (): string =>
+    props.note.what === "node_started" || props.note.what === "node_finished"
+      ? kindIcon(props.note.nodeKind)
+      : "◆";
+  return (
+    <p
+      data-workflow={props.note.what}
+      data-tone={words().tone}
+      class="flex min-w-0 items-baseline gap-1.5 px-1 text-xs text-muted"
+    >
+      <span aria-hidden="true" class="w-3 shrink-0 text-center">
+        {icon()}
+      </span>
+      <span class="min-w-0 wrap-break-word">
+        <span class={["font-medium", toneText[words().tone]]}>{words().text}</span>
+        <Show when={words().detail}>
+          {(detail) => <span class="whitespace-pre-wrap"> · {detail()}</span>}
+        </Show>
+      </span>
+    </p>
+  );
+}
+
 function questionLook(outcome: QuestionOutcome): Look {
   if (outcome.state === "pending") return { label: "Waiting for you", tone: "attention" };
   if (outcome.state === "expired") return { label: "No longer needed", tone: "neutral" };
@@ -444,7 +482,9 @@ function QuestionRow(props: { question: Question; outcome: QuestionOutcome }) {
       class="rounded-md border border-line bg-surface px-3 py-2"
     >
       <div class="flex min-w-0 flex-wrap items-center justify-between gap-x-2 gap-y-1">
-        <span class="text-xs font-medium text-muted">Question for you</span>
+        <span class="text-xs font-medium text-muted">
+          {props.question.gate ? "Workflow gate" : "Question for you"}
+        </span>
         <Badge look={questionLook(props.outcome)} pulse={props.outcome.state === "pending"} />
       </div>
       <Markdown text={props.question.text} />
@@ -513,8 +553,10 @@ function EntryRow(props: { entry: TranscriptEntry }) {
   const error = () => (props.entry.kind === "error" ? props.entry : undefined);
   const message = () => (props.entry.kind === "message" ? props.entry : undefined);
   const question = () => (props.entry.kind === "question" ? props.entry : undefined);
+  const workflow = () => (props.entry.kind === "workflow" ? props.entry : undefined);
   return (
     <Switch>
+      <Match when={workflow()}>{(entry) => <WorkflowRow note={entry().note} />}</Match>
       <Match when={message()}>
         {(entry) => <MessageRow message={entry().message} direction={entry().direction} />}
       </Match>
@@ -556,9 +598,9 @@ const NO_AGENTS: readonly Agent[] = [];
 const NO_CALLS: Readonly<Record<string, string>> = {};
 const plainSpeaker: Speaker = (_sessionId, agentId) => (agentId === null ? "you" : "another agent");
 
-/** The id a row carries so it can be scrolled to: its item's, for an item. */
+/** The id a row carries so it can be scrolled to: its item's, for an item; its key, for a workflow row. */
 const itemIdOf = (entry: TranscriptEntry): string | undefined =>
-  entry.kind === "item" ? entry.item.id : undefined;
+  entry.kind === "item" ? entry.item.id : entry.kind === "workflow" ? entry.key : undefined;
 
 function EntryItem(props: { entry: TranscriptEntry; revealed: string | undefined }) {
   return (
@@ -673,6 +715,8 @@ export function Transcript(props: {
   onFilter?: (agentId: string | null) => void;
   /** The item to bring into view, opening the group it is in. */
   reveal?: RevealRequest;
+  /** A loop node's limit, when known, so its rows can say "attempt 2 of 3". */
+  loopLimit?: (nodeId: string) => number | null;
 }) {
   const agents = () => props.agents ?? NO_AGENTS;
   // A filter naming an agent that is not (or no longer) in the session shows everything.
@@ -695,6 +739,7 @@ export function Transcript(props: {
     answers: () => (props.synced ? props.answers : undefined),
     openFile: () => props.onOpenFile,
     speaker: () => props.speaker ?? plainSpeaker,
+    loopLimit: (nodeId) => props.loopLimit?.(nodeId) ?? null,
   };
   // Which subagent groups the reader opened or closed; the others follow their agent's status.
   const [groups, setGroups] = createSignal<ReadonlyMap<string, boolean>>(new Map());

@@ -9,6 +9,7 @@ import type { Repo } from "../gen/Repo";
 import type { RepoSet } from "../gen/RepoSet";
 import type { Session } from "../gen/Session";
 import type { Settings } from "../gen/Settings";
+import type { WorkflowInfo } from "../gen/WorkflowInfo";
 import { errorMessage } from "../lib/errors";
 import { coalesce, type Schedule } from "../lib/schedule";
 import { createCatalog, type RepoRegistry } from "./catalog";
@@ -26,6 +27,12 @@ export type { RepoRegistry } from "./catalog";
 export type SettingsState =
   | { status: "loading" }
   | { status: "ready"; settings: Settings }
+  | { status: "error"; message: string };
+
+/** The workflows a session can run, as `GET /workflows` last answered. */
+export type WorkflowCatalog =
+  | { status: "loading" }
+  | { status: "ready"; workflows: readonly WorkflowInfo[] }
   | { status: "error"; message: string };
 
 export type AppServices = {
@@ -61,6 +68,10 @@ export type AppState = {
   cloneRepo(id: string): Promise<void>;
   /** Has the server re-read the home repo's list and rescan. */
   rescanRepos(): Promise<void>;
+  /** Stays `loading` until a screen calls `loadWorkflows`. */
+  workflows: Accessor<WorkflowCatalog>;
+  /** Reads the workflows, and again after a reconnect or a change of settings from then on. */
+  loadWorkflows(): void;
   /** Stays `loading` until a screen calls `loadSettings`. */
   settings: Accessor<SettingsState>;
   loadSettings(): void;
@@ -125,6 +136,27 @@ export function createAppState(services: AppServices): AppState {
     );
   }
 
+  const [workflows, setWorkflows] = createSignal<WorkflowCatalog>({ status: "loading" });
+  let workflowsKnown = false;
+  let workflowsWanted = false;
+  let workflowsInFlight = false;
+  function loadWorkflows(): void {
+    if (workflowsInFlight) return;
+    workflowsInFlight = true;
+    api.listWorkflows().then(
+      (loaded) => {
+        workflowsInFlight = false;
+        workflowsKnown = true;
+        setWorkflows({ status: "ready", workflows: loaded });
+      },
+      (error: unknown) => {
+        workflowsInFlight = false;
+        // A list that was read once stays usable through an outage.
+        if (!workflowsKnown) setWorkflows({ status: "error", message: errorMessage(error) });
+      },
+    );
+  }
+
   let healthKnown = false;
   let healthInFlight = false;
   function loadHealth(): void {
@@ -163,6 +195,11 @@ export function createAppState(services: AppServices): AppState {
     removeRepo: (id) => catalog.remove(id),
     cloneRepo: (id) => catalog.clone(id),
     rescanRepos: () => catalog.rescan(),
+    workflows,
+    loadWorkflows() {
+      workflowsWanted = true;
+      loadWorkflows();
+    },
     settings,
     loadSettings() {
       settingsWanted = true;
@@ -175,6 +212,8 @@ export function createAppState(services: AppServices): AppState {
       setSettings({ status: "ready", settings: stored });
       // api.rs: a change re-reads the home repo and rescans, so the repo list is another one now.
       catalog.invalidate();
+      // The workflows live in the home repo, which may be another one now.
+      if (workflowsWanted) loadWorkflows();
       return stored;
     },
     now,
@@ -203,6 +242,7 @@ export function createAppState(services: AppServices): AppState {
       loadHealth();
       catalog.reload({ missingOnly: true });
       if (settingsWanted && !settingsKnown) loadSettings();
+      if (workflowsWanted && !workflowsKnown) loadWorkflows();
       if (sessionsError() !== undefined) socket.resync(TOPIC_SESSIONS, 0);
       socket.reconnectNow();
     },
@@ -217,6 +257,8 @@ export function createAppState(services: AppServices): AppState {
         if (opens > 1 || !healthKnown) loadHealth();
         catalog.reload({ missingOnly: opens === 1 });
         if (settingsWanted && !settingsKnown) loadSettings();
+        // After a reconnect the home repo's files may have changed.
+        if (workflowsWanted && (opens > 1 || !workflowsKnown)) loadWorkflows();
       });
       const unsubscribe = socket.subscribe(TOPIC_SESSIONS, (msg) => {
         if (msg.op === "session_upserted") {

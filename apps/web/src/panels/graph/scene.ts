@@ -85,6 +85,8 @@ export const MAX_ZOOM = 2.5;
 /** Below this zoom the cards drop their text: it could not be read anyway. */
 export const LOD_BELOW = 0.45;
 const HOME_MIN_ZOOM = 0.6;
+/** The smallest zoom at which cards still show their text (see `LOD_BELOW`). */
+const LEGIBLE_ZOOM = 0.5;
 const PADDING = 16;
 /** The drawing starts under the zoom buttons that float over its top edge. */
 const HOME_TOP = 60;
@@ -451,12 +453,18 @@ export function createScene(options: SceneOptions) {
     zoomBy(factor: number): void {
       this.zoomAt(viewport.w / 2, viewport.h / 2, factor);
     },
-    /** Shows the whole drawing. */
-    fit(): void {
+    /**
+     * Shows the whole drawing. With `legible`, never below the zoom at which
+     * cards keep their text, and never under the buttons that float over the
+     * canvas: a drawing that is then too big starts at its top-left corner.
+     */
+    fit(legible = false): void {
       if (viewport.w === 0 || viewport.h === 0) return;
       homed = true;
       untouched = false;
-      Object.assign(view, fitView(content, viewport, PADDING, MIN_ZOOM, 1));
+      const next = fitView(content, viewport, PADDING, legible ? LEGIBLE_ZOOM : MIN_ZOOM, 1);
+      if (legible) next.y = Math.max(next.y, HOME_TOP);
+      Object.assign(view, next);
       touchView();
     },
     /** Pans just enough to bring a node into the viewport. */

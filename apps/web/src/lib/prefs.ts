@@ -17,6 +17,8 @@ export type ComposerPrefs = {
   permissionMode: PermissionMode;
   /** Absent until a runner was used: the server's default applies. */
   runner?: string;
+  /** The workflow id last started with; absent for the built-in `quick`. */
+  workflow?: string;
 };
 
 export const defaultComposerPrefs = (): ComposerPrefs => ({ permissionMode: "ask" });
@@ -74,6 +76,9 @@ export function loadComposerPrefs(): ComposerPrefs {
   const mode = permissionModes.find((one) => one === stored.permissionMode);
   if (mode) prefs.permissionMode = mode;
   if (typeof stored.runner === "string" && stored.runner !== "") prefs.runner = stored.runner;
+  if (typeof stored.workflow === "string" && stored.workflow !== "") {
+    prefs.workflow = stored.workflow;
+  }
   return prefs;
 }
 

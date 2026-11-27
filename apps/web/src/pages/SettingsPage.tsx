@@ -15,7 +15,8 @@ import type { Settings } from "../gen/Settings";
 import { errorMessage } from "../lib/errors";
 import { createRequest } from "../lib/request";
 import { blameSettingsField, settingsFromForm, type SettingsBlame } from "../lib/settings";
-import { AppContext, type RepoRegistry } from "../state/app";
+import { problemLines, stepCount } from "../lib/workflow";
+import { AppContext, type RepoRegistry, type WorkflowCatalog } from "../state/app";
 
 const EXAMPLE = `# <home repo>/.calin/repos.yaml
 repos:
@@ -40,6 +41,11 @@ function SettingsForm(props: { stored: Settings; onSave: (next: Settings) => Pro
   const [homeRepo, setHomeRepo] = createSignal(() => props.stored.home_repo ?? "");
   const [scanRoots, setScanRoots] = createSignal<readonly string[]>(() => props.stored.scan_roots);
   const [cloneRoot, setCloneRoot] = createSignal(() => props.stored.clone_root ?? "");
+  const [maxParallel, setMaxParallel] = createSignal(() =>
+    props.stored.max_parallel === null || props.stored.max_parallel === undefined
+      ? ""
+      : String(props.stored.max_parallel),
+  );
   const [newRoot, setNewRoot] = createSignal("");
   const [busy, setBusy] = createSignal(false);
   const [saved, setSaved] = createSignal(false);
@@ -47,6 +53,7 @@ function SettingsForm(props: { stored: Settings; onSave: (next: Settings) => Pro
   const homeId = createUniqueId();
   const rootId = createUniqueId();
   const cloneId = createUniqueId();
+  const parallelId = createUniqueId();
   const errorId = createUniqueId();
 
   const errorAt = (field: SettingsBlame["field"] | undefined): string | undefined => {
@@ -73,6 +80,7 @@ function SettingsForm(props: { stored: Settings; onSave: (next: Settings) => Pro
       homeRepo: homeRepo(),
       scanRoots: [...scanRoots(), newRoot()],
       cloneRoot: cloneRoot(),
+      maxParallel: maxParallel(),
     });
     setBusy(true);
     setFailure(undefined);
@@ -94,6 +102,8 @@ function SettingsForm(props: { stored: Settings; onSave: (next: Settings) => Pro
   return (
     <form
       aria-label="Settings"
+      // The server says what it accepts (api.rs); the browser's own checks would hide its words.
+      novalidate
       class="flex flex-col gap-5"
       onSubmit={(event) => {
         event.preventDefault();
@@ -242,6 +252,41 @@ function SettingsForm(props: { stored: Settings; onSave: (next: Settings) => Pro
         </p>
       </div>
 
+      <div class="flex flex-col gap-1.5">
+        <label for={parallelId} class="text-sm font-medium">
+          Sessions running at once
+        </label>
+        <input
+          id={parallelId}
+          type="number"
+          inputmode="numeric"
+          class="field h-11 w-32 px-3"
+          placeholder="Default"
+          value={maxParallel()}
+          aria-invalid={errorAt("max_parallel") === undefined ? undefined : "true"}
+          aria-describedby={
+            errorAt("max_parallel") === undefined
+              ? `${errorId}-parallel-hint`
+              : `${errorId}-parallel ${errorId}-parallel-hint`
+          }
+          onInput={(event) => {
+            setMaxParallel(event.currentTarget.value);
+            edited();
+          }}
+        />
+        <Show when={errorAt("max_parallel")}>
+          {(message) => (
+            <p id={`${errorId}-parallel`} role="alert" class={fieldError}>
+              {message()}
+            </p>
+          )}
+        </Show>
+        <p id={`${errorId}-parallel-hint`} class={hint}>
+          How many sessions may prepare or run at the same time; the others wait, queued, for a free
+          slot. Child sessions do not count. Empty for the server's default.
+        </p>
+      </div>
+
       <div class="flex flex-wrap items-center justify-end gap-3">
         <Show when={errorAt(undefined)}>
           {(message) => (
@@ -362,6 +407,74 @@ function HomeRepoSummary(props: {
   );
 }
 
+/** Every workflow the home repo offers, and what is wrong with those that cannot be used. */
+function WorkflowList(props: { catalog: WorkflowCatalog; onRetry: () => void }) {
+  return (
+    <Switch>
+      <Match when={props.catalog.status === "loading"}>
+        <p class="text-sm text-muted">Reading the workflows…</p>
+      </Match>
+      <Match when={props.catalog.status === "error" ? props.catalog : undefined}>
+        {(failure) => (
+          <p role="alert" class="flex items-center justify-between gap-2 text-sm">
+            <span class="min-w-0">The workflows could not be loaded: {failure().message}</span>
+            <button type="button" class="btn" onClick={() => props.onRetry()}>
+              Retry
+            </button>
+          </p>
+        )}
+      </Match>
+      <Match when={props.catalog.status === "ready" ? props.catalog.workflows : undefined}>
+        {(workflows) => (
+          <>
+            <ul aria-label="Workflows" class="divide-y divide-line rounded-md border border-line">
+              <For each={workflows()} keyed={(one) => one.id}>
+                {(one) => (
+                  <li
+                    data-workflow={one().id}
+                    data-invalid={one().problem === null ? undefined : ""}
+                    class="flex flex-col gap-1 px-3 py-2"
+                  >
+                    <div class="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5">
+                      <span class="font-medium wrap-anywhere">{one().name}</span>
+                      <span class="font-mono text-xs text-muted wrap-anywhere">{one().id}</span>
+                      <span class="ml-auto text-xs text-muted">
+                        <Show
+                          when={one().graph}
+                          fallback={<span class="font-medium text-tone-danger">Has errors</span>}
+                        >
+                          {(graph) => <span>{count(stepCount(graph()), "step", "steps")}</span>}
+                        </Show>
+                      </span>
+                    </div>
+                    <Show when={one().builtin}>
+                      <p class="text-xs text-muted">Built in</p>
+                    </Show>
+                    <Show when={one().problem !== null}>
+                      <ul
+                        aria-label={`Problems in ${one().id}`}
+                        class="overflow-x-auto rounded bg-danger-soft px-2 py-1.5 font-mono text-xs"
+                      >
+                        <For each={problemLines(one())}>
+                          {(line) => <li class="whitespace-pre-wrap wrap-anywhere">{line}</li>}
+                        </For>
+                      </ul>
+                    </Show>
+                  </li>
+                )}
+              </For>
+            </ul>
+            <p class={hint}>
+              Workflows are the <span class="font-mono">.yaml</span> files in the home repo's{" "}
+              <span class="font-mono">.calin/workflows</span> folder; the file name is the id.
+            </p>
+          </>
+        )}
+      </Match>
+    </Switch>
+  );
+}
+
 function HomeRepoExplained() {
   return (
     <>
@@ -386,10 +499,12 @@ function HomeRepoExplained() {
 export default function SettingsPage() {
   const app = useContext(AppContext);
   const summaryId = createUniqueId();
+  const workflowsId = createUniqueId();
 
   onSettled(() => {
     app.loadSettings();
     app.loadRepos();
+    app.loadWorkflows();
   });
 
   const stored = () => {
@@ -443,6 +558,15 @@ export default function SettingsPage() {
                       />
                     )}
                   </Show>
+                </section>
+                <section
+                  aria-labelledby={workflowsId}
+                  class="flex flex-col gap-3 border-t border-line pt-4"
+                >
+                  <h2 id={workflowsId} class="text-sm font-medium">
+                    Workflows
+                  </h2>
+                  <WorkflowList catalog={app.workflows()} onRetry={() => app.loadWorkflows()} />
                 </section>
               </>
             )}

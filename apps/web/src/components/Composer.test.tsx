@@ -5,7 +5,9 @@ import type { RegisterRepoRequest } from "../gen/RegisterRepoRequest";
 import type { Repo } from "../gen/Repo";
 import type { RepoSet } from "../gen/RepoSet";
 import type { RepoRegistry } from "../state/app";
-import { conflict, deferred, makeMissingRepo, makeRepo } from "../test/fakes";
+import type { WorkflowInfo } from "../gen/WorkflowInfo";
+import { conflict, deferred, makeMissingRepo, makeRepo, quickWorkflow } from "../test/fakes";
+import { workflowInfo } from "../test/workflows";
 import {
   choose,
   click,
@@ -801,5 +803,96 @@ describe("Composer: the catalog", () => {
       expect(host.querySelector("section button[aria-controls]")).toBeNull();
       expect(find(host, "ul").closest("[hidden]")).toBeNull();
     });
+  });
+});
+
+describe("Composer: workflows", () => {
+  const itr = workflowInfo("implement-test-review", {
+    name: "Implement, test, review",
+    description: "Implements, runs the checks until they pass, reviews, asks before shipping.",
+    budget_usd: 5,
+  });
+  const broken = workflowInfo("broken", { name: "Broken", graph: null, problem: "line 3: bad" });
+
+  function mountWith(workflows: readonly WorkflowInfo[]) {
+    const onCreate = vi.fn((_request: CreateSessionRequest) => Promise.resolve());
+    const host = mount(() => (
+      <Composer
+        runners={["mock"]}
+        registry={{ status: "ready", repos: [] }}
+        sets={[]}
+        workflows={{ status: "ready", workflows }}
+        onCreate={onCreate}
+        onRegisterRepo={() => Promise.reject(new Error("not stubbed"))}
+        onRemoveRepo={() => Promise.resolve()}
+        onCloneRepo={() => Promise.resolve()}
+        onRetryRepos={() => {}}
+      />
+    ));
+    const select = () => control<HTMLSelectElement>(host, "Workflow");
+    async function start(): Promise<CreateSessionRequest> {
+      type(find<HTMLTextAreaElement>(host, "textarea"), "Fix the login");
+      await click(findByText(host, "button", "Start"));
+      const request = onCreate.mock.lastCall?.[0];
+      if (!request) throw new Error("no session was started");
+      return request;
+    }
+    return { host, select, start };
+  }
+
+  it("offers no choice when only the built-in workflow exists, and sends none", async () => {
+    const { host, start } = mountWith([quickWorkflow]);
+    expect([...host.querySelectorAll("label")].some((one) => one.textContent === "Workflow")).toBe(
+      false,
+    );
+    expect(await start()).not.toHaveProperty("workflow");
+  });
+
+  it("starts on Quick, lists an invalid workflow disabled, and sends none for Quick", async () => {
+    const { select, start } = mountWith([quickWorkflow, broken, itr]);
+    const options = [...select().options];
+    expect(options.map((one) => [one.value, one.textContent, one.disabled])).toEqual([
+      ["quick", "Quick (no workflow)", false],
+      ["broken", "Broken (has errors)", true],
+      ["implement-test-review", "Implement, test, review", false],
+    ]);
+    expect(select().value).toBe("quick");
+    expect(await start()).not.toHaveProperty("workflow");
+  });
+
+  it("describes the chosen workflow: what it does, its budget and its shape", () => {
+    const { host, select } = mountWith([quickWorkflow, itr]);
+    choose(select(), "implement-test-review");
+    const note = document.getElementById(select().getAttribute("aria-describedby") ?? "");
+    expect(note?.textContent).toContain("Implements, runs the checks until they pass");
+    expect(note?.textContent).toContain("Budget: $5.00");
+    expect(find(host, '[data-part="workflow-shape"]').textContent).toBe(
+      "7 steps: 3 agent, 1 check, 1 loop, 1 gate, 1 ship",
+    );
+  });
+
+  it("sends the chosen workflow and remembers it for the next session", async () => {
+    const { select, start } = mountWith([quickWorkflow, itr]);
+    choose(select(), "implement-test-review");
+    expect((await start()).workflow).toBe("implement-test-review");
+    expect(JSON.parse(localStorage.getItem("calin.composer.v2") ?? "{}").workflow).toBe(
+      "implement-test-review",
+    );
+    unmountAll();
+    expect(mountWith([quickWorkflow, itr]).select().value).toBe("implement-test-review");
+  });
+
+  it.each([
+    ["became invalid", [quickWorkflow, { ...itr, graph: null, problem: "line 1: bad" }]],
+    ["no longer exists", [quickWorkflow, broken]],
+  ])("drops the remembered workflow when it %s", async (_case, workflows) => {
+    localStorage.setItem(
+      "calin.composer.v2",
+      JSON.stringify({ permissionMode: "ask", workflow: "implement-test-review" }),
+    );
+    const { select, start } = mountWith(workflows);
+    expect(select().value).toBe("quick");
+    expect(await start()).not.toHaveProperty("workflow");
+    expect(JSON.parse(localStorage.getItem("calin.composer.v2") ?? "{}").workflow).toBeUndefined();
   });
 });

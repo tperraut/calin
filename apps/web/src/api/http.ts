@@ -19,6 +19,8 @@ import type { Settings } from "../gen/Settings";
 import type { ShipRequest } from "../gen/ShipRequest";
 import type { Timeline } from "../gen/Timeline";
 import type { TreeEntry } from "../gen/TreeEntry";
+import type { WorkflowInfo } from "../gen/WorkflowInfo";
+import type { WorkflowRun } from "../gen/WorkflowRun";
 import type { WriteFileRequest } from "../gen/WriteFileRequest";
 
 /** Mount point of every route in `crates/calin-proto/src/api.rs`. */
@@ -65,6 +67,8 @@ export interface Api {
   removeRepo(id: string): Promise<void>;
   /** The home repo's named groups of repos, in its order. */
   listRepoSets(): Promise<RepoSet[]>;
+  /** The built-in `quick` first, then the home repo's workflows by id; an invalid one carries its problems. */
+  listWorkflows(): Promise<WorkflowInfo[]>;
   listSessions(): Promise<Session[]>;
   createSession(body: CreateSessionRequest): Promise<SessionDetail>;
   getSession(id: string): Promise<SessionDetail>;
@@ -81,6 +85,8 @@ export interface Api {
   getGraph(id: string, at?: number): Promise<Graph>;
   /** Every agent's activity over time, for the session's whole tree. */
   getTimeline(id: string): Promise<Timeline>;
+  /** The session's workflow run; `null` when it runs none (the server's 404). */
+  getWorkflow(id: string): Promise<WorkflowRun | null>;
   /** Attaches a repo to a session that is running, waiting or in review; 409 otherwise. */
   attachRepo(id: string, body: AttachRepoRequest): Promise<SessionRepo>;
   /**
@@ -180,6 +186,7 @@ export function createApi(
     cloneRepo: (id) => empty("POST", `/repos/${encodeURIComponent(id)}/clone`),
     removeRepo: (id) => empty("DELETE", `/repos/${encodeURIComponent(id)}`),
     listRepoSets: () => json<RepoSet[]>("GET", "/repo-sets"),
+    listWorkflows: () => json<WorkflowInfo[]>("GET", "/workflows"),
     listSessions: () => json<Session[]>("GET", "/sessions"),
     createSession: (body) => json<SessionDetail>("POST", "/sessions", body),
     getSession: (id) => json<SessionDetail>("GET", session(id)),
@@ -193,6 +200,15 @@ export function createApi(
     getGraph: (id, at) =>
       json<Graph>("GET", `${session(id)}/graph${at === undefined ? "" : `?at=${Math.round(at)}`}`),
     getTimeline: (id) => json<Timeline>("GET", `${session(id)}/timeline`),
+    async getWorkflow(id) {
+      try {
+        return await json<WorkflowRun>("GET", `${session(id)}/workflow`);
+      } catch (error) {
+        // api.rs: 404 is "this session runs no workflow", an answer rather than a failure.
+        if (error instanceof HttpError && error.status === 404 && error.fromServer) return null;
+        throw error;
+      }
+    },
     attachRepo: (id, body) => json<SessionRepo>("POST", `${session(id)}/repos`, body),
     shipSession: (id, body) => empty("POST", `${session(id)}/ship`, body),
     refreshPullRequests: (id) => empty("POST", `${session(id)}/pull-requests/refresh`),

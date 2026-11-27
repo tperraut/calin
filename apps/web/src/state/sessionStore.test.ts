@@ -21,6 +21,8 @@ import {
   settle,
   unreachable,
 } from "../test/fakes";
+import type { WorkflowRun } from "../gen/WorkflowRun";
+import { specGraph } from "../test/workflows";
 import { createSessionStore, SHIP_QUIET_MS } from "./sessionStore";
 
 const TOPIC = "session:s1";
@@ -715,5 +717,162 @@ describe("session store: delivery", () => {
     await expect(store.delivery.refresh()).resolves.toBeUndefined();
     expect(refreshPullRequests).toHaveBeenCalledWith("s1");
     await expect(store.delivery.refresh()).rejects.toThrow("GitHub cannot be reached");
+  });
+});
+
+describe("session store: the workflow run", () => {
+  const served = (cost: number): WorkflowRun => ({
+    workflow_id: "itr",
+    name: "Implement",
+    graph: specGraph(),
+    nodes: specGraph().nodes.map((one) => ({
+      id: one.id,
+      state: "idle",
+      runs: 0,
+      last_port: null,
+      outcome: null,
+      iteration: one.kind === "loop" ? 0 : null,
+      max: one.kind === "loop" ? 3 : null,
+    })),
+    taken: [],
+    status: "running",
+    reason: null,
+    budget_usd: 5,
+    cost_usd: cost,
+  });
+  const withWorkflow = () =>
+    Promise.resolve(makeDetail(makeSession("s1", 1000, { status: "running", workflow: "itr" })));
+
+  function live(getWorkflow: Api["getWorkflow"], getSession: Api["getSession"] = withWorkflow) {
+    const made = setup({ getWorkflow, getSession });
+    let seq = 0;
+    const emit = (body: EventBody) => {
+      seq += 1;
+      made.socket.emit(TOPIC, { op: "event", topic: TOPIC, event: makeEvent(seq, body) });
+    };
+    const caughtUp = () => made.subscribed(seq);
+    return { ...made, emit, caughtUp };
+  }
+
+  const begin: EventBody = {
+    type: "workflow_started",
+    workflow_id: "itr",
+    name: "Implement",
+    graph: specGraph(),
+    budget_usd: 5,
+  };
+  const node = (node_id: string, phase: "started" | "finished", port: string | null = null) =>
+    ({ type: "workflow_node", node_id, phase, port, outcome: null }) as const;
+
+  afterEach(() => vi.useRealTimers());
+
+  it("reads the run once the record says there is one, and adds loop limits and cost to the events", async () => {
+    const getWorkflow = vi.fn<Api["getWorkflow"]>().mockResolvedValue(served(1.25));
+    const { store, emit, caughtUp } = live(getWorkflow);
+    expect(store.workflow.known()).toBe(false);
+    await settle();
+    flush();
+    expect(getWorkflow).toHaveBeenCalledTimes(1);
+    expect(getWorkflow).toHaveBeenCalledWith("s1");
+    expect(store.workflow.known()).toBe(true);
+
+    emit(begin);
+    emit(node("retry", "started"));
+    emit(node("retry", "finished", "repeat"));
+    emit(node("retry", "started"));
+    caughtUp();
+    await settle();
+    flush();
+    // Seeded once: catching up does not read it again.
+    expect(getWorkflow).toHaveBeenCalledTimes(1);
+    const run = store.workflow.run();
+    expect(run?.cost_usd).toBe(1.25);
+    expect(run?.nodes.find((one) => one.id === "retry")).toMatchObject({
+      state: "active",
+      runs: 2,
+      iteration: 2,
+      max: 3,
+    });
+  });
+
+  it("takes the server's 404 as no run", async () => {
+    const getWorkflow = vi.fn<Api["getWorkflow"]>().mockResolvedValue(null);
+    const { store } = live(getWorkflow);
+    await settle();
+    flush();
+    expect(getWorkflow).toHaveBeenCalledTimes(1);
+    expect(store.workflow.run()).toBeUndefined();
+    expect(store.workflow.failure()).toBeUndefined();
+  });
+
+  it("reads nothing for a session without a workflow", async () => {
+    const getWorkflow = vi.fn<Api["getWorkflow"]>().mockResolvedValue(null);
+    const { store, caughtUp } = live(getWorkflow, () =>
+      Promise.resolve(makeDetail(makeSession("s1", 1000, { status: "running" }))),
+    );
+    caughtUp();
+    await settle();
+    flush();
+    expect(getWorkflow).not.toHaveBeenCalled();
+    expect(store.workflow.known()).toBe(false);
+  });
+
+  it("reads again, debounced, when a node moves or usage arrives while the view is on screen", async () => {
+    const getWorkflow = vi.fn<Api["getWorkflow"]>().mockResolvedValue(served(0.5));
+    const { store, emit, caughtUp } = live(getWorkflow);
+    emit(begin);
+    caughtUp();
+    await settle();
+    vi.useFakeTimers();
+    const seeded = getWorkflow.mock.calls.length;
+
+    // Not on screen: nothing is read for events.
+    emit(node("implement", "started"));
+    vi.advanceTimersByTime(5000);
+    expect(getWorkflow).toHaveBeenCalledTimes(seeded);
+
+    // Opening the view reads at once (it was stale).
+    store.workflow.setVisible(true);
+    expect(getWorkflow).toHaveBeenCalledTimes(seeded + 1);
+    await vi.advanceTimersByTimeAsync(0);
+
+    emit(node("implement", "finished", "done"));
+    emit({ type: "usage", cost_usd: 0.7, tokens_in: 10, tokens_out: 5 });
+    vi.advanceTimersByTime(499);
+    expect(getWorkflow).toHaveBeenCalledTimes(seeded + 1);
+    vi.advanceTimersByTime(1);
+    expect(getWorkflow).toHaveBeenCalledTimes(seeded + 2);
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Other events are not the run's news.
+    emit({ type: "user_message", text: "faster" });
+    vi.advanceTimersByTime(5000);
+    expect(getWorkflow).toHaveBeenCalledTimes(seeded + 2);
+
+    store.workflow.setVisible(false);
+    emit(node("tests", "started"));
+    vi.advanceTimersByTime(5000);
+    expect(getWorkflow).toHaveBeenCalledTimes(seeded + 2);
+  });
+
+  it("keeps the server's reason when a read fails", async () => {
+    const getWorkflow = vi.fn<Api["getWorkflow"]>().mockRejectedValue(conflict("store busy"));
+    const { store } = live(getWorkflow);
+    await settle();
+    flush();
+    expect(store.workflow.failure()).toBe("store busy");
+  });
+
+  it("answers a gate with its comment only when there is one", async () => {
+    const answerQuestion = vi.fn<Api["answerQuestion"]>().mockResolvedValue();
+    const { store } = setup({ answerQuestion });
+    await store.answerQuestion("g1", "approve");
+    await store.answerQuestion("g1", " reject ", "  Not yet.  ");
+    await store.answerQuestion("g1", "approve", "   ");
+    expect(answerQuestion.mock.calls).toEqual([
+      ["s1", "g1", { answer: "approve" }],
+      ["s1", "g1", { answer: "reject", comment: "Not yet." }],
+      ["s1", "g1", { answer: "approve" }],
+    ]);
   });
 });

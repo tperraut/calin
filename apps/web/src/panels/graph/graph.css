@@ -320,3 +320,159 @@
   fill: transparent;
   stroke: none;
 }
+
+/*
+ * The workflow view. A node's state is said by its corner's words and its
+ * outline's weight as well as by color; a failure port's edge is dashed and its
+ * name carries a "✕" (the graph is small and fixed, so dashes cost nothing here).
+ */
+.wnode {
+  cursor: pointer;
+  outline: none;
+}
+
+.wnode .wshape {
+  fill: var(--surface);
+  stroke: var(--muted);
+  stroke-width: 1.25;
+}
+
+.wnode[data-state="idle"] .wshape {
+  stroke: var(--muted);
+  stroke-dasharray: 4 3;
+}
+
+.wnode[data-state="idle"] text {
+  opacity: 0.7;
+}
+
+.wnode[data-state="finished"] .wshape {
+  stroke: var(--tone-success);
+  stroke-width: 1.5;
+}
+
+.wnode[data-failed] .wshape {
+  stroke: var(--tone-danger);
+  stroke-width: 1.5;
+}
+
+.wnode[data-state="active"] .wshape {
+  fill: var(--accent-soft);
+  stroke: var(--accent);
+  stroke-width: 3.5;
+}
+
+.wnode[data-selected] .wshape {
+  fill: var(--accent-soft);
+}
+
+.wnode .wfocus {
+  display: none;
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 2;
+  stroke-dasharray: 3 3;
+}
+
+.wnode:focus-visible .wfocus,
+.wnode[data-selected] .wfocus {
+  display: inline;
+}
+
+.wnode text {
+  fill: var(--fg);
+  font-family: var(--font-sans);
+  pointer-events: none;
+}
+
+.wnode .wkind,
+.wnode .wlabel {
+  fill: var(--muted);
+  font-size: 11px;
+}
+
+.wnode .wtitle {
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.wnode .wcorner {
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.wnode[data-state="active"] .wcorner {
+  fill: var(--tone-active);
+}
+
+.wnode[data-failed] .wcorner {
+  fill: var(--tone-danger);
+}
+
+.wedge .wline {
+  fill: none;
+  stroke: var(--muted);
+  stroke-width: 1.25;
+  opacity: 0.45;
+}
+
+.wedge[data-taken] .wline {
+  stroke: var(--fg);
+  stroke-width: 2.5;
+  opacity: 1;
+}
+
+.wedge[data-failure] .wline {
+  stroke-dasharray: 6 4;
+}
+
+.wedge[data-failure][data-taken] .wline {
+  stroke: var(--tone-danger);
+}
+
+.wedge .wport {
+  fill: var(--muted);
+  font-family: var(--font-sans);
+  font-size: 10.5px;
+  pointer-events: none;
+}
+
+.wedge[data-failure] .wport {
+  fill: var(--tone-danger);
+}
+
+.wedge[data-taken] .wport {
+  font-weight: 600;
+}
+
+.wedge .wcount rect {
+  fill: var(--surface);
+  stroke: var(--fg);
+}
+
+.wedge .wcount text {
+  fill: var(--fg);
+  font-family: var(--font-sans);
+  font-size: 10.5px;
+  font-weight: 600;
+  text-anchor: middle;
+}
+
+.wstatus[data-status="running"] {
+  color: var(--tone-active);
+}
+
+.wstatus[data-status="success"] {
+  color: var(--tone-success);
+}
+
+.wstatus[data-status="failed"] {
+  color: var(--tone-danger);
+}
+
+/* Zoomed far out: shapes and lines only, as in the session graph. */
+.lod .wnode text,
+.lod .wport,
+.lod .wcount {
+  display: none;
+}

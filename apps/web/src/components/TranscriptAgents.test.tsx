@@ -306,7 +306,12 @@ describe("Transcript: messages and questions", () => {
   });
 
   it("shows a question where it was asked, then who answered and what, or that it is no longer needed", () => {
-    const question = { id: "q1", text: "Header or **footer**?", options: ["Header", "Footer"] };
+    const question = {
+      id: "q1",
+      text: "Header or **footer**?",
+      options: ["Header", "Footer"],
+      gate: false,
+    };
     const row = (
       outcome: Extract<TranscriptEntry, { kind: "question" }>["outcome"],
     ): TranscriptEntry => ({

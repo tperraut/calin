@@ -178,6 +178,15 @@ export function SessionScreen(props: {
     speakerFor(store.session(), store.view().agents, store.tree().sessions),
   );
 
+  const loopLimit = (nodeId: string): number | null =>
+    store.workflow.run()?.nodes.find((node) => node.id === nodeId)?.max ?? null;
+  // api.rs, "The queue": a session past the limit waits for a slot; the server says so in words.
+  const queuedReason = (): string | undefined => {
+    if (store.status() !== "queued") return undefined;
+    const reason = store.view().statusReason;
+    return reason === null || reason.trim() === "" ? undefined : reason.trim();
+  };
+
   // The server's list, once read, sees what the events do not: a shell's edits, a revert.
   const changedCount = createMemo(() =>
     changedFileCount(store.changes.list(), store.changes.revision(), store.view().changedFiles),
@@ -252,6 +261,16 @@ export function SessionScreen(props: {
       </Match>
       <Match when={true}>
         <SessionHeader store={store} shipOpen={shipOpen()} onShipOpen={setShipOpen} />
+        <Show when={queuedReason()}>
+          {(reason) => (
+            <p
+              data-part="queued"
+              class="border-b border-line bg-sunken px-3 py-2 text-sm wrap-break-word"
+            >
+              <span class="font-medium">Queued:</span> {reason()}
+            </p>
+          )}
+        </Show>
         <Show when={store.stalled()}>
           <p role="alert" class="border-b border-line bg-attention-soft px-3 py-2 text-sm">
             Part of this transcript could not be loaded. Reload the page to try again.
@@ -320,6 +339,7 @@ export function SessionScreen(props: {
                 filter={agentFilter()}
                 onFilter={setAgentFilter}
                 reveal={reveal()}
+                loopLimit={loopLimit}
               />
               <Show when={store.view().plan.length > 0}>
                 <PlanPanel entries={store.view().plan} />
@@ -347,7 +367,9 @@ export function SessionScreen(props: {
             />
             <QuestionBar
               questions={questions()}
-              onAnswer={(questionId, answer) => store.answerQuestion(questionId, answer)}
+              onAnswer={(questionId, answer, comment) =>
+                store.answerQuestion(questionId, answer, comment)
+              }
               compact={transcriptHidden()}
             />
             <div hidden={transcriptHidden()}>

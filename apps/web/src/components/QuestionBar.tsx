@@ -9,15 +9,17 @@ const ANNOUNCED_CHARS = 200;
 
 /**
  * The oldest open question an agent asked, pinned above the message box: its
- * text, the suggested answers as buttons and a field for any other answer.
+ * text, the suggested answers as buttons and a field for any other answer. A
+ * workflow gate (api.rs, "A gate") is asked by the run, not the agent: it gets
+ * Approve and Reject, and a comment that goes with either.
  * Nothing here is optimistic: a question leaves the bar when its
  * `question_answered` event arrives, not when an answer is sent.
  */
 export function QuestionBar(props: {
   /** Oldest first. Empty while the transcript is still replaying, or while a permission waits. */
   questions: readonly OpenQuestion[];
-  /** Rejects with the server's reason when the answer is refused. */
-  onAnswer: (questionId: string, answer: string) => Promise<void>;
+  /** Rejects with the server's reason when the answer is refused. `comment` is a gate's note. */
+  onAnswer: (questionId: string, answer: string, comment?: string) => Promise<void>;
   /**
    * One line until the reader opens it: on a phone, under a panel that needs
    * the room. The question is still announced, and still one tap away.
@@ -27,11 +29,13 @@ export function QuestionBar(props: {
   // What the reader chose for the compact bar; closed again for the next question.
   const [opened, setOpened] = createSignal<string>();
   const [text, setText] = createSignal("");
+  const [comment, setComment] = createSignal("");
   const [sending, setSending] = createSignal<string>();
   // Answers the server accepted whose event has not arrived yet: answering twice would be a 409.
   const [sent, setSent] = createSignal<ReadonlySet<string>>(new Set());
   const [failure, setFailure] = createSignal<{ id: string; message: string }>();
   const fieldId = createUniqueId();
+  const commentId = createUniqueId();
   // Signals show a tick later; two taps in one tick must not send two answers.
   let busy = false;
 
@@ -53,13 +57,14 @@ export function QuestionBar(props: {
     const newest = props.questions.at(-1);
     if (!newest) return last.text === "" ? last : { seq: last.seq, text: "" };
     if (newest.seq <= last.seq) return last;
+    const asker = newest.question.gate ? "Workflow gate" : "The agent asks";
     return {
       seq: newest.seq,
-      text: `The agent asks: ${newest.question.text.slice(0, ANNOUNCED_CHARS)}`,
+      text: `${asker}: ${newest.question.text.slice(0, ANNOUNCED_CHARS)}`,
     };
   });
 
-  async function answer(value: string): Promise<void> {
+  async function answer(value: string, note?: string): Promise<void> {
     const id = currentId();
     const trimmed = value.trim();
     if (id === undefined || trimmed === "" || busy || waiting()) return;
@@ -67,9 +72,11 @@ export function QuestionBar(props: {
     setSending(id);
     setFailure(undefined);
     try {
-      await props.onAnswer(id, trimmed);
+      const said = note?.trim() ?? "";
+      await (said === "" ? props.onAnswer(id, trimmed) : props.onAnswer(id, trimmed, said));
       setSent((ids) => new Set(ids).add(id));
       setText("");
+      setComment("");
     } catch (cause) {
       setFailure({ id, message: errorMessage(cause) });
     } finally {
@@ -86,12 +93,15 @@ export function QuestionBar(props: {
       <Show when={current()}>
         {(open) => (
           <section
-            aria-label="Question from the agent"
+            aria-label={open().question.gate ? "Workflow gate" : "Question from the agent"}
+            data-gate={open().question.gate ? "" : undefined}
             // Capped, so a long question never takes the whole of a phone screen.
             class="flex max-h-[55dvh] shrink-0 flex-col gap-2 overflow-y-auto overscroll-contain border-t border-tone-attention bg-attention-soft p-3"
           >
             <div class="flex min-w-0 items-center gap-2">
-              <span class="shrink-0 text-sm font-medium">The agent asks</span>
+              <span class="shrink-0 text-sm font-medium">
+                {open().question.gate ? "Workflow gate" : "The agent asks"}
+              </span>
               <Show when={folded()}>
                 <span class="min-w-0 flex-1 truncate text-sm text-muted">
                   {open().question.text}
@@ -117,7 +127,59 @@ export function QuestionBar(props: {
               <div class="text-sm">
                 <Markdown text={open().question.text} />
               </div>
-              <Show when={open().question.options.length > 0}>
+              <Show when={open().question.gate}>
+                <form
+                  class="flex flex-col gap-2"
+                  onSubmit={(event) => {
+                    event.preventDefault();
+                  }}
+                >
+                  <div class="flex min-w-0 flex-col gap-1">
+                    <label for={commentId} class="text-sm">
+                      Comment (optional)
+                    </label>
+                    <textarea
+                      id={commentId}
+                      rows="2"
+                      class="field min-h-11 resize-y px-3 py-2"
+                      value={comment()}
+                      disabled={waiting()}
+                      onInput={(event) => setComment(event.currentTarget.value)}
+                    />
+                  </div>
+                  <Show when={error()}>
+                    {(message) => (
+                      <p role="alert" class="text-sm text-tone-danger">
+                        {message()}
+                      </p>
+                    )}
+                  </Show>
+                  <div class="flex flex-wrap items-center justify-end gap-2">
+                    <Show when={waiting()}>
+                      <span class="mr-auto text-xs text-muted">
+                        {sending() !== undefined ? "Sending…" : "Sent, waiting for the workflow…"}
+                      </span>
+                    </Show>
+                    <button
+                      type="button"
+                      class="btn"
+                      disabled={waiting()}
+                      onClick={() => void answer("reject", comment())}
+                    >
+                      Reject
+                    </button>
+                    <button
+                      type="button"
+                      class="btn btn-primary"
+                      disabled={waiting()}
+                      onClick={() => void answer("approve", comment())}
+                    >
+                      Approve
+                    </button>
+                  </div>
+                </form>
+              </Show>
+              <Show when={!open().question.gate && open().question.options.length > 0}>
                 <div role="group" aria-label="Suggested answers" class="flex flex-wrap gap-2">
                   <For each={open().question.options}>
                     {(option) => (
@@ -133,7 +195,7 @@ export function QuestionBar(props: {
                   </For>
                 </div>
               </Show>
-              <Show when={error()}>
+              <Show when={!open().question.gate && error()}>
                 {(message) => (
                   <p role="alert" class="text-sm text-tone-danger">
                     {message()}
@@ -141,6 +203,7 @@ export function QuestionBar(props: {
                 )}
               </Show>
               <form
+                hidden={open().question.gate}
                 class="flex flex-col gap-2 sm:flex-row sm:items-end"
                 onSubmit={(event) => {
                   event.preventDefault();

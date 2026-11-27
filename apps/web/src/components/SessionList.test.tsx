@@ -99,3 +99,16 @@ describe("SessionList", () => {
     expect(find(host, 'a[href="/s/orphan"]').textContent).toContain("mock");
   });
 });
+
+describe("SessionList: the queue", () => {
+  it("says a queued session waits for a free slot; a child or a running one does not", () => {
+    const { host } = setup([
+      makeSession("waiting", 300, { title: "Waiting" }),
+      makeSession("busy", 200, { status: "running", title: "Busy" }),
+      child("kid", 400, "busy", { status: "queued" }),
+    ]);
+    const queued = [...host.querySelectorAll('[data-part="queued"]')];
+    expect(queued.map((one) => one.textContent)).toEqual(["Queued: waiting for a free slot"]);
+    expect(queued[0].closest("a")?.getAttribute("href")).toBe("/s/waiting");
+  });
+});

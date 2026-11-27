@@ -107,6 +107,7 @@ const question = {
   id: "q1",
   text: "The badge goes in the **header** or the footer?",
   options: ["Header", "Footer"],
+  gate: false,
 };
 const tool = (
   id: string,
@@ -348,5 +349,57 @@ describe("from the graph to the transcript", () => {
     expect(find(main, "[data-revealed]").getAttribute("data-item")).toBe("t1");
     // Everything shows again: the item may belong to any agent.
     expect(find<HTMLSelectElement>(main, 'select[aria-label="Agent filter"]').value).toBe("");
+  });
+});
+
+describe("Orchestration: the queue and workflow gates", () => {
+  it("says why a queued session waits, with Stop at hand", async () => {
+    const queued = makeSession("s9", 9000, { title: "Waits its turn", status: "queued" });
+    const { main, emit, caughtUp } = await open("/s/s9", "s9", {}, [queued]);
+    emit(
+      {
+        type: "session_status",
+        status: "queued",
+        reason: "waiting for a free slot (4 of 4 running)",
+      },
+      null,
+    );
+    caughtUp();
+    expect(find(main, '[data-part="queued"]').textContent).toBe(
+      "Queued: waiting for a free slot (4 of 4 running)",
+    );
+    expect(findByText<HTMLButtonElement>(main, "button", "Stop").disabled).toBe(false);
+
+    // Once it runs, the reason has gone with the queue.
+    emit({ type: "session_status", status: "running", reason: null }, null);
+    expect(main.querySelector('[data-part="queued"]')).toBeNull();
+  });
+
+  it("approves a gate with a comment", async () => {
+    const answerQuestion = vi.fn<Api["answerQuestion"]>().mockResolvedValue();
+    const { main, emit, caughtUp } = await open("/s/s1", "s1", { answerQuestion });
+    emit(
+      {
+        type: "question_asked",
+        question: {
+          id: "g1",
+          text: "Open pull requests?",
+          options: ["approve", "reject"],
+          gate: true,
+        },
+      },
+      null,
+    );
+    caughtUp();
+    const gateBar = find(main, 'section[aria-label="Workflow gate"]');
+    expect(main.querySelector('section[aria-label="Question from the agent"]')).toBeNull();
+    const comment = control<HTMLTextAreaElement>(gateBar, "Comment (optional)");
+    comment.value = "Draft is fine";
+    comment.dispatchEvent(new InputEvent("input", { bubbles: true }));
+    flush();
+    await click(findByText(gateBar, "button", "Approve"));
+    expect(answerQuestion.mock.calls).toEqual([
+      ["s1", "g1", { answer: "approve", comment: "Draft is fine" }],
+    ]);
   });
 });

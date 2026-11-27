@@ -19,6 +19,7 @@ import {
   settle,
   unreachable,
 } from "../test/fakes";
+import { workflowInfo } from "../test/workflows";
 import { createAppState } from "./app";
 
 const health: Health = {
@@ -385,7 +386,12 @@ describe("app state", () => {
   });
 
   it("reads the settings on demand, and reports a failure until they can be read", async () => {
-    const stored: Settings = { home_repo: null, scan_roots: [], clone_root: null };
+    const stored: Settings = {
+      home_repo: null,
+      scan_roots: [],
+      clone_root: null,
+      max_parallel: null,
+    };
     const getSettings = vi
       .fn<Api["getSettings"]>()
       .mockRejectedValueOnce(unreachable())
@@ -407,8 +413,18 @@ describe("app state", () => {
   });
 
   it("saves the settings as the server stored them, and reads the repos again", async () => {
-    const sent: Settings = { home_repo: " /code/home", scan_roots: [], clone_root: null };
-    const stored: Settings = { home_repo: "/code/home", scan_roots: [], clone_root: "/data/repos" };
+    const sent: Settings = {
+      home_repo: " /code/home",
+      scan_roots: [],
+      clone_root: null,
+      max_parallel: null,
+    };
+    const stored: Settings = {
+      home_repo: "/code/home",
+      scan_roots: [],
+      clone_root: "/data/repos",
+      max_parallel: null,
+    };
     const putSettings = vi.fn<Api["putSettings"]>().mockResolvedValue(stored);
     const listRepos = vi
       .fn<Api["listRepos"]>()
@@ -427,7 +443,12 @@ describe("app state", () => {
   });
 
   it("keeps the settings on screen when a save is refused", async () => {
-    const stored: Settings = { home_repo: null, scan_roots: [], clone_root: null };
+    const stored: Settings = {
+      home_repo: null,
+      scan_roots: [],
+      clone_root: null,
+      max_parallel: null,
+    };
     const refusal = badRequest("home_repo: /nope is not the root of a git work tree");
     const listRepos = vi.fn<Api["listRepos"]>().mockResolvedValue([]);
     const { app } = setup({
@@ -510,5 +531,69 @@ describe("app state", () => {
     socket.emit("sessions", { op: "subscribed", topic: "sessions", head_seq: 0 });
     flush();
     expect(app.sessionsError()).toBeUndefined();
+  });
+});
+
+describe("app state: workflows", () => {
+  it("reads the workflows on demand, keeps them through a later failure, and reads again after a save", async () => {
+    const listed = [workflowInfo("quick", { builtin: true }), workflowInfo("itr")];
+    const listWorkflows = vi
+      .fn<Api["listWorkflows"]>()
+      .mockResolvedValueOnce(listed)
+      .mockRejectedValueOnce(unreachable())
+      .mockResolvedValue([listed[0]]);
+    const putSettings = vi
+      .fn<Api["putSettings"]>()
+      .mockImplementation((body) => Promise.resolve(body));
+    const { app, socket } = setup({
+      listWorkflows,
+      putSettings,
+      listRepos: () => Promise.resolve([]),
+    });
+    expect(app.workflows()).toEqual({ status: "loading" });
+    await settle();
+    expect(listWorkflows).not.toHaveBeenCalled();
+
+    app.loadWorkflows();
+    await settle();
+    flush();
+    expect(app.workflows()).toEqual({ status: "ready", workflows: listed });
+
+    // A reconnect reads them again; a failure then keeps the list on screen.
+    socket.setState("open");
+    socket.setState("reconnecting");
+    socket.setState("open");
+    await settle();
+    flush();
+    expect(listWorkflows).toHaveBeenCalledTimes(2);
+    expect(app.workflows()).toEqual({ status: "ready", workflows: listed });
+
+    // Another home repo, other workflows.
+    await app.saveSettings({
+      home_repo: "/code/b",
+      scan_roots: [],
+      clone_root: null,
+      max_parallel: 2,
+    });
+    await settle();
+    flush();
+    expect(listWorkflows).toHaveBeenCalledTimes(3);
+    expect(app.workflows()).toEqual({ status: "ready", workflows: [listed[0]] });
+  });
+
+  it("shows the server's message when the first read fails, and reads again on retry", async () => {
+    const listWorkflows = vi
+      .fn<Api["listWorkflows"]>()
+      .mockRejectedValueOnce(badRequest("home repo has no .calin folder"))
+      .mockResolvedValue([workflowInfo("quick")]);
+    const { app } = setup({ listWorkflows });
+    app.loadWorkflows();
+    await settle();
+    flush();
+    expect(app.workflows()).toEqual({ status: "error", message: "home repo has no .calin folder" });
+    app.retry();
+    await settle();
+    flush();
+    expect(app.workflows()).toMatchObject({ status: "ready" });
   });
 });

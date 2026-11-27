@@ -16,6 +16,7 @@ const asked = (
     id,
     text: `The badge can go in the **header** or the footer (${id}). Which one?`,
     options,
+    gate: false,
   },
   agentId: "a1",
   ts: 1000 + seq,
@@ -154,5 +155,91 @@ describe("QuestionBar", () => {
     expect(button("Hide").getAttribute("aria-expanded")).toBe("true");
     await click(button("Footer"));
     expect(bar()?.textContent).toContain("Sent, waiting for the agent…");
+  });
+});
+
+describe("QuestionBar: a workflow gate", () => {
+  const gate = (id: string, seq: number): OpenQuestion => ({
+    question: { id, text: "Open pull requests?", options: ["approve", "reject"], gate: true },
+    agentId: null,
+    ts: 1000 + seq,
+    seq,
+  });
+
+  function setupGate(onAnswer: (id: string, answer: string, comment?: string) => Promise<void>) {
+    const answer = vi.fn(onAnswer);
+    const host = mount(() => <QuestionBar questions={[gate("g1", 4)]} onAnswer={answer} />);
+    return {
+      host,
+      answer,
+      bar: () => find(host, 'section[aria-label="Workflow gate"]'),
+      button: (label: string) => findByText<HTMLButtonElement>(host, "button", label),
+      comment: () => control<HTMLTextAreaElement>(host, "Comment (optional)"),
+    };
+  }
+
+  it("is the workflow's, with Approve, Reject and a comment instead of answers", () => {
+    const { host, bar, button, comment } = setupGate(() => Promise.resolve());
+    expect(bar().textContent).toContain("Workflow gate");
+    expect(bar().textContent).not.toContain("The agent asks");
+    expect(bar().textContent).toContain("Open pull requests?");
+    expect(button("Approve").disabled).toBe(false);
+    expect(button("Reject").disabled).toBe(false);
+    expect(comment().value).toBe("");
+    // No free-text answer and no suggested answers: only the two decisions.
+    expect(host.querySelector('[aria-label="Suggested answers"]')).toBeNull();
+    expect(control(host, "Your answer").closest("form")?.hidden).toBe(true);
+    expect(find(host, '[role="status"]').textContent).toBe("Workflow gate: Open pull requests?");
+  });
+
+  it("approves without a comment", async () => {
+    const { answer, button } = setupGate(() => Promise.resolve());
+    await click(button("Approve"));
+    expect(answer.mock.calls).toEqual([["g1", "approve"]]);
+  });
+
+  it("rejects with a comment, trimmed", async () => {
+    const { answer, button, comment } = setupGate(() => Promise.resolve());
+    type(comment(), "  Not before the release.  ");
+    await click(button("Reject"));
+    expect(answer.mock.calls).toEqual([["g1", "reject", "Not before the release."]]);
+  });
+
+  it("approves with a comment", async () => {
+    const { answer, button, comment } = setupGate(() => Promise.resolve());
+    type(comment(), "Ship it");
+    await click(button("Approve"));
+    expect(answer.mock.calls).toEqual([["g1", "approve", "Ship it"]]);
+  });
+
+  it("holds both decisions and the comment while the answer is in flight", async () => {
+    const request = deferred();
+    const { bar, button, comment, answer } = setupGate(() => request.promise);
+    await click(button("Approve"));
+    expect(button("Approve").disabled).toBe(true);
+    expect(button("Reject").disabled).toBe(true);
+    expect(comment().disabled).toBe(true);
+    expect(bar().textContent).toContain("Sending…");
+    button("Reject").click();
+    request.resolve();
+    await click(bar());
+    expect(bar().textContent).toContain("Sent, waiting for the workflow…");
+    expect(answer).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows the server's message when the decision is refused, and lets the reader decide again", async () => {
+    let refuse = true;
+    const { bar, button, comment, answer } = setupGate(() =>
+      refuse ? Promise.reject(conflict("question was already answered")) : Promise.resolve(),
+    );
+    type(comment(), "why not");
+    await click(button("Reject"));
+    expect(find(bar(), '[role="alert"]').textContent).toBe("question was already answered");
+    expect(button("Approve").disabled).toBe(false);
+    expect(comment().value).toBe("why not");
+    refuse = false;
+    await click(button("Approve"));
+    expect(answer.mock.calls.at(-1)).toEqual(["g1", "approve", "why not"]);
+    expect(bar().querySelector('[role="alert"]')).toBeNull();
   });
 });

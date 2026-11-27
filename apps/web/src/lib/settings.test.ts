@@ -6,6 +6,7 @@ const sent: Settings = {
   home_repo: "/home/me/code/home",
   scan_roots: ["/home/me/code", "/srv/git"],
   clone_root: "/data/clones",
+  max_parallel: null,
 };
 
 describe("blameSettingsField", () => {
@@ -39,7 +40,12 @@ describe("blameSettingsField", () => {
   });
 
   it("does not guess between two fields holding the path that is quoted", () => {
-    const same: Settings = { home_repo: "/code", scan_roots: ["/code"], clone_root: null };
+    const same: Settings = {
+      home_repo: "/code",
+      scan_roots: ["/code"],
+      clone_root: null,
+      max_parallel: null,
+    };
     expect(blameSettingsField("/code: permission denied", same)).toBeUndefined();
     // The rule still tells.
     expect(blameSettingsField("/code is not a git work tree", same)).toEqual({
@@ -56,11 +62,32 @@ describe("settingsFromForm", () => {
         scanRoots: ["/code", " /code ", "", "  ", "/srv/git"],
         cloneRoot: "   ",
       }),
-    ).toEqual({ home_repo: "/code/home", scan_roots: ["/code", "/srv/git"], clone_root: null });
+    ).toEqual({
+      home_repo: "/code/home",
+      scan_roots: ["/code", "/srv/git"],
+      clone_root: null,
+      max_parallel: null,
+    });
     expect(settingsFromForm({ homeRepo: "", scanRoots: [], cloneRoot: " /data " })).toEqual({
       home_repo: null,
       scan_roots: [],
       clone_root: "/data",
+      max_parallel: null,
+    });
+  });
+
+  it("sends the number of sessions running at once as a number, and empty as not set", () => {
+    const form = { homeRepo: "", scanRoots: [], cloneRoot: "" };
+    expect(settingsFromForm({ ...form, maxParallel: " 6 " }).max_parallel).toBe(6);
+    expect(settingsFromForm({ ...form, maxParallel: "" }).max_parallel).toBeNull();
+    // Not ours to judge: the server refuses what it does not accept, in its own words.
+    expect(settingsFromForm({ ...form, maxParallel: "0" }).max_parallel).toBe(0);
+  });
+
+  it("blames the parallel limit for a 400 that names it", () => {
+    const sent: Settings = { home_repo: null, scan_roots: [], clone_root: null, max_parallel: 0 };
+    expect(blameSettingsField("max_parallel must be between 1 and 64", sent)).toEqual({
+      field: "max_parallel",
     });
   });
 });

@@ -4,6 +4,8 @@ import type { RepoSet } from "../gen/RepoSet";
 import type { Settings } from "../gen/Settings";
 import { makeDetail, makeMissingRepo, makeRepo, makeSession, makeSessionRepo } from "../test/fakes";
 import { makeGraph, makeTimeline } from "../test/orchestration";
+import { specGraph, workflowInfo } from "../test/workflows";
+import type { WorkflowRun } from "../gen/WorkflowRun";
 import { createApi, HttpError, type FetchLike } from "./http";
 
 const json = (body: unknown, status = 200): Response =>
@@ -197,6 +199,7 @@ describe("http api", () => {
       home_repo: "/code/home",
       scan_roots: ["/code"],
       clone_root: null,
+      max_parallel: null,
     };
     const repos = [makeRepo("home", { home: true }), makeMissingRepo("web")];
     const sets: RepoSet[] = [{ name: "storefront", repo_ids: ["api", "web"] }];
@@ -224,7 +227,7 @@ describe("http api", () => {
       [
         "PUT",
         "/api/v1/settings",
-        '{"home_repo":"/code/home","scan_roots":["/code"],"clone_root":null}',
+        '{"home_repo":"/code/home","scan_roots":["/code"],"clone_root":null,"max_parallel":null}',
       ],
       ["POST", "/api/v1/repos/refresh", undefined],
       ["POST", "/api/v1/repos/r%2F1/clone", undefined],
@@ -245,7 +248,14 @@ describe("http api", () => {
       return Promise.resolve(json({ error }, status));
     });
     const refused = [
-      await failureOf(api.putSettings({ home_repo: "/tmp/x", scan_roots: [], clone_root: null })),
+      await failureOf(
+        api.putSettings({
+          home_repo: "/tmp/x",
+          scan_roots: [],
+          clone_root: null,
+          max_parallel: null,
+        }),
+      ),
       await failureOf(api.cloneRepo("web")),
       await failureOf(api.removeRepo("web")),
       await failureOf(api.attachRepo("s1", { repo_id: "web" })),
@@ -328,6 +338,47 @@ describe("http api", () => {
       [404, "session not found", true],
       [404, "session not found", true],
     ]);
+  });
+
+  it("lists the workflows and reads a session's run", async () => {
+    const workflows = [workflowInfo("quick", { builtin: true }), workflowInfo("itr")];
+    const run: WorkflowRun = {
+      workflow_id: "itr",
+      name: "Implement",
+      graph: specGraph(),
+      nodes: [],
+      taken: [],
+      status: "running",
+      reason: null,
+      budget_usd: 5,
+      cost_usd: 0.5,
+    };
+    const { api, fetchFn } = setup((input) =>
+      Promise.resolve(json(input.endsWith("/workflows") ? workflows : run)),
+    );
+    await expect(api.listWorkflows()).resolves.toEqual(workflows);
+    await expect(api.getWorkflow("s 1")).resolves.toEqual(run);
+    expect(fetchFn.mock.calls.map(([input, init]) => [init?.method, input])).toEqual([
+      ["GET", "/api/v1/workflows"],
+      ["GET", "/api/v1/sessions/s%201/workflow"],
+    ]);
+  });
+
+  it("takes the server's 404 for a session's workflow as no run, and anything else as a failure", async () => {
+    const notFound = setup(() => Promise.resolve(json({ error: "no workflow" }, 404)));
+    await expect(notFound.api.getWorkflow("s1")).resolves.toBeNull();
+
+    const refused = setup(() => Promise.resolve(json({ error: "session is gone" }, 409)));
+    const conflict = await failureOf(refused.api.getWorkflow("s1"));
+    expect([conflict.status, conflict.message]).toEqual([409, "session is gone"]);
+
+    // A 404 from something in front of Calin is not the server's answer.
+    const proxy = setup(() => Promise.resolve(new Response("Not Found", { status: 404 })));
+    const lost = await failureOf(proxy.api.getWorkflow("s1"));
+    expect([lost.status, lost.fromServer]).toEqual([404, false]);
+
+    const listing = setup(() => Promise.resolve(json({ error: "home repo unreadable" }, 400)));
+    expect((await failureOf(listing.api.listWorkflows())).message).toBe("home repo unreadable");
   });
 
   it("reports a bad path as the server words it", async () => {

@@ -1263,7 +1263,12 @@ describe("App", () => {
 });
 
 describe("App: settings and the catalog", () => {
-  const stored: Settings = { home_repo: "/code/notes", scan_roots: ["/code"], clone_root: null };
+  const stored: Settings = {
+    home_repo: "/code/notes",
+    scan_roots: ["/code"],
+    clone_root: null,
+    max_parallel: null,
+  };
   const home = makeRepo("notes", { home: true });
   const api = makeRepo("api", { declared: true });
   const web = makeMissingRepo("web");

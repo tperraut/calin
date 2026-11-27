@@ -7,6 +7,7 @@ import type { PermissionRequest } from "../gen/PermissionRequest";
 import type { PullRequest } from "../gen/PullRequest";
 import type { SessionStatus } from "../gen/SessionStatus";
 import { makePullRequest, makeSessionRepo } from "../test/fakes";
+import { specGraph } from "../test/workflows";
 import { makeMessage, makeSubagent } from "../test/orchestration";
 import {
   applyEvent,
@@ -1349,7 +1350,12 @@ describe("applyEvent: messages between agents", () => {
 });
 
 describe("applyEvent: questions", () => {
-  const question = { id: "q1", text: "Header or footer?", options: ["Header", "Footer"] };
+  const question = {
+    id: "q1",
+    text: "Header or footer?",
+    options: ["Header", "Footer"],
+    gate: false,
+  };
 
   it("keeps an asked question open and shows it where it was asked", () => {
     const view = fold(
@@ -1399,7 +1405,7 @@ describe("applyEvent: questions", () => {
   });
 
   it("keeps several questions open, oldest first, and closes the one that is answered", () => {
-    const second = { id: "q2", text: "Which color?", options: [] };
+    const second = { id: "q2", text: "Which color?", options: [], gate: false };
     const view = fold(
       log(
         { type: "question_asked", question },
@@ -1500,5 +1506,253 @@ describe("applyEvent: subagents", () => {
     );
     expect(view.subagentCalls).toEqual({ sub1: "t1" });
     expect(view.agents.find((one) => one.id === "sub1")?.status).toBe("done");
+  });
+});
+
+describe("applyEvent: workflow runs", () => {
+  const begin: [null, EventBody] = [
+    null,
+    {
+      type: "workflow_started",
+      workflow_id: "implement-test-review",
+      name: "Implement, test, review",
+      graph: specGraph(),
+      budget_usd: 5,
+    },
+  ];
+  const on = (node_id: string): [null, EventBody] => [
+    null,
+    { type: "workflow_node", node_id, phase: "started", port: null, outcome: null },
+  ];
+  const off = (node_id: string, port: string, outcome: string | null = null): [null, EventBody] => [
+    null,
+    { type: "workflow_node", node_id, phase: "finished", port, outcome },
+  ];
+  const through = (node_id: string, port: string, outcome: string | null = null) => [
+    on(node_id),
+    off(node_id, port, outcome),
+  ];
+  const end = (status: "success" | "failed", reason: string | null = null): [null, EventBody] => [
+    null,
+    { type: "workflow_finished", status, reason },
+  ];
+  const edge = (from: string, port: string, to: string) => ({ from, port, to });
+
+  /** The spec's example, failing its checks twice before it passes and ships. */
+  const success = (): Event[] =>
+    log(
+      begin,
+      ...through("start", "next"),
+      ...through("implement", "done", "Added the badge"),
+      ...through("tests", "fail", "cargo test: 1 failed"),
+      ...through("retry", "repeat"),
+      ...through("fix", "done"),
+      ...through("tests", "fail", "cargo test: 1 failed"),
+      ...through("retry", "repeat"),
+      ...through("fix", "done"),
+      ...through("tests", "pass"),
+      ...through("review", "approve", "approve"),
+      ...through("gate", "approve", "looks good"),
+      ...through("ship", "done", "https://github.com/acme/web/pull/7"),
+      ...through("ok", "done"),
+      end("success"),
+    );
+
+  const nodeOf = (view: SessionView, id: string) =>
+    view.workflow?.nodes.find((one) => one.id === id);
+
+  it("folds a whole run: states, runs, last ports, outcomes, taken edges in order with repeats", () => {
+    const view = fold(success());
+    const run = view.workflow;
+    expect(run).toMatchObject({
+      workflow_id: "implement-test-review",
+      name: "Implement, test, review",
+      status: "success",
+      reason: null,
+      budget_usd: 5,
+    });
+    expect(nodeOf(view, "tests")).toEqual({
+      id: "tests",
+      state: "finished",
+      runs: 3,
+      last_port: "pass",
+      outcome: null,
+      iteration: null,
+      max: null,
+    });
+    expect(nodeOf(view, "retry")).toMatchObject({ runs: 2, last_port: "repeat" });
+    expect(nodeOf(view, "fix")).toMatchObject({ runs: 2, state: "finished" });
+    expect(nodeOf(view, "gate")).toMatchObject({ last_port: "approve", outcome: "looks good" });
+    expect(nodeOf(view, "gave-up")).toMatchObject({ state: "idle", runs: 0, last_port: null });
+    expect(run?.taken).toEqual([
+      edge("start", "next", "implement"),
+      edge("implement", "done", "tests"),
+      edge("tests", "fail", "retry"),
+      edge("retry", "repeat", "fix"),
+      edge("fix", "done", "tests"),
+      edge("tests", "fail", "retry"),
+      edge("retry", "repeat", "fix"),
+      edge("fix", "done", "tests"),
+      edge("tests", "pass", "review"),
+      edge("review", "approve", "gate"),
+      edge("gate", "approve", "ship"),
+      edge("ship", "done", "ok"),
+    ]);
+  });
+
+  it("marks the node running between its start and its end, one at a time", () => {
+    const view = fold(log(begin, ...through("start", "next"), on("implement")));
+    expect(nodeOf(view, "implement")).toMatchObject({ state: "active", runs: 1 });
+    expect(view.workflow?.nodes.filter((one) => one.state === "active")).toHaveLength(1);
+    expect(view.workflow?.status).toBe("running");
+  });
+
+  it("folds a failed run: the loop runs out and the run ends with its reason", () => {
+    const tries = [1, 2, 3].flatMap(() => [
+      ...through("tests", "fail", "cargo test: 1 failed"),
+      ...through("retry", "repeat"),
+      ...through("fix", "done"),
+    ]);
+    const view = fold(
+      log(
+        begin,
+        ...through("start", "next"),
+        ...through("implement", "done"),
+        ...tries,
+        ...through("tests", "fail"),
+        ...through("retry", "exhausted"),
+        on("gave-up"),
+        end("failed", "retry left through exhausted"),
+      ),
+    );
+    expect(view.workflow).toMatchObject({
+      status: "failed",
+      reason: "retry left through exhausted",
+    });
+    expect(nodeOf(view, "retry")).toMatchObject({ runs: 4, last_port: "exhausted" });
+    expect(nodeOf(view, "tests")).toMatchObject({ runs: 4 });
+    // Nothing stays running once the run is over.
+    expect(view.workflow?.nodes.some((one) => one.state === "active")).toBe(false);
+    expect(view.workflow?.taken.at(-1)).toEqual(edge("retry", "exhausted", "gave-up"));
+  });
+
+  it("is idempotent: a replayed event changes nothing", () => {
+    const events = success();
+    const once = fold(events);
+    expect(applyEvents(once, events).view).toBe(once);
+    for (const event of events) {
+      expect(applyEvent(once, event)).toEqual({ view: once, outcome: "duplicate" });
+    }
+    // The same log folded again gives the same run.
+    expect(fold(events)).toEqual(once);
+  });
+
+  it("ignores what it does not understand without throwing", () => {
+    const before = fold(log(begin, ...through("start", "next")));
+    const odd = log(
+      begin,
+      ...through("start", "next"),
+      on("nowhere"),
+      [
+        null,
+        {
+          type: "workflow_node",
+          node_id: "implement",
+          phase: "paused",
+          port: null,
+          outcome: null,
+        } as unknown as EventBody,
+      ],
+      [null, { type: "workflow_teleported", node_id: "implement" } as unknown as EventBody],
+    );
+    const view = fold(odd);
+    expect(view.workflow).toEqual(before.workflow);
+    expect(view.transcript).toEqual(before.transcript);
+    expect(view.seq).toBe(odd.length);
+  });
+
+  it("ignores nodes and ends that come before the run's start", () => {
+    const view = fold(log(on("implement"), off("implement", "done"), end("success")));
+    expect(view.workflow).toBeNull();
+    expect(view.transcript).toEqual([]);
+  });
+
+  it("writes light rows: the start, each step that starts, the results that are news, the end", () => {
+    const view = fold(success());
+    const notes = view.transcript.flatMap((entry) =>
+      entry.kind === "workflow" ? [entry.note] : [],
+    );
+    expect(view.transcript.every((entry) => entry.kind === "workflow")).toBe(true);
+    expect(notes.at(0)).toEqual({ what: "started", name: "Implement, test, review" });
+    expect(notes.at(-1)).toEqual({ what: "finished", status: "success", reason: null });
+    // Never a row for start or end.
+    expect(
+      notes.some((note) => "nodeId" in note && (note.nodeId === "start" || note.nodeId === "ok")),
+    ).toBe(false);
+    const startedRows = notes.flatMap((note) =>
+      note.what === "node_started" ? [`${note.nodeId}#${note.run}`] : [],
+    );
+    expect(startedRows).toEqual([
+      "implement#1",
+      "tests#1",
+      "retry#1",
+      "fix#1",
+      "tests#2",
+      "retry#2",
+      "fix#2",
+      "tests#3",
+      "review#1",
+      "gate#1",
+      "ship#1",
+    ]);
+    const finishedRows = notes.flatMap((note) =>
+      note.what === "node_finished" ? [`${note.nodeId}.${note.port}:${note.failure}`] : [],
+    );
+    // A check that passes, an agent that is done and a loop that repeats are not news.
+    expect(finishedRows).toEqual([
+      "tests.fail:true",
+      "tests.fail:true",
+      "review.approve:false",
+      "gate.approve:false",
+    ]);
+  });
+
+  it("has rows for a rejected gate, a loop that runs out, nothing to commit and a failed run", () => {
+    const graph = specGraph();
+    graph.nodes.push({
+      id: "save",
+      kind: "commit",
+      label: "wip",
+      ports: [
+        { name: "done", failure: false },
+        { name: "nothing", failure: false },
+        { name: "failed", failure: true },
+      ],
+    });
+    const view = fold(
+      log(
+        [null, { type: "workflow_started", workflow_id: "w", name: "W", graph, budget_usd: null }],
+        ...through("save", "nothing"),
+        ...through("save", "done"),
+        ...through("gate", "reject", "not yet"),
+        ...through("retry", "exhausted"),
+        end("failed", "gate left through reject"),
+      ),
+    );
+    const finished = view.transcript.flatMap((entry) =>
+      entry.kind === "workflow" && entry.note.what === "node_finished"
+        ? [[entry.note.nodeId, entry.note.port, entry.note.outcome, entry.note.failure]]
+        : [],
+    );
+    expect(finished).toEqual([
+      ["save", "nothing", null, false],
+      ["gate", "reject", "not yet", true],
+      ["retry", "exhausted", null, true],
+    ]);
+    expect(view.transcript.at(-1)).toMatchObject({
+      kind: "workflow",
+      agentId: null,
+      note: { what: "finished", status: "failed", reason: "gate left through reject" },
+    });
   });
 });

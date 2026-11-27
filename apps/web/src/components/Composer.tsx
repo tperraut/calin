@@ -4,10 +4,12 @@ import type { PermissionMode } from "../gen/PermissionMode";
 import type { RegisterRepoRequest } from "../gen/RegisterRepoRequest";
 import type { Repo } from "../gen/Repo";
 import type { RepoSet } from "../gen/RepoSet";
+import type { WorkflowInfo } from "../gen/WorkflowInfo";
 import { errorMessage } from "../lib/errors";
 import { loadComposerPrefs, saveComposerPrefs, type RepoChoice } from "../lib/prefs";
 import { defaultRepoMode, permissionModeLook, permissionModes } from "../lib/status";
-import type { RepoRegistry } from "../state/app";
+import { dollars, isUsable, QUICK_WORKFLOW, shapeSummary } from "../lib/workflow";
+import type { RepoRegistry, WorkflowCatalog } from "../state/app";
 import { RepoPicker } from "./RepoPicker";
 
 /** True for the chord that submits a multi-line field: Ctrl+Enter, or Cmd+Enter on a Mac. */
@@ -33,6 +35,19 @@ export function attachedRepos(
 }
 
 /**
+ * The workflow a new session runs: the one chosen, while it still exists and
+ * validates; the built-in `quick` otherwise (workflows spec, section 1).
+ */
+export function chosenWorkflow(
+  wanted: string | undefined,
+  workflows: readonly WorkflowInfo[],
+): WorkflowInfo | undefined {
+  const usable = (id: string | undefined): WorkflowInfo | undefined =>
+    workflows.find((one) => one.id === id && isUsable(one));
+  return usable(wanted) ?? usable(QUICK_WORKFLOW);
+}
+
+/**
  * The form that starts a session. `runners` comes from `GET /health`, default
  * first, `registry` from `GET /repos` and `sets` from `GET /repo-sets`.
  * `onCreate` resolves once the session exists and rejects with the reason. The
@@ -42,6 +57,8 @@ export function Composer(props: {
   runners: readonly string[];
   registry: RepoRegistry;
   sets: readonly RepoSet[];
+  /** `GET /workflows`; absent where no workflow can be chosen. */
+  workflows?: WorkflowCatalog;
   disabled?: boolean;
   onCreate: (request: CreateSessionRequest) => Promise<void>;
   onRegisterRepo: (request: RegisterRepoRequest) => Promise<Repo>;
@@ -56,6 +73,7 @@ export function Composer(props: {
   const [permissionMode, setPermissionMode] = createSignal<PermissionMode>(initial.permissionMode);
   const [runner, setRunner] = createSignal(initial.runner ?? "");
   const [model, setModel] = createSignal("");
+  const [workflow, setWorkflow] = createSignal<string | undefined>(initial.workflow);
   const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal<string>();
   const formId = createUniqueId();
@@ -64,6 +82,19 @@ export function Composer(props: {
   const modelId = createUniqueId();
   const errorId = createUniqueId();
   const modeGroup = createUniqueId();
+  const workflowId = createUniqueId();
+  const workflowNoteId = createUniqueId();
+
+  const workflowList = (): readonly WorkflowInfo[] =>
+    props.workflows?.status === "ready" ? props.workflows.workflows : [];
+  // Only worth a control when there is something besides the built-in one.
+  const offersWorkflows = (): boolean => workflowList().some((one) => one.id !== QUICK_WORKFLOW);
+  const pickedWorkflow = createMemo(() => chosenWorkflow(workflow(), workflowList()));
+  /** The id a session is started with; `quick` is said by saying nothing. */
+  const workflowToSend = (): string | undefined => {
+    const id = pickedWorkflow()?.id;
+    return id === undefined || id === QUICK_WORKFLOW ? undefined : id;
+  };
 
   // A remembered runner the server no longer offers gives way to its default (the first).
   const selectedRunner = (): string | undefined =>
@@ -87,13 +118,22 @@ export function Composer(props: {
     const usedRunner = selectedRunner();
     if (usedRunner !== undefined) request.runner = usedRunner;
     if (model().trim() !== "") request.model = model().trim();
+    // Without a list, nothing can be checked; the last choice is kept for the next visit.
+    const known = props.workflows?.status === "ready";
+    const usedWorkflow = known ? workflowToSend() : undefined;
+    if (usedWorkflow !== undefined) request.workflow = usedWorkflow;
     setBusy(true);
     setError(undefined);
     try {
       await props.onCreate(request);
       // Without a registry nothing could be attached; that is no reason to forget the last choices.
       const remembered = props.registry.status === "ready" ? repos : choices();
-      saveComposerPrefs({ repos: remembered?.slice(), permissionMode: mode, runner: usedRunner });
+      saveComposerPrefs({
+        repos: remembered?.slice(),
+        permissionMode: mode,
+        runner: usedRunner,
+        workflow: known ? usedWorkflow : workflow(),
+      });
       setPrompt("");
     } catch (reason) {
       setError(errorMessage(reason));
@@ -149,6 +189,54 @@ export function Composer(props: {
         onClone={props.onCloneRepo}
         onRetry={props.onRetryRepos}
       />
+
+      <Show when={offersWorkflows()}>
+        <div class="flex flex-col gap-1.5">
+          <label for={workflowId} class="text-sm font-medium">
+            Workflow
+          </label>
+          <select
+            id={workflowId}
+            class="field h-11 px-2"
+            aria-describedby={workflowNoteId}
+            disabled={props.disabled === true}
+            onChange={(event) => setWorkflow(event.currentTarget.value)}
+          >
+            <For each={workflowList()} keyed={(one) => one.id}>
+              {(one) => (
+                <option
+                  value={one().id}
+                  disabled={!isUsable(one())}
+                  selected={one().id === pickedWorkflow()?.id}
+                >
+                  {one().id === QUICK_WORKFLOW
+                    ? "Quick (no workflow)"
+                    : isUsable(one())
+                      ? one().name
+                      : `${one().name} (has errors)`}
+                </option>
+              )}
+            </For>
+          </select>
+          <div id={workflowNoteId} class="flex flex-col gap-0.5 text-xs text-muted">
+            <Show when={pickedWorkflow()}>
+              {(picked) => (
+                <>
+                  <Show when={picked().description}>
+                    {(description) => <p class="wrap-break-word">{description()}</p>}
+                  </Show>
+                  <Show when={picked().id !== QUICK_WORKFLOW && picked().graph}>
+                    {(graph) => <p data-part="workflow-shape">{shapeSummary(graph())}</p>}
+                  </Show>
+                  <Show when={picked().budget_usd}>
+                    {(budget) => <p>Budget: {dollars(budget())}</p>}
+                  </Show>
+                </>
+              )}
+            </Show>
+          </div>
+        </div>
+      </Show>
 
       <fieldset class="flex flex-col gap-1.5">
         <legend class="mb-1.5 text-sm font-medium">Permissions</legend>

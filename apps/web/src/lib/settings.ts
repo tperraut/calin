@@ -1,6 +1,6 @@
 import type { Settings } from "../gen/Settings";
 
-export type SettingsField = "home_repo" | "scan_roots" | "clone_root";
+export type SettingsField = "home_repo" | "scan_roots" | "clone_root" | "max_parallel";
 
 /** The field a refusal is about, and for the scan roots which one, when the message names it. */
 export type SettingsBlame = { field: SettingsField; scanRoot?: string };
@@ -9,6 +9,7 @@ const NAMED: ReadonlyArray<[RegExp, SettingsField]> = [
   [/home[ _-]?repo/, "home_repo"],
   [/scan[ _-]?root/, "scan_roots"],
   [/clone[ _-]?root/, "clone_root"],
+  [/(max[ _-]?)?parallel|at once/, "max_parallel"],
 ];
 
 /**
@@ -58,6 +59,8 @@ export function settingsFromForm(form: {
   homeRepo: string;
   scanRoots: readonly string[];
   cloneRoot: string;
+  /** As typed; empty for the server's default. The server says what it does not accept. */
+  maxParallel?: string;
 }): Settings {
   const roots: string[] = [];
   for (const root of form.scanRoots) {
@@ -68,5 +71,14 @@ export function settingsFromForm(form: {
     home_repo: form.homeRepo.trim() === "" ? null : form.homeRepo.trim(),
     scan_roots: roots,
     clone_root: form.cloneRoot.trim() === "" ? null : form.cloneRoot.trim(),
+    max_parallel: parallelOf(form.maxParallel ?? ""),
   };
+}
+
+/** The number typed, or `null` for none; a value that is not a number is the server's to refuse. */
+function parallelOf(typed: string): number | null {
+  const text = typed.trim();
+  if (text === "") return null;
+  const value = Number(text);
+  return Number.isFinite(value) ? value : null;
 }

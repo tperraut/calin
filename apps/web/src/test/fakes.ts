@@ -8,6 +8,7 @@ import type { Repo } from "../gen/Repo";
 import type { Session } from "../gen/Session";
 import type { SessionDetail } from "../gen/SessionDetail";
 import type { SessionRepo } from "../gen/SessionRepo";
+import type { WorkflowInfo } from "../gen/WorkflowInfo";
 import type { Schedule } from "../lib/schedule";
 
 export function makeSession(id: string, createdAt = 1000, patch: Partial<Session> = {}): Session {
@@ -18,6 +19,7 @@ export function makeSession(id: string, createdAt = 1000, patch: Partial<Session
     status: "queued",
     runner: "mock",
     permission_mode: "ask",
+    workflow: null,
     branch: null,
     parent_session_id: null,
     root_session_id: id,
@@ -165,6 +167,27 @@ export class FakeSocket implements SocketClient {
   }
 }
 
+/** The built-in workflow, as `GET /workflows` lists it. */
+export const quickWorkflow: WorkflowInfo = {
+  id: "quick",
+  name: "Quick",
+  description: "One agent turn on the prompt, then review.",
+  builtin: true,
+  budget_usd: null,
+  graph: {
+    nodes: [
+      { id: "start", kind: "start", label: "", ports: [{ name: "next", failure: false }] },
+      { id: "agent", kind: "agent", label: "{{task}}", ports: [{ name: "done", failure: false }] },
+      { id: "end", kind: "end", label: "", ports: [] },
+    ],
+    edges: [
+      { from: "start", port: "next", to: "agent" },
+      { from: "agent", port: "done", to: "end" },
+    ],
+  },
+  problem: null,
+};
+
 /** An `Api` whose routes all fail unless the test supplies them. */
 export function fakeApi(routes: Partial<Api> = {}): Api {
   const missing = (name: string) => () =>
@@ -180,6 +203,8 @@ export function fakeApi(routes: Partial<Api> = {}): Api {
     removeRepo: missing("removeRepo"),
     // Sets are a convenience on top of the repo list: none unless a test says so.
     listRepoSets: () => Promise.resolve([]),
+    // Only the built-in workflow unless a test says otherwise.
+    listWorkflows: () => Promise.resolve([quickWorkflow]),
     listSessions: missing("listSessions"),
     createSession: missing("createSession"),
     getSession: missing("getSession"),
@@ -190,6 +215,8 @@ export function fakeApi(routes: Partial<Api> = {}): Api {
     answerQuestion: missing("answerQuestion"),
     getGraph: missing("getGraph"),
     getTimeline: missing("getTimeline"),
+    // No workflow run unless a test says otherwise.
+    getWorkflow: () => Promise.resolve(null),
     attachRepo: missing("attachRepo"),
     shipSession: missing("shipSession"),
     refreshPullRequests: missing("refreshPullRequests"),
