@@ -371,6 +371,69 @@ try {
   await m4.shot("workflow-done");
   check("the M4 console is clean", m4.errors.length === 0, JSON.stringify(m4.errors).slice(0, 300));
 
+  // ---- M6: usage, starting from an issue, automations.
+  const m6 = await open(DESKTOP, "m6");
+  current = m6;
+  page = m6.page;
+  await page.goto(`${base}/usage`);
+  await m6.bodyHas("By day", 15000);
+  const usage = (await api("GET", "/usage?by=session")).body;
+  check(
+    "usage adds up what the sessions of this run cost",
+    usage.totals.cost_usd > 0 && usage.totals.sessions >= 3 && usage.rows.length >= 3,
+    JSON.stringify(usage.totals),
+  );
+  check("the usage page shows the plan's limit window", /5-hour window/i.test(await page.textContent("body")));
+  await page.waitForTimeout(400);
+  await m6.shot("usage");
+
+  await page.goto(`${base}/`);
+  await page.waitForSelector(PROMPT);
+  await page.getByText("Issues", { exact: true }).first().click();
+  const sample = page.getByRole("button", { name: /sample issue/i }).first();
+  await sample.waitFor({ timeout: 15000 });
+  await sample.click();
+  await page.getByRole("button", { name: /^remove issue #/i }).waitFor({ timeout: 10000 });
+  await m6.shot("issue-picked");
+  await page.getByRole("button", { name: /^start$/i }).click();
+  await page.waitForURL(/\/s\//, { timeout: 10000 });
+  const issueSession = page.url().split("/s/")[1].split("/")[0];
+  const fromIssue = (await api("GET", `/sessions/${issueSession}`)).body.session;
+  check("a session started from an issue remembers it", Boolean(fromIssue.issue?.number), JSON.stringify(fromIssue.issue));
+  const chip = await page
+    .getByText(`#${fromIssue.issue?.number}`, { exact: false })
+    .first()
+    .waitFor({ timeout: 10000 })
+    .then(() => true, () => false);
+  check("the session page shows the issue", chip);
+  await api("POST", `/sessions/${issueSession}/stop`);
+
+  const created = await api("POST", "/automations", {
+    name: "Nightly tidy",
+    enabled: false,
+    trigger: { kind: "schedule", cron: "0 3 * * *" },
+    session: { prompt: "Tidy the notes for {{date}}", permission_mode: "autonomous", repos: [] },
+  });
+  check("an automation can be saved", created.status === 201 && /03:00/.test(created.body.trigger_text), JSON.stringify(created.body).slice(0, 160));
+  const refused = await api("POST", "/automations", {
+    name: "Asks",
+    enabled: false,
+    trigger: { kind: "schedule", cron: "0 3 * * *" },
+    session: { prompt: "x", permission_mode: "ask", repos: [] },
+  });
+  check("an automation that would stop to ask is refused", refused.status === 400);
+  await page.goto(`${base}/automations`);
+  await m6.bodyHas("Nightly tidy", 15000);
+  await page.getByRole("link", { name: /nightly tidy/i }).first().click();
+  await page.getByRole("button", { name: /^run now$/i }).click();
+  await page.getByRole("link", { name: /open the started session/i }).waitFor({ timeout: 20000 });
+  await m6.shot("automation-run");
+  await page.getByRole("link", { name: /open the started session/i }).click();
+  await m6.bodyHas("Review", 30000);
+  const runs = (await api("GET", `/automations/${created.body.id}/runs`)).body;
+  check("running it now starts a session and records the run", runs.length === 1 && runs[0].outcome === "started" && runs[0].cause === "manual");
+  check("the M6 console is clean", m6.errors.filter((e) => !/409|400|Failed to load resource/.test(e)).length === 0, JSON.stringify(m6.errors).slice(0, 300));
+
   failed = env.results.some((result) => !result.ok);
 } catch (error) {
   console.log(`FAIL  the run broke: ${error.message.split("\n")[0]}`);

@@ -5,7 +5,9 @@ import type { PermissionMode } from "./PermissionMode";
 
 export type CreateSessionRequest = { 
 /**
- * What the agent should do. Must not be blank.
+ * What the agent should do. Must not be blank, unless `issue` is given:
+ * then it is optional extra instructions, and a blank one becomes
+ * "Work on issue #<number>: <title>".
  */
 prompt: string, 
 /**

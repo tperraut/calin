@@ -649,7 +649,10 @@ impl SessionManager {
         mut request: CreateSessionRequest,
         automation_id: Option<String>,
     ) -> Result<SessionDetail> {
-        if request.prompt.trim().is_empty() {
+        // An issue can stand in for the prompt: the web app offers "extra
+        // instructions (optional)" once one is picked (integrations spec, section 2).
+        let blank_prompt = request.prompt.trim().is_empty();
+        if blank_prompt && request.issue.is_none() {
             return Err(Error::Invalid("the prompt must not be blank".to_owned()));
         }
         // `None` for the built-in `quick`, however the request spells it.
@@ -662,11 +665,6 @@ impl SessionManager {
         let runner = self.inner.registry.resolve(requested).ok_or_else(|| {
             Error::Invalid(format!("unknown runner {}", requested.unwrap_or_default()))
         })?;
-        let title = request
-            .title
-            .map(|title| title.trim().to_owned())
-            .filter(|title| !title.is_empty())
-            .unwrap_or_else(|| default_title(&request.prompt));
         let model = request
             .model
             .map(|model| model.trim().to_owned())
@@ -694,6 +692,13 @@ impl SessionManager {
                     request.repos.insert(0, primary);
                 }
                 let context = briefing::issue_context(&detail);
+                if blank_prompt {
+                    // The transcript and the title need something to show.
+                    request.prompt = format!(
+                        "Work on issue #{}: {}",
+                        detail.issue.number, detail.issue.title
+                    );
+                }
                 let issue = IssueRef {
                     repo_id: from.repo_id,
                     number: detail.issue.number,
@@ -703,6 +708,12 @@ impl SessionManager {
                 (Some(issue), Some(context))
             }
         };
+        let title = request
+            .title
+            .take()
+            .map(|title| title.trim().to_owned())
+            .filter(|title| !title.is_empty())
+            .unwrap_or_else(|| default_title(&request.prompt));
         // Before anything is created: every repo must exist, once.
         let reservation = if request.repos.is_empty() {
             None

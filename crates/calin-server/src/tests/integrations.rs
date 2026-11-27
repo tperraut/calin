@@ -137,9 +137,14 @@ async fn a_session_starts_from_an_issue_or_is_refused() {
             .await
             .assert_error(StatusCode::BAD_REQUEST);
     }
-    // The prompt must not be blank, issue or not.
+    // An issue can stand in for the prompt; without one a blank prompt is refused.
     let body = json!({ "prompt": " ", "issue": { "repo_id": s.repo.id, "number": 4 } });
-    post(&s.app, "/api/v1/sessions", body)
+    let reply = post(&s.app, "/api/v1/sessions", body).await;
+    assert_eq!(reply.status, StatusCode::CREATED, "{}", reply.text());
+    let created: SessionDetail = reply.json();
+    assert!(created.session.prompt.starts_with("Work on issue #4: "));
+    assert!(created.session.title.starts_with("Work on issue #4"));
+    post(&s.app, "/api/v1/sessions", json!({ "prompt": " " }))
         .await
         .assert_error(StatusCode::BAD_REQUEST);
 }

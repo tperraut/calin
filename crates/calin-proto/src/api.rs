@@ -234,7 +234,9 @@ pub struct Health {
 #[derive(Serialize, Deserialize, TS, Clone, Debug, PartialEq)]
 #[ts(export)]
 pub struct CreateSessionRequest {
-    /// What the agent should do. Must not be blank.
+    /// What the agent should do. Must not be blank, unless `issue` is given:
+    /// then it is optional extra instructions, and a blank one becomes
+    /// "Work on issue #<number>: <title>".
     pub prompt: String,
     /// Shown in lists. Derived from the prompt when absent.
     #[serde(default)]
