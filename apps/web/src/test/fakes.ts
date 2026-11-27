@@ -148,6 +148,11 @@ export function fakeApi(routes: Partial<Api> = {}): Api {
     interruptSession: missing("interruptSession"),
     stopSession: missing("stopSession"),
     resolvePermission: missing("resolvePermission"),
+    getChanges: missing("getChanges"),
+    getDiff: missing("getDiff"),
+    listTree: missing("listTree"),
+    readFile: missing("readFile"),
+    writeFile: missing("writeFile"),
     ...routes,
   };
 }

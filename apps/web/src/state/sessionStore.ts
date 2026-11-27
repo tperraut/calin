@@ -1,12 +1,23 @@
 import { createSignal, type Accessor } from "solid-js";
 import { HttpError, type Api } from "../api/http";
 import { sessionTopic, type SocketClient, type TopicHandler } from "../api/socket";
+import type {
+  OpenTerminal,
+  TerminalClient,
+  TerminalHandlers,
+  TerminalRequest,
+} from "../api/terminal";
+import type { FileContent } from "../gen/FileContent";
+import type { FileDiff } from "../gen/FileDiff";
 import type { PermissionDecision } from "../gen/PermissionDecision";
+import type { RepoChanges } from "../gen/RepoChanges";
 import type { ResolvePermissionRequest } from "../gen/ResolvePermissionRequest";
 import type { Session } from "../gen/Session";
 import type { SessionDetail } from "../gen/SessionDetail";
 import type { SessionRepo } from "../gen/SessionRepo";
 import type { SessionStatus } from "../gen/SessionStatus";
+import type { TreeEntry } from "../gen/TreeEntry";
+import type { WriteFileRequest } from "../gen/WriteFileRequest";
 import { errorMessage } from "../lib/errors";
 import { coalesce, type Schedule } from "../lib/schedule";
 import { applyEvent, emptySessionView, mergeRepos, type SessionView } from "./sessionReducer";
@@ -47,6 +58,23 @@ export type SessionStore = {
   reload(): void;
   /** Subscribes and loads; returns the function that undoes both. */
   start(): () => void;
+  /** The session's repos on disk, for the workspace panels. Paths are relative to a repo's root. */
+  workspace: SessionWorkspace;
+};
+
+/** The routes under `/sessions/{id}` that read and write the repos (api.rs), and the terminal socket. */
+export type SessionWorkspace = {
+  changes(): Promise<RepoChanges[]>;
+  diff(sessionRepoId: string, path: string): Promise<FileDiff>;
+  /** One level; an empty `path` is the repo's root. */
+  tree(sessionRepoId: string, path: string): Promise<TreeEntry[]>;
+  readFile(sessionRepoId: string, path: string): Promise<FileContent>;
+  writeFile(sessionRepoId: string, path: string, body: WriteFileRequest): Promise<FileContent>;
+  /** Starts a shell on the server; closing the returned client kills it. */
+  openTerminal(
+    request: Omit<TerminalRequest, "sessionId">,
+    handlers: TerminalHandlers,
+  ): TerminalClient;
 };
 
 export type SessionStoreDeps = {
@@ -55,6 +83,15 @@ export type SessionStoreDeps = {
   /** The session as the `sessions` topic last reported it, if it did. */
   listed?: (id: string) => Session | undefined;
   schedule?: Schedule;
+  /** Absent where no terminal can be opened (most tests): asking for one reports an error. */
+  openTerminal?: OpenTerminal;
+};
+
+const noTerminal: OpenTerminal = (_request, handlers) => {
+  queueMicrotask(() =>
+    handlers.onEnd({ kind: "error", message: "Terminals are not available here." }),
+  );
+  return { write() {}, resize() {}, close() {} };
 };
 
 /** Resubscriptions in a row that brought nothing new before giving up. */
@@ -203,6 +240,15 @@ export function createSessionStore(deps: SessionStoreDeps, id: string): SessionS
         active = false;
         stopListening();
       };
+    },
+    workspace: {
+      changes: () => api.getChanges(id),
+      diff: (repo, path) => api.getDiff(id, repo, path),
+      tree: (repo, path) => api.listTree(id, repo, path),
+      readFile: (repo, path) => api.readFile(id, repo, path),
+      writeFile: (repo, path, body) => api.writeFile(id, repo, path, body),
+      openTerminal: (request, handlers) =>
+        (deps.openTerminal ?? noTerminal)({ ...request, sessionId: id }, handlers),
     },
   };
 }

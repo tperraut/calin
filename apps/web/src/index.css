@@ -137,6 +137,12 @@
     opacity: 0.5;
   }
 
+  /* A toggle that is on. */
+  .btn[aria-pressed="true"] {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
   .btn-primary {
     border-color: var(--accent);
     background: var(--accent);

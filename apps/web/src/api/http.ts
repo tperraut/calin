@@ -1,12 +1,17 @@
 import type { ApiError } from "../gen/ApiError";
 import type { CreateSessionRequest } from "../gen/CreateSessionRequest";
+import type { FileContent } from "../gen/FileContent";
+import type { FileDiff } from "../gen/FileDiff";
 import type { Health } from "../gen/Health";
 import type { RegisterRepoRequest } from "../gen/RegisterRepoRequest";
 import type { Repo } from "../gen/Repo";
+import type { RepoChanges } from "../gen/RepoChanges";
 import type { ResolvePermissionRequest } from "../gen/ResolvePermissionRequest";
 import type { SendMessageRequest } from "../gen/SendMessageRequest";
 import type { Session } from "../gen/Session";
 import type { SessionDetail } from "../gen/SessionDetail";
+import type { TreeEntry } from "../gen/TreeEntry";
+import type { WriteFileRequest } from "../gen/WriteFileRequest";
 
 /** Mount point of every route in `crates/calin-proto/src/api.rs`. */
 export const API_BASE = "/api/v1";
@@ -50,9 +55,23 @@ export interface Api {
   interruptSession(id: string): Promise<void>;
   stopSession(id: string): Promise<void>;
   resolvePermission(id: string, requestId: string, body: ResolvePermissionRequest): Promise<void>;
+  /** What the session changed, one entry per attached repo. */
+  getChanges(id: string): Promise<RepoChanges[]>;
+  /** Both sides of one changed file. `path` is relative to the repo root (api.rs, Semantics). */
+  getDiff(id: string, sessionRepoId: string, path: string): Promise<FileDiff>;
+  /** One level of a repo's tree; an empty `path` lists the root. */
+  listTree(id: string, sessionRepoId: string, path: string): Promise<TreeEntry[]>;
+  readFile(id: string, sessionRepoId: string, path: string): Promise<FileContent>;
+  /** 409 when `expected_hash` no longer matches the file, or when the repo is attached `read`. */
+  writeFile(
+    id: string,
+    sessionRepoId: string,
+    path: string,
+    body: WriteFileRequest,
+  ): Promise<FileContent>;
 }
 
-type Method = "GET" | "POST" | "DELETE";
+type Method = "GET" | "POST" | "PUT" | "DELETE";
 
 function isApiError(value: unknown): value is ApiError {
   return (
@@ -110,6 +129,10 @@ export function createApi(
   }
 
   const session = (id: string) => `/sessions/${encodeURIComponent(id)}`;
+  // A path is one query value: `/` and every awkward character in it travel percent-encoded.
+  const inRepo = (id: string, sessionRepoId: string, route: string, path: string) =>
+    `${session(id)}/repos/${encodeURIComponent(sessionRepoId)}/${route}` +
+    (path === "" ? "" : `?path=${encodeURIComponent(path)}`);
 
   return {
     health: () => json<Health>("GET", "/health"),
@@ -124,5 +147,11 @@ export function createApi(
     stopSession: (id) => empty("POST", `${session(id)}/stop`),
     resolvePermission: (id, requestId, body) =>
       empty("POST", `${session(id)}/permissions/${encodeURIComponent(requestId)}`, body),
+    getChanges: (id) => json<RepoChanges[]>("GET", `${session(id)}/changes`),
+    getDiff: (id, repo, path) => json<FileDiff>("GET", inRepo(id, repo, "diff", path)),
+    listTree: (id, repo, path) => json<TreeEntry[]>("GET", inRepo(id, repo, "tree", path)),
+    readFile: (id, repo, path) => json<FileContent>("GET", inRepo(id, repo, "file", path)),
+    writeFile: (id, repo, path, body) =>
+      json<FileContent>("PUT", inRepo(id, repo, "file", path), body),
   };
 }

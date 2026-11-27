@@ -180,4 +180,117 @@ describe("http api", () => {
     expect(error.status).toBe(400);
     expect(error.message).toBe("/tmp/nope is not the root of a git work tree");
   });
+
+  describe("workspace routes", () => {
+    const content = {
+      path: "src/main.rs",
+      text: "fn main() {}\n",
+      binary: false,
+      too_large: false,
+      size: 13,
+      hash: "h1",
+    };
+
+    it("calls changes, diff, tree and file with their method, path and body", async () => {
+      const { api, fetchFn } = setup((input) =>
+        Promise.resolve(json(input.includes("/file") ? content : [])),
+      );
+
+      await expect(api.getChanges("s 1")).resolves.toEqual([]);
+      await api.getDiff("s 1", "sr/1", "src/main.rs");
+      await api.listTree("s 1", "sr1", "");
+      await api.listTree("s 1", "sr1", "src/api");
+      await expect(api.readFile("s 1", "sr1", "src/main.rs")).resolves.toEqual(content);
+      await expect(
+        api.writeFile("s 1", "sr1", "src/main.rs", { text: "x", expected_hash: "h1" }),
+      ).resolves.toEqual(content);
+      await api.writeFile("s 1", "sr1", "notes.txt", { text: "" });
+
+      const calls = fetchFn.mock.calls.map(([input, init]) => [init?.method, input, init?.body]);
+      expect(calls).toEqual([
+        ["GET", "/api/v1/sessions/s%201/changes", undefined],
+        ["GET", "/api/v1/sessions/s%201/repos/sr%2F1/diff?path=src%2Fmain.rs", undefined],
+        // api.rs: an absent `path` lists the root.
+        ["GET", "/api/v1/sessions/s%201/repos/sr1/tree", undefined],
+        ["GET", "/api/v1/sessions/s%201/repos/sr1/tree?path=src%2Fapi", undefined],
+        ["GET", "/api/v1/sessions/s%201/repos/sr1/file?path=src%2Fmain.rs", undefined],
+        [
+          "PUT",
+          "/api/v1/sessions/s%201/repos/sr1/file?path=src%2Fmain.rs",
+          '{"text":"x","expected_hash":"h1"}',
+        ],
+        // Creating a file: no `expected_hash` at all.
+        ["PUT", "/api/v1/sessions/s%201/repos/sr1/file?path=notes.txt", '{"text":""}'],
+      ]);
+      expect(fetchFn.mock.calls[5][1]?.headers).toMatchObject({
+        "Content-Type": "application/json",
+      });
+    });
+
+    it.each([
+      "a file with spaces.txt",
+      "notes#1.md",
+      "what?.txt",
+      "100%.txt",
+      "50%25 off.txt",
+      "a&b=c.txt",
+      "a+b.txt",
+      "dossier/été/naïve—文件.txt",
+      "line\nbreak.txt",
+      "tab\there.txt",
+      "back\\slash.txt",
+    ])("sends the path %j as one query value that decodes back to itself", async (path) => {
+      const { api, fetchFn } = setup(() => Promise.resolve(json(content)));
+      await api.readFile("s1", "sr1", path);
+      await api.getDiff("s1", "sr1", path);
+      await api.listTree("s1", "sr1", path);
+      await api.writeFile("s1", "sr1", path, { text: "" });
+
+      for (const [input] of fetchFn.mock.calls) {
+        const url = new URL(input, "http://calin.test");
+        // Exactly one parameter, and nothing of the path leaked into the address or a fragment.
+        expect([...url.searchParams.keys()]).toEqual(["path"]);
+        expect(url.searchParams.get("path")).toBe(path);
+        expect(url.hash).toBe("");
+        expect(url.pathname).toMatch(/^\/api\/v1\/sessions\/s1\/repos\/sr1\/(file|diff|tree)$/);
+        expect(input).not.toMatch(/[\s#]/);
+      }
+    });
+
+    it("surfaces the server's message and status when a workspace route refuses", async () => {
+      const answers: Record<string, [number, string]> = {
+        "GET /api/v1/sessions/s1/changes": [404, "unknown session"],
+        "GET /api/v1/sessions/s1/repos/sr1/diff?path=..%2Fsecret": [400, "path leaves the repo"],
+        "GET /api/v1/sessions/s1/repos/sr1/tree?path=nope": [404, "nope is not a directory"],
+        "GET /api/v1/sessions/s1/repos/sr1/file?path=.git%2Fconfig": [400, ".git is never read"],
+        "PUT /api/v1/sessions/s1/repos/sr1/file?path=a.txt": [409, "a.txt changed on disk"],
+      };
+      const { api } = setup((input, init) => {
+        const [status, error] = answers[`${init?.method} ${input}`] ?? [500, "unexpected call"];
+        return Promise.resolve(json({ error }, status));
+      });
+
+      const failures = await Promise.all([
+        failureOf(api.getChanges("s1")),
+        failureOf(api.getDiff("s1", "sr1", "../secret")),
+        failureOf(api.listTree("s1", "sr1", "nope")),
+        failureOf(api.readFile("s1", "sr1", ".git/config")),
+        failureOf(api.writeFile("s1", "sr1", "a.txt", { text: "x", expected_hash: "old" })),
+      ]);
+      expect(failures.map((error) => [error.status, error.message, error.fromServer])).toEqual([
+        [404, "unknown session", true],
+        [400, "path leaves the repo", true],
+        [404, "nope is not a directory", true],
+        [400, ".git is never read", true],
+        [409, "a.txt changed on disk", true],
+      ]);
+    });
+
+    it("reports an unreachable server for a save like for any other call", async () => {
+      const { api } = setup(() => Promise.reject(new TypeError("Failed to fetch")));
+      const error = await failureOf(api.writeFile("s1", "sr1", "a.txt", { text: "x" }));
+      expect(error.unreachable).toBe(true);
+      expect(error.message).toBe("Cannot reach the server");
+    });
+  });
 });

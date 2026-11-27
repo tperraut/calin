@@ -1,6 +1,7 @@
 import { createContext, createSignal, type Accessor } from "solid-js";
 import type { Api } from "../api/http";
 import { TOPIC_SESSIONS, type ConnectionState, type SocketClient } from "../api/socket";
+import type { OpenTerminal } from "../api/terminal";
 import type { CreateSessionRequest } from "../gen/CreateSessionRequest";
 import type { Health } from "../gen/Health";
 import type { RegisterRepoRequest } from "../gen/RegisterRepoRequest";
@@ -26,6 +27,8 @@ export type AppServices = {
   api: Api;
   socket: SocketClient;
   schedule?: Schedule;
+  /** Opens a terminal socket; see `createTerminalOpener`. */
+  openTerminal?: OpenTerminal;
 };
 
 /** Everything components read and do. They get it from `AppContext`, never from `src/api`. */
@@ -161,6 +164,7 @@ export function createAppState(services: AppServices): AppState {
           socket,
           listed: (wanted) => sessions().find((session) => session.id === wanted),
           schedule: services.schedule,
+          openTerminal: services.openTerminal,
         },
         id,
       ),

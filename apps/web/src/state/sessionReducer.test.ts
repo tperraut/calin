@@ -678,21 +678,21 @@ describe("permissions", () => {
     },
   );
 
-  const closedByServer: EventBody = {
+  const expired: EventBody = {
     type: "permission_resolved",
     request_id: "p1",
     decision: "deny",
-    by: "policy",
+    by: "expired",
     message: "The turn ended.",
   };
 
-  it("reads the server closing a waiting request as no longer needed, not as a refusal", () => {
+  it("reads an expired request as no longer needed, not as a refusal", () => {
     const view = fold(
       log(
         status("running"),
         { type: "permission_requested", request: request("p1") },
         status("waiting"),
-        closedByServer,
+        expired,
         status("review"),
       ),
     );
@@ -703,13 +703,13 @@ describe("permissions", () => {
     expect(view.pendingPermissions).toEqual([]);
   });
 
-  it("reads it the same way when the closure arrives after the turn is over", () => {
+  it("reads it the same way when the expiry arrives after the turn is over", () => {
     const view = fold(
       log(
         status("waiting"),
         { type: "permission_requested", request: request("p1") },
         status("cancelled"),
-        closedByServer,
+        expired,
       ),
     );
     expect(view.transcript[0]).toMatchObject({
@@ -718,18 +718,23 @@ describe("permissions", () => {
     });
   });
 
-  it("still records a refusal by policy that nobody was asked about", () => {
-    const view = fold(
-      log(
-        status("running"),
-        { type: "permission_requested", request: request("p1") },
-        { ...closedByServer, message: "Edits are not allowed in a read-only repo." },
-      ),
-    );
-    expect(view.transcript[0]).toMatchObject({
-      kind: "permission",
-      outcome: { state: "resolved", decision: "deny", by: "policy" },
-    });
+  it("takes a denial by policy at its word, whatever the session is doing", () => {
+    // `policy` only ever means the permission mode answered: no guessing from the status.
+    const denied: EventBody = { ...expired, by: "policy", message: "Edits are denied here." };
+    for (const before of ["running", "waiting"] as const) {
+      const view = fold(
+        log(status(before), { type: "permission_requested", request: request("p1") }, denied),
+      );
+      expect(view.transcript[0]).toMatchObject({
+        kind: "permission",
+        outcome: {
+          state: "resolved",
+          decision: "deny",
+          by: "policy",
+          message: "Edits are denied here.",
+        },
+      });
+    }
   });
 
   it("keeps a denial by the reader a denial, even while the session waits", () => {
@@ -737,7 +742,7 @@ describe("permissions", () => {
       log(
         status("waiting"),
         { type: "permission_requested", request: request("p1") },
-        { ...closedByServer, by: "user", message: "No." },
+        { ...expired, by: "user", message: "No." },
       ),
     );
     expect(view.transcript[0]).toMatchObject({

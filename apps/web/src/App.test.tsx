@@ -5,7 +5,12 @@ import type { Api } from "./api/http";
 import type { Health } from "./gen/Health";
 import { createAppState } from "./state/app";
 import type { PermissionRequest } from "./gen/PermissionRequest";
+import type { RepoChanges } from "./gen/RepoChanges";
+import type { SessionRepo } from "./gen/SessionRepo";
 import type { SessionStatus } from "./gen/SessionStatus";
+import type { OpenTerminal } from "./api/terminal";
+import { editorFor, editors, resetFakeEditors } from "./test/fakeEditor";
+import { fakeTerminals, resetFakeTerminals, views } from "./test/fakeTerminal";
 import {
   conflict,
   fakeApi,
@@ -32,6 +37,14 @@ import {
   unmountAll,
 } from "./test/render";
 
+// The lazy panels load these in place of CodeMirror and xterm.js (see src/test/).
+vi.mock("./panels/editor/codemirror", async () => ({
+  default: (await import("./test/fakeEditor")).fakeEditorModule,
+}));
+vi.mock("./panels/terminal/xterm", async () => ({
+  default: (await import("./test/fakeTerminal")).fakeTerminalModule,
+}));
+
 const health: Health = {
   name: "calin",
   version: "0.1.0",
@@ -40,15 +53,17 @@ const health: Health = {
 };
 
 /** Mounts the whole app at `path` over fakes, with the socket already open. */
-async function start(path: string, routes: Partial<Api> = {}) {
+async function start(path: string, routes: Partial<Api> = {}, openTerminal?: OpenTerminal) {
   history.replaceState(null, "", path);
   const socket = new FakeSocket();
   const api = fakeApi({
     health: () => Promise.resolve(health),
     listRepos: () => Promise.resolve([]),
+    // What the Changes panel asks for when it opens.
+    getChanges: () => Promise.resolve([]),
     ...routes,
   });
-  const state = createAppState({ api, socket, schedule: immediately });
+  const state = createAppState({ api, socket, schedule: immediately, openTerminal });
   const host = mount(() => <App state={state} />);
   await settle();
   flush();
@@ -65,10 +80,12 @@ async function openSession(
   path: string,
   routes: Partial<Api> = {},
   status: SessionStatus = "running",
+  repos: SessionRepo[] = [],
 ) {
   const session = makeSession("s1", 1000, { title: "Add a health check", status });
-  const getSession = vi.fn<Api["getSession"]>().mockResolvedValue(makeDetail(session));
-  const app = await start(path, { getSession, ...routes });
+  const getSession = vi.fn<Api["getSession"]>().mockResolvedValue(makeDetail(session, repos));
+  const terminals = fakeTerminals();
+  const app = await start(path, { getSession, ...routes }, terminals.open);
   let seq = 0;
   const emit = (body: Parameters<typeof makeEvent>[1], agentId: string | null = "a1") => {
     seq += 1;
@@ -86,7 +103,7 @@ async function openSession(
   };
   const main = find(app.host, "main");
   const tab = (label: string) => findByText<HTMLButtonElement>(main, '[role="tab"]', label);
-  return { ...app, main, emit, caughtUp, getSession, tab };
+  return { ...app, main, emit, caughtUp, getSession, tab, shells: terminals.shells };
 }
 
 const permissionRequest = (id: string, title: string): PermissionRequest => ({
@@ -112,9 +129,15 @@ async function act(): Promise<void> {
 
 beforeEach(() => {
   history.replaceState(null, "", "/");
+  resetFakeEditors();
+  resetFakeTerminals();
 });
 
-afterEach(unmountAll);
+afterEach(() => {
+  unmountAll();
+  sessionStorage.clear();
+  vi.unstubAllGlobals();
+});
 
 describe("App", () => {
   it("says so when the server cannot be reached, and offers a retry", async () => {
@@ -700,6 +723,47 @@ describe("App", () => {
     expect(find(main, '[role="log"]').textContent).toContain("Allowed by policy");
   });
 
+  it("shows a request nobody answered in time as no longer needed, not as a denial", async () => {
+    const { main, emit, caughtUp } = await openSession("/s/s1", {}, "waiting");
+    emit({ type: "session_status", status: "waiting", reason: null }, null);
+    emit({ type: "permission_requested", request: permissionRequest("p1", "cargo test") });
+    emit({ type: "permission_requested", request: permissionRequest("p2", "rm -rf target") });
+    caughtUp();
+    expect(main.querySelector('section[aria-label="Permission request"]')).not.toBeNull();
+
+    emit(
+      {
+        type: "permission_resolved",
+        request_id: "p1",
+        decision: "deny",
+        by: "expired",
+        message: "The turn ended before this was answered.",
+      },
+      null,
+    );
+    // `policy` is the permission mode answering, and reads as such even while the session waits.
+    emit(
+      {
+        type: "permission_resolved",
+        request_id: "p2",
+        decision: "deny",
+        by: "policy",
+        message: null,
+      },
+      null,
+    );
+    const rows = [...find(main, '[role="log"]').querySelectorAll("li")].map(
+      (row) => row.textContent,
+    );
+    expect(rows[0]).toContain("cargo test");
+    expect(rows[0]).toContain("No longer needed");
+    expect(rows[0]).toContain("The turn ended before this was answered.");
+    expect(rows[0]).not.toContain("Denied");
+    expect(rows[0]).not.toContain("expired");
+    expect(rows[1]).toContain("Denied by policy");
+    expect(main.querySelector('section[aria-label="Permission request"]')).toBeNull();
+  });
+
   it("says so when the server refuses the session's live updates, and asks again", async () => {
     const { main, socket } = await openSession("/s/s1");
     socket.emit("session:s1", { op: "error", topic: "session:s1", message: "replay failed" });
@@ -736,7 +800,37 @@ describe("App", () => {
     beforeEach(() => setViewportWidth(PHONE));
 
     it("opens the panel the address names, as tabs under the header", async () => {
-      const { main, emit, caughtUp, tab } = await openSession("/s/s1/changes");
+      const changes: RepoChanges[] = [
+        {
+          session_repo_id: "api",
+          name: "api",
+          branch: null,
+          base_ref: null,
+          files: [
+            {
+              path: "src/health.rs",
+              old_path: null,
+              status: "added",
+              added: 9,
+              removed: 0,
+              binary: false,
+            },
+            {
+              path: "src/main.rs",
+              old_path: null,
+              status: "modified",
+              added: 2,
+              removed: 1,
+              binary: false,
+            },
+          ],
+          added: 11,
+          removed: 1,
+        },
+      ];
+      const { main, emit, caughtUp, tab } = await openSession("/s/s1/changes", {
+        getChanges: () => Promise.resolve(changes),
+      });
       const tabs = [...main.querySelectorAll('[role="tab"]')];
       expect(tabs.map((one) => one.textContent)).toEqual([
         "Transcript",
@@ -750,10 +844,11 @@ describe("App", () => {
         "false",
         "false",
       ]);
-      await shown(main, "No file has been changed yet.");
+      await shown(main, "2 files changed");
       const panel = find(main, `[id="${tab("Changes").getAttribute("aria-controls")}"]`);
       expect(panel.getAttribute("role")).toBe("tabpanel");
       expect(panel.getAttribute("aria-labelledby")).toBe(tab("Changes").id);
+      expect(panel.textContent).toContain("src/health.rs");
       // The transcript keeps its place in the page, out of sight, and the message box with it.
       expect(find(main, '[role="log"]').closest("[hidden]")).not.toBeNull();
       expect(find(main, "textarea").closest("[hidden]")).not.toBeNull();
@@ -766,15 +861,8 @@ describe("App", () => {
         null,
       );
       caughtUp();
+      // The tab counts the files the events named, wherever they are.
       expect(tab("Changes").textContent).toBe("Changes3");
-      const groups = [...panel.querySelectorAll("section")].map((group) => group.textContent);
-      expect(groups).toHaveLength(2);
-      expect(groups[0]).toContain("api");
-      expect(groups[0]).toContain("2 files");
-      expect(groups[0]).toContain("src/health.rs");
-      expect(groups[0]).toContain("Created by the agent");
-      expect(groups[1]).toContain("Outside the session's repos");
-      expect(groups[1]).toContain("Edited by you");
       // File changes never show up as transcript rows.
       expect(find(main, '[role="log"]').textContent).not.toContain("src/health.rs");
     });
@@ -787,18 +875,22 @@ describe("App", () => {
       await click(tab("Files"));
       expect(location.pathname).toBe("/s/s1/files");
       expect(tab("Files").getAttribute("aria-selected")).toBe("true");
-      await shown(main, "Browse the session's repos");
+      await shown(main, "No repo is attached to this session");
+      const files = find(main, 'section[aria-label="File tree"]');
+      expect(files.closest("[hidden]")).toBeNull();
 
       await click(tab("Terminal"));
       expect(location.pathname).toBe("/s/s1/terminal");
-      await shown(main, "A shell in the session's folder");
-      expect(main.textContent).not.toContain("Browse the session's repos");
+      await shown(main, "shell 1");
+      // The Files panel is still there, out of sight.
+      expect(files.isConnected).toBe(true);
+      expect(files.closest("[hidden]")).not.toBeNull();
 
       history.back();
       await vi.waitFor(() => expect(location.pathname).toBe("/s/s1/files"));
       await act();
       expect(tab("Files").getAttribute("aria-selected")).toBe("true");
-      await shown(main, "Browse the session's repos");
+      expect(files.closest("[hidden]")).toBeNull();
 
       await click(tab("Transcript"));
       expect(location.pathname).toBe("/s/s1");
@@ -876,7 +968,7 @@ describe("App", () => {
 
       await click(tab("Changes"));
       expect(location.pathname).toBe("/s/s1/changes");
-      await shown(pane, "No file has been changed yet.");
+      await shown(pane, "No changes yet");
       expect(tab("Changes").getAttribute("aria-selected")).toBe("true");
       expect(find(pane, '[role="tablist"]').getAttribute("aria-orientation")).toBe("horizontal");
       // Both at once: the transcript and its message box stay where they were.
@@ -891,7 +983,7 @@ describe("App", () => {
     it("opens the side pane on the panel the address names, and resizes it from the keyboard", async () => {
       const { main, tab } = await openSession("/s/s1/terminal");
       const pane = find(main, 'aside[aria-label="Workspace panels"]');
-      await shown(pane, "A shell in the session's folder");
+      await shown(pane, "shell 1");
       expect(tab("Terminal").getAttribute("aria-selected")).toBe("true");
 
       const edge = find(main, '[role="separator"]');
@@ -903,6 +995,236 @@ describe("App", () => {
       expect(narrowest).toBeLessThan(before);
       expect(pane.style.width).toBe(`${narrowest}px`);
       expect(narrowest).toBe(Number(edge.getAttribute("aria-valuemin")));
+    });
+  });
+
+  describe("panels stay alive while the session is open", () => {
+    const repos = [makeSessionRepo("api", { primary: true })];
+    const disk: Partial<Api> = {
+      listTree: () =>
+        Promise.resolve([
+          { name: "notes.md", path: "notes.md", kind: "file", size: 6, ignored: false },
+        ]),
+      readFile: (_id, _repo, path) =>
+        Promise.resolve({
+          path,
+          text: "hello\n",
+          binary: false,
+          too_large: false,
+          size: 6,
+          hash: "h1",
+        }),
+    };
+    const treeItem = (root: ParentNode, name: string) =>
+      findByText(root, '[role="treeitem"]', name);
+
+    it("keeps an unsaved edit through other panels and the transcript, on a phone", async () => {
+      setViewportWidth(PHONE);
+      const readFile = vi.fn(disk.readFile);
+      const { main, tab } = await openSession(
+        "/s/s1/files",
+        { ...disk, readFile },
+        "running",
+        repos,
+      );
+      await shown(main, "notes.md");
+      await click(treeItem(main, "notes.md"));
+      await vi.waitFor(() => expect(editors).toHaveLength(1));
+      const editor = editorFor("notes.md");
+      type(editor.field, "hello, unsaved\n");
+
+      await click(tab("Changes"));
+      await shown(main, "No changes yet");
+      expect(editor.field.isConnected).toBe(true);
+      expect(editor.field.closest("[hidden]")).not.toBeNull();
+      await click(tab("Transcript"));
+      expect(find(main, '[role="log"]').closest("[hidden]")).toBeNull();
+      expect(editor.field.closest("[hidden]")).not.toBeNull();
+      await click(tab("Terminal"));
+      await shown(main, "api 1");
+
+      await click(tab("Files"));
+      // The same editor, with the same text: nothing was mounted again or read again.
+      expect(editors).toHaveLength(1);
+      expect(editor.destroyed).toBe(false);
+      expect(editor.field.closest("[hidden]")).toBeNull();
+      expect(editor.field.value).toBe("hello, unsaved\n");
+      expect(main.textContent).toContain("Unsaved changes:");
+      expect(readFile).toHaveBeenCalledTimes(1);
+    });
+
+    it("keeps a shell running behind the other panels, and its output", async () => {
+      setViewportWidth(PHONE);
+      const { main, tab, shells } = await openSession("/s/s1/terminal", disk, "running", repos);
+      await vi.waitFor(() => expect(shells).toHaveLength(1));
+      const [shell] = shells;
+      const [view] = views;
+      shell.handlers.onOpen?.();
+      shell.handlers.onData(new TextEncoder().encode("api $ "));
+
+      await click(tab("Files"));
+      await shown(main, "notes.md");
+      await click(tab("Transcript"));
+      await click(tab("Changes"));
+      expect(shell.closed).toBe(false);
+      expect(view.disposed).toBe(false);
+      expect(view.element.closest("[hidden]")).not.toBeNull();
+      // Output that arrives meanwhile is on the screen when the reader comes back.
+      shell.handlers.onData(new TextEncoder().encode("make: done\r\n"));
+
+      await click(tab("Terminal"));
+      expect(view.element.closest("[hidden]")).toBeNull();
+      expect(view.screen).toBe("api $ make: done\r\n");
+      expect(shells).toHaveLength(1);
+      expect(views).toHaveLength(1);
+      view.options.onInput("ls\r");
+      expect(shell.input).toBe("ls\r");
+    });
+
+    it("keeps both through the side pane collapsing and opening again, on a wide screen", async () => {
+      const { main, tab, shells } = await openSession("/s/s1/files", disk, "running", repos);
+      const pane = find(main, 'aside[aria-label="Workspace panels"]');
+      await shown(pane, "notes.md");
+      await click(treeItem(pane, "notes.md"));
+      await vi.waitFor(() => expect(editors).toHaveLength(1));
+      const editor = editorFor("notes.md");
+      type(editor.field, "wide and unsaved\n");
+      await click(tab("Terminal"));
+      await vi.waitFor(() => expect(shells).toHaveLength(1));
+
+      await click(find(pane, 'button[aria-label="Collapse the panel"]'));
+      expect(location.pathname).toBe("/s/s1");
+      expect(main.querySelector('[role="tabpanel"]')).toBeNull();
+      expect(editor.field.isConnected).toBe(true);
+      expect(shells[0].closed).toBe(false);
+
+      await click(tab("Files"));
+      expect(editor.field.closest("[hidden]")).toBeNull();
+      expect(editor.field.value).toBe("wide and unsaved\n");
+      expect(editors).toHaveLength(1);
+      expect(shells).toHaveLength(1);
+      expect(shells[0].closed).toBe(false);
+    });
+
+    it("loads nothing for a panel that was never opened", async () => {
+      const listTree = vi.fn(disk.listTree);
+      const { main, shells } = await openSession(
+        "/s/s1/changes",
+        { ...disk, listTree },
+        "running",
+        repos,
+      );
+      await shown(main, "No changes yet");
+      await act();
+      expect(shells).toHaveLength(0);
+      expect(views).toHaveLength(0);
+      expect(listTree).not.toHaveBeenCalled();
+      expect(main.querySelector('[role="tree"]')).toBeNull();
+    });
+
+    it("opens no terminal for a session that does not exist", async () => {
+      const { main, shells } = await openSession("/s/s1/terminal", {
+        getSession: () => Promise.reject(notFound()),
+      });
+      await act();
+      expect(main.textContent).toContain("Session not found");
+      expect(shells).toHaveLength(0);
+    });
+
+    it("closes the shells and drops the editors when the session screen goes away", async () => {
+      const { host, main, tab, shells } = await openSession(
+        "/s/s1/terminal",
+        disk,
+        "running",
+        repos,
+      );
+      await vi.waitFor(() => expect(shells).toHaveLength(1));
+      await click(tab("Files"));
+      await shown(main, "notes.md");
+      await click(findByText<HTMLAnchorElement>(host, "a", "Calin"));
+      await act();
+      expect(location.pathname).toBe("/");
+      expect(shells[0].closed).toBe(true);
+      expect(views[0].disposed).toBe(true);
+    });
+
+    it("opens a changed file in the Files panel from its diff", async () => {
+      const changes: RepoChanges[] = [
+        {
+          session_repo_id: "api",
+          name: "api",
+          branch: null,
+          base_ref: null,
+          files: [
+            {
+              path: "notes.md",
+              old_path: null,
+              status: "modified",
+              added: 1,
+              removed: 1,
+              binary: false,
+            },
+          ],
+          added: 1,
+          removed: 1,
+        },
+      ];
+      const { main, tab } = await openSession(
+        "/s/s1/changes",
+        {
+          ...disk,
+          getChanges: () => Promise.resolve(changes),
+          getDiff: (_id, _repo, path) =>
+            Promise.resolve({
+              path,
+              old_path: null,
+              old: "hi\n",
+              new: "hello\n",
+              binary: false,
+              too_large: false,
+            }),
+        },
+        "running",
+        repos,
+      );
+      await shown(main, "1 file changed");
+      await click(findByText(main, "li > button", "notes.md"));
+      await act();
+      await click(findByText(main, "button", "Open in Files"));
+      await vi.waitFor(() => expect(location.pathname).toBe("/s/s1/files"));
+      expect(tab("Files").getAttribute("aria-selected")).toBe("true");
+      await vi.waitFor(() => expect(editorFor("notes.md").field.value).toBe("hello\n"));
+      expect(editorFor("notes.md").field.closest("[hidden]")).toBeNull();
+    });
+
+    it("asks before a link leaves the session while a file has unsaved changes", async () => {
+      const { host, main } = await openSession("/s/s1/files", disk, "running", repos);
+      await shown(main, "notes.md");
+      await click(treeItem(main, "notes.md"));
+      await vi.waitFor(() => expect(editors).toHaveLength(1));
+      type(editorFor("notes.md").field, "unsaved\n");
+      // happy-dom has no dialogs of its own.
+      const confirm = vi.fn<(message?: string) => boolean>().mockReturnValue(false);
+      vi.stubGlobal("confirm", confirm);
+
+      await click(findByText<HTMLAnchorElement>(host, "a", "Calin"));
+      await act();
+      expect(confirm).toHaveBeenCalledWith(
+        "A file has unsaved changes. Leave this session and lose them?",
+      );
+      expect(location.pathname).toBe("/s/s1/files");
+      expect(editorFor("notes.md").field.value).toBe("unsaved\n");
+
+      // Moving between the session's own panels loses nothing and asks nothing.
+      confirm.mockClear();
+      await click(findByText<HTMLButtonElement>(main, '[role="tab"]', "Changes"));
+      expect(location.pathname).toBe("/s/s1/changes");
+      expect(confirm).not.toHaveBeenCalled();
+
+      confirm.mockReturnValue(true);
+      await click(findByText<HTMLAnchorElement>(host, "a", "Calin"));
+      await act();
+      expect(location.pathname).toBe("/");
     });
   });
 

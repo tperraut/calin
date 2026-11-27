@@ -17,3 +17,22 @@ export function createMediaQuery(query: string): Accessor<boolean> {
   });
   return matches;
 }
+
+/**
+ * Width of an element in pixels, kept current; 0 until it is laid out. For
+ * panels whose layout depends on the room their pane gives them, not on the window.
+ */
+export function createWidth(element: () => HTMLElement | undefined): Accessor<number> {
+  const [width, setWidth] = createSignal(0);
+  onSettled(() => {
+    const target = element();
+    if (!target || typeof ResizeObserver !== "function") return;
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries.at(-1);
+      if (entry) setWidth(entry.contentRect.width);
+    });
+    observer.observe(target);
+    return () => observer.disconnect();
+  });
+  return width;
+}

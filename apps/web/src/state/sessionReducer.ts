@@ -14,13 +14,17 @@ import type { SessionStatus } from "../gen/SessionStatus";
 /** Running totals, in the shape of the `usage` event. */
 export type Usage = Omit<Extract<EventBody, { type: "usage" }>, "type">;
 
+/** Who can answer a request; `expired` is nobody answering in time. */
+export type Answerer = Exclude<DecisionSource, "expired">;
+
 /**
  * Where a permission request stands. `lapsed`: nobody had answered when the
- * turn ended, so the answer is no longer needed; `message` is the server's note, if any.
+ * turn ended (an `expired` resolution, or the turn seen ending before one
+ * arrived), so the answer is no longer needed; `message` is the server's note, if any.
  */
 export type PermissionOutcome =
   | { state: "pending" }
-  | { state: "resolved"; decision: PermissionDecision; by: DecisionSource; message: string | null }
+  | { state: "resolved"; decision: PermissionDecision; by: Answerer; message: string | null }
   | { state: "lapsed"; message: string | null };
 
 /** One row of the transcript. `key` is stable for the life of the row. */
@@ -271,17 +275,11 @@ function resolvePermission(
   const entry = index === -1 ? undefined : view.transcript[index];
   // An answer to a request this log never showed has no row to update.
   if (entry?.kind !== "permission") return view;
-  // The server closes a request left open by the end of a turn as a denial by
-  // policy. Policy answers without asking, so a denial of a request that was
-  // waiting for the reader is that closure, not a refusal. The wire has no
-  // field for it; the session waiting, or the turn already over, is the sign.
-  const closed =
-    body.decision === "deny" &&
-    body.by === "policy" &&
-    (entry.outcome.state === "lapsed" || view.status === "waiting");
-  const outcome: PermissionOutcome = closed
-    ? { state: "lapsed", message: body.message }
-    : { state: "resolved", decision: body.decision, by: body.by, message: body.message };
+  // permission.rs: `expired` is the server closing a request nobody answered.
+  const outcome: PermissionOutcome =
+    body.by === "expired"
+      ? { state: "lapsed", message: body.message }
+      : { state: "resolved", decision: body.decision, by: body.by, message: body.message };
   return {
     ...view,
     transcript: withEntry(view.transcript, index, { ...entry, outcome }),

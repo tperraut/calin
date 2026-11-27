@@ -19,7 +19,7 @@ import { Transcript } from "../components/Transcript";
 import type { SessionStatus } from "../gen/SessionStatus";
 import { createMediaQuery, WIDE_QUERY } from "../lib/media";
 import { canMessage, resumesOnMessage, sessionLook } from "../lib/status";
-import { PanelHost } from "../panels/PanelHost";
+import { PanelHost, PanelOutlet } from "../panels/PanelHost";
 import {
   panelFromSegment,
   sessionPath,
@@ -98,6 +98,20 @@ export function SessionScreen(props: {
   };
   const sidePanel = (): SidePanelId | undefined =>
     props.panel === "transcript" ? undefined : props.panel;
+
+  // The side panels live here, once, for as long as this screen does: the two
+  // layouts below only adopt their element (see PanelHost). They wait for the
+  // session's record, so no panel loads or opens a socket for an unknown session.
+  const hostedPanel = createMemo(() => (store.load().status === "ready" ? sidePanel() : undefined));
+  let panels: HTMLDivElement | undefined;
+  void (
+    <PanelHost
+      store={store}
+      panel={hostedPanel()}
+      onPanel={(panel) => props.onPanel(panel)}
+      ref={(element) => (panels = element)}
+    />
+  );
   // On a phone only the selected panel shows; the transcript keeps its place in the page meanwhile.
   const transcriptHidden = (): boolean => !wide() && props.panel !== "transcript";
   // A replay passes through every request ever made; only the caught-up list is worth showing.
@@ -210,17 +224,17 @@ export function SessionScreen(props: {
                 <PlanPanel entries={store.view().plan} />
               </Show>
             </div>
-            <Show when={!wide() && sidePanel()}>
-              {(panel) => (
-                <div
-                  role="tabpanel"
-                  id={tabPanelId(idBase, panel())}
-                  aria-labelledby={tabId(idBase, panel())}
-                  class="flex min-h-0 flex-1 flex-col"
-                >
-                  <PanelHost panel={panel()} store={store} />
-                </div>
-              )}
+            <Show when={!wide()}>
+              {/* Kept in the page while the transcript shows, so the panels stay laid out where they were. */}
+              <div
+                role={sidePanel() === undefined ? undefined : "tabpanel"}
+                id={tabPanelId(idBase, sidePanel() ?? "none")}
+                aria-labelledby={sidePanel() === undefined ? undefined : tabId(idBase, props.panel)}
+                hidden={sidePanel() === undefined}
+                class="flex min-h-0 flex-1 flex-col"
+              >
+                <PanelOutlet panels={panels} />
+              </div>
             </Show>
             {/* Under every panel: a request must not wait unseen behind a tab. */}
             <PermissionBar
@@ -243,10 +257,11 @@ export function SessionScreen(props: {
               idBase={idBase}
               tabs={sideTabs()}
               panel={sidePanel()}
-              store={store}
               onSelect={(panel) => props.onPanel(panel)}
               onCollapse={() => props.onPanel("transcript")}
-            />
+            >
+              <PanelOutlet panels={panels} />
+            </SidePane>
           </Show>
         </div>
       </Match>

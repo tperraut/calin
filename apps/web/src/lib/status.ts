@@ -1,5 +1,4 @@
 import type { DecisionSource } from "../gen/DecisionSource";
-import type { FileOp } from "../gen/FileOp";
 import type { ItemStatus } from "../gen/ItemStatus";
 import type { PermissionMode } from "../gen/PermissionMode";
 import type { PlanStatus } from "../gen/PlanStatus";
@@ -77,19 +76,15 @@ const repoModeLabels: Record<RepoMode, string> = {
 
 export const repoModeLabel = (mode: RepoMode): string => lookup(repoModeLabels, mode) ?? mode;
 
-const sourceLabels: Record<DecisionSource, string> = { user: "you", policy: "policy" };
-
-/** Who answered a permission request, as it reads after "by". */
-export const decisionSourceLabel = (by: DecisionSource): string => lookup(sourceLabels, by) ?? by;
-
-const fileOpLabels: Record<FileOp, string> = {
-  create: "Created",
-  edit: "Edited",
-  delete: "Deleted",
-  rename: "Renamed",
+// `expired` is nobody answering; it reads as "No longer needed", never after "by".
+const sourceLabels: Record<Exclude<DecisionSource, "expired">, string> = {
+  user: "you",
+  policy: "policy",
 };
 
-export const fileOpLabel = (op: FileOp): string => lookup(fileOpLabels, op) ?? op;
+/** Who answered a permission request, as it reads after "by". */
+export const decisionSourceLabel = (by: Exclude<DecisionSource, "expired">): string =>
+  lookup(sourceLabels, by) ?? by;
 
 // The lists below restate the "Semantics" section of calin-proto/src/api.rs.
 const interruptible: readonly SessionStatus[] = ["running", "waiting"];

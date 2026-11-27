@@ -1,0 +1,114 @@
+/* Loaded with the editor chunk. The tokens extend the app's own (index.css). */
+:root {
+  --editor-selection: #cfdcfa;
+  --editor-active-line: #f4f4f1;
+  --editor-match: #e6e6e0;
+  --diff-added: #e3f4e6;
+  --diff-added-strong: #b5e3bf;
+  --diff-removed: #fbe9e7;
+  --diff-removed-strong: #f5c1bb;
+
+  /* Each keeps at least 4.5:1 on --surface. */
+  --syntax-keyword: #8431a8;
+  --syntax-string: #1c6b34;
+  --syntax-number: #9a4a00;
+  --syntax-comment: #66665f;
+  --syntax-type: #0f6577;
+  --syntax-function: #1f4fbf;
+  --syntax-property: #7a4a12;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --editor-selection: #2c3d66;
+    --editor-active-line: #222320;
+    --editor-match: #34362f;
+    --diff-added: #17301e;
+    --diff-added-strong: #23592f;
+    --diff-removed: #3a1c1a;
+    --diff-removed-strong: #6e2b26;
+
+    --syntax-keyword: #d7a0f0;
+    --syntax-string: #8fd6a2;
+    --syntax-number: #f0b072;
+    --syntax-comment: #9b9b93;
+    --syntax-type: #7fd0e0;
+    --syntax-function: #9dbcff;
+    --syntax-property: #e0c08a;
+  }
+}
+
+/* The search panel: the app's controls, at the app's touch size. */
+.cm-editor .cm-panel.cm-search {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 50px 6px 6px;
+  font-family: system-ui, sans-serif;
+  font-size: 14px;
+}
+
+.cm-editor .cm-panel.cm-search br {
+  display: none;
+}
+
+.cm-editor .cm-panel.cm-search .cm-textfield {
+  min-width: 0;
+  flex: 1 1 9rem;
+  height: 44px;
+  margin: 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  padding: 0 0.6rem;
+  color: var(--fg);
+  font-size: 16px;
+}
+
+.cm-editor .cm-panel.cm-search .cm-button {
+  min-height: 44px;
+  min-width: 44px;
+  margin: 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  padding: 0 0.7rem;
+  color: var(--fg);
+  font-size: 14px;
+}
+
+.cm-editor .cm-panel.cm-search label {
+  display: inline-flex;
+  min-height: 44px;
+  align-items: center;
+  gap: 4px;
+  font-size: 13px;
+}
+
+.cm-editor .cm-panel.cm-search [name="close"] {
+  top: 6px;
+  right: 6px;
+  width: 44px;
+  height: 44px;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--fg);
+  font-size: 20px;
+}
+
+/* The merge view: one scroller around both sides. Its colors are in the editor theme. */
+.cm-mergeView {
+  height: 100%;
+  overflow: auto;
+  overscroll-behavior: contain;
+  background: var(--surface);
+}
+
+.cm-mergeView .cm-mergeViewEditor {
+  min-width: 0;
+}
+
+.cm-mergeView .cm-mergeViewEditor + .cm-mergeViewEditor {
+  border-left: 1px solid var(--line);
+}

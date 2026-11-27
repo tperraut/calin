@@ -1,0 +1,53 @@
+/* Loaded with the Terminal panel. The ANSI palette, each color readable on --surface in its theme. */
+:root {
+  --term-selection: #cfdcfa;
+  --term-black: #1b1b19;
+  --term-red: #b3261e;
+  --term-green: #1f7a3d;
+  --term-yellow: #8a5a00;
+  --term-blue: #2a56c6;
+  --term-magenta: #8431a8;
+  --term-cyan: #0f6577;
+  --term-white: #5c5c56;
+  --term-bright-black: #6e6e67;
+  --term-bright-red: #c7372f;
+  --term-bright-green: #23874a;
+  --term-bright-yellow: #96650a;
+  --term-bright-blue: #3a66d6;
+  --term-bright-magenta: #9a45c0;
+  --term-bright-cyan: #14788c;
+  --term-bright-white: #1b1b19;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --term-selection: #2c3d66;
+    --term-black: #33352f;
+    --term-red: #ff8a80;
+    --term-green: #6fcf8e;
+    --term-yellow: #e2b24a;
+    --term-blue: #8fb0ff;
+    --term-magenta: #d7a0f0;
+    --term-cyan: #7fd0e0;
+    --term-white: #c9c9c3;
+    --term-bright-black: #8a8a83;
+    --term-bright-red: #ffb3ab;
+    --term-bright-green: #9be0b1;
+    --term-bright-yellow: #f0cc7a;
+    --term-bright-blue: #b5caff;
+    --term-bright-magenta: #e6c2f7;
+    --term-bright-cyan: #a8e1ec;
+    --term-bright-white: #ffffff;
+  }
+}
+
+.xterm {
+  height: 100%;
+  padding: 4px 0 0 6px;
+}
+
+/* xterm paints these black until its theme lands, and around the padding for good. */
+.xterm .xterm-viewport,
+.xterm .xterm-scrollable-element {
+  background-color: var(--surface) !important;
+}

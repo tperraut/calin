@@ -20,6 +20,8 @@ export const defaultComposerPrefs = (): ComposerPrefs => ({ repos: [], permissio
 
 const COMPOSER_KEY = "calin.composer.v1";
 const SIDE_PANE_KEY = "calin.sidePane.v1";
+const DIFF_LAYOUT_KEY = "calin.diffLayout.v1";
+const EDITOR_WRAP_KEY = "calin.editorWrap.v1";
 
 // Storage can be missing, full or forbidden (private windows, blocked site
 // data). Every access is guarded: the app works the same, it just forgets.
@@ -80,4 +82,26 @@ export function loadSidePaneWidth(): number | undefined {
 
 export function saveSidePaneWidth(width: number): void {
   write(SIDE_PANE_KEY, Math.round(width));
+}
+
+export type DiffLayoutChoice = "split" | "unified";
+
+/** The diff layout the reader picked on a wide screen, if they did. */
+export function loadDiffLayout(): DiffLayoutChoice | undefined {
+  const stored = read(DIFF_LAYOUT_KEY);
+  return stored === "split" || stored === "unified" ? stored : undefined;
+}
+
+export function saveDiffLayout(layout: DiffLayoutChoice): void {
+  write(DIFF_LAYOUT_KEY, layout);
+}
+
+/** Whether the editor wraps long lines, when the reader has chosen. */
+export function loadEditorWrap(): boolean | undefined {
+  const stored = read(EDITOR_WRAP_KEY);
+  return typeof stored === "boolean" ? stored : undefined;
+}
+
+export function saveEditorWrap(wrap: boolean): void {
+  write(EDITOR_WRAP_KEY, wrap);
 }

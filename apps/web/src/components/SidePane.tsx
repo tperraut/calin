@@ -1,8 +1,6 @@
-import { createSignal, onSettled, Show } from "solid-js";
+import { createSignal, onSettled, Show, type ParentProps } from "solid-js";
 import { loadSidePaneWidth, saveSidePaneWidth } from "../lib/prefs";
-import { PanelHost } from "../panels/PanelHost";
 import type { SidePanelId } from "../panels/registry";
-import type { SessionStore } from "../state/sessionStore";
 import { PanelTabs, tabId, tabPanelId, type Tab } from "./PanelTabs";
 
 const MIN_WIDTH = 280;
@@ -14,16 +12,18 @@ const KEY_STEP = 24;
 /**
  * The right-hand pane of the wide layout: the side panels behind their own
  * tabs. Collapsed (no `panel`) it is only the tabs, as a rail; open, it is
- * resizable by dragging its edge or with the arrow keys on it.
+ * resizable by dragging its edge or with the arrow keys on it. Its children
+ * are the panels themselves, kept in place (hidden) while it is collapsed.
  */
-export function SidePane(props: {
-  idBase: string;
-  tabs: readonly Tab<SidePanelId>[];
-  panel: SidePanelId | undefined;
-  store: SessionStore;
-  onSelect: (panel: SidePanelId) => void;
-  onCollapse: () => void;
-}) {
+export function SidePane(
+  props: ParentProps<{
+    idBase: string;
+    tabs: readonly Tab<SidePanelId>[];
+    panel: SidePanelId | undefined;
+    onSelect: (panel: SidePanelId) => void;
+    onCollapse: () => void;
+  }>,
+) {
   const [width, setWidth] = createSignal(loadSidePaneWidth() ?? DEFAULT_WIDTH);
   // Depends on the window, so it is measured: once shown, then with every resize of the pane.
   const [widest, setWidest] = createSignal<number>();
@@ -128,18 +128,15 @@ export function SidePane(props: {
             </button>
           </Show>
         </div>
-        <Show when={props.panel}>
-          {(panel) => (
-            <div
-              role="tabpanel"
-              id={tabPanelId(props.idBase, panel())}
-              aria-labelledby={tabId(props.idBase, panel())}
-              class="flex min-h-0 flex-1 flex-col"
-            >
-              <PanelHost panel={panel()} store={props.store} />
-            </div>
-          )}
-        </Show>
+        <div
+          role={props.panel === undefined ? undefined : "tabpanel"}
+          id={tabPanelId(props.idBase, props.panel ?? "none")}
+          aria-labelledby={props.panel === undefined ? undefined : tabId(props.idBase, props.panel)}
+          hidden={props.panel === undefined}
+          class="flex min-h-0 flex-1 flex-col"
+        >
+          {props.children}
+        </div>
       </aside>
     </>
   );
