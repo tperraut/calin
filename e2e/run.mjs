@@ -434,6 +434,61 @@ try {
   check("running it now starts a session and records the run", runs.length === 1 && runs[0].outcome === "started" && runs[0].cause === "manual");
   check("the M6 console is clean", m6.errors.filter((e) => !/409|400|Failed to load resource/.test(e)).length === 0, JSON.stringify(m6.errors).slice(0, 300));
 
+  // ---- Orchestration, with the mock following directives in the prompt.
+  const demo = await api("POST", "/sessions", {
+    prompt: "Ship the health check demo: orchestrate demo: note",
+    permission_mode: "autonomous",
+    repos: [],
+  });
+  const leadId = demo.body.session.id;
+  let tree = [];
+  for (let i = 0; i < 80; i++) {
+    tree = (await api("GET", "/sessions")).body.filter((x) => x.root_session_id === leadId);
+    if (tree.length === 3 && tree.every((x) => x.status === "review")) break;
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  check(
+    "a lead dispatches two child sessions and all three come to rest",
+    tree.length === 3 && tree.every((x) => x.status === "review"),
+    JSON.stringify(tree.map((x) => [x.title, x.status])),
+  );
+  const demoGraph = (await api("GET", `/sessions/${leadId}/graph`)).body;
+  const kinds = (kind) => demoGraph.edges.filter((e) => e.kind === kind).length;
+  check(
+    "the graph has both dispatches, both reports and the notes",
+    kinds("dispatched") === 2 && kinds("report") === 2 && kinds("message") >= 2,
+    JSON.stringify(demoGraph.edges.map((e) => [e.kind, e.count])),
+  );
+  const orch = await open(DESKTOP, "orchestration");
+  current = orch;
+  page = orch.page;
+  await page.goto(`${base}/s/${leadId}/graph`);
+  await page.waitForSelector('[aria-label="Session graph"]', { timeout: 15000 });
+  await page.waitForFunction(
+    () => /part B/.test(document.querySelector('[aria-label="Session graph"]')?.textContent ?? ""),
+    null,
+    { timeout: 15000 },
+  );
+  check("the session list nests the children under the lead", (await page.locator("a[href^='/s/']").allInnerTexts()).some((t) => /part A/.test(t)));
+  await page.waitForTimeout(800);
+  await orch.shot("graph");
+  await page.getByRole("group", { name: "View" }).getByRole("button", { name: "Timeline" }).click();
+  await page.waitForTimeout(600);
+  await orch.shot("timeline");
+
+  // A question from the agent, answered in the page.
+  const asking = await api("POST", "/sessions", { prompt: "Which database? demo: ask", permission_mode: "autonomous", repos: [] });
+  await page.goto(`${base}/s/${asking.body.session.id}`);
+  const question = page.getByRole("region", { name: "Question from the agent" });
+  await question.waitFor({ timeout: 20000 });
+  check("a question parks the session", (await page.textContent("body")).includes("Waiting"));
+  await orch.shot("question");
+  await question.getByRole("group", { name: "Suggested answers" }).getByRole("button").first().click();
+  await orch.bodyHas("You answered", 20000);
+  await orch.bodyHas("Review", 20000);
+  check("the answer reaches the agent and the session moves on", true);
+  check("the orchestration console is clean", orch.errors.length === 0, JSON.stringify(orch.errors).slice(0, 300));
+
   failed = env.results.some((result) => !result.ok);
 } catch (error) {
   console.log(`FAIL  the run broke: ${error.message.split("\n")[0]}`);

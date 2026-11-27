@@ -115,9 +115,10 @@ Known gaps carried forward from M2:
 
 Known gaps carried forward from M3:
 
-- The mock runner cannot dispatch, send notes or ask, so `make e2e` covers subagents but not
-  child sessions, notes or questions. Those are covered by core tests and one real run.
-- On a busy session the note, report and change edges are wide arcs that tangle beside the tree.
+- Graph edges now run in lanes beside the tree and never through a card (2026-11-28). On a
+  busy session about ten lines still meet at the lead's side with overlapping arrowheads, the
+  column layout's corridor between the lead and its children is crowded, and count labels can
+  sit far from both cards.
 - A child that is stopped, or failed by a server restart, sends no report: its parent is not told.
 - Nothing has run on a real phone; the graph's frame rates were measured in a headless browser.
 - A stopped or failed turn is not scanned for shell-made changes.
@@ -204,6 +205,15 @@ Known gaps carried forward from M6:
 - Cron: five fields only, no `@daily`, seconds or `L W # ?`.
 - A repo set always adds its repos as worktrees.
 - Cost is what the agent CLI reports; on a subscription it is an estimate, and the page says so.
+
+## After M6 (2026-11-28)
+
+- [x] The mock runner follows `demo: orchestrate`, `demo: note` and `demo: ask` in a prompt and
+      uses the real tool endpoint, so a dry run shows a full orchestration tree
+- [x] `make e2e` covers child sessions, reports, notes and a question answered in the page
+      (54 + 14 checks)
+- [x] Graph edges routed in lanes
+- [x] A repo attached read-only stays read-only; usage days follow the server's
 
 ## What is left
 
