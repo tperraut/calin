@@ -8,14 +8,18 @@ use std::io::{BufRead, BufReader, ErrorKind, Seek, SeekFrom, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use calin_proto::{AttachRepoRequest, Event, EventBody, Session, SessionDetail, SessionStatus};
+use calin_proto::{
+    AttachRepoRequest, Event, EventBody, Graph, Session, SessionDetail, SessionStatus, Timeline,
+};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use ulid::Ulid;
 
 use super::index::{self, Indexed};
-use super::{EventDraft, NewSession, OpenPermission, SessionSetup, log};
+use super::{
+    Dispatch, EventDraft, NewSession, OpenPermission, OpenQuestion, SessionSetup, log, views,
+};
 use crate::error::{Error, Result};
 use crate::home::Home;
 use crate::title::default_title;
@@ -84,6 +88,24 @@ pub(super) enum Cmd {
         url_prefix: String,
         reply: Reply<u32>,
     },
+    QuestionAnswered {
+        session_id: String,
+        question_id: String,
+        reply: Reply<Option<bool>>,
+    },
+    OpenQuestions {
+        session_id: Option<String>,
+        reply: Reply<Vec<OpenQuestion>>,
+    },
+    Graph {
+        session_id: String,
+        at: Option<i64>,
+        reply: Reply<Graph>,
+    },
+    Timeline {
+        session_id: String,
+        reply: Reply<Timeline>,
+    },
     /// Sent by the store's timer when a delayed upsert is due.
     FlushUpserts,
     Close {
@@ -138,6 +160,8 @@ struct Meta {
     model: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     repos: Vec<AttachRepoRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dispatch: Option<Dispatch>,
 }
 
 pub(super) struct Writer {
@@ -237,6 +261,34 @@ impl Writer {
                         &url_prefix,
                     ));
                 }
+                Cmd::QuestionAnswered {
+                    session_id,
+                    question_id,
+                    reply,
+                } => {
+                    let _ = reply.send(index::question_answered(
+                        &self.db,
+                        &session_id,
+                        &question_id,
+                    ));
+                }
+                Cmd::OpenQuestions { session_id, reply } => {
+                    let _ = reply.send(index::open_questions(&self.db, session_id.as_deref()));
+                }
+                Cmd::Graph {
+                    session_id,
+                    at,
+                    reply,
+                } => {
+                    let graph = views::graph(&self.db, &session_id, at)
+                        .and_then(|graph| graph.ok_or(Error::NotFound(session_id)));
+                    let _ = reply.send(graph);
+                }
+                Cmd::Timeline { session_id, reply } => {
+                    let timeline = views::timeline(&self.db, &session_id)
+                        .and_then(|timeline| timeline.ok_or(Error::NotFound(session_id)));
+                    let _ = reply.send(timeline);
+                }
                 Cmd::FlushUpserts => self.flush_upserts(),
                 Cmd::Close { reply } => {
                     // Closing the connection first checkpoints the WAL before the caller moves on.
@@ -259,8 +311,14 @@ impl Writer {
             runner: new.runner,
             permission_mode: new.permission_mode,
             branch: None,
-            parent_session_id: None,
-            root_session_id: id.clone(),
+            parent_session_id: new
+                .dispatch
+                .as_ref()
+                .map(|dispatch| dispatch.parent_session_id.clone()),
+            root_session_id: match &new.dispatch {
+                Some(dispatch) => dispatch.root_session_id.clone(),
+                None => id.clone(),
+            },
             head_seq: 0,
             created_at: now,
             updated_at: now,
@@ -269,6 +327,7 @@ impl Writer {
             session,
             model: new.model,
             repos: new.repos,
+            dispatch: new.dispatch,
         };
         // Disk before index, like events: a reindex must be able to find the session.
         std::fs::create_dir_all(self.home.session_dir(&id))?;
@@ -459,6 +518,7 @@ impl Writer {
             Some(meta) => SessionSetup {
                 model: meta.model,
                 repos: meta.repos,
+                dispatch: meta.dispatch,
             },
             None => SessionSetup::default(),
         })

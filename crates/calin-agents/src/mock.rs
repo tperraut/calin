@@ -14,7 +14,7 @@ use tokio::sync::mpsc::error::TryRecvError;
 
 use crate::runner::{
     AgentHandle, AgentIo, Exit, PermissionAsk, Runner, RunnerError, RunnerInput, RunnerOutput,
-    StartParams, ToolAccess,
+    StartParams, SubagentStart, ToolAccess,
 };
 
 pub const MOCK_RUNNER_ID: &str = "mock";
@@ -24,6 +24,11 @@ const MOCK_MODEL: &str = "mock-1";
 /// The file the scripted edit appends to, relative to the working directory.
 /// A real file, so a dry run has something to show as a change and a diff.
 const EDITED_FILE: &str = "calin-mock-notes.md";
+
+/// The scripted subagent: its type and what it is asked to do.
+const SUBAGENT_ROLE: &str = "explorer";
+const SUBAGENT_TASK: &str = "Read the project notes";
+const SUBAGENT_PROMPT: &str = "Read calin-mock-notes.md and say what it holds.";
 
 const DEFAULT_DELAY: Duration = Duration::from_millis(40);
 
@@ -72,6 +77,14 @@ impl Runner for MockRunner {
 
     fn start(&self, params: StartParams) -> Result<AgentHandle, RunnerError> {
         let (handle, io) = AgentHandle::channel();
+        self.spawn(params, io);
+        Ok(handle)
+    }
+}
+
+impl MockRunner {
+    /// Runs the scripted agent on `io`, the runner's end of a handle.
+    fn spawn(&self, params: StartParams, io: AgentIo) {
         let native_session = params
             .resume
             .unwrap_or_else(|| format!("mock-{}", params.agent_id));
@@ -85,10 +98,11 @@ impl Runner for MockRunner {
             items: 0,
             turns: 0,
             open: None,
+            inside: None,
+            calling: None,
             queued: VecDeque::new(),
         };
         tokio::spawn(agent.run(native_session, params.prompt));
-        Ok(handle)
     }
 }
 
@@ -113,6 +127,11 @@ struct MockAgent {
     turns: u64,
     /// The item being streamed, as far as it got. Completed when the turn is cut short.
     open: Option<Item>,
+    /// The key of the subagent that is at work: what is emitted is its own.
+    inside: Option<String>,
+    /// The item of the call that runs that subagent. It stays open, and the
+    /// agent's own, until the subagent has ended.
+    calling: Option<Item>,
     /// Messages that arrived mid-turn; each starts a turn of its own.
     queued: VecDeque<String>,
 }
@@ -129,7 +148,7 @@ impl MockAgent {
         let mut next = Some(prompt);
         while let Some(text) = next.take() {
             let cut = self.turn(&text).await.err();
-            if matches!(cut, Some(Cut::Detached)) || !self.close_open_item().await {
+            if matches!(cut, Some(Cut::Detached)) || !self.close_open_items().await {
                 return;
             }
             if matches!(cut, Some(Cut::Stopped)) {
@@ -158,8 +177,25 @@ impl MockAgent {
         }
     }
 
-    /// Completes the item a cut turn left running: a tool call as failed,
-    /// prose with what was written. False when nobody is listening.
+    /// Completes what a cut turn left running: a tool call as failed, prose
+    /// with what was written. A subagent that was at work ends, cut short,
+    /// between its own item and the call that ran it. False when nobody is
+    /// listening.
+    async fn close_open_items(&mut self) -> bool {
+        if !self.close_open_item().await {
+            return false;
+        }
+        let Some(key) = self.inside.take() else {
+            return true;
+        };
+        let ended = RunnerOutput::SubagentEnded { key, ok: false };
+        if self.io.outputs.send(ended).await.is_err() {
+            return false;
+        }
+        self.open = self.calling.take();
+        self.close_open_item().await
+    }
+
     async fn close_open_item(&mut self) -> bool {
         let Some(mut item) = self.open.take() else {
             return true;
@@ -168,7 +204,7 @@ impl MockAgent {
             ItemContent::Tool { .. } => ItemStatus::Failed,
             ItemContent::Text { .. } | ItemContent::Reasoning { .. } => ItemStatus::Completed,
         };
-        let completed = RunnerOutput::Event(EventBody::ItemCompleted { item });
+        let completed = self.attributed(EventBody::ItemCompleted { item });
         self.io.outputs.send(completed).await.is_ok()
     }
 
@@ -220,6 +256,8 @@ impl MockAgent {
             .iter()
             .map(|path| path.to_string_lossy().into_owned())
             .collect();
+        self.subagent(locations.clone()).await?;
+
         let note = format!("- turn {}: {quote}\n", self.turns);
         self.tool(
             "Edit",
@@ -256,6 +294,70 @@ impl MockAgent {
             tokens_out: 350 * self.turns,
         })
         .await
+    }
+
+    /// A subagent that reads the notes file and says what it holds: a call
+    /// of the agent's own, and inside it a tool call and some text that are
+    /// the subagent's. It never asks: reading needs no permission.
+    async fn subagent(&mut self, locations: Vec<String>) -> Result<(), Cut> {
+        let key = self.next_item_id();
+        self.start_item(Item {
+            id: key.clone(),
+            status: ItemStatus::Running,
+            content: ItemContent::Tool {
+                name: "Agent".to_owned(),
+                tool_kind: ToolKind::Task,
+                title: SUBAGENT_TASK.to_owned(),
+                input: json!({
+                    "description": SUBAGENT_TASK,
+                    "subagent_type": SUBAGENT_ROLE,
+                    "prompt": SUBAGENT_PROMPT,
+                }),
+                output: None,
+                locations: Vec::new(),
+            },
+        })
+        .await?;
+        self.pause().await?;
+        self.send(RunnerOutput::SubagentStarted(SubagentStart {
+            key: key.clone(),
+            parent: None,
+            role: SUBAGENT_ROLE.to_owned(),
+            description: SUBAGENT_TASK.to_owned(),
+            item_id: Some(key.clone()),
+        }))
+        .await?;
+        self.calling = self.open.take();
+        self.inside = Some(key.clone());
+
+        let notes = self.turns - 1;
+        let found = format!("{notes} notes from earlier turns\n");
+        self.tool(
+            "Read",
+            ToolKind::Read,
+            EDITED_FILE,
+            json!({ "file_path": EDITED_FILE }),
+            locations,
+            &[&found],
+            None,
+        )
+        .await?;
+        self.streamed(
+            Prose::Text,
+            &["The notes file holds ", "one line ", "per earlier turn."],
+        )
+        .await?;
+
+        self.pause().await?;
+        self.send(RunnerOutput::SubagentEnded { key, ok: true })
+            .await?;
+        self.inside = None;
+        self.open = self.calling.take();
+        self.delta(ItemDelta::Output {
+            text: format!("The notes file holds {notes} lines.\n"),
+        })
+        .await?;
+        self.complete_item(ItemStatus::Completed).await
     }
 
     /// A text or reasoning item streamed chunk by chunk.
@@ -319,6 +421,7 @@ impl MockAgent {
                     item_id: Some(id),
                 },
                 access,
+                subagent: self.inside.clone(),
             };
             if let (PermissionDecision::Deny, message) = self.ask(request).await? {
                 if let Some(Item {
@@ -374,11 +477,7 @@ impl MockAgent {
         request: PermissionAsk,
     ) -> Result<(PermissionDecision, Option<String>), Cut> {
         let id = request.request.id.clone();
-        self.io
-            .outputs
-            .send(RunnerOutput::PermissionRequest(request))
-            .await
-            .map_err(|_| Cut::Detached)?;
+        self.send(RunnerOutput::PermissionRequest(request)).await?;
         loop {
             match self.io.inputs.recv().await.ok_or(Cut::Detached)? {
                 // The mock has no notion of directories: grants are ignored.
@@ -455,9 +554,25 @@ impl MockAgent {
 
     async fn emit(&mut self, body: EventBody) -> Result<(), Cut> {
         self.pause().await?;
+        let output = self.attributed(body);
+        self.send(output).await
+    }
+
+    /// An event of the subagent that is at work, or of the agent itself.
+    fn attributed(&self, body: EventBody) -> RunnerOutput {
+        match &self.inside {
+            Some(key) => RunnerOutput::SubagentEvent {
+                key: key.clone(),
+                body,
+            },
+            None => RunnerOutput::Event(body),
+        }
+    }
+
+    async fn send(&mut self, output: RunnerOutput) -> Result<(), Cut> {
         self.io
             .outputs
-            .send(RunnerOutput::Event(body))
+            .send(output)
             .await
             .map_err(|_| Cut::Detached)
     }
@@ -634,7 +749,10 @@ mod tests {
 
     /// One turn, with every permission request answered by `answer`.
     struct Turn {
+        /// Every event of the turn, the subagent's among the agent's own.
         events: Vec<EventBody>,
+        /// The same events with whose they are, and the subagent's start and end.
+        outputs: Vec<RunnerOutput>,
         requests: Vec<PermissionRequest>,
         /// What each request said it reaches for, in the order of `requests`.
         access: Vec<ToolAccess>,
@@ -646,13 +764,32 @@ mod tests {
     ) -> Turn {
         let mut turn = Turn {
             events: Vec::new(),
+            outputs: Vec::new(),
             requests: Vec::new(),
             access: Vec::new(),
         };
         loop {
             match next(handle).await {
-                Some(RunnerOutput::Event(body)) => turn.events.push(body),
-                Some(RunnerOutput::PermissionRequest(PermissionAsk { request, access })) => {
+                Some(RunnerOutput::Event(body)) => {
+                    turn.outputs.push(RunnerOutput::Event(body.clone()));
+                    turn.events.push(body);
+                }
+                Some(RunnerOutput::SubagentEvent { key, body }) => {
+                    let body = body.clone();
+                    turn.events.push(body.clone());
+                    turn.outputs.push(RunnerOutput::SubagentEvent { key, body });
+                }
+                Some(
+                    output
+                    @ (RunnerOutput::SubagentStarted(_) | RunnerOutput::SubagentEnded { .. }),
+                ) => turn.outputs.push(output),
+                Some(RunnerOutput::PermissionRequest(PermissionAsk {
+                    request,
+                    access,
+                    subagent,
+                })) => {
+                    // The scripted subagent only reads, which never asks.
+                    assert_eq!(subagent, None);
                     turn.access.push(access);
                     let (decision, message) = answer(&request);
                     handle
@@ -722,6 +859,49 @@ mod tests {
         completed
     }
 
+    /// Who did what, one short line per output: item starts and ends
+    /// (prefixed with the subagent's key when they are its own) and the
+    /// subagent's start (`+`) and end (`-`). Also checks that what carries
+    /// a key lies between that subagent's start and its end.
+    fn trace(outputs: &[RunnerOutput]) -> Vec<String> {
+        let line = |body: &EventBody| match body {
+            EventBody::ItemStarted { item } => Some(format!("start {}", item.id)),
+            EventBody::ItemCompleted { item } => {
+                let status = format!("{:?}", item.status).to_lowercase();
+                Some(format!("{status} {}", item.id))
+            }
+            _ => None,
+        };
+        let mut running: Option<String> = None;
+        let mut lines = Vec::new();
+        for output in outputs {
+            match output {
+                RunnerOutput::Event(body) => lines.extend(line(body)),
+                RunnerOutput::SubagentEvent { key, body } => {
+                    assert_eq!(running.as_ref(), Some(key), "{key} is not running");
+                    lines.extend(line(body).map(|line| format!("{key}: {line}")));
+                }
+                RunnerOutput::SubagentStarted(start) => {
+                    assert_eq!(running, None, "one subagent at a time");
+                    assert_eq!(start.parent, None);
+                    assert_eq!(start.item_id.as_ref(), Some(&start.key));
+                    assert_eq!(start.role, SUBAGENT_ROLE);
+                    assert_eq!(start.description, SUBAGENT_TASK);
+                    running = Some(start.key.clone());
+                    lines.push(format!("+{}", start.key));
+                }
+                RunnerOutput::SubagentEnded { key, ok } => {
+                    assert_eq!(running.take().as_ref(), Some(key), "{key} is not running");
+                    lines.push(format!("-{key} {}", if *ok { "ok" } else { "cut" }));
+                }
+                other => panic!("not part of a turn's work: {other:?}"),
+            }
+        }
+        assert_eq!(running, None, "a subagent never ended");
+        lines
+    }
+
+    /// The tool calls of the agent and of its subagent, in the order they ended.
     fn tool_items(items: &[Item]) -> Vec<(ToolKind, ItemStatus)> {
         items
             .iter()
@@ -771,10 +951,31 @@ mod tests {
                     tool_kind: ToolKind::Edit,
                     ..
                 } => "edit",
+                ItemContent::Tool {
+                    tool_kind: ToolKind::Read,
+                    ..
+                } => "read",
+                ItemContent::Tool {
+                    tool_kind: ToolKind::Task,
+                    ..
+                } => "task",
                 ItemContent::Tool { .. } => "tool",
             })
             .collect();
-        assert_eq!(kinds, ["reasoning", "text", "execute", "edit", "text"]);
+        // In the order they ended: the subagent's read and text end inside its call.
+        assert_eq!(
+            kinds,
+            [
+                "reasoning",
+                "text",
+                "execute",
+                "read",
+                "text",
+                "task",
+                "edit",
+                "text"
+            ]
+        );
 
         let text_deltas = events
             .iter()
@@ -831,7 +1032,11 @@ mod tests {
             })
             .collect();
         let edited = handle.notes_path().to_string_lossy().into_owned();
-        assert_eq!(locations, [&vec![], &vec![edited]]);
+        // The command, the subagent's read, the call that ran it, the edit.
+        assert_eq!(
+            locations,
+            [&vec![], &vec![edited.clone()], &vec![], &vec![edited]]
+        );
         assert_eq!(handle.notes().as_deref(), Some("- turn 1: edit\n"));
 
         // Each turn appends its own line.
@@ -855,7 +1060,9 @@ mod tests {
             tool_items(&check_turn(&turn.events)),
             [
                 (ToolKind::Execute, ItemStatus::Completed),
-                (ToolKind::Edit, ItemStatus::Declined)
+                (ToolKind::Read, ItemStatus::Completed),
+                (ToolKind::Task, ItemStatus::Completed),
+                (ToolKind::Edit, ItemStatus::Declined),
             ]
         );
         assert_eq!(handle.notes(), None);
@@ -872,10 +1079,12 @@ mod tests {
             tool_items(&items),
             [
                 (ToolKind::Execute, ItemStatus::Completed),
-                (ToolKind::Edit, ItemStatus::Failed)
+                (ToolKind::Read, ItemStatus::Completed),
+                (ToolKind::Task, ItemStatus::Completed),
+                (ToolKind::Edit, ItemStatus::Failed),
             ]
         );
-        assert_eq!(items.len(), 5);
+        assert_eq!(items.len(), 8);
     }
 
     #[tokio::test]
@@ -893,7 +1102,9 @@ mod tests {
             tool_items(&items),
             [
                 (ToolKind::Execute, ItemStatus::Completed),
-                (ToolKind::Edit, ItemStatus::Completed)
+                (ToolKind::Read, ItemStatus::Completed),
+                (ToolKind::Task, ItemStatus::Completed),
+                (ToolKind::Edit, ItemStatus::Completed),
             ]
         );
         assert!(items.iter().all(|item| !matches!(
@@ -942,7 +1153,7 @@ mod tests {
         for item in check_turn(&first).iter().chain(&check_turn(&second)) {
             assert!(ids.insert(item.id.clone()), "duplicate item id {}", item.id);
         }
-        assert_eq!(ids.len(), 10);
+        assert_eq!(ids.len(), 16);
 
         let (cost_1, in_1, out_1) = usage(&first);
         let (cost_2, in_2, out_2) = usage(&second);
@@ -986,10 +1197,20 @@ mod tests {
                 (ToolKind::Edit, "calin-mock-notes.md")
             ]
         );
-        // Each request points at its tool item, and its id is its own.
+        // Each request points at its tool item, and its id is its own. The
+        // subagent's call and its read are the two calls nobody asks about.
+        let asks = |item: &&Item| {
+            matches!(
+                item.content,
+                ItemContent::Tool {
+                    tool_kind: ToolKind::Execute | ToolKind::Edit,
+                    ..
+                }
+            )
+        };
         let tool_ids: Vec<Option<String>> = items
             .iter()
-            .filter(|item| matches!(item.content, ItemContent::Tool { .. }))
+            .filter(asks)
             .map(|item| Some(item.id.clone()))
             .collect();
         let pointed: Vec<Option<String>> =
@@ -1032,7 +1253,9 @@ mod tests {
             tool_items(&check_turn(&turn.events)),
             [
                 (ToolKind::Execute, ItemStatus::Completed),
-                (ToolKind::Edit, ItemStatus::Completed)
+                (ToolKind::Read, ItemStatus::Completed),
+                (ToolKind::Task, ItemStatus::Completed),
+                (ToolKind::Edit, ItemStatus::Completed),
             ]
         );
     }
@@ -1050,7 +1273,9 @@ mod tests {
             tool_items(&items),
             [
                 (ToolKind::Execute, ItemStatus::Declined),
-                (ToolKind::Edit, ItemStatus::Completed)
+                (ToolKind::Read, ItemStatus::Completed),
+                (ToolKind::Task, ItemStatus::Completed),
+                (ToolKind::Edit, ItemStatus::Completed),
             ]
         );
         let declined = items
@@ -1065,9 +1290,9 @@ mod tests {
         assert!(!turn.events.iter().any(|body| matches!(
             body,
             EventBody::ItemDelta {
+                item_id,
                 delta: ItemDelta::Output { .. },
-                ..
-            }
+            } if *item_id == declined.id
         )));
         assert!(matches!(
             &items.last().unwrap().content,
@@ -1135,7 +1360,7 @@ mod tests {
         handle.send_message("second").unwrap();
         let second = run_turn(&mut handle, allow).await;
         let items = check_turn(&second.events);
-        assert_eq!(items.len(), 5);
+        assert_eq!(items.len(), 8);
         assert!(
             items
                 .iter()
@@ -1216,6 +1441,218 @@ mod tests {
             next(&mut handle).await,
             Some(RunnerOutput::Exited(Exit::Ok))
         );
+    }
+
+    #[tokio::test]
+    async fn the_subagent_works_inside_the_call_that_started_it() {
+        let mut handle = start(Duration::ZERO, "delegate");
+        let turn = run_turn(&mut handle, allow).await;
+        // Items are numbered in the order they start: 1 and 2 are the
+        // opening prose, 3 the command, 4 the call that runs the subagent.
+        assert_eq!(
+            trace(&turn.outputs),
+            [
+                "start mock-3-1",
+                "completed mock-3-1",
+                "start mock-3-2",
+                "completed mock-3-2",
+                "start mock-3-3",
+                "completed mock-3-3",
+                "start mock-3-4",
+                "+mock-3-4",
+                "mock-3-4: start mock-3-5",
+                "mock-3-4: completed mock-3-5",
+                "mock-3-4: start mock-3-6",
+                "mock-3-4: completed mock-3-6",
+                "-mock-3-4 ok",
+                "completed mock-3-4",
+                "start mock-3-7",
+                "completed mock-3-7",
+                "start mock-3-8",
+                "completed mock-3-8",
+            ]
+        );
+        let items = check_turn(&turn.events);
+        let call = items.iter().find(|item| item.id == "mock-3-4").unwrap();
+        assert_eq!(
+            call.content,
+            ItemContent::Tool {
+                name: "Agent".into(),
+                tool_kind: ToolKind::Task,
+                title: SUBAGENT_TASK.into(),
+                input: json!({
+                    "description": SUBAGENT_TASK,
+                    "subagent_type": SUBAGENT_ROLE,
+                    "prompt": SUBAGENT_PROMPT,
+                }),
+                output: Some("The notes file holds 0 lines.\n".into()),
+                locations: vec![],
+            }
+        );
+        // Totals are the agent's: the subagent reports none.
+        assert!(!turn.outputs.iter().any(|output| matches!(
+            output,
+            RunnerOutput::SubagentEvent {
+                body: EventBody::Usage { .. } | EventBody::PlanUpdated { .. },
+                ..
+            }
+        )));
+
+        // The next turn's subagent is another one, and finds the first note.
+        handle.send_message("again").unwrap();
+        let second = run_turn(&mut handle, allow).await;
+        let lines = trace(&second.outputs);
+        assert!(lines.contains(&"+mock-3-12".to_owned()), "{lines:?}");
+        assert!(second.events.iter().any(|body| matches!(
+            body,
+            EventBody::ItemCompleted { item } if matches!(
+                &item.content,
+                ItemContent::Tool { name, output: Some(output), .. }
+                    if name == "Read" && output == "1 notes from earlier turns\n"
+            )
+        )));
+    }
+
+    /// An agent on a channel that holds one output: it cannot run more than
+    /// two outputs ahead of the test, so an input sent on seeing the
+    /// subagent start reaches it while the subagent is still at work.
+    struct Narrow {
+        outputs: tokio::sync::mpsc::Receiver<RunnerOutput>,
+        inputs: tokio::sync::mpsc::UnboundedSender<RunnerInput>,
+        _dir: tempfile::TempDir,
+    }
+
+    impl Narrow {
+        fn start(prompt: &str) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let (outputs_tx, outputs) = tokio::sync::mpsc::channel(1);
+            let (inputs, inputs_rx) = tokio::sync::mpsc::unbounded_channel();
+            let io = AgentIo {
+                outputs: outputs_tx,
+                inputs: inputs_rx,
+            };
+            let params = StartParams {
+                prompt: prompt.into(),
+                cwd: dir.path().to_owned(),
+                permission_mode: PermissionMode::Autonomous,
+                start_seq: 3,
+                ..StartParams::default()
+            };
+            MockRunner::new(MockConfig {
+                delay: Duration::ZERO,
+            })
+            .spawn(params, io);
+            Self {
+                outputs,
+                inputs,
+                _dir: dir,
+            }
+        }
+
+        async fn next(&mut self) -> Option<RunnerOutput> {
+            tokio::time::timeout(TIMEOUT, self.outputs.recv())
+                .await
+                .expect("the mock agent went quiet")
+        }
+
+        /// The turn's outputs up to the start of the subagent, then `input`
+        /// is sent, then the rest up to `last`, which is left out.
+        async fn cut_in_the_subagent(
+            &mut self,
+            input: RunnerInput,
+            last: RunnerOutput,
+        ) -> Vec<RunnerOutput> {
+            let mut outputs = Vec::new();
+            let mut sent = Some(input);
+            loop {
+                let output = self.next().await.expect("the agent ended early");
+                if output == last {
+                    return outputs;
+                }
+                let started = matches!(output, RunnerOutput::SubagentStarted(_));
+                if !matches!(output, RunnerOutput::NativeSession { .. }) {
+                    outputs.push(output);
+                }
+                if started && let Some(input) = sent.take() {
+                    self.inputs.send(input).unwrap();
+                }
+            }
+        }
+    }
+
+    /// What a turn cut inside the subagent must look like, whichever of the
+    /// subagent's first outputs the cut came after.
+    fn check_cut_subagent(outputs: &[RunnerOutput]) {
+        let lines = trace(outputs);
+        let from_call = lines
+            .iter()
+            .position(|line| line == "start mock-3-4")
+            .unwrap();
+        let tail: Vec<&str> = lines[from_call..].iter().map(String::as_str).collect();
+        let cut_before_the_read = ["start mock-3-4", "+mock-3-4", "-mock-3-4 cut"];
+        let cut_in_the_read = [
+            "start mock-3-4",
+            "+mock-3-4",
+            "mock-3-4: start mock-3-5",
+            "mock-3-4: failed mock-3-5",
+            "-mock-3-4 cut",
+        ];
+        let subagent = &tail[..tail.len() - 1];
+        assert!(
+            subagent == cut_before_the_read || subagent == cut_in_the_read,
+            "{tail:?}"
+        );
+        // The call that ran it fails last, and is the agent's own.
+        assert_eq!(tail.last(), Some(&"failed mock-3-4"));
+        let events: Vec<EventBody> = outputs
+            .iter()
+            .filter_map(|output| match output {
+                RunnerOutput::Event(body) | RunnerOutput::SubagentEvent { body, .. } => {
+                    Some(body.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        check_turn(&events);
+    }
+
+    #[tokio::test]
+    async fn an_interrupt_inside_the_subagent_ends_it_then_its_call_then_the_turn() {
+        let mut agent = Narrow::start("first");
+        let outputs = agent
+            .cut_in_the_subagent(RunnerInput::Interrupt, RunnerOutput::TurnEnded)
+            .await;
+        check_cut_subagent(&outputs);
+
+        // The agent lives on: the next turn runs its subagent to the end.
+        agent
+            .inputs
+            .send(RunnerInput::UserMessage("second".into()))
+            .unwrap();
+        let mut second = Vec::new();
+        loop {
+            match agent.next().await {
+                Some(RunnerOutput::TurnEnded) => break,
+                Some(output) => second.push(output),
+                None => panic!("the agent ended early"),
+            }
+        }
+        let lines = trace(&second);
+        // The cut turn used the ids up to 4 or 5.
+        let ended = lines.iter().filter(|line| line.ends_with(" ok")).count();
+        assert_eq!(ended, 1, "{lines:?}");
+        assert!(!lines.iter().any(|line| line.contains("failed")));
+    }
+
+    #[tokio::test]
+    async fn a_stop_inside_the_subagent_ends_it_then_its_call_then_the_agent() {
+        let mut agent = Narrow::start("stop me");
+        let outputs = agent
+            .cut_in_the_subagent(RunnerInput::Stop, RunnerOutput::Exited(Exit::Ok))
+            .await;
+        check_cut_subagent(&outputs);
+        // No `TurnEnded` on the way out, and nothing after the exit.
+        assert_eq!(agent.next().await, None);
     }
 
     #[test]

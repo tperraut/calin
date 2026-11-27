@@ -1,0 +1,9 @@
+{
+  "files": {
+    "notes.txt": "Calin fixture note.\nSecond line.\n",
+    "todo.txt": "Buy milk.\nCall the plumber.\n"
+  },
+  "turns": [
+    "Start two subagents in parallel, both in a single message, with the Agent tool (general-purpose type). The first one's prompt: 'Read the file notes.txt in the current directory and reply with its first line only.' The second one's prompt: 'Read the file todo.txt in the current directory and reply with its first line only.' Then tell me in one short sentence what each answered."
+  ]
+}

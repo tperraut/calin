@@ -589,7 +589,7 @@ impl Runner for Capture {
     }
 }
 
-type Starts = mpsc::UnboundedReceiver<(StartParams, AgentIo)>;
+pub(super) type Starts = mpsc::UnboundedReceiver<(StartParams, AgentIo)>;
 
 async fn capturing_state(dir: &TempDir) -> (AppState, Starts) {
     let store = Store::open(Home::new(dir.path())).await.unwrap();
@@ -609,20 +609,78 @@ async fn capturing_state(dir: &TempDir) -> (AppState, Starts) {
 
 /// A session whose agent the test plays, with `api` attached, and the
 /// agent's tool endpoint as a path of the router.
-struct Agent {
-    app: Router,
-    state: AppState,
-    session_id: String,
-    agent_id: String,
+pub(super) struct Agent {
+    pub(super) app: Router,
+    pub(super) state: AppState,
+    pub(super) session_id: String,
+    pub(super) agent_id: String,
     /// `/api/v1/mcp/<token>`.
-    endpoint: String,
-    params: StartParams,
-    io: AgentIo,
+    pub(super) endpoint: String,
+    pub(super) params: StartParams,
+    pub(super) io: AgentIo,
     web: Repo,
+    /// The agents started after this one: those of the sessions it dispatches.
+    pub(super) starts: Starts,
     _dirs: (TempDir, TempDir),
 }
 
-async fn agent() -> Agent {
+/// The path of the tool endpoint an agent was started with.
+pub(super) fn endpoint_of(params: &StartParams) -> String {
+    let url = params
+        .tool_endpoint
+        .clone()
+        .expect("the agent has a tool endpoint");
+    let endpoint = url
+        .strip_prefix(&format!("http://{LOCAL}"))
+        .unwrap()
+        .to_owned();
+    assert!(endpoint.starts_with("/api/v1/mcp/"), "{endpoint}");
+    endpoint
+}
+
+/// One JSON-RPC request to a tool endpoint; the response's body.
+pub(super) async fn rpc(
+    app: &Router,
+    endpoint: &str,
+    id: Value,
+    method: &str,
+    params: Value,
+) -> Value {
+    let body = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+    let reply = post(app, endpoint, body).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    assert_eq!(reply.content_type(), "application/json");
+    let answer: Value = reply.json();
+    assert_eq!(answer["jsonrpc"], "2.0");
+    assert_eq!(answer["id"], id);
+    answer
+}
+
+/// Calls a tool at an endpoint; its text and whether it is an error.
+pub(super) async fn call_tool(
+    app: &Router,
+    endpoint: &str,
+    name: &str,
+    arguments: Value,
+) -> (String, bool) {
+    let params = json!({
+        "name": name, "arguments": arguments,
+        // What a real client adds; nothing here depends on it.
+        "_meta": { "progressToken": 7 },
+    });
+    let answer = rpc(app, endpoint, json!(3), "tools/call", params).await;
+    let result = &answer["result"];
+    assert!(answer.get("error").is_none(), "{answer}");
+    let content = result["content"].as_array().unwrap();
+    assert_eq!(content.len(), 1);
+    assert_eq!(content[0]["type"], "text");
+    (
+        content[0]["text"].as_str().unwrap().to_owned(),
+        result["isError"].as_bool().unwrap(),
+    )
+}
+
+pub(super) async fn agent() -> Agent {
     let data = TempDir::new().unwrap();
     let clones = TempDir::new().unwrap();
     let (state, mut starts) = capturing_state(&data).await;
@@ -646,15 +704,7 @@ async fn agent() -> Agent {
         .await
         .unwrap()
         .unwrap();
-    let url = params
-        .tool_endpoint
-        .clone()
-        .expect("the agent has a tool endpoint");
-    let endpoint = url
-        .strip_prefix(&format!("http://{LOCAL}"))
-        .unwrap()
-        .to_owned();
-    assert!(endpoint.starts_with("/api/v1/mcp/"), "{endpoint}");
+    let endpoint = endpoint_of(&params);
     let detail = wait_for(&app, &created.session.id, SessionStatus::Running).await;
     Agent {
         app,
@@ -665,40 +715,20 @@ async fn agent() -> Agent {
         params,
         io,
         web,
+        starts,
         _dirs: (data, clones),
     }
 }
 
 impl Agent {
     /// One JSON-RPC request to the agent's endpoint; the response's body.
-    async fn rpc(&self, id: Value, method: &str, params: Value) -> Value {
-        let body = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-        let reply = post(&self.app, &self.endpoint, body).await;
-        assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
-        assert_eq!(reply.content_type(), "application/json");
-        let answer: Value = reply.json();
-        assert_eq!(answer["jsonrpc"], "2.0");
-        assert_eq!(answer["id"], id);
-        answer
+    pub(super) async fn rpc(&self, id: Value, method: &str, params: Value) -> Value {
+        rpc(&self.app, &self.endpoint, id, method, params).await
     }
 
     /// Calls a tool; its text and whether it is an error.
-    async fn tool(&self, name: &str, arguments: Value) -> (String, bool) {
-        let params = json!({
-            "name": name, "arguments": arguments,
-            // What a real client adds; nothing here depends on it.
-            "_meta": { "progressToken": 7 },
-        });
-        let answer = self.rpc(json!(3), "tools/call", params).await;
-        let result = &answer["result"];
-        assert!(answer.get("error").is_none(), "{answer}");
-        let content = result["content"].as_array().unwrap();
-        assert_eq!(content.len(), 1);
-        assert_eq!(content[0]["type"], "text");
-        (
-            content[0]["text"].as_str().unwrap().to_owned(),
-            result["isError"].as_bool().unwrap(),
-        )
+    pub(super) async fn tool(&self, name: &str, arguments: Value) -> (String, bool) {
+        call_tool(&self.app, &self.endpoint, name, arguments).await
     }
 }
 
@@ -780,7 +810,17 @@ async fn the_tool_endpoint_speaks_the_handshake_a_client_expects() {
         .iter()
         .map(|tool| tool["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, ["list_repos", "attach_repo"]);
+    assert_eq!(
+        names,
+        [
+            "list_repos",
+            "attach_repo",
+            "dispatch",
+            "send_message",
+            "report",
+            "ask_user"
+        ]
+    );
     for tool in tools {
         assert!(tool["description"].as_str().unwrap().len() > 40);
         assert_eq!(tool["inputSchema"]["type"], "object");
@@ -804,7 +844,7 @@ async fn the_tool_endpoint_speaks_the_handshake_a_client_expects() {
             .contains("resources/list")
     );
     let no_tool = agent
-        .rpc(json!(5), "tools/call", json!({ "name": "dispatch" }))
+        .rpc(json!(5), "tools/call", json!({ "name": "merge_branch" }))
         .await;
     assert_eq!(no_tool["error"]["code"], -32602);
 

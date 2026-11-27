@@ -99,6 +99,44 @@ pub(crate) fn describe(name: &str, input: &Value, cwd: &Path) -> ToolView {
     }
 }
 
+/// Told about a subagent whose call names no type.
+const DEFAULT_SUBAGENT_ROLE: &str = "subagent";
+
+/// What a call that starts a subagent says about it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SubagentView {
+    /// The subagent's type.
+    pub role: String,
+    /// One line saying what it was asked to do.
+    pub description: String,
+    /// The call returns at once and the subagent keeps running.
+    pub background: bool,
+}
+
+/// The subagent a call of `name` with `input` starts, or `None` when the
+/// tool starts none. `Agent` is the tool of CLI 2.1.332 (recorded in
+/// `subagent`); `Task` is its earlier name.
+pub(crate) fn subagent(name: &str, input: &Value) -> Option<SubagentView> {
+    if !matches!(name, "Task" | "Agent") {
+        return None;
+    }
+    let text = |key: &str| {
+        input
+            .get(key)
+            .and_then(Value::as_str)
+            .map(one_line)
+            .filter(|value| !value.is_empty())
+    };
+    let role = text("subagent_type").unwrap_or_else(|| DEFAULT_SUBAGENT_ROLE.to_owned());
+    Some(SubagentView {
+        description: text("description")
+            .or_else(|| text("prompt"))
+            .unwrap_or_else(|| role.clone()),
+        role,
+        background: input.get("run_in_background").and_then(Value::as_bool) == Some(true),
+    })
+}
+
 /// The plan a `TodoWrite` call carries, or `None` when its input has no list.
 pub(crate) fn plan_entries(input: &Value) -> Option<Vec<PlanEntry>> {
     let todos = input.get("todos")?.as_array()?;
@@ -370,6 +408,47 @@ mod tests {
                 (ToolKind::Task, "Review the diff".into(), vec![])
             );
         }
+    }
+
+    #[test]
+    fn only_the_agent_tools_start_a_subagent() {
+        assert_eq!(subagent("Bash", &json!({ "command": "ls" })), None);
+        assert_eq!(subagent("mcp__calin__dispatch", &json!({})), None);
+        for name in ["Task", "Agent"] {
+            assert_eq!(
+                subagent(
+                    name,
+                    &json!({
+                        "description": "Review the diff\nin detail",
+                        "prompt": "Look at it.",
+                        "subagent_type": "reviewer",
+                        "run_in_background": true,
+                    })
+                ),
+                Some(SubagentView {
+                    role: "reviewer".into(),
+                    description: "Review the diff".into(),
+                    background: true,
+                })
+            );
+        }
+        // Without a description the prompt's first line stands in, then the type.
+        assert_eq!(
+            subagent("Agent", &json!({ "prompt": "\nFind the bug\nthen fix it" })),
+            Some(SubagentView {
+                role: "subagent".into(),
+                description: "Find the bug".into(),
+                background: false,
+            })
+        );
+        assert_eq!(
+            subagent("Agent", &json!({ "subagent_type": " ", "description": "" })),
+            Some(SubagentView {
+                role: "subagent".into(),
+                description: "subagent".into(),
+                background: false,
+            })
+        );
     }
 
     #[test]

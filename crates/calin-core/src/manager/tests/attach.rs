@@ -133,6 +133,7 @@ fn file_ask(id: &str, write: bool, paths: &[String]) -> RunnerOutput {
             paths: paths.iter().map(PathBuf::from).collect(),
             write,
         },
+        subagent: None,
     })
 }
 
@@ -666,6 +667,7 @@ async fn in_accept_edits_the_policy_answers_for_the_sessions_repos_and_opens_eac
             item_id: None,
         },
         access: ToolAccess::Orchestrator,
+        subagent: None,
     };
     emit(&session.io, RunnerOutput::PermissionRequest(own_tool)).await;
     assert_eq!(session.input().await, decision("t1", allow, Vec::new()));

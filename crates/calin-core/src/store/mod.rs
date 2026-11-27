@@ -4,15 +4,20 @@
 
 mod index;
 mod log;
+mod views;
 mod writer;
 
 #[cfg(test)]
 mod tests;
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use calin_proto::{AttachRepoRequest, Event, EventBody, PermissionMode, Session, SessionDetail};
+use calin_proto::{
+    AttachRepoRequest, Event, EventBody, Graph, PermissionMode, Session, SessionDetail, Timeline,
+};
+use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use self::writer::{Cmd, Writer};
@@ -34,6 +39,27 @@ pub struct NewSession {
     pub model: Option<String>,
     /// The repos the request asked for, in order.
     pub repos: Vec<AttachRepoRequest>,
+    /// Set for a child session: who dispatched it, and from where.
+    pub dispatch: Option<Dispatch>,
+}
+
+/// How a child session came to be (the "Child sessions" semantics in
+/// `calin-proto/src/api.rs`). Kept in the child's `session.json`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Dispatch {
+    pub parent_session_id: String,
+    pub root_session_id: String,
+    /// The agent that dispatched the child: its report goes back to it.
+    pub agent_id: String,
+    /// The id of the child's lead agent, fixed before that agent starts so
+    /// that the dispatch message can be addressed to it.
+    pub lead_agent_id: String,
+    /// The `dispatch` message, which the child's reports answer.
+    pub message_id: String,
+    /// By repo id: the commit the child's branch starts at, which is the
+    /// parent's commit in that repo when it dispatched.
+    #[serde(default)]
+    pub start_points: BTreeMap<String, String>,
 }
 
 /// What a session was asked to run with, beyond what [`Session`] carries.
@@ -42,6 +68,18 @@ pub struct NewSession {
 pub struct SessionSetup {
     pub model: Option<String>,
     pub repos: Vec<AttachRepoRequest>,
+    pub dispatch: Option<Dispatch>,
+}
+
+/// A question to the user that nobody answered yet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenQuestion {
+    pub session_id: String,
+    pub question_id: String,
+    /// The agent that asked.
+    pub agent_id: Option<String>,
+    /// The `question_asked` event.
+    pub event_id: String,
 }
 
 /// A permission request nobody answered yet.
@@ -267,6 +305,49 @@ impl Store {
         let session_id = session_id.map(str::to_owned);
         self.call(|reply| Cmd::OpenPermissions { session_id, reply })
             .await
+    }
+
+    /// Whether a question was answered. `None` when the session never asked
+    /// a question with this id.
+    pub async fn question_answered(
+        &self,
+        session_id: &str,
+        question_id: &str,
+    ) -> Result<Option<bool>> {
+        let (session_id, question_id) = (session_id.to_owned(), question_id.to_owned());
+        self.call(|reply| Cmd::QuestionAnswered {
+            session_id,
+            question_id,
+            reply,
+        })
+        .await
+    }
+
+    /// The questions still waiting for an answer, oldest first: those of one
+    /// session, or of every session when `session_id` is `None`.
+    pub async fn open_questions(&self, session_id: Option<&str>) -> Result<Vec<OpenQuestion>> {
+        let session_id = session_id.map(str::to_owned);
+        self.call(|reply| Cmd::OpenQuestions { session_id, reply })
+            .await
+    }
+
+    /// The graph of the whole tree the session belongs to: as it was at
+    /// `at` (Unix milliseconds, clamped to the tree's time range), or as it
+    /// is now. Read from the index; no log is opened.
+    pub async fn graph(&self, session_id: &str, at: Option<i64>) -> Result<Graph> {
+        let session_id = session_id.to_owned();
+        self.call(|reply| Cmd::Graph {
+            session_id,
+            at,
+            reply,
+        })
+        .await
+    }
+
+    /// The timeline of the whole tree the session belongs to.
+    pub async fn timeline(&self, session_id: &str) -> Result<Timeline> {
+        let session_id = session_id.to_owned();
+        self.call(|reply| Cmd::Timeline { session_id, reply }).await
     }
 
     /// The highest number among the pull requests recorded for a repo, in

@@ -19,6 +19,7 @@ use crate::home::Home;
 use crate::testing::{git, git_repo, write_file};
 
 mod attach;
+mod orchestration;
 mod shipping;
 
 const TIMEOUT: Duration = Duration::from_secs(20);
@@ -225,6 +226,23 @@ fn label(event: &Event) -> String {
         EventBody::PullRequestUpdated { pull_request } => {
             format!("pull_request_updated:{}", pull_request.url)
         }
+        EventBody::MessageSent { message } => {
+            format!(
+                "message_sent:{}",
+                format!("{:?}", message.kind).to_lowercase()
+            )
+        }
+        EventBody::MessageReceived { message } => {
+            format!(
+                "message_received:{}",
+                format!("{:?}", message.kind).to_lowercase()
+            )
+        }
+        EventBody::QuestionAsked { question } => format!("question_asked:{}", question.text),
+        EventBody::QuestionAnswered { answer, by, .. } => format!(
+            "question_answered:{answer}:{}",
+            format!("{by:?}").to_lowercase()
+        ),
     }
 }
 
@@ -353,13 +371,18 @@ async fn a_new_session_runs_one_turn_and_waits_for_review() {
 
     let events = events_until(&manager, &session.id, 0, is_status(SessionStatus::Review)).await;
     let detail = manager.get(&session.id).await.unwrap();
-    assert_eq!(detail.agents.len(), 1);
+    // The lead, and the one subagent the mock's turn starts.
+    assert_eq!(detail.agents.len(), 2);
     let lead = &detail.agents[0];
     assert_eq!(lead.role, "lead");
     assert_eq!(lead.kind, AgentKind::Process);
     assert_eq!(lead.runner, "mock");
     assert_eq!(lead.model.as_deref(), Some("mock-1"));
     assert_eq!(lead.session_id, session.id);
+    let subagent = &detail.agents[1];
+    assert_eq!(subagent.kind, AgentKind::Subagent);
+    assert_eq!(subagent.parent_agent_id.as_ref(), Some(&lead.id));
+    assert_eq!(subagent.status, AgentStatus::Done);
     let labels = labels(&events);
     assert_eq!(
         labels[..5],
@@ -379,8 +402,8 @@ async fn a_new_session_runs_one_turn_and_waits_for_review() {
     assert!(!labels.contains(&"session_status:preparing".to_owned()));
     let turn = &events[4..events.len() - 2];
     assert!(turn.len() > 10);
+    let mut by_subagent = 0;
     for event in turn {
-        assert_eq!(event.agent_id.as_deref(), Some(lead.id.as_str()));
         match event.body {
             EventBody::AgentSession { .. }
             | EventBody::ItemStarted { .. }
@@ -390,12 +413,23 @@ async fn a_new_session_runs_one_turn_and_waits_for_review() {
             | EventBody::Usage { .. } => {
                 // The prompt caused the turn.
                 assert_eq!(event.parent_id.as_ref(), Some(&events[1].id));
+                if event.agent_id.as_ref() == Some(&subagent.id) {
+                    by_subagent += 1;
+                } else {
+                    assert_eq!(event.agent_id.as_ref(), Some(&lead.id));
+                }
             }
             // Caused by the tool call that made the change, checked elsewhere.
-            EventBody::FileChanged { .. } => {}
+            EventBody::FileChanged { .. } => assert_eq!(event.agent_id.as_ref(), Some(&lead.id)),
+            // The subagent, from start to end; checked in `orchestration`.
+            EventBody::AgentSpawned { .. } => assert_eq!(event.agent_id, None),
+            EventBody::AgentStatus { .. } => {
+                assert_eq!(event.agent_id.as_ref(), Some(&subagent.id));
+            }
             _ => panic!("unexpected {} inside the turn", label(event)),
         }
     }
+    assert!(by_subagent > 3, "the subagent's own items are its events");
     for (index, event) in events.iter().enumerate() {
         assert_eq!(event.seq, index as u64 + 1);
     }
@@ -446,16 +480,27 @@ async fn a_message_in_review_runs_another_turn() {
         labels[labels.len() - 2..],
         ["agent_status:idle", "session_status:review"]
     );
-    assert!(!labels.contains(&"agent_spawned".to_owned()));
+    // No second lead: the one spawn of the turn is the mock's subagent.
+    let spawned: Vec<&Event> = second
+        .iter()
+        .filter(|event| matches!(event.body, EventBody::AgentSpawned { .. }))
+        .collect();
+    assert_eq!(spawned.len(), 1);
+    assert!(matches!(
+        &spawned[0].body,
+        EventBody::AgentSpawned { agent } if agent.kind == AgentKind::Subagent
+    ));
     assert_eq!(second[0].seq, after + 1);
 
     let ids: Vec<String> = [started_item_ids(&first), started_item_ids(&second)].concat();
-    assert_eq!(ids.len(), 10);
-    assert_eq!(ids.iter().collect::<HashSet<_>>().len(), 10);
+    assert_eq!(ids.len(), 16);
+    assert_eq!(ids.iter().collect::<HashSet<_>>().len(), 16);
 
     let detail = manager.get(&id).await.unwrap();
-    assert_eq!(detail.agents.len(), 1);
+    // The lead and the subagent of each turn; the totals stay on the lead.
+    assert_eq!(detail.agents.len(), 3);
     assert_eq!(detail.agents[0].tokens_in, 2400);
+    assert_eq!(detail.agents[1].tokens_in + detail.agents[2].tokens_in, 0);
     assert_eq!(detail.session.status, SessionStatus::Review);
 }
 
@@ -518,6 +563,9 @@ async fn a_message_sent_while_running_waits_for_the_current_turn() {
             "agent_spawned",
             "item_started",
             "user_message:second",
+            // One turn ends and the next begins: the timeline reads both.
+            "agent_status:idle",
+            "agent_status:running",
             "item_started",
             "agent_status:idle",
             "session_status:review",
@@ -525,7 +573,9 @@ async fn a_message_sent_while_running_waits_for_the_current_turn() {
     );
     // Each turn's events point at the message that caused it.
     assert_eq!(events[4].parent_id.as_ref(), Some(&events[1].id));
-    assert_eq!(events[6].parent_id.as_ref(), Some(&events[5].id));
+    assert_eq!(events[6].parent_id.as_ref(), Some(&events[1].id));
+    assert_eq!(events[7].parent_id.as_ref(), Some(&events[5].id));
+    assert_eq!(events[8].parent_id.as_ref(), Some(&events[5].id));
 }
 
 #[tokio::test]
@@ -1035,8 +1085,11 @@ async fn a_restart_fails_interrupted_sessions_and_keeps_settled_ones() {
         started_item_ids(&resumed),
     ]
     .concat();
-    assert_eq!(ids.iter().collect::<HashSet<_>>().len(), 10);
-    assert_eq!(manager.get(&settled).await.unwrap().agents.len(), 1);
+    assert_eq!(ids.iter().collect::<HashSet<_>>().len(), 16);
+    // One lead, and the subagent of each of its two turns.
+    let agents = manager.get(&settled).await.unwrap().agents;
+    let leads = agents.iter().filter(|a| a.kind == AgentKind::Process);
+    assert_eq!((agents.len(), leads.count()), (3, 1));
     assert!(starts.try_recv().is_err());
 }
 
@@ -1513,7 +1566,8 @@ async fn in_ask_mode_each_request_waits_for_the_user_and_an_allow_runs_the_call(
             _ => None,
         })
         .collect();
-    assert_eq!(tools, [ItemStatus::Completed, ItemStatus::Completed]);
+    // The command, the subagent's read, the subagent's own call, the edit.
+    assert_eq!(tools, [ItemStatus::Completed; 4]);
     let waits = labels(&all)
         .iter()
         .filter(|label| *label == "session_status:waiting")
@@ -2019,6 +2073,9 @@ async fn interrupt_ends_the_turn_and_holds_queued_messages_for_the_next_one() {
         [
             "user_message:next",
             "session_status:running",
+            "agent_status:running",
+            // The held message's turn ends, the new message's turn begins.
+            "agent_status:idle",
             "agent_status:running",
             "agent_status:idle",
             "session_status:review",

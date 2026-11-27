@@ -15,5 +15,5 @@ pub use mock::{MOCK_RUNNER_ID, MockConfig, MockRunner};
 pub use registry::{RegistryConfig, RunnerRegistry};
 pub use runner::{
     AgentHandle, AgentIo, DirGrant, Exit, PermissionAsk, Runner, RunnerError, RunnerInput,
-    RunnerOutput, StartParams, ToolAccess,
+    RunnerOutput, StartParams, SubagentStart, ToolAccess,
 };

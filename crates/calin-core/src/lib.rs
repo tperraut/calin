@@ -24,9 +24,12 @@ mod workspace;
 
 pub use error::{Error, Result};
 pub use home::{ENV_HOME, Home, HomeError, resolve_home};
-pub use manager::{AgentRepo, ManagerConfig, SessionManager};
+pub use manager::{
+    AgentRepo, Dispatched, DispatchedRepo, ManagerConfig, NoteOutcome, SessionManager,
+};
 pub use store::{
-    EventDraft, Live, LiveEnd, NewSession, OpenPermission, SessionSetup, Store, Subscription,
+    Dispatch, EventDraft, Live, LiveEnd, NewSession, OpenPermission, OpenQuestion, SessionSetup,
+    Store, Subscription,
 };
 pub use tokens::AgentRef;
 pub use workspace::MAX_FILE_BYTES;

@@ -1,20 +1,29 @@
 //! The SQLite index: session and agent projections plus one row per event
-//! pointing into the session's log. Everything here can be rebuilt from the logs.
+//! pointing into the session's log, and what the graph and the timeline are
+//! read from (`views.rs`). Everything here can be rebuilt from the logs.
+//!
+//! A projection row is derived from its own session's events only, in log
+//! order. That is what makes a reindex give the same rows whichever order
+//! the sessions are read in.
 
 use std::path::Path;
 
-use calin_proto::{Agent, Event, EventBody, PullRequest, Session, SessionRepo};
+use calin_proto::{
+    Agent, AgentKind, AgentMessage, AgentStatus, Event, EventBody, ItemContent, PullRequest,
+    Session, SessionRepo, SessionStatus,
+};
 use rusqlite::types::Type;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use super::OpenPermission;
+use super::{OpenPermission, OpenQuestion};
 use crate::error::Result;
+use crate::title::excerpt;
 
 /// Bumped when the tables change. A database with another version is
 /// dropped and rebuilt from the logs, so there are no migrations to write.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 const SCHEMA: &str = "
 CREATE TABLE sessions (
@@ -33,6 +42,7 @@ CREATE TABLE sessions (
     -- Bytes of the log that are indexed. A longer log has events to catch up on.
     log_len           INTEGER NOT NULL
 ) WITHOUT ROWID;
+CREATE INDEX sessions_by_root ON sessions (root_session_id);
 
 CREATE TABLE agents (
     id              TEXT PRIMARY KEY,
@@ -47,7 +57,10 @@ CREATE TABLE agents (
     cost_usd        REAL NOT NULL,
     tokens_in       INTEGER NOT NULL,
     tokens_out      INTEGER NOT NULL,
-    spawned_seq     INTEGER NOT NULL
+    spawned_seq     INTEGER NOT NULL,
+    spawned_ts      INTEGER NOT NULL,
+    -- What a subagent was asked to do: the title of the tool call that started it.
+    label           TEXT
 ) WITHOUT ROWID;
 CREATE INDEX agents_by_session ON agents (session_id, spawned_seq);
 
@@ -60,6 +73,9 @@ CREATE TABLE events (
     kind       TEXT NOT NULL,
     log_offset INTEGER NOT NULL,
     ts         INTEGER NOT NULL,
+    -- For an event that can start a turn (a user message, a message that
+    -- arrived, an answer): its first line, which titles the turn.
+    label      TEXT,
     PRIMARY KEY (session_id, seq)
 ) WITHOUT ROWID;
 CREATE UNIQUE INDEX events_by_id ON events (id);
@@ -75,7 +91,8 @@ CREATE TABLE session_repos (
     branch       TEXT,
     base_ref     TEXT,
     is_primary   INTEGER NOT NULL,
-    attached_seq INTEGER NOT NULL
+    attached_seq INTEGER NOT NULL,
+    attached_ts  INTEGER NOT NULL
 ) WITHOUT ROWID;
 CREATE INDEX session_repos_by_session ON session_repos (session_id, attached_seq);
 CREATE INDEX session_repos_by_repo ON session_repos (repo_id);
@@ -106,10 +123,100 @@ CREATE TABLE pull_requests (
     updated_at      INTEGER NOT NULL
 ) WITHOUT ROWID;
 CREATE INDEX pull_requests_by_session ON pull_requests (session_id);
+
+-- Questions put to the user and whether each was answered.
+CREATE TABLE questions (
+    session_id  TEXT NOT NULL,
+    question_id TEXT NOT NULL,
+    agent_id    TEXT,
+    -- The `question_asked` event, the cause of the answer.
+    event_id    TEXT NOT NULL,
+    answered    INTEGER NOT NULL,
+    PRIMARY KEY (session_id, question_id)
+) WITHOUT ROWID;
+
+-- The timeline's spans: turns, tool calls and waiting periods, each in the
+-- lane of one agent. `end_ts` is NULL while the span is open.
+CREATE TABLE spans (
+    session_id TEXT NOT NULL,
+    -- `<kind>:<id of the event that opened it>`: unique across sessions.
+    id         TEXT NOT NULL,
+    agent_id   TEXT NOT NULL,
+    kind       TEXT NOT NULL,
+    title      TEXT NOT NULL,
+    tool_kind  TEXT,
+    status     TEXT,
+    -- For a tool span: the item, which is how its completion finds it.
+    item_id    TEXT,
+    start_ts   INTEGER NOT NULL,
+    end_ts     INTEGER,
+    seq        INTEGER NOT NULL,
+    PRIMARY KEY (session_id, id)
+) WITHOUT ROWID;
+CREATE INDEX spans_open ON spans (session_id, kind, agent_id) WHERE end_ts IS NULL;
+CREATE INDEX spans_by_item ON spans (session_id, item_id) WHERE item_id IS NOT NULL;
+
+-- One row per `message_sent` and per `message_received`, in the session
+-- whose log holds the event.
+CREATE TABLE messages (
+    session_id      TEXT NOT NULL,
+    seq             INTEGER NOT NULL,
+    id              TEXT NOT NULL,
+    sent            INTEGER NOT NULL,
+    kind            TEXT NOT NULL,
+    from_session_id TEXT NOT NULL,
+    from_agent_id   TEXT,
+    to_session_id   TEXT NOT NULL,
+    to_agent_id     TEXT,
+    -- The first line of the body, cut to fit an edge.
+    label           TEXT NOT NULL,
+    ts              INTEGER NOT NULL,
+    -- Ids sort in the order events were written, across sessions.
+    event_id        TEXT NOT NULL,
+    PRIMARY KEY (session_id, seq)
+) WITHOUT ROWID;
+
+CREATE TABLE file_changes (
+    session_id      TEXT NOT NULL,
+    seq             INTEGER NOT NULL,
+    agent_id        TEXT,
+    session_repo_id TEXT,
+    path            TEXT NOT NULL,
+    ts              INTEGER NOT NULL,
+    PRIMARY KEY (session_id, seq)
+) WITHOUT ROWID;
+
+-- Every change of an agent's status or totals, so that the graph can say
+-- what they were at any moment. A row sets the columns that are not NULL.
+CREATE TABLE agent_states (
+    session_id TEXT NOT NULL,
+    seq        INTEGER NOT NULL,
+    agent_id   TEXT NOT NULL,
+    ts         INTEGER NOT NULL,
+    status     TEXT,
+    cost_usd   REAL,
+    tokens_in  INTEGER,
+    tokens_out INTEGER,
+    PRIMARY KEY (session_id, seq)
+) WITHOUT ROWID;
+
+CREATE TABLE session_states (
+    session_id TEXT NOT NULL,
+    seq        INTEGER NOT NULL,
+    ts         INTEGER NOT NULL,
+    status     TEXT NOT NULL,
+    PRIMARY KEY (session_id, seq)
+) WITHOUT ROWID;
 ";
 
 /// Every table, for dropping a database of another schema version.
-const TABLES: [&str; 6] = [
+const TABLES: [&str; 12] = [
+    "session_states",
+    "agent_states",
+    "file_changes",
+    "messages",
+    "spans",
+    "questions",
     "pull_requests",
     "permissions",
     "session_repos",
@@ -119,7 +226,13 @@ const TABLES: [&str; 6] = [
 ];
 
 /// The tables that hold what a session's events projected, keyed by `session_id`.
-const PROJECTIONS: [&str; 5] = [
+const PROJECTIONS: [&str; 11] = [
+    "session_states",
+    "agent_states",
+    "file_changes",
+    "messages",
+    "spans",
+    "questions",
     "pull_requests",
     "permissions",
     "session_repos",
@@ -378,8 +491,8 @@ pub(super) fn log_offset(db: &Connection, session_id: &str, seq: u64) -> Result<
 /// `offset..end` is the event's line in the log. Call inside a transaction.
 pub(super) fn index_event(db: &Connection, event: &Event, offset: u64, end: u64) -> Result<()> {
     db.prepare_cached(
-        "INSERT INTO events (session_id, seq, id, agent_id, parent_id, kind, log_offset, ts) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT INTO events (session_id, seq, id, agent_id, parent_id, kind, log_offset, ts, \
+         label) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
     )?
     .execute(params![
         event.session_id,
@@ -390,19 +503,49 @@ pub(super) fn index_event(db: &Connection, event: &Event, offset: u64, end: u64)
         kind(&event.body),
         offset as i64,
         event.ts,
+        input_label(&event.body),
     ])?;
 
     match &event.body {
-        EventBody::SessionStatus { status, .. } => {
+        EventBody::SessionStatus { status, reason } => {
+            let name = wire_name(status)?;
             db.prepare_cached("UPDATE sessions SET status = ?1 WHERE id = ?2")?
-                .execute(params![wire_name(status)?, event.session_id])?;
+                .execute(params![name, event.session_id])?;
+            db.prepare_cached(
+                "INSERT OR REPLACE INTO session_states (session_id, seq, ts, status) \
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?
+            .execute(params![event.session_id, event.seq as i64, event.ts, name])?;
+            // Whatever the session moved to, it is no longer the waiting it was in.
+            db.prepare_cached(
+                "UPDATE spans SET end_ts = ?1 \
+                 WHERE session_id = ?2 AND kind = 'waiting' AND end_ts IS NULL",
+            )?
+            .execute(params![event.ts, event.session_id])?;
+            if *status == SessionStatus::Waiting
+                && let Some(lead) = lead_agent(db, &event.session_id)?
+            {
+                let title = match reason.as_deref() {
+                    Some("permission") => "Waiting for permission",
+                    Some("question") => "Waiting for an answer",
+                    _ => "Waiting",
+                };
+                open_span(db, event, "wait", &lead, "waiting", title, event.ts)?;
+            }
         }
         EventBody::AgentSpawned { agent } => {
+            // A subagent is described by the tool call that started it.
+            let label = match (agent.kind, &event.parent_id) {
+                (AgentKind::Subagent, Some(started)) => {
+                    span_title(db, &event.session_id, &format!("tool:{started}"))?
+                }
+                _ => None,
+            };
             db.prepare_cached(
                 "INSERT OR REPLACE INTO agents (id, session_id, parent_agent_id, kind, role, \
                  runner, model, status, cost_usd, tokens_in, tokens_out, spawned_seq, \
-                 native_session_id) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                 native_session_id, spawned_ts, label) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             )?
             .execute(params![
                 agent.id,
@@ -418,7 +561,20 @@ pub(super) fn index_event(db: &Connection, event: &Event, offset: u64, end: u64)
                 agent.tokens_out as i64,
                 event.seq as i64,
                 agent.native_session_id,
+                event.ts,
+                label,
             ])?;
+            agent_state(db, event, &agent.id, Some(agent.status), None)?;
+            if !ended(agent.status) {
+                match agent.kind {
+                    // Its one turn: from its start to its end.
+                    AgentKind::Subagent => {
+                        let title = label.unwrap_or_else(|| agent.role.clone());
+                        open_turn(db, event, &agent.id, &title, event.ts)?;
+                    }
+                    AgentKind::Process => open_caused_turn(db, event, &agent.id)?,
+                }
+            }
         }
         EventBody::AgentSession {
             native_session_id,
@@ -441,8 +597,8 @@ pub(super) fn index_event(db: &Connection, event: &Event, offset: u64, end: u64)
         EventBody::RepoAttached { repo } => {
             db.prepare_cached(
                 "INSERT OR REPLACE INTO session_repos (id, session_id, repo_id, name, mode, \
-                 path, branch, base_ref, is_primary, attached_seq) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                 path, branch, base_ref, is_primary, attached_seq, attached_ts) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             )?
             .execute(params![
                 repo.id,
@@ -455,6 +611,7 @@ pub(super) fn index_event(db: &Connection, event: &Event, offset: u64, end: u64)
                 repo.base_ref,
                 repo.primary,
                 event.seq as i64,
+                event.ts,
             ])?;
             // The session's branch is the one of the first repo that has one.
             db.prepare_cached("UPDATE sessions SET branch = ?1 WHERE id = ?2 AND branch IS NULL")?
@@ -488,6 +645,14 @@ pub(super) fn index_event(db: &Connection, event: &Event, offset: u64, end: u64)
                     agent_id,
                     event.session_id
                 ])?;
+                agent_state(db, event, agent_id, Some(*status), None)?;
+                // The lead's `running` opens a turn; any other status ends the
+                // one in progress (the semantics of `TimelineSpan`).
+                if *status == AgentStatus::Running {
+                    open_caused_turn(db, event, agent_id)?;
+                } else if *status != AgentStatus::Starting {
+                    close_turn(db, event, agent_id)?;
+                }
             }
         }
         EventBody::Usage {
@@ -507,6 +672,8 @@ pub(super) fn index_event(db: &Connection, event: &Event, offset: u64, end: u64)
                     agent_id,
                     event.session_id
                 ])?;
+                let totals = (*cost_usd, *tokens_in, *tokens_out);
+                agent_state(db, event, agent_id, None, Some(totals))?;
             }
         }
         // Opened or updated, the event carries the whole value: the newest wins.
@@ -529,12 +696,86 @@ pub(super) fn index_event(db: &Connection, event: &Event, offset: u64, end: u64)
                 pull_request.updated_at,
             ])?;
         }
+        // A tool call is a span in the lane of the agent that made it. The
+        // orchestrator's own (a setup command) has no lane.
+        EventBody::ItemStarted { item } => {
+            if let (
+                ItemContent::Tool {
+                    title, tool_kind, ..
+                },
+                Some(agent_id),
+            ) = (&item.content, &event.agent_id)
+            {
+                open_span(db, event, "tool", agent_id, "tool", title, event.ts)?;
+                db.prepare_cached(
+                    "UPDATE spans SET tool_kind = ?1, status = ?2, item_id = ?3 \
+                     WHERE session_id = ?4 AND id = ?5",
+                )?
+                .execute(params![
+                    wire_name(tool_kind)?,
+                    wire_name(&item.status)?,
+                    item.id,
+                    event.session_id,
+                    format!("tool:{}", event.id),
+                ])?;
+            }
+        }
+        EventBody::ItemCompleted { item } => {
+            if let ItemContent::Tool { title, .. } = &item.content {
+                db.prepare_cached(
+                    "UPDATE spans SET end_ts = ?1, status = ?2, title = ?3 \
+                     WHERE session_id = ?4 AND item_id = ?5 AND end_ts IS NULL",
+                )?
+                .execute(params![
+                    event.ts,
+                    wire_name(&item.status)?,
+                    title,
+                    event.session_id,
+                    item.id,
+                ])?;
+            }
+        }
+        EventBody::MessageSent { message } => index_message(db, event, message, true)?,
+        EventBody::MessageReceived { message } => index_message(db, event, message, false)?,
+        EventBody::QuestionAsked { question } => {
+            db.prepare_cached(
+                "INSERT OR REPLACE INTO questions (session_id, question_id, agent_id, \
+                 event_id, answered) VALUES (?1, ?2, ?3, ?4, 0)",
+            )?
+            .execute(params![
+                event.session_id,
+                question.id,
+                event.agent_id,
+                event.id
+            ])?;
+        }
+        EventBody::QuestionAnswered { question_id, .. } => {
+            db.prepare_cached(
+                "UPDATE questions SET answered = 1 WHERE session_id = ?1 AND question_id = ?2",
+            )?
+            .execute(params![event.session_id, question_id])?;
+        }
+        EventBody::FileChanged {
+            session_repo_id,
+            path,
+            ..
+        } => {
+            db.prepare_cached(
+                "INSERT OR REPLACE INTO file_changes (session_id, seq, agent_id, \
+                 session_repo_id, path, ts) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?
+            .execute(params![
+                event.session_id,
+                event.seq as i64,
+                event.agent_id,
+                session_repo_id,
+                path,
+                event.ts,
+            ])?;
+        }
         EventBody::UserMessage { .. }
-        | EventBody::ItemStarted { .. }
         | EventBody::ItemDelta { .. }
-        | EventBody::ItemCompleted { .. }
         | EventBody::PlanUpdated { .. }
-        | EventBody::FileChanged { .. }
         | EventBody::Error { .. } => {}
     }
 
@@ -548,6 +789,207 @@ pub(super) fn index_event(db: &Connection, event: &Event, offset: u64, end: u64)
         event.session_id
     ])?;
     Ok(())
+}
+
+/// The first line of an event that can start a turn; `None` for any other.
+fn input_label(body: &EventBody) -> Option<String> {
+    let text = match body {
+        EventBody::UserMessage { text } => text,
+        EventBody::MessageReceived { message } => &message.body,
+        EventBody::QuestionAnswered { answer, .. } => answer,
+        _ => return None,
+    };
+    Some(excerpt(text)).filter(|label| !label.is_empty())
+}
+
+fn ended(status: AgentStatus) -> bool {
+    matches!(
+        status,
+        AgentStatus::Done | AgentStatus::Failed | AgentStatus::Stopped
+    )
+}
+
+/// The session's lead: its first agent with a process of its own.
+fn lead_agent(db: &Connection, session_id: &str) -> Result<Option<String>> {
+    Ok(db
+        .prepare_cached(
+            "SELECT id FROM agents WHERE session_id = ?1 AND kind = 'process' \
+             ORDER BY spawned_seq, id LIMIT 1",
+        )?
+        .query_row([session_id], |row| row.get(0))
+        .optional()?)
+}
+
+fn span_title(db: &Connection, session_id: &str, span_id: &str) -> Result<Option<String>> {
+    Ok(db
+        .prepare_cached("SELECT title FROM spans WHERE session_id = ?1 AND id = ?2")?
+        .query_row([session_id, span_id], |row| row.get(0))
+        .optional()?)
+}
+
+/// Opens a span named after the event that opens it.
+fn open_span(
+    db: &Connection,
+    event: &Event,
+    prefix: &str,
+    agent_id: &str,
+    kind: &str,
+    title: &str,
+    start_ts: i64,
+) -> Result<()> {
+    db.prepare_cached(
+        "INSERT OR REPLACE INTO spans (session_id, id, agent_id, kind, title, start_ts, seq) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+    )?
+    .execute(params![
+        event.session_id,
+        format!("{prefix}:{}", event.id),
+        agent_id,
+        kind,
+        title,
+        start_ts,
+        event.seq as i64,
+    ])?;
+    Ok(())
+}
+
+/// Opens a turn of `agent_id` at `start_ts`, or where its previous turn
+/// ended when that is later: the input of a turn may have waited for it.
+fn open_turn(
+    db: &Connection,
+    event: &Event,
+    agent_id: &str,
+    title: &str,
+    start_ts: i64,
+) -> Result<()> {
+    // A turn the log never closed ends where the next one begins.
+    close_turn(db, event, agent_id)?;
+    let previous_end: Option<i64> = db
+        .prepare_cached(
+            "SELECT MAX(end_ts) FROM spans \
+             WHERE session_id = ?1 AND id >= 'turn:' AND id < 'turn;' AND agent_id = ?2",
+        )?
+        .query_row([&event.session_id, agent_id], |row| row.get(0))?;
+    let start_ts = start_ts.max(previous_end.unwrap_or(start_ts)).min(event.ts);
+    open_span(db, event, "turn", agent_id, "turn", title, start_ts)
+}
+
+/// Opens the turn this event starts for a process agent: from the input
+/// that caused it (the event's parent), titled with that input's first line.
+fn open_caused_turn(db: &Connection, event: &Event, agent_id: &str) -> Result<()> {
+    let cause: Option<(i64, Option<String>)> = match &event.parent_id {
+        Some(parent) => db
+            .prepare_cached("SELECT ts, label FROM events WHERE id = ?1 AND session_id = ?2")?
+            .query_row([parent, &event.session_id], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .optional()?,
+        None => None,
+    };
+    let (start_ts, label) = cause.unwrap_or((event.ts, None));
+    let title = label.unwrap_or_else(|| "Turn".to_owned());
+    open_turn(db, event, agent_id, &title, start_ts)
+}
+
+/// Ends the agent's turn, and the tool calls it never completed with it.
+fn close_turn(db: &Connection, event: &Event, agent_id: &str) -> Result<()> {
+    db.prepare_cached(
+        "UPDATE spans SET end_ts = ?1 \
+         WHERE session_id = ?2 AND kind = 'turn' AND agent_id = ?3 AND end_ts IS NULL",
+    )?
+    .execute(params![event.ts, event.session_id, agent_id])?;
+    db.prepare_cached(
+        "UPDATE spans SET end_ts = ?1, \
+         status = CASE status WHEN 'running' THEN 'failed' ELSE status END \
+         WHERE session_id = ?2 AND kind = 'tool' AND agent_id = ?3 AND end_ts IS NULL",
+    )?
+    .execute(params![event.ts, event.session_id, agent_id])?;
+    Ok(())
+}
+
+/// Records what changed about an agent with this event.
+fn agent_state(
+    db: &Connection,
+    event: &Event,
+    agent_id: &str,
+    status: Option<AgentStatus>,
+    totals: Option<(f64, u64, u64)>,
+) -> Result<()> {
+    let status = status.as_ref().map(wire_name).transpose()?;
+    db.prepare_cached(
+        "INSERT OR REPLACE INTO agent_states (session_id, seq, agent_id, ts, status, cost_usd, \
+         tokens_in, tokens_out) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+    )?
+    .execute(params![
+        event.session_id,
+        event.seq as i64,
+        agent_id,
+        event.ts,
+        status,
+        totals.map(|totals| totals.0),
+        totals.map(|totals| totals.1 as i64),
+        totals.map(|totals| totals.2 as i64),
+    ])?;
+    Ok(())
+}
+
+fn index_message(db: &Connection, event: &Event, message: &AgentMessage, sent: bool) -> Result<()> {
+    db.prepare_cached(
+        "INSERT OR REPLACE INTO messages (session_id, seq, id, sent, kind, from_session_id, \
+         from_agent_id, to_session_id, to_agent_id, label, ts, event_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+    )?
+    .execute(params![
+        event.session_id,
+        event.seq as i64,
+        message.id,
+        sent,
+        wire_name(&message.kind)?,
+        message.from_session_id,
+        message.from_agent_id,
+        message.to_session_id,
+        message.to_agent_id,
+        excerpt(&message.body),
+        event.ts,
+        event.id,
+    ])?;
+    Ok(())
+}
+
+/// Whether a question was answered; `None` when there is no such question.
+pub(super) fn question_answered(
+    db: &Connection,
+    session_id: &str,
+    question_id: &str,
+) -> Result<Option<bool>> {
+    Ok(db
+        .prepare_cached(
+            "SELECT answered FROM questions WHERE session_id = ?1 AND question_id = ?2",
+        )?
+        .query_row([session_id, question_id], |row| row.get(0))
+        .optional()?)
+}
+
+/// The questions nobody answered yet, of one session or of all of them, oldest first.
+pub(super) fn open_questions(
+    db: &Connection,
+    session_id: Option<&str>,
+) -> Result<Vec<OpenQuestion>> {
+    let mut statement = db.prepare_cached(
+        "SELECT session_id, question_id, agent_id, event_id FROM questions \
+         WHERE answered = 0 AND (?1 IS NULL OR session_id = ?1) ORDER BY event_id",
+    )?;
+    let open = statement
+        .query_map([session_id], |row| {
+            Ok(OpenQuestion {
+                session_id: row.get(0)?,
+                question_id: row.get(1)?,
+                agent_id: row.get(2)?,
+                event_id: row.get(3)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(open)
 }
 
 /// The event's `type` tag, as it appears on the wire.
@@ -569,6 +1011,10 @@ fn kind(body: &EventBody) -> &'static str {
         EventBody::FileChanged { .. } => "file_changed",
         EventBody::PullRequestOpened { .. } => "pull_request_opened",
         EventBody::PullRequestUpdated { .. } => "pull_request_updated",
+        EventBody::MessageSent { .. } => "message_sent",
+        EventBody::MessageReceived { .. } => "message_received",
+        EventBody::QuestionAsked { .. } => "question_asked",
+        EventBody::QuestionAnswered { .. } => "question_answered",
         EventBody::Error { .. } => "error",
     }
 }
@@ -581,13 +1027,16 @@ fn wire_name<T: Serialize>(value: &T) -> Result<String> {
     }
 }
 
-fn from_wire_name<T: DeserializeOwned>(row: &Row<'_>, index: usize) -> rusqlite::Result<T> {
+pub(super) fn from_wire_name<T: DeserializeOwned>(
+    row: &Row<'_>,
+    index: usize,
+) -> rusqlite::Result<T> {
     let name: String = row.get(index)?;
     serde_json::from_value(serde_json::Value::String(name))
         .map_err(|err| rusqlite::Error::FromSqlConversionFailure(index, Type::Text, Box::new(err)))
 }
 
-fn uint(row: &Row<'_>, index: usize) -> rusqlite::Result<u64> {
+pub(super) fn uint(row: &Row<'_>, index: usize) -> rusqlite::Result<u64> {
     let value: i64 = row.get(index)?;
     u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(index, value))
 }
@@ -665,6 +1114,20 @@ mod tests {
         }
     }
 
+    fn note() -> AgentMessage {
+        AgentMessage {
+            id: "m".into(),
+            kind: calin_proto::MessageKind::Note,
+            from_session_id: "s".into(),
+            from_agent_id: None,
+            to_session_id: "s".into(),
+            to_agent_id: None,
+            body: "b".into(),
+            in_reply_to: None,
+            ts: 0,
+        }
+    }
+
     #[test]
     fn the_kind_column_matches_the_wire_tag() {
         let bodies = [
@@ -701,6 +1164,20 @@ mod tests {
             },
             EventBody::PullRequestUpdated {
                 pull_request: pull_request(),
+            },
+            EventBody::MessageSent { message: note() },
+            EventBody::MessageReceived { message: note() },
+            EventBody::QuestionAsked {
+                question: calin_proto::Question {
+                    id: "q".into(),
+                    text: "?".into(),
+                    options: vec![],
+                },
+            },
+            EventBody::QuestionAnswered {
+                question_id: "q".into(),
+                answer: String::new(),
+                by: calin_proto::DecisionSource::Expired,
             },
         ];
         for body in bodies {

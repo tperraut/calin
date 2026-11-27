@@ -14,6 +14,25 @@ pub(crate) fn default_title(prompt: &str) -> String {
         .collect()
 }
 
+/// Longest excerpt of a message, in characters: what fits on a graph edge.
+const EXCERPT_CHARS: usize = 80;
+
+/// The first line of `text` that says something, cut to 80 characters with
+/// an ellipsis when it is longer. Empty when the text is blank.
+pub(crate) fn excerpt(text: &str) -> String {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    if line.chars().count() <= EXCERPT_CHARS {
+        return line.to_owned();
+    }
+    let mut cut: String = line.chars().take(EXCERPT_CHARS - 1).collect();
+    cut.push('…');
+    cut
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -25,6 +44,17 @@ mod tests {
             "Fix the bug"
         );
         assert_eq!(default_title("one line"), "one line");
+    }
+
+    #[test]
+    fn an_excerpt_is_one_line_of_at_most_80_characters() {
+        assert_eq!(excerpt("\n\n  first line  \nsecond"), "first line");
+        assert_eq!(excerpt(" \n\t\n"), "");
+        let exact = "é".repeat(80);
+        assert_eq!(excerpt(&exact), exact);
+        let long = excerpt(&"é".repeat(81));
+        assert_eq!(long.chars().count(), 80);
+        assert_eq!(long, format!("{}…", "é".repeat(79)));
     }
 
     #[test]

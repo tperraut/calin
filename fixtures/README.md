@@ -27,7 +27,8 @@ real transcript is interpreted.
 | `interrupt` | An interrupt request during a long command, then a second turn in the same process |
 | `edit-existing-file` | A read, then an allowed edit of an existing file |
 | `resume` | A second process continues the conversation of `edit-existing-file` |
-| `subagent` | A subagent runs a tool; its output carries `parent_tool_use_id` |
+| `subagent` | A subagent runs a tool; its output carries `parent_tool_use_id`, which is how the runner attributes it to the subagent the `Agent` call started |
+| `parallel-subagents` | Two subagents the CLI launches in the background on its own: each `Agent` call returns at once (`async_launched`), their output interleaves, one ends with its `task_notification`, the other is still running when the turn ends |
 | `unknown-model` | The API refuses the model: an error result |
 | `resume-missing` | `--resume` of a conversation that does not exist: an error result, then the CLI exits |
 

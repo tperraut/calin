@@ -15,7 +15,7 @@ use calin_proto::{
 use serde_json::{Value, json};
 
 use super::tools;
-use crate::runner::{DirGrant, PermissionAsk, RunnerOutput};
+use crate::runner::{DirGrant, PermissionAsk, RunnerOutput, SubagentStart};
 
 /// Told to the agent with a denial that carries no message of its own.
 const DEFAULT_DENIAL: &str = "The user denied this request.";
@@ -38,6 +38,9 @@ pub(crate) struct Mapper {
     /// each subagent's interleave on the same pipe. Ordered, so that closing
     /// them all is deterministic.
     scopes: BTreeMap<Option<String>, Scope>,
+    /// The subagents that are running, oldest first. What arrives in the
+    /// scope of one of their keys is theirs.
+    subagents: Vec<Subagent>,
     /// Tool items that wait for their result, oldest first.
     running: Vec<ToolCall>,
     /// Every tool-use id that became an item, so none becomes one twice.
@@ -61,9 +64,26 @@ struct Scope {
     block: Option<Block>,
 }
 
+/// A subagent started by an `Agent` call. Its key is the call's tool-use id,
+/// which is also the `parent_tool_use_id` of everything it produces.
+#[derive(Debug)]
+struct Subagent {
+    key: String,
+    /// The subagent that made the call; `None` when the lead did.
+    parent: Option<String>,
+    /// Runs in the background, so it does not end with its call: it was
+    /// started with `run_in_background`, or the CLI said so when the call
+    /// returned (it may decide that by itself).
+    background: bool,
+    /// Its call returned while it runs on: only a notification ends it now.
+    detached: bool,
+}
+
 /// A text or thinking block being streamed.
 #[derive(Debug)]
 struct Block {
+    /// The subagent whose block it is; `None` for the lead.
+    owner: Option<String>,
     index: Option<u64>,
     prose: Prose,
     item_id: String,
@@ -96,6 +116,8 @@ impl Prose {
 
 #[derive(Debug)]
 struct ToolCall {
+    /// The subagent that made the call; `None` when the lead did.
+    owner: Option<String>,
     id: String,
     name: String,
     kind: ToolKind,
@@ -145,6 +167,7 @@ impl Mapper {
             interrupts: 0,
             native: None,
             scopes: BTreeMap::new(),
+            subagents: Vec::new(),
             running: Vec::new(),
             started: HashSet::new(),
             pending: HashMap::new(),
@@ -196,7 +219,7 @@ impl Mapper {
     /// `result`: the process died or was killed.
     pub(crate) fn finish(&mut self) -> Vec<RunnerOutput> {
         let mut out = Vec::new();
-        self.close_all(&mut out);
+        self.close_all(true, &mut out);
         out
     }
 
@@ -276,6 +299,10 @@ impl Mapper {
             }
             return;
         }
+        if str_field(message, "subtype") == Some("task_notification") {
+            self.task_notification(message, out);
+            return;
+        }
         // `init` opens every turn; only a change is news.
         if str_field(message, "subtype") != Some("init") {
             return;
@@ -293,6 +320,21 @@ impl Mapper {
                 model: native.1.clone(),
             });
             self.native = Some(native);
+        }
+    }
+
+    /// A task of the CLI's own is over. For a subagent that was left running
+    /// in the background this is its end (recorded in `parallel-subagents`).
+    /// One that ran in the foreground ends with the result of its call,
+    /// which follows the notification (recorded in `subagent`).
+    fn task_notification(&mut self, message: &Value, out: &mut Vec<RunnerOutput>) {
+        let Some(key) = str_field(message, "tool_use_id") else {
+            return;
+        };
+        let background = |subagent: &Subagent| subagent.key == key && subagent.background;
+        if self.subagents.iter().any(background) {
+            let ok = str_field(message, "status") == Some("completed");
+            self.end_subagent(key, ok, out);
         }
     }
 
@@ -329,7 +371,9 @@ impl Mapper {
                     _ => return,
                 };
                 let item_id = self.mint_id();
+                let owner = self.owner_of(&parent);
                 let block = self.scopes.entry(parent).or_default().block.insert(Block {
+                    owner,
                     index,
                     prose,
                     item_id,
@@ -385,6 +429,7 @@ impl Mapper {
         }
 
         let parent = parent_of(message);
+        let owner = self.owner_of(&parent);
         let streamed = {
             let id = str_field(inner, "id");
             let streaming = self
@@ -397,11 +442,11 @@ impl Mapper {
             match str_field(block, "type") {
                 Some("text") => {
                     let text = str_field(block, "text").unwrap_or_default();
-                    self.prose(&parent, Prose::Text, text, streamed, out);
+                    self.prose(&parent, &owner, Prose::Text, text, streamed, out);
                 }
                 Some("thinking") => {
                     let text = str_field(block, "thinking").unwrap_or_default();
-                    self.prose(&parent, Prose::Reasoning, text, streamed, out);
+                    self.prose(&parent, &owner, Prose::Reasoning, text, streamed, out);
                 }
                 Some("tool_use") => {
                     let (Some(id), Some(name)) = (str_field(block, "id"), str_field(block, "name"))
@@ -409,7 +454,7 @@ impl Mapper {
                         continue;
                     };
                     let input = block.get("input").cloned().unwrap_or_else(|| json!({}));
-                    self.start_tool(id, name, input, out);
+                    self.start_tool(id, name, input, &owner, out);
                 }
                 _ => {}
             }
@@ -421,6 +466,7 @@ impl Mapper {
     fn prose(
         &mut self,
         parent: &Option<String>,
+        owner: &Option<String>,
         prose: Prose,
         text: &str,
         streamed: bool,
@@ -446,6 +492,7 @@ impl Mapper {
             return;
         }
         let mut block = Block {
+            owner: owner.clone(),
             index: None,
             prose,
             item_id: self.mint_id(),
@@ -457,12 +504,22 @@ impl Mapper {
         block.complete(out);
     }
 
-    fn start_tool(&mut self, id: &str, name: &str, input: Value, out: &mut Vec<RunnerOutput>) {
+    /// Starts the item of a tool call made by `owner` (`None` for the lead).
+    /// A call that starts a subagent announces it right after its item.
+    fn start_tool(
+        &mut self,
+        id: &str,
+        name: &str,
+        input: Value,
+        owner: &Option<String>,
+        out: &mut Vec<RunnerOutput>,
+    ) {
         if !self.started.insert(id.to_owned()) {
             return;
         }
         let view = tools::describe(name, &input, &self.cwd);
         let call = ToolCall {
+            owner: owner.clone(),
             id: id.to_owned(),
             name: name.to_owned(),
             kind: view.kind,
@@ -470,13 +527,31 @@ impl Mapper {
             input,
             locations: view.locations,
         };
-        out.push(event(EventBody::ItemStarted {
-            item: call.item(ItemStatus::Running, None),
-        }));
+        out.push(event_of(
+            owner,
+            EventBody::ItemStarted {
+                item: call.item(ItemStatus::Running, None),
+            },
+        ));
         if name == tools::PLAN_TOOL
             && let Some(entries) = tools::plan_entries(&call.input)
         {
-            out.push(event(EventBody::PlanUpdated { entries }));
+            out.push(event_of(owner, EventBody::PlanUpdated { entries }));
+        }
+        if let Some(subagent) = tools::subagent(name, &call.input) {
+            out.push(RunnerOutput::SubagentStarted(SubagentStart {
+                key: id.to_owned(),
+                parent: owner.clone(),
+                role: subagent.role,
+                description: subagent.description,
+                item_id: Some(id.to_owned()),
+            }));
+            self.subagents.push(Subagent {
+                key: id.to_owned(),
+                parent: owner.clone(),
+                background: subagent.background,
+                detached: false,
+            });
         }
         self.running.push(call);
     }
@@ -501,11 +576,6 @@ impl Mapper {
                 continue;
             };
             let call = self.running.remove(position);
-            // What a subagent left open ends with the call that ran it.
-            let scope = Some(id.to_owned());
-            self.close_block(&scope, out);
-            self.scopes.remove(&scope);
-
             let failed = block.get("is_error").and_then(Value::as_bool) == Some(true);
             let status = if self.denied.remove(id) || rejected(message, id) {
                 ItemStatus::Declined
@@ -514,6 +584,23 @@ impl Mapper {
             } else {
                 ItemStatus::Completed
             };
+            let ok = status == ItemStatus::Completed;
+            let launched = launched_in_background(message);
+            match self.subagents.iter_mut().find(|sub| sub.key == id) {
+                // Launched in the background: its call is over, it is not.
+                Some(subagent) if (subagent.background || launched) && ok => {
+                    subagent.background = true;
+                    subagent.detached = true;
+                }
+                // A subagent ends with the call that ran it.
+                Some(_) => self.end_subagent(id, ok, out),
+                None => {
+                    // Not a subagent, but its scope may have streamed.
+                    let scope = Some(id.to_owned());
+                    self.close_block(&scope, out);
+                    self.scopes.remove(&scope);
+                }
+            }
             let output = tools::result_text(block.get("content").unwrap_or(&Value::Null));
             let plan = (status == ItemStatus::Completed)
                 .then(|| {
@@ -521,12 +608,15 @@ impl Mapper {
                     self.tasks.apply(&call.name, &call.input, result, &output)
                 })
                 .flatten();
-            out.push(event(EventBody::ItemCompleted {
-                item: call.item(status, Some(tools::capped(output))),
-            }));
+            out.push(event_of(
+                &call.owner,
+                EventBody::ItemCompleted {
+                    item: call.item(status, Some(tools::capped(output))),
+                },
+            ));
             // After the call: the plan changed when the tool said so.
             if let Some(entries) = plan {
-                out.push(event(EventBody::PlanUpdated { entries }));
+                out.push(event_of(&call.owner, EventBody::PlanUpdated { entries }));
             }
         }
     }
@@ -549,10 +639,24 @@ impl Mapper {
         };
         let input = request.get("input").cloned().unwrap_or_else(|| json!({}));
         let tool_use_id = str_field(request, "tool_use_id").map(str::to_owned);
+        let asked = self
+            .running
+            .iter()
+            .find(|call| Some(&call.id) == tool_use_id.as_ref());
+        let owner = match asked {
+            // Whoever made the call is who asks.
+            Some(call) => call.owner.clone(),
+            // The call is not known yet. Recorded requests name no scope
+            // (they come after the call's message); one that did would name
+            // it like every other message.
+            None => self
+                .owner_of(&parent_of(message))
+                .or_else(|| self.owner_of(&parent_of(request))),
+        };
         if let Some(id) = &tool_use_id {
             // The request normally follows the call's message. If it comes
             // first, the item starts here so that `item_id` points at one.
-            self.start_tool(id, name, input.clone(), out);
+            self.start_tool(id, name, input.clone(), &owner, out);
         }
         let view = tools::describe(name, &input, &self.cwd);
         self.pending.insert(
@@ -572,12 +676,13 @@ impl Mapper {
                 item_id: tool_use_id,
             },
             access: view.access,
+            subagent: owner,
         }));
     }
 
     /// The end of a turn: totals, the error if it failed, `TurnEnded`.
     fn result(&mut self, message: &Value, out: &mut Vec<RunnerOutput>) {
-        self.close_all(out);
+        self.close_all(false, out);
         self.count(message);
         out.push(event(EventBody::Usage {
             cost_usd: self.totals.cost_usd,
@@ -649,21 +754,109 @@ impl Mapper {
         }
     }
 
-    /// Completes every open item: prose with what arrived, tool calls as
-    /// failed (or declined, when their request was denied). Also voids the
-    /// permission requests nobody answered.
-    fn close_all(&mut self, out: &mut Vec<RunnerOutput>) {
-        for scope in std::mem::take(&mut self.scopes).into_values() {
-            if let Some(mut block) = scope.block {
+    /// The subagent output in the scope `parent` belongs to: the one whose
+    /// call has that id, while it runs. Anything else is the lead's.
+    fn owner_of(&self, parent: &Option<String>) -> Option<String> {
+        let key = parent.as_deref()?;
+        let running = self.subagents.iter().any(|subagent| subagent.key == key);
+        running.then(|| key.to_owned())
+    }
+
+    /// True for a subagent that goes on when the turn ends: one whose
+    /// background call returned, and the subagents below it.
+    fn outlives_turn(&self, key: &str) -> bool {
+        let mut next = Some(key);
+        while let Some(key) = next {
+            let Some(subagent) = self.subagents.iter().find(|sub| sub.key == key) else {
+                return false;
+            };
+            if subagent.background && subagent.detached {
+                return true;
+            }
+            next = subagent.parent.as_deref();
+        }
+        false
+    }
+
+    /// Ends a subagent: first the subagents it started, cut short, then
+    /// what it left open (prose with what arrived, its tool calls as
+    /// failed), then the subagent itself. The item of its own call is the
+    /// caller's and completes after this.
+    fn end_subagent(&mut self, key: &str, ok: bool, out: &mut Vec<RunnerOutput>) {
+        if !self.subagents.iter().any(|subagent| subagent.key == key) {
+            return;
+        }
+        let child_of = |subagent: &&Subagent| subagent.parent.as_deref() == Some(key);
+        while let Some(child) = self.subagents.iter().find(child_of) {
+            let child = child.key.clone();
+            self.end_subagent(&child, false, out);
+        }
+        let owner = Some(key.to_owned());
+        self.close_block(&owner, out);
+        self.scopes.remove(&owner);
+        let (own, others): (Vec<ToolCall>, Vec<ToolCall>) = std::mem::take(&mut self.running)
+            .into_iter()
+            .partition(|call| call.owner == owner);
+        self.running = others;
+        for call in own {
+            // Nobody is left to act on an answer.
+            self.pending
+                .retain(|_, pending| pending.tool_use_id.as_deref() != Some(&call.id));
+            let status = self.cut_status(&call);
+            out.push(event_of(
+                &owner,
+                EventBody::ItemCompleted {
+                    item: call.item(status, None),
+                },
+            ));
+        }
+        self.subagents.retain(|subagent| subagent.key != key);
+        out.push(RunnerOutput::SubagentEnded {
+            key: key.to_owned(),
+            ok,
+        });
+    }
+
+    /// How a call that never got its result ends: declined when its request
+    /// was denied, failed otherwise.
+    fn cut_status(&mut self, call: &ToolCall) -> ItemStatus {
+        if self.denied.remove(&call.id) {
+            ItemStatus::Declined
+        } else {
+            ItemStatus::Failed
+        }
+    }
+
+    /// Completes what is open: prose with what arrived, tool calls as failed
+    /// (or declined, when their request was denied), subagents as cut short.
+    /// Also voids the permission requests nobody answered.
+    ///
+    /// At the end of a turn (`everything` is false) a subagent that was left
+    /// running in the background stays, with what it has open: the CLI goes
+    /// on reporting its work. At the end of the stream nothing stays.
+    fn close_all(&mut self, everything: bool, out: &mut Vec<RunnerOutput>) {
+        // Subagents first: the call that ran one completes after it ended.
+        loop {
+            let ends = |sub: &&Subagent| everything || !self.outlives_turn(&sub.key);
+            let Some(key) = self.subagents.iter().find(ends).map(|sub| sub.key.clone()) else {
+                break;
+            };
+            self.end_subagent(&key, false, out);
+        }
+        // Every subagent still here stays, and so does what is its own.
+        for (parent, scope) in std::mem::take(&mut self.scopes) {
+            if self.owner_of(&parent).is_some() {
+                self.scopes.insert(parent, scope);
+            } else if let Some(mut block) = scope.block {
                 block.complete(out);
             }
         }
-        for call in std::mem::take(&mut self.running) {
-            let status = if self.denied.contains(&call.id) {
-                ItemStatus::Declined
-            } else {
-                ItemStatus::Failed
-            };
+        let (kept, cut): (Vec<ToolCall>, Vec<ToolCall>) = std::mem::take(&mut self.running)
+            .into_iter()
+            .partition(|call| call.owner.is_some());
+        self.running = kept;
+        for call in cut {
+            let status = self.cut_status(&call);
             out.push(event(EventBody::ItemCompleted {
                 item: call.item(status, None),
             }));
@@ -681,13 +874,16 @@ impl Mapper {
 impl Block {
     fn start(&mut self, out: &mut Vec<RunnerOutput>) {
         self.started = true;
-        out.push(event(EventBody::ItemStarted {
-            item: Item {
-                id: self.item_id.clone(),
-                status: ItemStatus::Running,
-                content: self.prose.content(String::new()),
+        out.push(event_of(
+            &self.owner,
+            EventBody::ItemStarted {
+                item: Item {
+                    id: self.item_id.clone(),
+                    status: ItemStatus::Running,
+                    content: self.prose.content(String::new()),
+                },
             },
-        }));
+        ));
     }
 
     fn append(&mut self, chunk: &str, out: &mut Vec<RunnerOutput>) {
@@ -698,10 +894,13 @@ impl Block {
             self.start(out);
         }
         self.text.push_str(chunk);
-        out.push(event(EventBody::ItemDelta {
-            item_id: self.item_id.clone(),
-            delta: self.prose.delta(chunk.to_owned()),
-        }));
+        out.push(event_of(
+            &self.owner,
+            EventBody::ItemDelta {
+                item_id: self.item_id.clone(),
+                delta: self.prose.delta(chunk.to_owned()),
+            },
+        ));
     }
 
     /// Completes the item, if the block ever became one.
@@ -710,18 +909,32 @@ impl Block {
             return;
         }
         self.started = false;
-        out.push(event(EventBody::ItemCompleted {
-            item: Item {
-                id: self.item_id.clone(),
-                status: ItemStatus::Completed,
-                content: self.prose.content(std::mem::take(&mut self.text)),
+        out.push(event_of(
+            &self.owner,
+            EventBody::ItemCompleted {
+                item: Item {
+                    id: self.item_id.clone(),
+                    status: ItemStatus::Completed,
+                    content: self.prose.content(std::mem::take(&mut self.text)),
+                },
             },
-        }));
+        ));
     }
 }
 
 fn event(body: EventBody) -> RunnerOutput {
     RunnerOutput::Event(body)
+}
+
+/// An event of the subagent `owner`, or of the lead when there is none.
+fn event_of(owner: &Option<String>, body: EventBody) -> RunnerOutput {
+    match owner {
+        Some(key) => RunnerOutput::SubagentEvent {
+            key: key.clone(),
+            body,
+        },
+        None => event(body),
+    }
 }
 
 /// One entry of `updatedPermissions`, in the shape of the CLI's own
@@ -748,6 +961,15 @@ fn str_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
 /// The subagent a message belongs to: the tool-use id of the call that runs it.
 fn parent_of(message: &Value) -> Option<String> {
     str_field(message, "parent_tool_use_id").map(str::to_owned)
+}
+
+/// True when the `user` message that carries an `Agent` call's result says
+/// the subagent was only launched and runs on (recorded in
+/// `parallel-subagents`, where the CLI chose that without being asked).
+fn launched_in_background(message: &Value) -> bool {
+    let result = message.get("tool_use_result").unwrap_or(&Value::Null);
+    str_field(result, "status") == Some("async_launched")
+        || result.get("isAsync").and_then(Value::as_bool) == Some(true)
 }
 
 /// True when the `user` message says the call was refused at a permission

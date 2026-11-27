@@ -8,9 +8,10 @@ use axum::http::StatusCode;
 use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
 use calin_proto::{
-    ApiError, AttachRepoRequest, CreateSessionRequest, FileContent, FileDiff, Health,
-    RegisterRepoRequest, Repo, RepoChanges, RepoSet, ResolvePermissionRequest, SendMessageRequest,
-    Session, SessionDetail, SessionRepo, Settings, ShipRequest, TreeEntry, WriteFileRequest,
+    AnswerQuestionRequest, ApiError, AttachRepoRequest, CreateSessionRequest, FileContent,
+    FileDiff, Graph, Health, RegisterRepoRequest, Repo, RepoChanges, RepoSet,
+    ResolvePermissionRequest, SendMessageRequest, Session, SessionDetail, SessionRepo, Settings,
+    ShipRequest, Timeline, TreeEntry, WriteFileRequest,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -240,6 +241,40 @@ pub(crate) async fn resolve_permission(
         .resolve_permission(&session_id, &request_id, request.decision, request.message)
         .await?;
     Ok(StatusCode::ACCEPTED)
+}
+
+pub(crate) async fn answer_question(
+    State(state): State<AppState>,
+    Path((session_id, question_id)): Path<(String, String)>,
+    ApiJson(request): ApiJson<AnswerQuestionRequest>,
+) -> ApiResult<StatusCode> {
+    state
+        .manager
+        .answer_question(&session_id, &question_id, &request.answer)
+        .await?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+/// The `at` parameter of the graph route: Unix milliseconds. Absent means now.
+#[derive(Deserialize)]
+pub(crate) struct AtQuery {
+    #[serde(default)]
+    at: Option<i64>,
+}
+
+pub(crate) async fn session_graph(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    ApiQuery(query): ApiQuery<AtQuery>,
+) -> ApiResult<Json<Graph>> {
+    Ok(Json(state.manager.graph(&session_id, query.at).await?))
+}
+
+pub(crate) async fn session_timeline(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> ApiResult<Json<Timeline>> {
+    Ok(Json(state.manager.timeline(&session_id).await?))
 }
 
 pub(crate) async fn attach_repo(

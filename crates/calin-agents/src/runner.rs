@@ -69,6 +69,29 @@ impl std::fmt::Debug for StartParams {
 pub struct PermissionAsk {
     pub request: PermissionRequest,
     pub access: ToolAccess,
+    /// The key of the subagent that asks ([`SubagentStart::key`]); `None`
+    /// when the process agent itself does.
+    pub subagent: Option<String>,
+}
+
+/// A subagent an agent started inside its own process. It has no process and
+/// no conversation of its own: the runner tells its output apart by `key`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubagentStart {
+    /// Chosen by the runner, unique among the subagents of one agent start.
+    /// The orchestrator never looks inside it.
+    pub key: String,
+    /// The key of the subagent that started this one; `None` when the
+    /// process agent did.
+    pub parent: Option<String>,
+    /// The subagent's type, for example `general-purpose`. It becomes the
+    /// role of the agent the orchestrator records.
+    pub role: String,
+    /// One line saying what it was asked to do.
+    pub description: String,
+    /// The tool item whose call started it, when there is one. That item
+    /// belongs to the agent that made the call, not to the subagent.
+    pub item_id: Option<String>,
 }
 
 /// What the tool call behind a permission request reaches for.
@@ -90,6 +113,7 @@ impl From<PermissionRequest> for PermissionAsk {
         Self {
             request,
             access: ToolAccess::Other,
+            subagent: None,
         }
     }
 }
@@ -112,7 +136,18 @@ pub enum RunnerOutput {
     /// The agent wants to use a tool and waits for
     /// [`RunnerInput::PermissionDecision`] with the request's id. The runner
     /// forwards every request it receives and applies no policy of its own.
+    /// [`PermissionAsk::subagent`] says which subagent asks, if one does.
     PermissionRequest(PermissionAsk),
+    /// The agent, or one of its subagents, started a subagent inside the
+    /// same process. Sent after the `ItemStarted` of the tool item that
+    /// started it and before any output that carries its key.
+    SubagentStarted(SubagentStart),
+    /// Like [`RunnerOutput::Event`], for something the subagent with this
+    /// key produced.
+    SubagentEvent { key: String, body: EventBody },
+    /// The subagent is over: `ok` when it finished its work, false when it
+    /// failed or was cut short. Nothing with its key follows.
+    SubagentEnded { key: String, ok: bool },
     /// The runner's own conversation id for this agent, and the model in use
     /// when the runner knows it. Sent when first known and again whenever
     /// either changes; store the id and pass it as [`StartParams::resume`].
@@ -198,6 +233,25 @@ pub enum RunnerError {
 /// `Exited` that follows. A tool call cut short by an interrupt, a stop or the
 /// death of the agent completes as `failed`, unfinished text as `completed`
 /// with what was written so far. Item ids are unique within the session.
+///
+/// # Subagents
+///
+/// An agent that starts a subagent inside its own process says so with
+/// `SubagentStarted`, then reports what the subagent does as `SubagentEvent`
+/// (and `PermissionRequest` with the subagent's key) and closes it with
+/// `SubagentEnded`. A subagent may start subagents of its own; they end
+/// before it does. The item of the call that started a subagent belongs to
+/// the caller and completes after the `SubagentEnded`, unless the call
+/// returned at once and left the subagent running in the background.
+///
+/// A subagent's items complete before its `SubagentEnded`. A subagent that
+/// runs in the foreground ends before the `TurnEnded` of the turn that
+/// started it. One left running in the background may outlive the turn, and
+/// its items with it: they are the one exception to the rule above, and
+/// its outputs, its `SubagentEnded` included, may arrive between turns.
+/// Every subagent is over once the agent has `Exited`, whether or not the
+/// runner could still say so. Totals (`Usage`) are reported for the whole
+/// process, as an `Event` of the agent itself.
 ///
 /// # Permission requests
 ///

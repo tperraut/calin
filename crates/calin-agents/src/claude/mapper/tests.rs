@@ -94,7 +94,25 @@ fn to_json(output: &RunnerOutput) -> Value {
                 ToolAccess::Orchestrator => json!("orchestrator"),
                 ToolAccess::Other => json!("other"),
             };
-            json!({ "permission_request": ask.request, "access": access })
+            let mut line = json!({ "permission_request": ask.request, "access": access });
+            // Only when a subagent asks, so the lead's lines stay as they were.
+            if let Some(key) = &ask.subagent {
+                line["subagent"] = json!(key);
+            }
+            line
+        }
+        RunnerOutput::SubagentStarted(start) => json!({ "subagent_started": {
+            "key": start.key,
+            "parent": start.parent,
+            "role": start.role,
+            "description": start.description,
+            "item_id": start.item_id,
+        } }),
+        RunnerOutput::SubagentEvent { key, body } => {
+            json!({ "subagent_event": { "key": key, "event": body } })
+        }
+        RunnerOutput::SubagentEnded { key, ok } => {
+            json!({ "subagent_ended": { "key": key, "ok": ok } })
         }
         RunnerOutput::NativeSession { id, model } => {
             json!({ "native_session": { "id": id, "model": model } })
@@ -170,70 +188,157 @@ fn every_fixture_maps_to_its_expected_outputs() {
 
 /// The rules every stream of outputs obeys, whatever the transcript.
 fn check_invariants(name: &str, outputs: &[RunnerOutput]) -> usize {
+    /// A running item: the text its deltas added up to, and whose it is.
+    struct Open {
+        streamed: String,
+        owner: Option<String>,
+    }
     let mut ids = HashSet::new();
-    // Running items with the text their deltas added up to.
-    let mut open: HashMap<String, String> = HashMap::new();
+    let mut open: HashMap<String, Open> = HashMap::new();
     let mut requests = HashSet::new();
+    // Running subagents with the subagent that started each, and every key ever used.
+    let mut subagents: HashMap<String, Option<String>> = HashMap::new();
+    let mut keys = HashSet::new();
     let mut turns = 0;
     for output in outputs {
-        match output {
-            RunnerOutput::Event(EventBody::ItemStarted { item }) => {
+        let (owner, body) = match output {
+            RunnerOutput::Event(body) => (None, Some(body)),
+            RunnerOutput::SubagentEvent { key, body } => {
+                assert!(
+                    subagents.contains_key(key),
+                    "{name}: output of {key}, which is not a running subagent"
+                );
+                (Some(key.clone()), Some(body))
+            }
+            _ => (None, None),
+        };
+        match (output, body) {
+            (_, Some(EventBody::ItemStarted { item })) => {
                 assert_eq!(item.status, ItemStatus::Running, "{name}: {item:?}");
                 assert!(ids.insert(item.id.clone()), "{name}: id {} reused", item.id);
-                open.insert(item.id.clone(), String::new());
+                let streamed = String::new();
+                open.insert(item.id.clone(), Open { streamed, owner });
             }
-            RunnerOutput::Event(EventBody::ItemDelta { item_id, delta }) => {
-                let text = open
+            (_, Some(EventBody::ItemDelta { item_id, delta })) => {
+                let item = open
                     .get_mut(item_id)
                     .unwrap_or_else(|| panic!("{name}: delta for {item_id}, which is not running"));
+                assert_eq!(item.owner, owner, "{name}: {item_id} changed hands");
                 match delta {
                     ItemDelta::Text { text: chunk }
                     | ItemDelta::Reasoning { text: chunk }
-                    | ItemDelta::Output { text: chunk } => text.push_str(chunk),
+                    | ItemDelta::Output { text: chunk } => item.streamed.push_str(chunk),
                 }
             }
-            RunnerOutput::Event(EventBody::ItemCompleted { item }) => {
-                let streamed = open
+            (_, Some(EventBody::ItemCompleted { item })) => {
+                let was = open
                     .remove(&item.id)
                     .unwrap_or_else(|| panic!("{name}: {} completed but is not running", item.id));
+                assert_eq!(was.owner, owner, "{name}: {} changed hands", item.id);
                 assert_ne!(item.status, ItemStatus::Running, "{name}: {item:?}");
                 match &item.content {
                     ItemContent::Text { text } | ItemContent::Reasoning { text } => {
                         assert!(!text.is_empty(), "{name}: empty prose item {}", item.id);
                         assert!(
-                            streamed.is_empty() || streamed == *text,
+                            was.streamed.is_empty() || was.streamed == *text,
                             "{name}: deltas of {} do not add up to its text",
                             item.id
                         );
                     }
-                    ItemContent::Tool { .. } => assert!(streamed.is_empty()),
+                    ItemContent::Tool { .. } => assert!(was.streamed.is_empty()),
                 }
             }
-            RunnerOutput::PermissionRequest(PermissionAsk { request, .. }) => {
+            (_, Some(EventBody::Usage { .. })) => {
+                assert_eq!(owner, None, "{name}: totals are the whole process's");
+            }
+            (_, Some(_)) => {}
+            (RunnerOutput::PermissionRequest(ask), _) => {
+                let PermissionAsk {
+                    request, subagent, ..
+                } = ask;
                 assert!(
                     requests.insert(request.id.clone()),
                     "{name}: request reused"
                 );
                 let item_id = request.item_id.as_ref().expect("requests name their item");
+                let item = open
+                    .get(item_id)
+                    .unwrap_or_else(|| panic!("{name}: request for an idle item"));
+                assert_eq!(
+                    &item.owner, subagent,
+                    "{name}: {item_id} asked for by another"
+                );
+                if let Some(key) = subagent {
+                    assert!(
+                        subagents.contains_key(key),
+                        "{name}: {key} asks but is over"
+                    );
+                }
+            }
+            (RunnerOutput::SubagentStarted(start), _) => {
                 assert!(
-                    open.contains_key(item_id),
-                    "{name}: request for an idle item"
+                    keys.insert(start.key.clone()),
+                    "{name}: key {} reused",
+                    start.key
+                );
+                if let Some(parent) = &start.parent {
+                    assert!(
+                        subagents.contains_key(parent),
+                        "{name}: {} started by {parent}, which is not running",
+                        start.key
+                    );
+                }
+                let item_id = start.item_id.as_ref().expect("the call is known");
+                let call = open
+                    .get(item_id)
+                    .unwrap_or_else(|| panic!("{name}: {} started by an idle item", start.key));
+                assert_eq!(call.owner, start.parent, "{name}: the call is the caller's");
+                subagents.insert(start.key.clone(), start.parent.clone());
+            }
+            (RunnerOutput::SubagentEnded { key, .. }, _) => {
+                assert!(
+                    subagents.remove(key).is_some(),
+                    "{name}: {key} ended but is not running"
+                );
+                assert!(
+                    !subagents
+                        .values()
+                        .any(|parent| parent.as_ref() == Some(key)),
+                    "{name}: {key} ended before a subagent it started"
+                );
+                assert!(
+                    !open.values().any(|item| item.owner.as_ref() == Some(key)),
+                    "{name}: {key} ended with items open"
                 );
             }
-            RunnerOutput::TurnEnded => {
+            (RunnerOutput::TurnEnded, _) => {
+                // Only a subagent that outlives the turn keeps items open.
+                let lead: Vec<&String> = open
+                    .iter()
+                    .filter(|(_, item)| item.owner.is_none())
+                    .map(|(id, _)| id)
+                    .collect();
                 assert!(
-                    open.is_empty(),
-                    "{name}: a turn ended with open items {open:?}"
+                    lead.is_empty(),
+                    "{name}: a turn ended with open items {lead:?}"
                 );
                 turns += 1;
             }
-            RunnerOutput::Exited(_) => panic!("{name}: a mapper never reports an exit"),
-            RunnerOutput::Event(_) | RunnerOutput::NativeSession { .. } => {}
+            (RunnerOutput::Exited(_), _) => panic!("{name}: a mapper never reports an exit"),
+            (RunnerOutput::NativeSession { .. }, _) => {}
+            (RunnerOutput::Event(_) | RunnerOutput::SubagentEvent { .. }, None) => {
+                unreachable!("an event has a body")
+            }
         }
     }
     assert!(
         open.is_empty(),
-        "{name}: the stream ended with open items {open:?}"
+        "{name}: the stream ended with open items {:?}",
+        open.keys()
+    );
+    assert!(
+        subagents.is_empty(),
+        "{name}: the stream ended with running subagents {subagents:?}"
     );
     turns
 }
@@ -252,7 +357,25 @@ fn every_fixture_keeps_the_invariants() {
         assert_eq!(turns, results, "{name}");
         assert!(turns >= 1, "{name}: no turn");
         if results > 0 {
-            assert_eq!(outputs.last(), Some(&RunnerOutput::TurnEnded), "{name}");
+            // Nothing follows the last turn but the end of what a subagent
+            // left running in the background, cut with the stream.
+            let after_turns = outputs
+                .iter()
+                .rev()
+                .take_while(|output| **output != RunnerOutput::TurnEnded);
+            for output in after_turns {
+                assert!(
+                    matches!(
+                        output,
+                        RunnerOutput::SubagentEnded { ok: false, .. }
+                            | RunnerOutput::SubagentEvent {
+                                body: EventBody::ItemCompleted { .. },
+                                ..
+                            }
+                    ),
+                    "{name}: {output:?} after the last turn"
+                );
+            }
         }
     }
 }
@@ -331,13 +454,23 @@ fn recorded_grants(updates: &Value) -> Vec<DirGrant> {
         .collect()
 }
 
-fn events(outputs: &[RunnerOutput]) -> Vec<&EventBody> {
+/// Every event with the key of the subagent it belongs to, `None` for the lead.
+fn attributed(outputs: &[RunnerOutput]) -> Vec<(Option<&str>, &EventBody)> {
     outputs
         .iter()
         .filter_map(|output| match output {
-            RunnerOutput::Event(body) => Some(body),
+            RunnerOutput::Event(body) => Some((None, body)),
+            RunnerOutput::SubagentEvent { key, body } => Some((Some(key.as_str()), body)),
             _ => None,
         })
+        .collect()
+}
+
+/// Every event, whoever produced it.
+fn events(outputs: &[RunnerOutput]) -> Vec<&EventBody> {
+    attributed(outputs)
+        .into_iter()
+        .map(|(_, body)| body)
         .collect()
 }
 
@@ -515,6 +648,130 @@ fn a_subagent_shows_as_a_task_with_its_own_tool_calls() {
         &task.content,
         ItemContent::Tool { output: Some(output), .. } if output.contains("Calin fixture note.")
     ));
+}
+
+/// The outputs that say who did what, one short line each: item starts and
+/// ends (prefixed with the subagent's key when they are one's), subagents
+/// starting (`+`) and ending (`-`), and the ends of turns.
+fn trace(outputs: &[RunnerOutput]) -> Vec<String> {
+    let line = |body: &EventBody| match body {
+        EventBody::ItemStarted { item } => Some(format!("start {}", item.id)),
+        EventBody::ItemCompleted { item } => {
+            let status = format!("{:?}", item.status).to_lowercase();
+            Some(format!("{status} {}", item.id))
+        }
+        _ => None,
+    };
+    outputs
+        .iter()
+        .filter_map(|output| match output {
+            RunnerOutput::Event(body) => line(body),
+            RunnerOutput::SubagentEvent { key, body } => {
+                line(body).map(|line| format!("{key}: {line}"))
+            }
+            RunnerOutput::SubagentStarted(start) => Some(format!(
+                "+{} by {}",
+                start.key,
+                start.parent.as_deref().unwrap_or("lead")
+            )),
+            RunnerOutput::SubagentEnded { key, ok } => {
+                Some(format!("-{key} {}", if *ok { "ok" } else { "cut" }))
+            }
+            RunnerOutput::TurnEnded => Some("turn".to_owned()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn the_recorded_subagent_owns_what_it_did_and_ends_with_its_call() {
+    let outputs = replay(&fixture("subagent"));
+    assert_eq!(
+        trace(&outputs),
+        [
+            "start toolu-0001",
+            "+toolu-0001 by lead",
+            "toolu-0001: start toolu-0002",
+            "toolu-0001: completed toolu-0002",
+            // The CLI's notification comes first; the call's result is the end.
+            "-toolu-0001 ok",
+            "completed toolu-0001",
+            "start claude-7-3",
+            "completed claude-7-3",
+            "turn",
+        ]
+    );
+    let started: Vec<&SubagentStart> = outputs
+        .iter()
+        .filter_map(|output| match output {
+            RunnerOutput::SubagentStarted(start) => Some(start),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        started,
+        [&SubagentStart {
+            key: "toolu-0001".into(),
+            parent: None,
+            role: "general-purpose".into(),
+            description: "Read first line of notes.txt".into(),
+            item_id: Some("toolu-0001".into()),
+        }]
+    );
+    // Totals are the whole process's, never a subagent's.
+    assert_eq!(usage(&outputs).len(), 1);
+    assert!(
+        attributed(&outputs)
+            .iter()
+            .all(|(key, body)| key.is_none() || !matches!(body, EventBody::Usage { .. }))
+    );
+}
+
+/// Two subagents the CLI launched in the background on its own: their
+/// calls return at once, their work interleaves on one pipe, one is over
+/// before the turn ends and the other outlives it.
+#[test]
+fn recorded_background_subagents_keep_their_work_apart_and_outlive_their_calls() {
+    let outputs = replay(&fixture("parallel-subagents"));
+    assert_eq!(
+        trace(&outputs),
+        [
+            "start toolu-0001",
+            "+toolu-0001 by lead",
+            // "Async agent launched": the call is over, the subagent is not.
+            "completed toolu-0001",
+            "start toolu-0002",
+            "+toolu-0002 by lead",
+            "completed toolu-0002",
+            "toolu-0002: start toolu-0003",
+            "toolu-0002: completed toolu-0003",
+            "toolu-0001: start toolu-0004",
+            "toolu-0001: completed toolu-0004",
+            "start claude-7-2",
+            "toolu-0002: start claude-7-3",
+            "toolu-0002: completed claude-7-3",
+            "completed claude-7-2",
+            // Its notification names it.
+            "-toolu-0002 ok",
+            "turn",
+            // Still running when the recording ends: cut with the stream.
+            "-toolu-0001 cut",
+        ]
+    );
+    // Neither call asked to run in the background: the result says it did.
+    for call in ["toolu-0001", "toolu-0002"] {
+        let item = completed(&outputs).into_iter().find(|item| item.id == call);
+        let ItemContent::Tool { input, output, .. } = &item.unwrap().content else {
+            panic!("{call} is a tool call");
+        };
+        assert!(input.get("run_in_background").is_none());
+        assert!(
+            output
+                .as_deref()
+                .unwrap()
+                .starts_with("Async agent launched")
+        );
+    }
 }
 
 #[test]
@@ -1044,6 +1301,7 @@ fn a_request_that_comes_before_its_call_starts_the_item() {
                 item_id: Some("t1".into()),
             },
             access: ToolAccess::Other,
+            subagent: None,
         })
     );
 }
@@ -1665,4 +1923,450 @@ fn tokens_add_up_from_per_turn_usage_when_totals_are_missing() {
         })],
     );
     assert_eq!(usage(&outputs), [(1.0, 400, 50)]);
+}
+
+// Subagents, in shapes the one recording does not hold.
+
+/// `message` as the CLI sends it from inside the subagent run by `call`.
+fn inside(call: &str, mut message: Value) -> Value {
+    message["parent_tool_use_id"] = json!(call);
+    message
+}
+
+fn agent_call(id: &str, parent: Option<&str>, input: Value) -> Value {
+    assistant(
+        &format!("msg_{id}"),
+        parent,
+        json!([{ "type": "tool_use", "id": id, "name": "Agent", "input": input }]),
+    )
+}
+
+/// A tool call made inside the subagent run by `call`.
+fn call_inside(call: &str, id: &str, name: &str, input: Value) -> Value {
+    assistant(
+        &format!("msg_{id}"),
+        Some(call),
+        json!([{ "type": "tool_use", "id": id, "name": name, "input": input }]),
+    )
+}
+
+fn text_inside(call: &str, message_id: &str, text: &str) -> Value {
+    assistant(
+        message_id,
+        Some(call),
+        json!([{ "type": "text", "text": text }]),
+    )
+}
+
+fn notification(call: &str, status: &str) -> Value {
+    json!({
+        "type": "system", "subtype": "task_notification", "tool_use_id": call,
+        "task_id": "task-1", "status": status,
+    })
+}
+
+#[test]
+fn a_subagent_that_starts_another_is_its_parent_and_outlives_it() {
+    let mut mapper = mapper();
+    let outputs = feed(
+        &mut mapper,
+        &[
+            agent_call(
+                "a1",
+                None,
+                json!({ "description": "Outer", "subagent_type": "general-purpose", "prompt": "p" }),
+            ),
+            // `Task` is the tool's earlier name.
+            assistant(
+                "msg_a2",
+                Some("a1"),
+                json!([{ "type": "tool_use", "id": "a2", "name": "Task",
+                         "input": { "prompt": "Review it\nwith care", "subagent_type": "reviewer" } }]),
+            ),
+            call_inside("a2", "b1", "Bash", json!({ "command": "make" })),
+            inside("a2", tool_result("b1", json!({ "content": "ok" }))),
+            text_inside("a2", "msg_t1", "inner done"),
+            inside(
+                "a1",
+                tool_result("a2", json!({ "content": "inner result" })),
+            ),
+            text_inside("a1", "msg_t2", "outer done"),
+            tool_result("a1", json!({ "content": "outer result" })),
+            result(),
+        ],
+    );
+    assert_eq!(check_invariants("nested", &outputs), 1);
+    assert_eq!(
+        trace(&outputs),
+        [
+            "start a1",
+            "+a1 by lead",
+            "a1: start a2",
+            "+a2 by a1",
+            "a2: start b1",
+            "a2: completed b1",
+            "a2: start claude-7-1",
+            "a2: completed claude-7-1",
+            "-a2 ok",
+            "a1: completed a2",
+            "a1: start claude-7-2",
+            "a1: completed claude-7-2",
+            "-a1 ok",
+            "completed a1",
+            "turn",
+        ]
+    );
+    let inner = outputs
+        .iter()
+        .find_map(|output| match output {
+            RunnerOutput::SubagentStarted(start) if start.key == "a2" => Some(start),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        inner,
+        &SubagentStart {
+            key: "a2".into(),
+            parent: Some("a1".into()),
+            role: "reviewer".into(),
+            // No description: the first line of the prompt.
+            description: "Review it".into(),
+            item_id: Some("a2".into()),
+        }
+    );
+    assert_eq!(mapper.finish(), []);
+}
+
+#[test]
+fn a_failed_call_fails_its_subagent_and_what_was_running_below_it() {
+    let mut mapper = mapper();
+    let outputs = feed(
+        &mut mapper,
+        &[
+            agent_call("a1", None, json!({ "description": "Outer" })),
+            agent_call("a2", Some("a1"), json!({ "description": "Inner" })),
+            call_inside("a2", "b1", "Bash", json!({ "command": "make" })),
+            inside(
+                "a2",
+                stream(json!({
+                    "type": "content_block_start", "index": 0,
+                    "content_block": { "type": "text", "text": "Half a sen" },
+                })),
+            ),
+            // The outer call fails while the inner subagent is at work.
+            tool_result("a1", json!({ "content": "crashed", "is_error": true })),
+            // What the dead subagents still say is nobody's.
+            inside("a2", tool_result("b1", json!({ "content": "late" }))),
+            result(),
+        ],
+    );
+    assert_eq!(check_invariants("failed", &outputs), 1);
+    assert_eq!(
+        trace(&outputs),
+        [
+            "start a1",
+            "+a1 by lead",
+            "a1: start a2",
+            "+a2 by a1",
+            "a2: start b1",
+            "a2: start claude-7-1",
+            // Children first, each with what it left open.
+            "a2: completed claude-7-1",
+            "a2: failed b1",
+            "-a2 cut",
+            "a1: failed a2",
+            "-a1 cut",
+            "failed a1",
+            "turn",
+        ]
+    );
+
+    // A subagent whose own result is an error, with nothing left open.
+    let mut mapper = self::mapper();
+    let outputs = feed(
+        &mut mapper,
+        &[
+            agent_call("a1", None, json!({ "description": "Outer" })),
+            tool_result(
+                "a1",
+                json!({ "content": "no such agent", "is_error": true }),
+            ),
+            result(),
+        ],
+    );
+    assert_eq!(
+        trace(&outputs),
+        ["start a1", "+a1 by lead", "-a1 cut", "failed a1", "turn"]
+    );
+}
+
+#[test]
+fn a_turn_or_a_stream_that_ends_cuts_its_subagents_short() {
+    let messages = [
+        agent_call("a1", None, json!({ "description": "Outer" })),
+        call_inside("a1", "b1", "Bash", json!({ "command": "sleep 60" })),
+    ];
+    let cut = [
+        "start a1",
+        "+a1 by lead",
+        "a1: start b1",
+        "a1: failed b1",
+        "-a1 cut",
+        "failed a1",
+    ];
+
+    // An interrupted turn.
+    let mut mapper = mapper();
+    let mut outputs = feed(&mut mapper, &messages);
+    outputs.extend(feed(&mut mapper, &[result()]));
+    assert_eq!(check_invariants("interrupted", &outputs), 1);
+    let mut expected: Vec<&str> = cut.to_vec();
+    expected.push("turn");
+    assert_eq!(trace(&outputs), expected);
+    assert_eq!(mapper.finish(), []);
+
+    // A process that died.
+    let mut mapper = self::mapper();
+    let mut outputs = feed(&mut mapper, &messages);
+    outputs.extend(mapper.finish());
+    assert_eq!(check_invariants("killed", &outputs), 0);
+    assert_eq!(trace(&outputs), cut);
+}
+
+#[test]
+fn a_background_subagent_outlives_its_call_and_its_turn() {
+    let launch = [
+        agent_call(
+            "bg",
+            None,
+            json!({ "description": "Watch the build", "run_in_background": true }),
+        ),
+        // The call returns at once.
+        tool_result("bg", json!({ "content": "launched" })),
+        call_inside("bg", "b1", "Bash", json!({ "command": "make watch" })),
+        result(),
+    ];
+    let launched = [
+        "start bg",
+        "+bg by lead",
+        "completed bg",
+        "bg: start b1",
+        "turn",
+    ];
+
+    let mut mapper = mapper();
+    let mut outputs = feed(&mut mapper, &launch);
+    assert_eq!(trace(&outputs), launched);
+    // Between turns it goes on, streaming included, and its end is said.
+    let later = feed(
+        &mut mapper,
+        &[
+            inside("bg", tool_result("b1", json!({ "content": "built" }))),
+            inside(
+                "bg",
+                stream(json!({
+                    "type": "content_block_start", "index": 0,
+                    "content_block": { "type": "text", "text": "All green" },
+                })),
+            ),
+            // Not this subagent's task: nothing happens.
+            notification("someone-else", "completed"),
+            notification("bg", "completed"),
+        ],
+    );
+    assert_eq!(
+        trace(&later),
+        [
+            "bg: completed b1",
+            "bg: start claude-7-1",
+            "bg: completed claude-7-1",
+            "-bg ok",
+        ]
+    );
+    outputs.extend(later);
+    // Over: what still names it is the lead's, as before there were subagents.
+    let stray = feed(&mut mapper, &[text_inside("bg", "msg_late", "late")]);
+    assert!(
+        stray
+            .iter()
+            .all(|output| matches!(output, RunnerOutput::Event(_)))
+    );
+    outputs.extend(stray);
+    outputs.extend(mapper.finish());
+    assert_eq!(check_invariants("background", &outputs), 1);
+
+    // A task that did not complete is a subagent that failed.
+    let mut mapper = self::mapper();
+    feed(&mut mapper, &launch);
+    assert_eq!(
+        trace(&feed(&mut mapper, &[notification("bg", "killed")])),
+        ["bg: failed b1", "-bg cut"]
+    );
+
+    // The process ends first: so does the subagent.
+    let mut mapper = self::mapper();
+    let mut outputs = feed(&mut mapper, &launch);
+    outputs.extend(mapper.finish());
+    assert_eq!(check_invariants("background, killed", &outputs), 1);
+    let mut expected: Vec<&str> = launched.to_vec();
+    expected.extend(["bg: failed b1", "-bg cut"]);
+    assert_eq!(trace(&outputs), expected);
+
+    // A launch that failed leaves nothing running.
+    let mut mapper = self::mapper();
+    let outputs = feed(
+        &mut mapper,
+        &[
+            launch[0].clone(),
+            tool_result("bg", json!({ "content": "no", "is_error": true })),
+        ],
+    );
+    assert_eq!(
+        trace(&outputs),
+        ["start bg", "+bg by lead", "-bg cut", "failed bg"]
+    );
+
+    // One that runs in the foreground ends with its call, whatever the
+    // CLI notifies before that (recorded in `subagent`).
+    let mut mapper = self::mapper();
+    let outputs = feed(
+        &mut mapper,
+        &[
+            agent_call("a1", None, json!({ "description": "Outer" })),
+            notification("a1", "completed"),
+        ],
+    );
+    assert_eq!(trace(&outputs), ["start a1", "+a1 by lead"]);
+}
+
+#[test]
+fn a_request_from_inside_a_subagent_says_which_one_asks() {
+    let mut mapper = mapper();
+    let write = json!({ "file_path": "/work/x" });
+    let command = json!({ "command": "make" });
+    let outputs = feed(
+        &mut mapper,
+        &[
+            agent_call("a1", None, json!({ "description": "Outer" })),
+            call_inside("a1", "w1", "Write", write.clone()),
+            can_use("r1", "w1", "Write", write),
+            // A request ahead of its call, should the CLI ever name its scope.
+            inside("a1", can_use("r2", "c1", "Bash", command.clone())),
+            // The lead's own.
+            tool_use("c2", "Bash", command.clone()),
+            can_use("r3", "c2", "Bash", command),
+        ],
+    );
+    let asking: Vec<(&str, Option<&str>)> = asks(&outputs)
+        .into_iter()
+        .map(|ask| (ask.request.id.as_str(), ask.subagent.as_deref()))
+        .collect();
+    assert_eq!(
+        asking,
+        [("r1", Some("a1")), ("r2", Some("a1")), ("r3", None)]
+    );
+    assert_eq!(
+        trace(&outputs),
+        [
+            "start a1",
+            "+a1 by lead",
+            "a1: start w1",
+            "a1: start c1",
+            "start c2"
+        ]
+    );
+
+    // A denied call is declined in the subagent's name, and when the
+    // subagent ends, its unanswered request dies with its call.
+    assert!(
+        mapper
+            .permission_response("r1", PermissionDecision::Deny, None)
+            .is_some()
+    );
+    let mut all = outputs;
+    all.extend(feed(
+        &mut mapper,
+        &[
+            inside(
+                "a1",
+                tool_result("w1", json!({ "content": "denied", "is_error": true })),
+            ),
+            tool_result("a1", json!({ "content": "gave up" })),
+        ],
+    ));
+    assert_eq!(
+        trace(&all)[5..],
+        ["a1: declined w1", "a1: failed c1", "-a1 ok", "completed a1"]
+    );
+    assert_eq!(
+        mapper.permission_response("r2", PermissionDecision::Allow, None),
+        None
+    );
+    assert!(
+        mapper
+            .permission_response("r3", PermissionDecision::Allow, None)
+            .is_some()
+    );
+    all.extend(feed(
+        &mut mapper,
+        &[tool_result("c2", json!({ "content": "ok" })), result()],
+    ));
+    assert_eq!(check_invariants("requests", &all), 1);
+}
+
+#[test]
+fn streamed_text_and_plans_inside_a_subagent_are_its_own() {
+    let mut mapper = mapper();
+    let todos = json!({ "todos": [{ "content": "Look", "status": "in_progress" }] });
+    let outputs = feed(
+        &mut mapper,
+        &[
+            agent_call("a1", None, json!({ "description": "Outer" })),
+            inside(
+                "a1",
+                stream(json!({
+                    "type": "content_block_start", "index": 0,
+                    "content_block": { "type": "text", "text": "" },
+                })),
+            ),
+            inside(
+                "a1",
+                stream(json!({
+                    "type": "content_block_delta", "index": 0,
+                    "delta": { "type": "text_delta", "text": "Looking" },
+                })),
+            ),
+            call_inside("a1", "p1", "TodoWrite", todos),
+            // The lead streams at the same time, in its own scope.
+            stream(json!({
+                "type": "content_block_start", "index": 0,
+                "content_block": { "type": "text", "text": "Waiting" },
+            })),
+        ],
+    );
+    let whose: Vec<(Option<&str>, &str)> = attributed(&outputs)
+        .into_iter()
+        .map(|(key, body)| {
+            let kind = match body {
+                EventBody::ItemStarted { .. } => "started",
+                EventBody::ItemDelta { .. } => "delta",
+                EventBody::ItemCompleted { .. } => "completed",
+                EventBody::PlanUpdated { .. } => "plan",
+                other => panic!("unexpected {other:?}"),
+            };
+            (key, kind)
+        })
+        .collect();
+    assert_eq!(
+        whose,
+        [
+            (None, "started"),
+            (Some("a1"), "started"),
+            (Some("a1"), "delta"),
+            (Some("a1"), "started"),
+            (Some("a1"), "plan"),
+            (None, "started"),
+            (None, "delta"),
+        ]
+    );
 }

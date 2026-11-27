@@ -87,10 +87,21 @@ fn describe(output: &RunnerOutput) -> String {
             Ok(json) => format!("event {json}"),
             Err(err) => format!("event that does not serialize: {err}"),
         },
-        RunnerOutput::PermissionRequest(PermissionAsk { request, .. }) => format!(
-            "permission_request {} {} {:?} item={:?}",
+        RunnerOutput::PermissionRequest(PermissionAsk {
+            request, subagent, ..
+        }) => format!(
+            "permission_request {} {} {:?} item={:?} subagent={subagent:?}",
             request.id, request.tool_name, request.title, request.item_id
         ),
+        RunnerOutput::SubagentStarted(start) => format!(
+            "subagent_started {} parent={:?} role={} {:?} item={:?}",
+            start.key, start.parent, start.role, start.description, start.item_id
+        ),
+        RunnerOutput::SubagentEvent { key, body } => match serde_json::to_string(body) {
+            Ok(json) => format!("subagent_event {key} {json}"),
+            Err(err) => format!("subagent_event {key} that does not serialize: {err}"),
+        },
+        RunnerOutput::SubagentEnded { key, ok } => format!("subagent_ended {key} ok={ok}"),
         RunnerOutput::NativeSession { id, model } => format!("native_session {id} model={model:?}"),
         RunnerOutput::TurnEnded => "turn_ended".to_owned(),
         RunnerOutput::Exited(exit) => format!("exited {exit:?}"),

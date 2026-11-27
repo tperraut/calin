@@ -106,6 +106,12 @@ pub fn router(state: AppState) -> Router {
             "/sessions/{id}/permissions/{request_id}",
             post(api::resolve_permission),
         )
+        .route(
+            "/sessions/{id}/questions/{question_id}",
+            post(api::answer_question),
+        )
+        .route("/sessions/{id}/graph", get(api::session_graph))
+        .route("/sessions/{id}/timeline", get(api::session_timeline))
         .route("/sessions/{id}/repos", post(api::attach_repo))
         .route("/sessions/{id}/ship", post(api::ship_session))
         .route(

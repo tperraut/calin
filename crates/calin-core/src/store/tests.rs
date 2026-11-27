@@ -13,6 +13,8 @@ use tokio::task::JoinSet;
 use super::writer::{LIVE_BUFFER, UPSERT_INTERVAL};
 use super::*;
 
+mod views;
+
 const TIMEOUT: Duration = Duration::from_secs(20);
 
 async fn open(dir: &TempDir) -> Store {
@@ -27,6 +29,7 @@ fn new_session(prompt: &str) -> NewSession {
         permission_mode: PermissionMode::Ask,
         model: None,
         repos: Vec::new(),
+        dispatch: None,
     }
 }
 
@@ -677,6 +680,7 @@ async fn what_a_session_was_created_with_survives_a_reindex() {
     let expected = SessionSetup {
         model: Some("opus".to_owned()),
         repos: wanted,
+        dispatch: None,
     };
     assert_eq!(store.setup(&configured.id).await.unwrap(), expected);
     assert_eq!(

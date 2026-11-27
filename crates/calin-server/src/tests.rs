@@ -9,8 +9,8 @@ use axum::http::{HeaderMap, Method, Request, StatusCode};
 use calin_agents::{ClaudeConfig, MockConfig, RegistryConfig, RunnerRegistry};
 use calin_core::{EventDraft, Home, MAX_FILE_BYTES, ManagerConfig, SessionManager, Store};
 use calin_proto::{
-    ApiError, ChangeStatus, ClientMsg, CreateSessionRequest, DecisionSource, EntryKind, Event,
-    EventBody, FileContent, FileDiff, FileOp, Health, PermissionDecision, PermissionMode,
+    AgentKind, ApiError, ChangeStatus, ClientMsg, CreateSessionRequest, DecisionSource, EntryKind,
+    Event, EventBody, FileContent, FileDiff, FileOp, Health, PermissionDecision, PermissionMode,
     PermissionRequest, Repo, RepoChanges, RepoMode, ServerMsg, Session, SessionDetail,
     SessionStatus, TOPIC_SESSIONS, TermClientMsg, TermServerMsg, TreeEntry, session_topic,
 };
@@ -30,6 +30,7 @@ use super::*;
 
 mod catalog;
 mod delivery;
+mod orchestration;
 
 const TIMEOUT: Duration = Duration::from_secs(20);
 const LOCAL: &str = "127.0.0.1:4680";
@@ -410,8 +411,14 @@ async fn sessions_are_created_listed_and_fetched() {
 
     let done = wait_for(&app, &first.session.id, SessionStatus::Review).await;
     assert_eq!(done.session.id, first.session.id);
-    assert_eq!(done.agents.len(), 1);
+    // The lead, and the subagent the mock's turn starts.
+    assert_eq!(done.agents.len(), 2);
     assert_eq!(done.agents[0].role, "lead");
+    assert_eq!(done.agents[1].kind, AgentKind::Subagent);
+    assert_eq!(
+        done.agents[1].parent_agent_id,
+        Some(done.agents[0].id.clone())
+    );
     assert_eq!(done.agents[0].tokens_in, 1200);
     assert!(done.agents[0].native_session_id.is_some());
     assert!(done.session.head_seq > 10);
@@ -522,7 +529,9 @@ async fn messages_are_accepted_until_the_session_is_done() {
     let reply = post(&app, &messages, json!({ "text": "not done yet" })).await;
     assert_eq!(reply.status, StatusCode::ACCEPTED, "{}", reply.text());
     let detail = wait_for(&app, &id, SessionStatus::Review).await;
-    assert_eq!(detail.agents.len(), 1);
+    // Still one lead; each turn that got that far added its subagent.
+    let leads = detail.agents.iter().filter(|agent| agent.role == "lead");
+    assert_eq!(leads.count(), 1);
 
     // Only `done` is final.
     let done = EventBody::SessionStatus {

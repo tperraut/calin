@@ -1,5 +1,5 @@
 //! The tool endpoint agents call: the Model Context Protocol over HTTP, as
-//! far as two tools need it. One JSON-RPC 2.0 message per POST, one JSON
+//! far as a handful of tools need it. One JSON-RPC 2.0 message per POST, one JSON
 //! response, no session and no stream (the semantics in
 //! `calin-proto/src/api.rs`). What the tools do is `calin-core`'s business.
 
@@ -8,7 +8,7 @@ use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use calin_core::{AgentRef, AgentRepo};
+use calin_core::{AgentRef, AgentRepo, NoteOutcome};
 use calin_proto::RepoMode;
 use serde_json::{Value, json};
 
@@ -21,6 +21,10 @@ const VERSIONS: [&str; 4] = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-
 
 const LIST_REPOS: &str = "list_repos";
 const ATTACH_REPO: &str = "attach_repo";
+const DISPATCH: &str = "dispatch";
+const SEND_MESSAGE: &str = "send_message";
+const REPORT: &str = "report";
+const ASK_USER: &str = "ask_user";
 
 // JSON-RPC 2.0 error codes.
 const PARSE_ERROR: i64 = -32700;
@@ -31,7 +35,10 @@ const INVALID_PARAMS: i64 = -32602;
 /// Told to the agent's client when it connects.
 const INSTRUCTIONS: &str = "Calin's own tools for the agent of one session. Use attach_repo to \
     work in a repository that is not attached to the session yet, and list_repos to see which \
-    repositories exist.";
+    repositories exist. Use dispatch to hand an independent piece of work to a child session, \
+    report (in a child session) to hand the result back, send_message for a note to another \
+    agent or to the user, and ask_user when only the user can decide. Messages that start with \
+    [Calin] are deliveries from Calin (a report, a note, an answer), not from the user.";
 
 pub(crate) async fn call(
     State(state): State<AppState>,
@@ -140,6 +147,113 @@ fn tools() -> Value {
                 "additionalProperties": false,
             },
         },
+        {
+            "name": DISPATCH,
+            "description": "Start a child session: another agent that works on its own, with \
+                a fresh context, on its own branch of each repository it is given (the \
+                branch starts at your current commit there). Use it for an independent \
+                piece of work that can proceed in parallel with yours, or that needs a fresh \
+                context. The child knows nothing of this conversation, so the brief must \
+                stand on its own. It returns the child's id at once; the child's report is \
+                delivered to you later as a message that starts your next turn, so after \
+                dispatching finish what you can do yourself and end your turn instead of \
+                waiting or polling. At most 4 children run at a time. Uncommitted changes \
+                in your worktree are not given to the child: commit first if it needs them.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "A short name for the child session, on one line. \
+                            It also names the child's branch.",
+                    },
+                    "brief": {
+                        "type": "string",
+                        "description": "Everything the child needs to do the work without \
+                            asking: the goal, the files or areas involved, constraints, \
+                            what done looks like, and what to report back.",
+                    },
+                    "repos": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Names of the repositories to give the child: a \
+                            subset of the repositories attached to your session in write \
+                            mode. All of those when omitted.",
+                    },
+                },
+                "required": ["title", "brief"],
+                "additionalProperties": false,
+            },
+        },
+        {
+            "name": SEND_MESSAGE,
+            "description": "Send a note to another participant: `parent` (the agent that \
+                dispatched this session, when it is a child session), the id of a child \
+                session you dispatched, or `user`. A note to an agent is delivered as its \
+                next input and may start a turn there. A note to the user only shows in the \
+                transcript and does not wait for an answer: use ask_user for a question. A \
+                child's final result goes through report, not through this.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "to": {
+                        "type": "string",
+                        "description": "`parent`, `user`, or the id of a child session as \
+                            dispatch returned it.",
+                    },
+                    "text": { "type": "string", "description": "The note." },
+                },
+                "required": ["to", "text"],
+                "additionalProperties": false,
+            },
+        },
+        {
+            "name": REPORT,
+            "description": "In a child session only: hand your result to the agent that \
+                dispatched you. Call it once when your work is done or you cannot go on, \
+                with what you did, what you verified and what is left open, then end your \
+                turn. Commit your work first: the report is delivered with your branch \
+                names, and only commits can be merged from them.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "summary": {
+                        "type": "string",
+                        "description": "The result, written for an agent that has not \
+                            seen your work.",
+                    },
+                },
+                "required": ["summary"],
+                "additionalProperties": false,
+            },
+        },
+        {
+            "name": ASK_USER,
+            "description": "Ask the user a question when you are blocked on a decision only \
+                they can make: a choice between real alternatives, something only they \
+                know, or their consent to something that cannot be undone. The session \
+                waits for them. The tool returns at once and you must then end your turn: \
+                the answer arrives as your next message. One question at a time. Do not \
+                use it for what you can find out or decide yourself.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "The question, with what the user needs to know to \
+                            answer it.",
+                    },
+                    "options": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Suggested answers, when there are natural choices. \
+                            The user may still answer in their own words.",
+                    },
+                },
+                "required": ["question"],
+                "additionalProperties": false,
+            },
+        },
     ])
 }
 
@@ -159,6 +273,10 @@ async fn call_tool(
     let outcome = match name {
         LIST_REPOS => list_repos(state, agent).await,
         ATTACH_REPO => attach_repo(state, agent, arguments).await,
+        DISPATCH => dispatch(state, agent, arguments).await,
+        SEND_MESSAGE => send_message(state, agent, arguments).await,
+        REPORT => report(state, agent, arguments).await,
+        ASK_USER => ask_user(state, agent, arguments).await,
         _ => return Err((INVALID_PARAMS, format!("unknown tool: {name}"))),
     };
     let (text, is_error) = match outcome {
@@ -255,4 +373,125 @@ async fn attach_repo(
                 .unwrap_or_default()
         ),
     })
+}
+
+/// A required text argument: `Err` with what to tell the model when it is
+/// absent, not a string or blank.
+fn text_argument<'a>(arguments: &'a Value, tool: &str, key: &str) -> Result<&'a str, String> {
+    match arguments.get(key).and_then(Value::as_str).map(str::trim) {
+        Some(text) if !text.is_empty() => Ok(text),
+        _ => Err(format!("{tool} needs `{key}`: a string that is not blank.")),
+    }
+}
+
+/// An optional list of strings. `Err` when the argument is anything else.
+fn list_argument(arguments: &Value, key: &str) -> Result<Option<Vec<String>>, String> {
+    let wrong = || format!("`{key}` must be a list of strings.");
+    match arguments.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| item.as_str().map(str::to_owned).ok_or_else(wrong))
+            .collect::<Result<Vec<String>, String>>()
+            .map(Some),
+        Some(_) => Err(wrong()),
+    }
+}
+
+fn status_name(status: calin_proto::SessionStatus) -> String {
+    format!("{status:?}").to_lowercase()
+}
+
+async fn dispatch(state: &AppState, agent: &AgentRef, arguments: &Value) -> Result<String, String> {
+    let title = text_argument(arguments, DISPATCH, "title")?;
+    let brief = text_argument(arguments, DISPATCH, "brief")?;
+    let repos = list_argument(arguments, "repos")?;
+    let dispatched = state.manager.agent_dispatch(agent, title, brief, repos);
+    let dispatched = dispatched.await.map_err(failure)?;
+    let mut text = format!(
+        "Dispatched child session \"{}\" (id {}).\n",
+        dispatched.session.title, dispatched.session.id
+    );
+    if dispatched.repos.is_empty() {
+        text.push_str("It was given no repository: it works in an empty folder of its own.\n");
+    } else {
+        let starts: Vec<String> = dispatched
+            .repos
+            .iter()
+            .map(|repo| format!("{} (commit {})", repo.name, short(&repo.commit)))
+            .collect();
+        text.push_str(&format!(
+            "It works on a branch of its own that starts at your current commit in: {}.\n",
+            starts.join(", ")
+        ));
+    }
+    let dirty: Vec<&str> = dispatched
+        .repos
+        .iter()
+        .filter(|repo| repo.dirty)
+        .map(|repo| repo.name.as_str())
+        .collect();
+    if !dirty.is_empty() {
+        text.push_str(&format!(
+            "Note: your worktree of {} has uncommitted changes. The child does not have \
+             them, because it started from your last commit. If it needs them, commit them \
+             and tell the child with send_message to merge your branch; next time, commit \
+             before you dispatch.\n",
+            dirty.join(", ")
+        ));
+    }
+    text.push_str(
+        "Its report will be delivered to you as a message when it finishes. Do not wait or \
+         poll for it: finish what you can do yourself, then end your turn.",
+    );
+    Ok(text)
+}
+
+/// A commit id, as short as people write them.
+fn short(commit: &str) -> &str {
+    commit.get(..10).unwrap_or(commit)
+}
+
+async fn send_message(
+    state: &AppState,
+    agent: &AgentRef,
+    arguments: &Value,
+) -> Result<String, String> {
+    let to = text_argument(arguments, SEND_MESSAGE, "to")?;
+    let text = text_argument(arguments, SEND_MESSAGE, "text")?;
+    let sent = state.manager.agent_send_message(agent, to, text).await;
+    Ok(match sent.map_err(failure)? {
+        NoteOutcome::Shown => "Noted for the user. It shows in the transcript; the user is not \
+            asked to answer. Use ask_user when you need an answer."
+            .to_owned(),
+        NoteOutcome::Delivered => {
+            "Sent. It is delivered to that agent as its next input.".to_owned()
+        }
+        NoteOutcome::Unread(status) => format!(
+            "Recorded, but that session is {}: nobody will act on the note.",
+            status_name(status)
+        ),
+    })
+}
+
+async fn report(state: &AppState, agent: &AgentRef, arguments: &Value) -> Result<String, String> {
+    let summary = text_argument(arguments, REPORT, "summary")?;
+    let kept = state.manager.agent_report(agent, summary).await;
+    kept.map_err(failure)?;
+    Ok(
+        "Recorded. It is delivered to the agent that dispatched you, with your branch names, \
+         when this turn ends. End your turn now."
+            .to_owned(),
+    )
+}
+
+async fn ask_user(state: &AppState, agent: &AgentRef, arguments: &Value) -> Result<String, String> {
+    let question = text_argument(arguments, ASK_USER, "question")?;
+    let options = list_argument(arguments, "options")?.unwrap_or_default();
+    let asked = state.manager.agent_ask_user(agent, question, options).await;
+    let id = asked.map_err(failure)?;
+    Ok(format!(
+        "The question was put to the user (question {id}). End your turn now: the answer \
+         arrives as your next message."
+    ))
 }
