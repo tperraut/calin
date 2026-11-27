@@ -24,6 +24,18 @@
 //! | POST | `/repos/{id}/clone` | | `202`; the repo reports `cloning` until it is `available` |
 //! | DELETE | `/repos/{id}` | | `204`; removes the registry entry only |
 //! | GET | `/repo-sets` | | `Vec<RepoSet>`, in the home repo's order |
+//! | GET | `/repos/{id}/issues?state=&q=` | | `Vec<Issue>`, newest first, at most 50 |
+//! | GET | `/repos/{id}/issues/{number}` | | [`IssueDetail`] |
+//! | GET | `/usage?from=&to=&by=` | | [`Usage`] |
+//! | GET | `/usage/limits` | | `Vec<RunnerLimits>` |
+//! | GET | `/automations` | | `Vec<Automation>`, by name |
+//! | POST | `/automations` | [`AutomationRequest`] | `201` [`Automation`] |
+//! | GET | `/automations/cron?expr=` | | [`CronPreview`] |
+//! | GET | `/automations/{id}` | | [`Automation`] |
+//! | PUT | `/automations/{id}` | [`AutomationRequest`] | [`Automation`] |
+//! | DELETE | `/automations/{id}` | | `204` |
+//! | POST | `/automations/{id}/run` | [`RunAutomationRequest`] | `201` [`AutomationRun`] |
+//! | GET | `/automations/{id}/runs` | | `Vec<AutomationRun>`, newest first, at most 50 |
 //! | GET | `/workflows` | | `Vec<WorkflowInfo>`: `quick` first, then by id |
 //! | GET | `/sessions` | | `Vec<Session>`, newest first |
 //! | POST | `/sessions` | [`CreateSessionRequest`] | `201` [`SessionDetail`] |
@@ -180,6 +192,18 @@
 //!   or keys that do not decode to the right lengths, are a 400. Subscriptions
 //!   and preferences belong to the caller's identity; another identity's id is
 //!   a 404. A subscription the push service reports as gone is removed.
+//! - **Usage, issues and automations** follow
+//!   `docs/specs/2026-11-28-integrations.md`, which is part of this contract.
+//!   An invalid `from`, `to` or `by` is a 400. Issues need a GitHub remote and
+//!   a usable `gh` (409 with the reason otherwise); an unknown issue is a 404.
+//!   An automation that does not validate (blank name, an invalid cron
+//!   expression, an unknown repo or workflow, permission mode `ask`, a blank
+//!   prompt, an unknown template placeholder) is a 400 that says which.
+//!   `POST /automations/{id}/run` works whether or not the automation is
+//!   enabled, and answers 409 when its previous session is still active.
+//! - **Starting from an issue**: `CreateSessionRequest::issue` names it. The
+//!   issue's repo is attached as the primary repo unless `repos` already
+//!   lists it. An unknown repo or issue is a 400.
 //! - **Registering a repo**: the path must be the root of a git work tree
 //!   (400 otherwise); a name already in use is a 409. A repo attached to a
 //!   session that is not `done`, `failed` or `cancelled` cannot be deleted (409).
@@ -187,7 +211,9 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-use crate::{Agent, AttachRepoRequest, PermissionMode, PullRequest, Session, SessionRepo};
+use crate::{
+    Agent, AttachRepoRequest, FromIssue, PermissionMode, PullRequest, Session, SessionRepo,
+};
 
 #[derive(Serialize, Deserialize, TS, Clone, Debug, PartialEq)]
 #[ts(export)]
@@ -230,6 +256,11 @@ pub struct CreateSessionRequest {
     #[serde(default)]
     #[ts(optional)]
     pub workflow: Option<String>,
+    /// Start from this GitHub issue: its text is given to the agent and its
+    /// pull request will close it.
+    #[serde(default)]
+    #[ts(optional)]
+    pub issue: Option<FromIssue>,
     /// Repos to attach, in order. The first one is the primary repo: the
     /// agent's working directory. With none, the agent works in an empty
     /// folder inside the session's own directory.

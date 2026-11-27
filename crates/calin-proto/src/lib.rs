@@ -22,6 +22,7 @@ mod push;
 mod repo;
 mod settings;
 mod terminal;
+mod usage;
 mod workflow;
 mod ws;
 
@@ -36,6 +37,7 @@ pub use push::*;
 pub use repo::*;
 pub use settings::*;
 pub use terminal::*;
+pub use usage::*;
 pub use workflow::*;
 pub use ws::*;
 

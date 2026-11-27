@@ -2,9 +2,9 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 use crate::{
-    Agent, AgentMessage, AgentStatus, DecisionSource, FileOp, NodePhase, PermissionDecision,
-    PermissionRequest, PullRequest, Question, SessionRepo, SessionStatus, WorkflowGraph,
-    WorkflowStatus,
+    Agent, AgentMessage, AgentStatus, DecisionSource, FileOp, LimitWindow, NodePhase,
+    PermissionDecision, PermissionRequest, PullRequest, Question, SessionRepo, SessionStatus,
+    WorkflowGraph, WorkflowStatus,
 };
 
 /// One entry in a session's append-only log.
@@ -153,6 +153,10 @@ pub enum EventBody {
     WorkflowFinished {
         status: WorkflowStatus,
         reason: Option<String>,
+    },
+    /// The emitting agent's runner reported the plan's limit windows.
+    Limits {
+        windows: Vec<LimitWindow>,
     },
     /// Something went wrong that the user should see in the transcript.
     Error {

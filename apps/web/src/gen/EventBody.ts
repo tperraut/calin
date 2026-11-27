@@ -6,6 +6,7 @@ import type { DecisionSource } from "./DecisionSource";
 import type { FileOp } from "./FileOp";
 import type { Item } from "./Item";
 import type { ItemDelta } from "./ItemDelta";
+import type { LimitWindow } from "./LimitWindow";
 import type { NodePhase } from "./NodePhase";
 import type { PermissionDecision } from "./PermissionDecision";
 import type { PermissionRequest } from "./PermissionRequest";
@@ -25,4 +26,4 @@ session_repo_id: string | null,
 /**
  * Relative to the repo root when `session_repo_id` is set, absolute otherwise.
  */
-path: string, op: FileOp, } | { "type": "pull_request_opened", pull_request: PullRequest, } | { "type": "pull_request_updated", pull_request: PullRequest, } | { "type": "message_sent", message: AgentMessage, } | { "type": "message_received", message: AgentMessage, } | { "type": "question_asked", question: Question, } | { "type": "question_answered", question_id: string, answer: string, by: DecisionSource, } | { "type": "workflow_started", workflow_id: string, name: string, graph: WorkflowGraph, budget_usd: number | null, } | { "type": "workflow_node", node_id: string, phase: NodePhase, port: string | null, outcome: string | null, } | { "type": "workflow_finished", status: WorkflowStatus, reason: string | null, } | { "type": "error", message: string, };
+path: string, op: FileOp, } | { "type": "pull_request_opened", pull_request: PullRequest, } | { "type": "pull_request_updated", pull_request: PullRequest, } | { "type": "message_sent", message: AgentMessage, } | { "type": "message_received", message: AgentMessage, } | { "type": "question_asked", question: Question, } | { "type": "question_answered", question_id: string, answer: string, by: DecisionSource, } | { "type": "workflow_started", workflow_id: string, name: string, graph: WorkflowGraph, budget_usd: number | null, } | { "type": "workflow_node", node_id: string, phase: NodePhase, port: string | null, outcome: string | null, } | { "type": "workflow_finished", status: WorkflowStatus, reason: string | null, } | { "type": "limits", windows: Array<LimitWindow>, } | { "type": "error", message: string, };

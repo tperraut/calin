@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+use crate::IssueRef;
+
 /// Where a session is in its lifecycle. See the lifecycle diagram in the design spec.
 #[derive(Serialize, Deserialize, TS, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -65,6 +67,12 @@ pub struct Session {
     /// The workflow this session runs. Absent for the built-in `quick` behavior.
     #[serde(default)]
     pub workflow: Option<String>,
+    /// The issue this session was started from, if any.
+    #[serde(default)]
+    pub issue: Option<IssueRef>,
+    /// The automation that started this session, if one did.
+    #[serde(default)]
+    pub automation_id: Option<String>,
     /// Branch name used in every attached repo. Set once worktrees exist.
     pub branch: Option<String>,
     pub parent_session_id: Option<String>,
