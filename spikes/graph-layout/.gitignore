@@ -1,0 +1,7 @@
+node_modules
+dist
+*.local
+# measurement output: raw traces and full-resolution screenshots stay local
+results/*.trace.json
+shots/*-full.png
+traces

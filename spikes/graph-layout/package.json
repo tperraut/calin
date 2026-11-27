@@ -1,0 +1,38 @@
+{
+  "name": "calin-spike-graph-layout",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Throwaway spike: ELK in a worker + Solid/SVG vs canvas for the session graph on a phone.",
+  "scripts": {
+    "dev": "vp dev",
+    "build": "vp build",
+    "preview": "vp preview",
+    "stability": "node scripts/stability.ts",
+    "measure": "node scripts/measure.mjs"
+  },
+  "dependencies": {
+    "@dschz/solid-flow": "1.0.1",
+    "@solidjs/web": "^2.0.3",
+    "elkjs": "0.12.2",
+    "solid-js": "^2.0.3"
+  },
+  "devDependencies": {
+    "@solidjs/vite-plugin": "^3.0.1",
+    "@types/node": "^26.6.6",
+    "playwright-core": "^1.50.0",
+    "typescript": "~7.0.2",
+    "vite": "npm:@voidzero-dev/vite-plus-core@8.3.8001",
+    "vite-plus": "1.8.0"
+  },
+  "overrides": {
+    "vite": "npm:@voidzero-dev/vite-plus-core@8.3.8001"
+  },
+  "devEngines": {
+    "packageManager": {
+      "name": "bun",
+      "version": "1.4.5",
+      "onFail": "download"
+    }
+  }
+}

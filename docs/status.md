@@ -26,7 +26,7 @@ Known gaps carried forward:
 - Replay loads a session's whole backlog into memory.
 - The graph layout spike moved to the start of M3, where its result is used.
 
-## M1: One session, real agent, real repos (in progress, branch `m1`)
+## M1: One session, real agent, real repos (done 2026-11-27)
 
 Sessions take a repo set from the start, so M1 already creates one worktree per attached repo and
 shows changes grouped by repo. What stays in M2 is the home repo's repo list, attaching a repo
@@ -40,13 +40,13 @@ mid-session, and pull requests.
 - [x] Core and server: repo registry, repo set and worktrees, permission flow, interrupt, continue
       after stop or failure, file-change events, all new routes, terminal socket
 - [x] Web: repo picker, permission mode, permission cards, interrupt
-- [ ] Web: Changes with diff view, Files with editor, Terminal
+- [x] Web: Changes with diff view, Files with editor, Terminal
 - [x] A real Claude Code session through the server's API: worktree on its own branch, a
       permission request allowed over the API, the edit in changes and diff, a second turn
-- [ ] `make e2e` covering repos, permissions, changes, files and the terminal with the mock runner
-- [ ] The same real session driven from the web app
+- [x] `make e2e` covering repos, permissions, changes, files and the terminal with the mock runner
+- [x] The same real session driven from the web app
 
-Known gaps carried forward from M1 so far:
+Known gaps carried forward from M1:
 
 - Claude Code 2.1.332 has no `TodoWrite` tool, so no plan is shown for real sessions yet. Find
   what the CLI uses for task lists now and map it.
@@ -56,6 +56,13 @@ Known gaps carried forward from M1 so far:
 - Output produced inside a subagent is attributed to the lead agent until M3.
 - Idle worktrees are never reclaimed yet.
 - Branch names are slugs of the whole first prompt line and can be long.
+- An agent that edits files through its shell instead of an edit tool produces no `file_changed`
+  event. The Changes list is still right (it asks git), but the tab's count badge, which counts
+  events, is not.
+- In the Changes list a long branch name squeezes the repo name; the repo name should win.
+- A permission card is listed after the tool call it belongs to; they should be one card.
+- A 409 from saving a file does not say which of its three causes it was, except in its message.
+- Real-agent runs are checked by hand; `make e2e` covers the mock runner only.
 
 ## Later
 

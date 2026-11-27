@@ -4,7 +4,7 @@
 // directory, so nothing here needs an agent login or touches ~/.calin.
 
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, mkdirSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -123,8 +123,52 @@ export async function start({ binary, shots }) {
       return { page, errors, shot, bodyHas };
     }
 
+    /** Calls the server's REST API directly, for setup and for verifying what the UI did. */
+    async function api(method, path, body) {
+      const response = await fetch(`${base}/api/v1${path}`, {
+        method,
+        headers: body === undefined ? {} : { "content-type": "application/json" },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+      const text = await response.text();
+      return { status: response.status, body: text ? JSON.parse(text) : null };
+    }
+
+    /** A throwaway git clone with one commit, registered with the server. */
+    async function repo(name, files) {
+      const dir = join(scratch, "repos", name);
+      mkdirSync(dir, { recursive: true });
+      for (const [file, content] of Object.entries(files)) {
+        mkdirSync(join(dir, file, ".."), { recursive: true });
+        writeFileSync(join(dir, file), content);
+      }
+      const git = (...args) => {
+        const result = spawnSync("git", args, {
+          cwd: dir,
+          env: {
+            ...process.env,
+            GIT_CONFIG_GLOBAL: "/dev/null",
+            GIT_CONFIG_SYSTEM: "/dev/null",
+            GIT_AUTHOR_NAME: "e2e",
+            GIT_AUTHOR_EMAIL: "e2e@example.invalid",
+            GIT_COMMITTER_NAME: "e2e",
+            GIT_COMMITTER_EMAIL: "e2e@example.invalid",
+          },
+        });
+        if (result.status !== 0) throw new Error(`git ${args.join(" ")} failed: ${result.stderr}`);
+      };
+      git("init", "-q", "-b", "main");
+      git("add", "-A");
+      git("commit", "-q", "-m", "initial");
+      const registered = await api("POST", "/repos", { path: dir });
+      if (registered.status !== 201) throw new Error(`could not register ${name}: ${JSON.stringify(registered.body)}`);
+      return registered.body;
+    }
+
     return {
       base,
+      api,
+      repo,
       check,
       open,
       results,

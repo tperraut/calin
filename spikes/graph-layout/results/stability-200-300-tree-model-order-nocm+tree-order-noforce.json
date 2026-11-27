@@ -1,0 +1,36 @@
+[
+ {
+  "config": "tree-model-order-nocm",
+  "failed": "",
+  "rawMeanPx": 8.7,
+  "rawMaxMeanPx": 49.8,
+  "compMeanPx": 6,
+  "compMaxMeanPx": 50.6,
+  "compMaxP95Px": 238.7,
+  "compMaxWorstPx": 856.7,
+  "movedPct": 26.4,
+  "stepsQuietPct": 14.6,
+  "layoutMsMean": 57.2,
+  "layoutMsLast": 180.2,
+  "bbox": "1340x5893",
+  "overlaps": 0,
+  "routedEdgeLenK": 241.6
+ },
+ {
+  "config": "tree-order-noforce",
+  "failed": "",
+  "rawMeanPx": 11.6,
+  "rawMaxMeanPx": 36,
+  "compMeanPx": 7.3,
+  "compMaxMeanPx": 36.3,
+  "compMaxP95Px": 110.3,
+  "compMaxWorstPx": 474.8,
+  "movedPct": 16.9,
+  "stepsQuietPct": 19.7,
+  "layoutMsMean": 54.5,
+  "layoutMsLast": 174,
+  "bbox": "836x5669",
+  "overlaps": 0,
+  "routedEdgeLenK": 39
+ }
+]
