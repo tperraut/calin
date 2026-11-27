@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "original-uri", "query", "tokio", "ws"] }
+calin-auth = { version = "0.0.1", path = "../calin-auth" }
 calin-agents = { version = "0.0.1", path = "../calin-agents" }
 calin-core = { version = "0.0.1", path = "../calin-core" }
 calin-proto = { version = "0.0.1", path = "../calin-proto" }
@@ -14,16 +15,21 @@ calin-term = { version = "0.0.1", path = "../calin-term" }
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["sync", "time", "rt", "macros", "net"] }
 tokio-util = "0.7.20"
 tracing = "0.1.44"
+url = "2.5.9"
 
 [lints]
 workspace = true
 
 [dev-dependencies]
+# The tests sign in against calin-auth's own provider, with real signed tokens.
+calin-auth = { version = "0.0.1", path = "../calin-auth", features = ["test-provider"] }
 http-body-util = "0.1.5"
 tempfile = "3.27.0"
 tokio = { version = "1.54.1", features = ["rt-multi-thread"] }
 tokio-tungstenite = "0.30.0"
 tower = { version = "0.5.3", features = ["util"] }
+tracing-subscriber = "0.3.23"

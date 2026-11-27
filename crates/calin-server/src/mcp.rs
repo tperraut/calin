@@ -6,7 +6,9 @@
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::header::HOST;
+use axum::http::request::Parts;
+use axum::http::{Extensions, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use calin_core::{AgentRef, AgentRepo, NoteOutcome};
 use calin_proto::RepoMode;
@@ -14,6 +16,8 @@ use serde_json::{Value, json};
 
 use crate::AppState;
 use crate::api::ApiFailure;
+use crate::auth::peer_ip;
+use crate::guard::is_loopback_authority;
 
 /// The protocol revisions this endpoint speaks, newest first. Nothing it
 /// uses differs between them.
@@ -40,14 +44,46 @@ const INSTRUCTIONS: &str = "Calin's own tools for the agent of one session. Use 
     agent or to the user, and ask_user when only the user can decide. Messages that start with \
     [Calin] are deliveries from Calin (a report, a note, an answer), not from the user.";
 
+/// What a reverse proxy adds to a request it passes on. One of them on a
+/// request means it did not start on this machine.
+const FORWARDING_HEADERS: [&str; 5] = [
+    "forwarded",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-real-ip",
+];
+
+/// Whether a request came straight from this machine, where the agents run
+/// (remote-access spec, section 1): a loopback peer and no forwarding
+/// header. Agents are given a loopback URL, so the Host is loopback too; a
+/// proxy that passes the public name on fails that as well.
+fn came_straight_from_loopback(extensions: &Extensions, headers: &HeaderMap) -> bool {
+    let loopback_peer = peer_ip(extensions).is_some_and(|peer| peer.to_canonical().is_loopback());
+    let loopback_host = headers
+        .get(HOST)
+        .and_then(|host| host.to_str().ok())
+        .is_some_and(is_loopback_authority);
+    loopback_peer
+        && loopback_host
+        && FORWARDING_HEADERS
+            .iter()
+            .all(|name| !headers.contains_key(*name))
+}
+
 pub(crate) async fn call(
     State(state): State<AppState>,
     Path(token): Path<String>,
+    request: Parts,
     body: Bytes,
 ) -> Response {
     // The token is the whole credential: without a running agent behind it
-    // there is nothing here.
-    let Some(agent) = state.manager.agent_for_token(&token) else {
+    // there is nothing here. Neither is there for a request from elsewhere,
+    // which gets the very same answer.
+    let agent = Some(())
+        .filter(|()| came_straight_from_loopback(&request.extensions, &request.headers))
+        .and_then(|()| state.manager.agent_for_token(&token));
+    let Some(agent) = agent else {
         return ApiFailure::new(StatusCode::NOT_FOUND, "unknown tool endpoint").into_response();
     };
     let message: Value = match serde_json::from_slice(&body) {

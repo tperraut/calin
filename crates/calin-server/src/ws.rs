@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use axum::Extension;
 use axum::extract::State;
 use axum::extract::ws::rejection::WebSocketUpgradeRejection;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -24,6 +25,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::AppState;
 use crate::api::ApiFailure;
+use crate::auth::{Caller, close_with_credential};
 
 /// Frames queued for one client. Replay waits when it is full.
 const OUTBOUND_BUFFER: usize = 256;
@@ -36,23 +38,26 @@ const MAX_TOPICS: usize = 256;
 
 pub(crate) async fn upgrade(
     State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
     upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Response {
     match upgrade {
         Ok(upgrade) => upgrade
             .max_message_size(MAX_CLIENT_FRAME)
-            .on_upgrade(move |socket| serve(socket, state)),
+            .on_upgrade(move |socket| serve(socket, state, caller)),
         Err(rejection) => {
             ApiFailure::new(StatusCode::BAD_REQUEST, rejection.body_text()).into_response()
         }
     }
 }
 
-async fn serve(socket: WebSocket, state: AppState) {
+async fn serve(socket: WebSocket, state: AppState, caller: Caller) {
     let (sink, mut frames) = socket.split();
     let (out, outbound) = mpsc::channel(OUTBOUND_BUFFER);
-    // Cancelled when the server shuts down or this connection has to end.
+    // Cancelled when the server shuts down or this connection has to end,
+    // which includes the end of the sign-in it was opened with.
     let closing = state.shutdown.child_token();
+    close_with_credential(&state, &caller, &closing);
     let writer = tokio::spawn(write(sink, outbound, closing.clone()));
     let mut connection = Connection {
         store: state.manager.store().clone(),

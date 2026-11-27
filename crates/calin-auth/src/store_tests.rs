@@ -682,7 +682,8 @@ async fn an_unknown_device_token_authenticates_nobody() {
 #[tokio::test]
 async fn device_token_names_are_validated() {
     let fixture = Fixture::new().await;
-    let long = "n".repeat(65);
+    // 80 is the limit the wire contract documents.
+    let long = "n".repeat(81);
     for name in ["", "   ", "a\nb", "tab\there", long.as_str()] {
         let error = fixture
             .store
@@ -691,7 +692,7 @@ async fn device_token_names_are_validated() {
             .unwrap_err();
         assert!(matches!(error, StoreError::InvalidName), "{name:?}");
     }
-    let longest = "\u{e9}".repeat(64);
+    let longest = "\u{e9}".repeat(80);
     for name in ["x", "CI runner #2", longest.as_str()] {
         assert!(
             fixture

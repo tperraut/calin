@@ -1,15 +1,15 @@
 //! REST handlers. The route table lives in `calin-proto/src/api.rs`; the
 //! handlers only translate between HTTP and `calin-core`.
 
-use axum::Json;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{FromRequest, FromRequestParts, Path, Query, Request, State};
 use axum::http::StatusCode;
 use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
+use axum::{Extension, Json};
 use calin_proto::{
     AnswerQuestionRequest, ApiError, AttachRepoRequest, CreateSessionRequest, FileContent,
-    FileDiff, Graph, Health, RegisterRepoRequest, Repo, RepoChanges, RepoSet,
+    FileDiff, Graph, Health, PublicHealth, RegisterRepoRequest, Repo, RepoChanges, RepoSet,
     ResolvePermissionRequest, SendMessageRequest, Session, SessionDetail, SessionRepo, Settings,
     ShipRequest, Timeline, TreeEntry, WorkflowInfo, WorkflowRun, WriteFileRequest,
 };
@@ -17,6 +17,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
 use crate::AppState;
+use crate::auth::Caller;
 
 /// An error response: a status and an [`ApiError`] body.
 #[derive(Debug)]
@@ -66,11 +67,11 @@ impl From<calin_core::Error> for ApiFailure {
     }
 }
 
-type ApiResult<T> = Result<T, ApiFailure>;
+pub(crate) type ApiResult<T> = Result<T, ApiFailure>;
 
 /// `Json`, but a body that does not parse is a 400 with an [`ApiError`]
 /// like every other invalid input.
-pub(crate) struct ApiJson<T>(T);
+pub(crate) struct ApiJson<T>(pub(crate) T);
 
 impl<S, T> FromRequest<S> for ApiJson<T>
 where
@@ -123,7 +124,18 @@ pub(crate) struct PathQuery {
     path: String,
 }
 
-pub(crate) async fn health(State(state): State<AppState>) -> Json<Health> {
+pub(crate) async fn health(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+) -> Response {
+    // Sign-in is required and absent: say that, and nothing about the server.
+    if matches!(caller, Caller::Anonymous) {
+        return Json(PublicHealth {
+            name: "calin".to_owned(),
+            auth: "required".to_owned(),
+        })
+        .into_response();
+    }
     let registry = state.manager.registry();
     Json(Health {
         name: "calin".to_owned(),
@@ -133,6 +145,7 @@ pub(crate) async fn health(State(state): State<AppState>) -> Json<Health> {
         // Asked of `gh` at most once a minute, however often clients poll.
         github_problem: state.manager.github_problem().await,
     })
+    .into_response()
 }
 
 pub(crate) async fn get_settings(State(state): State<AppState>) -> Json<Settings> {

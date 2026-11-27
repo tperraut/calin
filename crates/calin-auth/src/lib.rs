@@ -153,6 +153,8 @@ mod oidc;
 mod ratelimit;
 mod secret;
 mod store;
+#[cfg(feature = "test-provider")]
+pub mod test_provider;
 
 pub use client_addr::client_address;
 pub use clock::{Clock, ManualClock, SystemClock};

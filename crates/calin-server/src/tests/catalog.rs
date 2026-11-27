@@ -593,7 +593,7 @@ impl Runner for Capture {
 
 pub(super) type Starts = mpsc::UnboundedReceiver<(StartParams, AgentIo)>;
 
-async fn capturing_state(dir: &TempDir) -> (AppState, Starts) {
+pub(super) async fn capturing_state(dir: &TempDir) -> (AppState, Starts) {
     let store = Store::open(Home::new(dir.path())).await.unwrap();
     let mut registry = RunnerRegistry::new(RegistryConfig {
         mock: MockConfig {

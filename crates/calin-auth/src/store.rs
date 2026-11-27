@@ -32,7 +32,8 @@ const MAX_DEVICE_TOKENS_PER_IDENTITY: usize = 100;
 /// taken to be wrong: the allowance ID tokens get.
 const CLOCK_TOLERANCE_SECS: u64 = 60;
 const MAX_USER_AGENT_CHARS: usize = 200;
-const MAX_TOKEN_NAME_CHARS: usize = 64;
+/// The contract's limit (`CreateDeviceTokenRequest::name`).
+const MAX_TOKEN_NAME_CHARS: usize = 80;
 const FILE_VERSION: u32 = 1;
 
 /// The store of sessions and device tokens. Cheap to clone; clones share
@@ -259,7 +260,7 @@ pub enum StoreError {
     /// The identity may not sign in, so nothing is created for it.
     #[error("{0} is not on the allow-list")]
     NotAllowed(Identity),
-    /// A device token name must be 1 to 64 characters, none of them control
+    /// A device token name must be 1 to 80 characters, none of them control
     /// characters.
     #[error("the device token name is empty, too long or has a control character")]
     InvalidName,

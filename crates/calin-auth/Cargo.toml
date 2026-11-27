@@ -27,6 +27,15 @@ tracing = "0.1.44"
 url = "2.5.9"
 webpki-roots = "1.0.12"
 
+[features]
+# Exposes the tests' OpenID Connect provider (`test_provider`) to the tests
+# of other crates. Off by default: nothing in the `calin` binary enables it.
+test-provider = ["tokio/net", "tokio/io-util"]
+
+[[example]]
+name = "test-provider"
+required-features = ["test-provider"]
+
 [lints]
 workspace = true
 

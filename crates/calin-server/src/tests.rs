@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
+use axum::extract::ConnectInfo;
 use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, HOST, ORIGIN};
 use axum::http::{HeaderMap, Method, Request, StatusCode};
 use calin_agents::{ClaudeConfig, MockConfig, RegistryConfig, RunnerRegistry};
@@ -31,6 +32,7 @@ use super::*;
 mod catalog;
 mod delivery;
 mod orchestration;
+mod signin;
 mod workflows;
 
 const TIMEOUT: Duration = Duration::from_secs(20);
@@ -123,7 +125,21 @@ fn request(method: Method, path: &str) -> axum::http::request::Builder {
         .header(HOST, LOCAL)
 }
 
-async fn call(app: &Router, request: Request<Body>) -> Reply {
+/// The peer a request driven without a socket claims: this machine, as
+/// every real request to a server that only binds loopback.
+const PEER: SocketAddr =
+    SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 50_000);
+
+async fn call(app: &Router, mut request: Request<Body>) -> Reply {
+    // What `Server::run` records for a real connection, unless the test
+    // already said where the request comes from.
+    if request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .is_none()
+    {
+        request.extensions_mut().insert(ConnectInfo(PEER));
+    }
     let response = app.clone().oneshot(request).await.unwrap();
     let (parts, body) = response.into_parts();
     Reply {

@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.105"
+calin-auth = { version = "0.0.1", path = "../calin-auth" }
 calin-agents = { version = "0.0.1", path = "../calin-agents" }
 calin-core = { version = "0.0.1", path = "../calin-core" }
 calin-server = { version = "0.0.1", path = "../calin-server" }
@@ -21,3 +22,6 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"

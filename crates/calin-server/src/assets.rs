@@ -77,6 +77,11 @@ pub(crate) async fn serve(
         return ApiFailure::new(StatusCode::NOT_FOUND, format!("no such route: {path}"))
             .into_response();
     }
+    // Sign-in's own prefix: what is not one of its routes is nothing, not
+    // the web app (which never has a page there).
+    if crate::guard::is_auth_path(path) {
+        return crate::auth::not_found();
+    }
     if method != Method::GET && method != Method::HEAD {
         return (StatusCode::METHOD_NOT_ALLOWED, [(ALLOW, "GET, HEAD")]).into_response();
     }

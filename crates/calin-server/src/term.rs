@@ -10,6 +10,7 @@ use std::ffi::OsString;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use axum::Extension;
 use axum::extract::ws::rejection::WebSocketUpgradeRejection;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
@@ -24,6 +25,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::AppState;
 use crate::api::{ApiFailure, ApiQuery};
+use crate::auth::{Caller, close_with_credential};
 
 /// Shells one session may have open at a time. Each one is a process tree
 /// and three threads, and nothing else bounds what a client can open.
@@ -101,6 +103,7 @@ pub(crate) struct TerminalQuery {
 
 pub(crate) async fn upgrade(
     State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
     Path(session_id): Path<String>,
     ApiQuery(query): ApiQuery<TerminalQuery>,
     upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
@@ -134,12 +137,13 @@ pub(crate) async fn upgrade(
     let slot = state.terminals.acquire(&session_id);
     upgrade
         .max_message_size(MAX_CLIENT_FRAME)
-        .on_upgrade(move |socket| serve(socket, state, session_id, config, slot))
+        .on_upgrade(move |socket| serve(socket, state, caller, session_id, config, slot))
 }
 
 async fn serve(
     socket: WebSocket,
     state: AppState,
+    caller: Caller,
     session_id: String,
     config: TerminalConfig,
     slot: Option<Slot>,
@@ -165,8 +169,10 @@ async fn serve(
         }
     };
     let terminal = Arc::new(terminal);
-    // Cancelled when the server shuts down or the client is gone.
+    // Cancelled when the server shuts down, the client is gone, or the
+    // sign-in the socket was opened with has ended.
     let closing = state.shutdown.child_token();
+    close_with_credential(&state, &caller, &closing);
     let reader = tokio::spawn(read(frames, Arc::clone(&terminal), closing.clone()));
 
     let exited = loop {

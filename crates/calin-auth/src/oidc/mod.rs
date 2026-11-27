@@ -7,8 +7,8 @@ mod jwks;
 mod jwt;
 mod pending;
 
-#[cfg(test)]
-mod testing;
+#[cfg(any(test, feature = "test-provider"))]
+pub(crate) mod testing;
 #[cfg(test)]
 mod tests;
 

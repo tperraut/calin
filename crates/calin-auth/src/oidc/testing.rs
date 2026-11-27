@@ -2,9 +2,15 @@
 //! key set, authorization and token endpoints over HTTP on a loopback port,
 //! issuing ID tokens signed with keys generated in the test process. Every
 //! way it can misbehave is a field a test sets.
+//!
+//! Compiled for this crate's tests, and for other crates' tests through the
+//! `test-provider` feature and [`crate::test_provider`].
+
+// Under the feature alone only part of this is reached, through the wrapper.
+#![cfg_attr(not(test), allow(dead_code))]
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -15,7 +21,7 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 
 use super::http::ProviderHttp;
-use crate::clock::{Clock as _, ManualClock};
+use crate::clock::Clock;
 use crate::config::LoopbackHttp;
 use crate::secret::{base64url, random_id, random_token, sha256};
 
@@ -46,8 +52,10 @@ impl SigningKey {
 
     /// An RSA key. Generating one takes seconds in a debug build, so the
     /// test process makes one and every caller gets it under its own key id.
+    /// Only for this crate's tests: `rsa` is a dev-dependency.
+    #[cfg(test)]
     pub(crate) fn rs256(key_id: &str) -> Arc<Self> {
-        static PKCS8: OnceLock<Vec<u8>> = OnceLock::new();
+        static PKCS8: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
         let pkcs8 = PKCS8.get_or_init(|| {
             use rsa::pkcs8::EncodePrivateKey as _;
             use rsa::{Generate as _, PrivateKey};
@@ -208,11 +216,21 @@ impl Drop for FakeProvider {
 
 impl FakeProvider {
     pub(crate) async fn start(
-        clock: Arc<ManualClock>,
+        clock: Arc<dyn Clock>,
         client_id: &str,
         client_secret: Option<&str>,
     ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        Self::start_on(listener, clock, client_id, client_secret)
+    }
+
+    /// Serves on a listener the caller bound, for a provider on a known port.
+    pub(crate) fn start_on(
+        listener: TcpListener,
+        clock: Arc<dyn Clock>,
+        client_id: &str,
+        client_secret: Option<&str>,
+    ) -> Self {
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let key = SigningKey::es256("key-1");
         let state = Arc::new(Mutex::new(State {
@@ -297,7 +315,7 @@ async fn serve(
     listener: TcpListener,
     origin: String,
     state: Arc<Mutex<State>>,
-    clock: Arc<ManualClock>,
+    clock: Arc<dyn Clock>,
 ) {
     loop {
         let Ok((stream, _)) = listener.accept().await else {
@@ -317,7 +335,7 @@ async fn serve(
             let Some(request) = read_request(&mut stream).await else {
                 return;
             };
-            let answer = route(&request, &origin, &state, &clock);
+            let answer = route(&request, &origin, &state, clock.as_ref());
             let bytes = match answer {
                 Answer::Hang => {
                     tokio::time::sleep(Duration::from_secs(3600)).await;
@@ -428,7 +446,7 @@ fn form(text: &str) -> HashMap<String, String> {
         .collect()
 }
 
-fn route(request: &Request, origin: &str, state: &Mutex<State>, clock: &ManualClock) -> Answer {
+fn route(request: &Request, origin: &str, state: &Mutex<State>, clock: &dyn Clock) -> Answer {
     let mut state = state.lock().unwrap();
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", path) if path.ends_with("/.well-known/openid-configuration") => {
