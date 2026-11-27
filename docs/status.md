@@ -214,6 +214,24 @@ Known gaps carried forward from M6:
       (54 + 14 checks)
 - [x] Graph edges routed in lanes
 - [x] A repo attached read-only stays read-only; usage days follow the server's
+- [x] `calin home init` scaffolds a home repo (repo list from a scan, two example workflows, a
+      starter link script), and `docs/guide.md` is the user guide
+- [x] A real Claude session on Calin's own code, under a workflow that runs its tests: it added
+      the cron aliases, the check passed, and the session ended in review
+
+## Where the design spec and the code differ
+
+Found while writing the user guide (2026-11-28). The code is the truth; the design spec has not
+been edited for these.
+
+- The agent's working directory is the first attached repo. The spec says it is the home repo;
+  in practice the web form puts the home repo first, edited in place.
+- `dispatch` takes a title, a brief and repos. The spec also gives it a budget; only a workflow
+  has one.
+- An agent can attach a repo as `write` or `read`, not `live`.
+- Device tokens exist, but the desktop app and a `calin` client CLI that would use them do not.
+- Described in the spec and not built: reclaiming idle worktrees, a review note on a line sent to
+  the agent, and the view of sessions that overlap on a repo or file.
 
 ## What is left
 

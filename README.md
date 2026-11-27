@@ -14,6 +14,19 @@ Calin is inspired by [cezar](https://github.com/open-mercato/cezar) and differs 
 graph and sign-in work; nothing has been run on a real server or a real phone yet. See
 [docs/status.md](docs/status.md) and the [design spec](docs/specs/2026-11-26-calin-design.md).
 
+## Getting started
+
+The [user guide](docs/guide.md) covers running Calin, sessions, workflows and running it on a
+server. To set up a home repo (the repository every session starts from, with your repo list and
+workflows):
+
+```sh
+calin home init ~/code/home --scan ~/code
+```
+
+It writes `.calin/repos.yaml` from the clones it finds, two starter workflows, a README and a
+script that links your skills into `~/.claude`. It never overwrites a file and never commits.
+
 ## Development
 
 You need Rust (the version in `rust-toolchain.toml`) and [Vite+](https://viteplus.dev), which

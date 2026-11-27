@@ -1,0 +1,92 @@
+# A Calin workflow: implement, check (with up to three fixes), commit, have a
+# reviewer with a fresh context look at the result, ask you before shipping,
+# then open one pull request per changed repo. Every run ends with the session
+# in review (or shipping, once pull requests are open).
+#
+# The file name (without .yaml) is the workflow's id. The format is in Calin's
+# docs/specs/2026-11-27-workflows.md; unknown keys are errors.
+version: 1
+name: Implement, review, ship
+description: Implement and check, a fresh-context review, your approval, then pull requests.
+
+# Optional: stop the run once the session has cost this much (US dollars).
+# budget_usd: 10
+
+nodes:
+  - { id: start, type: start }
+  - { id: implement, type: agent, prompt: "{{task}}" }
+
+  # Each changed repo's `checks` from .calin/repos.yaml.
+  - { id: checks, type: check }
+  - { id: retry, type: loop, max: 3 }
+  - id: fix
+    type: agent
+    prompt: |
+      The checks failed (attempt {{nodes.retry.iteration}} of {{nodes.retry.max}}).
+      Find the cause and fix it; do not weaken or skip the checks.
+      Output of the last command that ran:
+
+      {{nodes.checks.output}}
+
+  # The reviewer below starts from the session's commits, so the work is
+  # committed first. `nothing` means there was nothing left to commit.
+  - { id: commit, type: commit, message: "{{session.title}}" }
+
+  # `fresh: true` runs this prompt in a new child session, so the reviewer
+  # has not seen the implementation's reasoning. With `verdicts`, the reviewer
+  # ends its answer with `VERDICT: approve` or `VERDICT: changes`, and the
+  # node leaves through the port of that name.
+  - id: review
+    type: agent
+    fresh: true
+    verdicts: [approve, changes]
+    prompt: |
+      Your worktrees start from the latest commits of the branch
+      {{session.branch}}. Review what that branch adds to each repo's default
+      branch. The task was:
+
+      {{task}}
+
+      Look for bugs, missing tests, and changes the task did not ask for.
+      Do not change any file. List what must change, most important first.
+
+  # Review comments go back to the lead agent at most twice.
+  - { id: rework, type: loop, max: 2 }
+  - id: address
+    type: agent
+    prompt: |
+      A reviewer asked for changes (round {{nodes.rework.iteration}} of {{nodes.rework.max}}):
+
+      {{nodes.review.summary}}
+
+      Make the changes that are right, and say which ones you did not make and why.
+
+  # The session waits here until you approve or reject.
+  - { id: ask-to-ship, type: gate, message: "The review passed. Open pull requests?" }
+
+  # One pull request per changed repo, opened as drafts. Calin never merges.
+  - { id: ship, type: ship, title: "{{session.title}}", draft: true }
+
+  - { id: shipped, type: end, status: success }
+  # Rejecting at the gate keeps the work in review; you can ship it later.
+  - { id: not-shipped, type: end, status: success }
+  - { id: gave-up, type: end, status: failed }
+
+edges:
+  - { from: start, to: implement }
+  - { from: implement.done, to: checks }
+  - { from: checks.pass, to: commit }
+  - { from: checks.fail, to: retry }
+  - { from: retry.repeat, to: fix }
+  - { from: retry.exhausted, to: gave-up }
+  - { from: fix.done, to: checks }
+  - { from: commit.done, to: review }
+  - { from: commit.nothing, to: review }
+  - { from: review.approve, to: ask-to-ship }
+  - { from: review.changes, to: rework }
+  - { from: rework.repeat, to: address }
+  - { from: rework.exhausted, to: gave-up }
+  - { from: address.done, to: checks }
+  - { from: ask-to-ship.approve, to: ship }
+  - { from: ask-to-ship.reject, to: not-shipped }
+  - { from: ship.done, to: shipped }

@@ -1,0 +1,51 @@
+# A Calin workflow: the agent implements the task, then each changed repo's
+# checks run. When they fail, the agent gets the failing output and tries
+# again, up to three times. Every run ends with the session in review, where
+# you decide what to do with the work.
+#
+# The file name (without .yaml) is the workflow's id. The format is in Calin's
+# docs/specs/2026-11-27-workflows.md; unknown keys are errors, so a typo never
+# changes behavior silently. Calin reads this file again when it changes.
+version: 1
+name: Implement and check
+description: The agent implements the task; the repos' checks run, with up to three fixes.
+
+# Optional: stop the run once the session has cost this much (US dollars).
+# budget_usd: 5
+
+nodes:
+  - { id: start, type: start }
+
+  # `{{task}}` is the prompt you started the session with.
+  - { id: implement, type: agent, prompt: "{{task}}" }
+
+  # A check with no `command` runs the `checks` that .calin/repos.yaml lists
+  # for each repo the session changed. Give it `command:` (and `repo:`) to run
+  # one command instead.
+  - { id: checks, type: check }
+
+  # A loop counts. Every cycle in a workflow must go through one, so every
+  # run ends.
+  - { id: retry, type: loop, max: 3 }
+
+  - id: fix
+    type: agent
+    prompt: |
+      The checks failed (attempt {{nodes.retry.iteration}} of {{nodes.retry.max}}).
+      Find the cause and fix it; do not weaken or skip the checks.
+      Output of the last command that ran:
+
+      {{nodes.checks.output}}
+
+  - { id: done, type: end, status: success }
+  - { id: gave-up, type: end, status: failed }
+
+edges:
+  - { from: start, to: implement }
+  - { from: implement.done, to: checks }
+  # `implement.failed` has no edge: taking it ends the run as failed.
+  - { from: checks.pass, to: done }
+  - { from: checks.fail, to: retry }
+  - { from: retry.repeat, to: fix }
+  - { from: retry.exhausted, to: gave-up }
+  - { from: fix.done, to: checks }

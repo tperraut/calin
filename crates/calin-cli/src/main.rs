@@ -15,6 +15,8 @@ use calin_push::EndpointPolicy;
 use calin_server::{AUTH_FILE, AppState, Assets, Push, PushSetup, Server, SignIn, vapid_subject};
 use clap::{Args, Parser, Subcommand};
 
+mod home_cmd;
+mod home_init;
 mod server_cmd;
 use tracing_subscriber::EnvFilter;
 
@@ -50,6 +52,9 @@ enum Command {
     /// Install Calin as a service on a Linux server, or verify an installation
     #[command(subcommand)]
     Server(server_cmd::ServerCommand),
+    /// Set up a home repo: the repository every session starts from
+    #[command(subcommand)]
+    Home(home_cmd::HomeCommand),
 }
 
 #[derive(Args)]
@@ -78,6 +83,9 @@ async fn main() -> Result<()> {
     match cli.command {
         Some(Command::Serve(args)) => serve(args).await,
         Some(Command::Server(command)) => server_cmd::run(command).await,
+        Some(Command::Home(command)) => {
+            home_cmd::run(command, &format!("http://{DEFAULT_BIND}")).await
+        }
         None => serve(ServeArgs::default()).await,
     }
 }
