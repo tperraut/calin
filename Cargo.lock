@@ -255,6 +255,7 @@ dependencies = [
  "calin-agents",
  "calin-auth",
  "calin-core",
+ "calin-push",
  "calin-server",
  "clap",
  "tempfile",
@@ -294,6 +295,23 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror",
+]
+
+[[package]]
+name = "calin-install"
+version = "0.0.1"
+dependencies = [
+ "bytes",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "rustls",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -339,6 +357,7 @@ dependencies = [
  "calin-auth",
  "calin-core",
  "calin-proto",
+ "calin-push",
  "calin-term",
  "futures-util",
  "http-body-util",

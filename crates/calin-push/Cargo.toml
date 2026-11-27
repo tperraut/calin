@@ -13,6 +13,9 @@ http-body-util = "0.1.5"
 hyper = { version = "1.13.0", features = ["client", "http1"] }
 hyper-rustls = { version = "0.27.10", default-features = false, features = ["ring", "http1", "tls12"] }
 hyper-util = { version = "0.1.21", features = ["client-legacy", "http1", "tokio"] }
+# Only for the `test-service` feature: a fake device's key agreement, which
+# `ring` cannot do with a key it did not generate for one use.
+p256 = { version = "0.14.0", features = ["ecdh"], optional = true }
 ring = "0.17.14"
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0.229", features = ["derive"] }
@@ -23,6 +26,11 @@ tower-service = "0.3.3"
 tracing = "0.1.44"
 url = "2.5.9"
 webpki-roots = "1.0.12"
+
+[features]
+# Exposes the fake push service of the tests (`test_service`) to the tests of
+# other crates. Off by default: nothing in the `calin` binary enables it.
+test-service = ["dep:p256", "tokio/net", "tokio/io-util"]
 
 [lints]
 workspace = true

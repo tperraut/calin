@@ -11,7 +11,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use calin_agents::{RegistryConfig, RunnerRegistry};
 use calin_auth::{AuthMode, ConfigError, LoopbackHttp, SystemClock};
 use calin_core::{ManagerConfig, SessionManager, Store, resolve_home};
-use calin_server::{AUTH_FILE, AppState, Assets, Server, SignIn};
+use calin_push::EndpointPolicy;
+use calin_server::{AUTH_FILE, AppState, Assets, Push, PushSetup, Server, SignIn, vapid_subject};
 use clap::{Args, Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
@@ -25,6 +26,9 @@ const ENV_GH_BIN: &str = "CALIN_GH_BIN";
 /// and the sign-in provider may be plain `http` on `localhost` or
 /// `127.0.0.1`. Browser tests need it; a real server never does.
 const ENV_UNSAFE_HTTP: &str = "CALIN_UNSAFE_DEV_ALLOW_HTTP_LOOPBACK";
+/// Public mode, optional: a `mailto:` address push services can reach the
+/// operator at. The public URL is the contact otherwise.
+const ENV_PUSH_CONTACT: &str = "CALIN_PUSH_CONTACT";
 
 #[derive(Parser)]
 #[command(
@@ -95,10 +99,15 @@ async fn serve(args: ServeArgs) -> Result<()> {
     let store = Store::open(home.clone())
         .await
         .with_context(|| format!("cannot open the data directory {}", home.root().display()))?;
-    let sign_in = match mode {
-        AuthMode::Local => None,
+    let (sign_in, push) = match mode {
+        AuthMode::Local => (None, None),
         AuthMode::Public(config) => {
             let public_url = config.public_origin().to_owned();
+            let setup = push_setup(
+                &public_url,
+                config.loopback_http(),
+                std::env::var_os(ENV_PUSH_CONTACT),
+            )?;
             if config.loopback_http() == LoopbackHttp::AllowForDevelopment {
                 tracing::warn!(
                     "{ENV_UNSAFE_HTTP} is set: plain http is accepted for loopback URLs. \
@@ -109,8 +118,13 @@ async fn serve(args: ServeArgs) -> Result<()> {
             let sign_in = SignIn::open(config, auth_file, Arc::new(SystemClock))
                 .await
                 .context("cannot set up sign-in")?;
+            // Next to `auth.json`. A corrupt key file stops the server here,
+            // naming the file: replacing it would orphan every subscription.
+            let push = Push::open(home.root(), setup, Arc::new(calin_push::SystemClock))
+                .await
+                .context("cannot set up push notifications")?;
             tracing::info!(%public_url, "public mode: sign-in is required");
-            Some(Arc::new(sign_in))
+            (Some(Arc::new(sign_in)), Some(Arc::new(push)))
         }
     };
     let manager = SessionManager::start_with(store.clone(), registry, manager_config())
@@ -119,6 +133,9 @@ async fn serve(args: ServeArgs) -> Result<()> {
     let mut state = AppState::new(manager.clone());
     if let Some(sign_in) = &sign_in {
         state = state.with_sign_in(sign_in.clone());
+    }
+    if let Some(push) = push {
+        state = state.with_push(push);
     }
     let server = Server::bind(addr, state)
         .await
@@ -176,6 +193,30 @@ fn read_auth_mode(
             problems.join("\n  - ")
         )),
     }
+}
+
+/// How push notifications are sent: the VAPID contact, and which endpoints
+/// may be called. The development switch also lets a fake push service on
+/// `http://127.0.0.1:<port>` be used, as it lets the provider be.
+fn push_setup(
+    public_origin: &str,
+    loopback_http: LoopbackHttp,
+    contact: Option<OsString>,
+) -> Result<PushSetup> {
+    // An empty value is how a shell spells "not set".
+    let contact = contact
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string_lossy().into_owned());
+    let subject = vapid_subject(public_origin, contact.as_deref())
+        .map_err(|problem| anyhow!("{ENV_PUSH_CONTACT}: {problem}"))?;
+    let endpoint_policy = match loopback_http {
+        LoopbackHttp::Refuse => EndpointPolicy::PublicHttpsOnly,
+        LoopbackHttp::AllowForDevelopment => EndpointPolicy::AllowLoopbackHttpForDevelopment,
+    };
+    Ok(PushSetup {
+        subject,
+        endpoint_policy,
+    })
 }
 
 /// The defaults, with `gh` replaced by `CALIN_GH_BIN` when that is set.
@@ -295,6 +336,46 @@ mod tests {
         let named = with_gh_bin(default.clone(), Some("/opt/gh/bin/gh".into()));
         assert_eq!(named.gh_bin, PathBuf::from("/opt/gh/bin/gh"));
         assert_eq!(named.setup_limit, default.setup_limit);
+    }
+
+    #[test]
+    fn push_uses_the_public_origin_or_the_contact_and_only_public_endpoints() {
+        let setup = push_setup("https://calin.example.com", LoopbackHttp::Refuse, None).unwrap();
+        assert_eq!(setup.subject, "https://calin.example.com");
+        assert_eq!(setup.endpoint_policy, EndpointPolicy::PublicHttpsOnly);
+        let setup = push_setup(
+            "https://calin.example.com",
+            LoopbackHttp::Refuse,
+            Some("".into()),
+        )
+        .unwrap();
+        assert_eq!(setup.subject, "https://calin.example.com");
+        let setup = push_setup(
+            "https://calin.example.com",
+            LoopbackHttp::Refuse,
+            Some("mailto:ops@example.com".into()),
+        )
+        .unwrap();
+        assert_eq!(setup.subject, "mailto:ops@example.com");
+        let error = push_setup(
+            "https://calin.example.com",
+            LoopbackHttp::Refuse,
+            Some("ops@example.com".into()),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains(ENV_PUSH_CONTACT), "{error}");
+        let dev = push_setup(
+            "http://localhost:4680",
+            LoopbackHttp::AllowForDevelopment,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            dev.endpoint_policy,
+            EndpointPolicy::AllowLoopbackHttpForDevelopment
+        );
+        assert!(dev.subject.starts_with("mailto:"), "{}", dev.subject);
     }
 
     #[test]

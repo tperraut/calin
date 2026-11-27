@@ -79,6 +79,8 @@ mod http;
 mod secret;
 mod sender;
 mod store;
+#[cfg(feature = "test-service")]
+pub mod test_service;
 mod user_agent;
 mod vapid;
 

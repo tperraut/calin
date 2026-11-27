@@ -26,6 +26,7 @@ use tokio_util::sync::CancellationToken;
 use crate::AppState;
 use crate::api::ApiFailure;
 use crate::auth::{Caller, close_with_credential};
+use crate::push::{ViewGuard, Viewers};
 
 /// Frames queued for one client. Replay waits when it is full.
 const OUTBOUND_BUFFER: usize = 256;
@@ -59,12 +60,19 @@ async fn serve(socket: WebSocket, state: AppState, caller: Caller) {
     let closing = state.shutdown.child_token();
     close_with_credential(&state, &caller, &closing);
     let writer = tokio::spawn(write(sink, outbound, closing.clone()));
+    let identity = match &caller {
+        Caller::SignedIn(who) => Some(who.identity.to_string()),
+        Caller::Local | Caller::Anonymous => None,
+    };
     let mut connection = Connection {
         store: state.manager.store().clone(),
         out,
         closing: closing.clone(),
         topics: HashMap::new(),
         retired: HashMap::new(),
+        viewers: state.viewers.clone(),
+        identity,
+        views: HashMap::new(),
     };
 
     loop {
@@ -155,6 +163,13 @@ struct Connection {
     /// Aborted forwarders that may not have stopped yet. A new subscription
     /// to the same topic waits for them so frames cannot interleave.
     retired: HashMap<String, JoinHandle<()>>,
+    /// Who has which session open, for the push notifications it spares.
+    viewers: Viewers,
+    /// The signed-in identity; `None` in local mode, where nobody is notified.
+    identity: Option<String>,
+    /// One per subscribed session topic; dropped with the subscription or
+    /// the connection.
+    views: HashMap<String, ViewGuard>,
 }
 
 impl Connection {
@@ -166,6 +181,7 @@ impl Connection {
                 if !is_topic(&topic) {
                     return Some(error(format!("unknown topic {topic}"), Some(&topic)));
                 }
+                self.views.remove(&topic);
                 // Leaving a topic that was never joined is not an error.
                 if let Some(task) = self.topics.remove(&topic) {
                     task.abort();
@@ -195,8 +211,13 @@ impl Connection {
             .remove(&topic)
             .or_else(|| self.retired.remove(&topic));
         if self.topics.len() >= MAX_TOPICS {
+            self.views.remove(&topic);
             let message = format!("too many subscriptions on one socket (limit {MAX_TOPICS})");
             return Some(error(message, Some(&topic)));
+        }
+        if let (Source::Session { session_id, .. }, Some(identity)) = (&source, &self.identity) {
+            let view = self.viewers.watch(identity, session_id);
+            self.views.insert(topic.clone(), view);
         }
         let forwarder = Forwarder {
             store: self.store.clone(),

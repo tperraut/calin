@@ -21,6 +21,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::*;
 
+mod push;
+
 const START: u64 = 1_800_000_000;
 const DAY: u64 = 24 * 60 * 60;
 const PUBLIC_URL: &str = "https://calin.example.com";
@@ -70,6 +72,8 @@ struct Public {
     state: AppState,
     provider: TestProvider,
     clock: Arc<ManualClock>,
+    /// Push has a clock of its own, in milliseconds: the throttle's.
+    push_clock: Arc<calin_push::ManualClock>,
     home: TempDir,
 }
 
@@ -100,17 +104,42 @@ async fn public_mode(allowed: &str) -> Public {
     let clock = Arc::new(ManualClock::new(START));
     let provider = TestProvider::start(clock.clone(), CLIENT_ID, Some(CLIENT_SECRET)).await;
     let state = state(&home, true).await;
+    public_on(home, state, clock, provider, allowed).await
+}
+
+/// `state` in public mode, with sign-in and push, on its home `home`.
+async fn public_on(
+    home: TempDir,
+    state: AppState,
+    clock: Arc<ManualClock>,
+    provider: TestProvider,
+    allowed: &str,
+) -> Public {
     let sign_in = open_sign_in(&provider, &clock, &home.path().join(AUTH_FILE), allowed).await;
+    let push_clock = Arc::new(calin_push::ManualClock::new(START * 1000));
+    let push = open_push(home.path(), &push_clock).await;
     let state = state
         .with_assets(Assets::new(WEB_APP))
-        .with_sign_in(sign_in);
+        .with_sign_in(sign_in)
+        .with_push(Arc::new(push));
     Public {
         app: router(state.clone()),
         state,
         provider,
         clock,
+        push_clock,
         home,
     }
+}
+
+/// Push as public mode opens it, except that the push service may be the
+/// tests' fake one on a loopback port.
+async fn open_push(home: &Path, clock: &Arc<calin_push::ManualClock>) -> Push {
+    let setup = PushSetup {
+        subject: vapid_subject(PUBLIC_URL, None).unwrap(),
+        endpoint_policy: calin_push::EndpointPolicy::AllowLoopbackHttpForDevelopment,
+    };
+    Push::open(home, setup, clock.clone()).await.unwrap()
 }
 
 // --- Clients ---
@@ -543,13 +572,8 @@ fn the_route_table_is_the_contracts_table() {
     // Nothing is served that the contract does not list.
     let undocumented: Vec<_> = served.difference(&contract).collect();
     assert!(undocumented.is_empty(), "{undocumented:?}");
-    // What the contract lists and the server does not serve yet: only the
-    // push routes (remote-access spec, section 6), which are not part of
-    // sign-in. Drop this allowance when they are added to `api_routes`.
-    let missing: Vec<_> = contract
-        .difference(&served)
-        .filter(|(_, path)| !path.starts_with("/push/"))
-        .collect();
+    // And everything the contract lists is served.
+    let missing: Vec<_> = contract.difference(&served).collect();
     assert!(missing.is_empty(), "{missing:?}");
 
     // The two exceptions to sign-in, and no third.

@@ -109,6 +109,16 @@ impl SignIn {
         }
     }
 
+    /// Everyone who may sign in, as the stores key identities.
+    pub(crate) fn allowed_identities(&self) -> Vec<String> {
+        self.config
+            .allow_list()
+            .identities()
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }
+
     pub(crate) fn store(&self) -> &AuthStore {
         &self.store
     }

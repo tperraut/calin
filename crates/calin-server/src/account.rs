@@ -35,7 +35,10 @@ fn session_required() -> ApiFailure {
 
 /// The signed-in caller, or the refusal: 409 in local mode, where there is
 /// nobody to have sessions or tokens.
-fn signed_in(state: &AppState, caller: Caller) -> ApiResult<(Arc<SignIn>, Authenticated)> {
+pub(crate) fn signed_in(
+    state: &AppState,
+    caller: Caller,
+) -> ApiResult<(Arc<SignIn>, Authenticated)> {
     match (state.sign_in.clone(), caller) {
         (Some(sign_in), Caller::SignedIn(who)) => Ok((sign_in, who)),
         (None, _) | (_, Caller::Local) => Err(ApiFailure::new(

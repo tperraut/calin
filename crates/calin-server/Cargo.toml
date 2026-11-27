@@ -11,6 +11,7 @@ calin-auth = { version = "0.0.1", path = "../calin-auth" }
 calin-agents = { version = "0.0.1", path = "../calin-agents" }
 calin-core = { version = "0.0.1", path = "../calin-core" }
 calin-proto = { version = "0.0.1", path = "../calin-proto" }
+calin-push = { version = "0.0.1", path = "../calin-push" }
 calin-term = { version = "0.0.1", path = "../calin-term" }
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
 serde = { version = "1.0.229", features = ["derive"] }
@@ -27,6 +28,8 @@ workspace = true
 [dev-dependencies]
 # The tests sign in against calin-auth's own provider, with real signed tokens.
 calin-auth = { version = "0.0.1", path = "../calin-auth", features = ["test-provider"] }
+# The push tests send to calin-push's fake service, which decrypts.
+calin-push = { version = "0.0.1", path = "../calin-push", features = ["test-service"] }
 http-body-util = "0.1.5"
 tempfile = "3.27.0"
 tokio = { version = "1.54.1", features = ["rt-multi-thread"] }

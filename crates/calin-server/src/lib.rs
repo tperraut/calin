@@ -9,6 +9,8 @@ mod auth;
 mod guard;
 mod headers;
 mod mcp;
+mod notify;
+mod push;
 mod term;
 mod ws;
 
@@ -30,6 +32,7 @@ use tokio_util::sync::CancellationToken;
 
 pub use assets::Assets;
 pub use auth::{AUTH_FILE, SignIn, SignInError};
+pub use push::{PUSH_KEY_FILE, PUSH_SUBSCRIPTIONS_FILE, Push, PushError, PushSetup, vapid_subject};
 
 /// Where agents reach Calin's tools, under [`API_ROOT`]: the token of one
 /// agent follows.
@@ -54,6 +57,10 @@ pub struct AppState {
     terminals: term::Terminals,
     /// Public mode. `None` is local mode: loopback only, nobody signs in.
     sign_in: Option<Arc<SignIn>>,
+    /// Web Push, in public mode. `None` in local mode, where it does not exist.
+    push: Option<Arc<Push>>,
+    /// Who has which session open on an event socket.
+    viewers: push::Viewers,
 }
 
 impl AppState {
@@ -67,6 +74,8 @@ impl AppState {
             terminal_command: None,
             terminals: term::Terminals::default(),
             sign_in: None,
+            push: None,
+            viewers: push::Viewers::default(),
         }
     }
 
@@ -93,6 +102,13 @@ impl AppState {
     /// Public mode: every request to the API must be signed in.
     pub fn with_sign_in(mut self, sign_in: Arc<SignIn>) -> Self {
         self.sign_in = Some(sign_in);
+        self
+    }
+
+    /// Web Push: the `/push` routes and the notifications. Public mode only;
+    /// without sign-in the routes still answer 409.
+    pub fn with_push(mut self, push: Arc<Push>) -> Self {
+        self.push = Some(push);
         self
     }
 
@@ -182,6 +198,23 @@ fn api_routes() -> Vec<ApiRoute> {
             SignedIn,
             account::revoke_device_token,
         ),
+        route(Get, "/push/key", SignedIn, push::key),
+        route(
+            Get,
+            "/push/subscriptions",
+            SignedIn,
+            push::list_subscriptions,
+        ),
+        route(Post, "/push/subscriptions", SignedIn, push::subscribe),
+        route(
+            Delete,
+            "/push/subscriptions/{id}",
+            SignedIn,
+            push::unsubscribe,
+        ),
+        route(Get, "/push/preferences", SignedIn, push::get_preferences),
+        route(Put, "/push/preferences", SignedIn, push::set_preferences),
+        route(Post, "/push/test", SignedIn, push::test),
         route(Get, "/settings", SignedIn, api::get_settings),
         route(Put, "/settings", SignedIn, api::update_settings),
         route(Get, "/repos", SignedIn, api::list_repos),
@@ -341,6 +374,9 @@ impl Server {
     ) -> std::io::Result<()> {
         let sockets = self.state.shutdown.clone();
         let sign_in = self.state.sign_in.clone();
+        let push = self.state.push.clone();
+        // Ends with `sockets`, when the server shuts down.
+        let notifications = notify::spawn(&self.state, None);
         // With connection info: the tool endpoint and the sign-in rate limit
         // need the peer's address.
         let app = router(self.state).into_make_service_with_connect_info::<SocketAddr>();
@@ -350,7 +386,14 @@ impl Server {
                 sockets.cancel();
             })
             .await;
-        // "Last used" times reach the file at most every 30 seconds otherwise.
+        if let Some(notifications) = notifications {
+            let _ = notifications.await;
+        }
+        // "Last used" and "last sent" times reach their files at most every
+        // 30 seconds otherwise.
+        if let Some(push) = push {
+            push.flush().await;
+        }
         if let Some(sign_in) = sign_in {
             sign_in.flush().await;
         }

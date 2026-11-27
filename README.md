@@ -50,7 +50,8 @@ login is needed. The server only listens on loopback addresses until sign-in exi
 | `CALIN_OIDC_CLIENT_ID` | Public mode: the client id registered with the provider. |
 | `CALIN_OIDC_CLIENT_SECRET` | Public mode, optional: the client secret. Without it Calin is a public client and relies on PKCE alone. |
 | `CALIN_ALLOWED_USERS` | Public mode: who may sign in, comma-separated: email addresses, or `sub:<subject>`. Must not be empty. Sessions and device tokens of an identity removed from it end at the next start. They are kept in `auth.json` in the data directory. |
-| `CALIN_UNSAFE_DEV_ALLOW_HTTP_LOOPBACK=1` | **Unsafe, for development and automated browser tests only.** Lets `CALIN_PUBLIC_URL` and `CALIN_OIDC_ISSUER` be plain `http` on `localhost` or `127.0.0.1` with an explicit port. Never set it on a real server: sign-in over plain HTTP protects nothing. Any value other than `1` is an error. |
+| `CALIN_PUSH_CONTACT` | Public mode, optional: a `mailto:` address, for example `mailto:admin@example.com`, that push services can reach whoever runs the server at. Default: the public URL. Push notifications keep their key pair in `push-vapid-key.json` and the devices that subscribed in `push-subscriptions.json`, in the data directory. |
+| `CALIN_UNSAFE_DEV_ALLOW_HTTP_LOOPBACK=1` | **Unsafe, for development and automated browser tests only.** Lets `CALIN_PUBLIC_URL` and `CALIN_OIDC_ISSUER` be plain `http` on `localhost` or `127.0.0.1` with an explicit port, and push subscriptions point at a push service on `http://127.0.0.1:<port>`. Never set it on a real server: sign-in over plain HTTP protects nothing. Any value other than `1` is an error. |
 | `CLAUDE_CODE_ENABLE_TODO_TOOLS=1` | Not Calin's own: it is passed on to Claude Code, which then offers its task tools to every model. A session shows the agent's plan only when the agent has those tools. |
 
 ## License
