@@ -869,3 +869,108 @@ fn the_examples_in_the_user_guide_are_valid() {
     assert_eq!(names, ["api", "web", "notes"]);
     assert_eq!(file.sets["storefront"], ["api", "web"]);
 }
+
+fn found(name: &str) -> Found {
+    Found {
+        name: name.to_owned(),
+        path: PathBuf::from("/code").join(name),
+        url: None,
+        renamed_from: None,
+        guess: Guess::default(),
+    }
+}
+
+#[test]
+fn the_summary_says_how_many_repos_the_list_holds() {
+    let note = |scan: &[&str], repos: &[&str]| {
+        let report = Report {
+            root: "/home/u/home".into(),
+            created: vec![REPOS_FILE.to_owned()],
+            scan_roots: scan.iter().map(PathBuf::from).collect(),
+            repos: repos.iter().map(|name| found(name)).collect(),
+            ..Report::default()
+        };
+        let text = summary(&report, "http://127.0.0.1:4680");
+        let line = text.lines().find(|l| l.starts_with("  .calin/repos.yaml"));
+        line.unwrap().to_owned()
+    };
+    assert_eq!(note(&[], &[]), "  .calin/repos.yaml (a commented example)");
+    assert_eq!(
+        note(&["/code"], &[]),
+        "  .calin/repos.yaml (no clone found; a commented example)"
+    );
+    assert_eq!(note(&["/code"], &["api"]), "  .calin/repos.yaml (1 repo)");
+    assert_eq!(
+        note(&["/code"], &["api", "web"]),
+        "  .calin/repos.yaml (2 repos)"
+    );
+}
+
+#[test]
+fn the_whole_summary() {
+    let report = Report {
+        root: "/home/u/home".into(),
+        initialized: true,
+        created: vec![
+            REPOS_FILE.to_owned(),
+            "README.md".to_owned(),
+            "skills/.gitkeep".to_owned(),
+        ],
+        kept: vec![WORKFLOWS[0].to_owned(), "agents/".to_owned()],
+        scan_roots: vec!["/code".into(), "/more code".into()],
+        repos: vec![found("api")],
+        notes: vec!["skipped /code/x: not a clone".to_owned()],
+    };
+    let text = summary(&report, "http://127.0.0.1:4680");
+    assert_eq!(
+        text,
+        r#"Initialized a git repository in /home/u/home.
+Home repo: /home/u/home
+
+Created:
+  .calin/repos.yaml (1 repo)
+  README.md
+  skills/.gitkeep
+
+Kept as they were:
+  .calin/workflows/implement-and-check.yaml
+  agents/
+
+Note: skipped /code/x: not a clone
+
+Next steps:
+  1. Review .calin/repos.yaml: names, URLs, and the commented setup and checks lines.
+  2. Commit:
+       cd /home/u/home
+       git add .calin README.md skills
+       git commit -m "Calin home repo"
+  3. Start Calin (`calin serve`), open Settings, set these and save:
+       Home repo:  /home/u/home
+       Scan roots: /code, /more code
+     Or, from this machine (this replaces all of Calin's settings):
+       curl -X PUT http://127.0.0.1:4680/api/v1/settings -H 'Content-Type: application/json' \
+         -d '{"home_repo":"/home/u/home","scan_roots":["/code","/more code"]}'
+  4. Optionally, see how scripts/link-claude.sh would link skills/, agents/, commands/ and
+     CLAUDE.md into ~/.claude:
+       /home/u/home/scripts/link-claude.sh --dry-run
+"#
+    );
+    let nothing_new = Report {
+        root: "/home/u/home".into(),
+        kept: vec![REPOS_FILE.to_owned()],
+        ..Report::default()
+    };
+    let text = summary(&nothing_new, "http://127.0.0.1:4680");
+    assert!(
+        text.starts_with(
+            "Home repo: /home/u/home\n\nKept as they were:\n  .calin/repos.yaml\n\nNext steps:\n"
+        ),
+        "{text}"
+    );
+    for line in [
+        "  2. Commit any changes you made.",
+        "       Scan roots: the folders that hold your clones",
+    ] {
+        assert!(text.lines().any(|l| l == line), "{line:?} not in\n{text}");
+    }
+}
