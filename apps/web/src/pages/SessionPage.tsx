@@ -2,6 +2,7 @@ import { useNavigate, useParams } from "@solidjs/router";
 import {
   createEffect,
   createMemo,
+  createSignal,
   createUniqueId,
   Match,
   onSettled,
@@ -17,6 +18,7 @@ import { SessionHeader } from "../components/SessionHeader";
 import { SidePane } from "../components/SidePane";
 import { Transcript } from "../components/Transcript";
 import type { SessionStatus } from "../gen/SessionStatus";
+import { changedFileCount } from "../lib/changeCount";
 import { createMediaQuery, WIDE_QUERY } from "../lib/media";
 import { canMessage, resumesOnMessage, sessionLook } from "../lib/status";
 import { PanelHost, PanelOutlet } from "../panels/PanelHost";
@@ -24,10 +26,13 @@ import {
   panelFromSegment,
   sessionPath,
   sidePanels,
+  type FileRequest,
+  type FileTarget,
   type PanelId,
   type SidePanelId,
 } from "../panels/registry";
 import { AppContext } from "../state/app";
+import { createPermissionAnswers } from "../state/permissionAnswers";
 import type { PendingPermission, TranscriptEntry } from "../state/sessionReducer";
 
 const ANNOUNCED_CHARS = 300;
@@ -103,14 +108,27 @@ export function SessionScreen(props: {
   // layouts below only adopt their element (see PanelHost). They wait for the
   // session's record, so no panel loads or opens a socket for an unknown session.
   const hostedPanel = createMemo(() => (store.load().status === "ready" ? sidePanel() : undefined));
+  // A file asked for from a panel or from the transcript; the Files panel takes it, now or when it mounts.
+  const [fileRequest, setFileRequest] = createSignal<FileRequest>();
+  let fileRequests = 0;
+  function openFile(target: FileTarget): void {
+    fileRequests += 1;
+    setFileRequest({ target, seq: fileRequests });
+    props.onPanel("files");
+  }
   let panels: HTMLDivElement | undefined;
   void (
     <PanelHost
       store={store}
       panel={hostedPanel()}
-      onPanel={(panel) => props.onPanel(panel)}
+      fileRequest={fileRequest()}
+      onOpenFile={openFile}
       ref={(element) => (panels = element)}
     />
+  );
+  // One set of answers for the pinned bar and the tool cards: either can answer a request.
+  const answers = createPermissionAnswers((requestId, decision, message) =>
+    store.resolvePermission(requestId, decision, message),
   );
   // On a phone only the selected panel shows; the transcript keeps its place in the page meanwhile.
   const transcriptHidden = (): boolean => !wide() && props.panel !== "transcript";
@@ -118,7 +136,18 @@ export function SessionScreen(props: {
   const pending = (): readonly PendingPermission[] =>
     store.synced() ? store.view().pendingPermissions : NONE_PENDING;
 
-  const changedCount = createMemo(() => store.view().changedFiles.length);
+  // The server's list, once read, sees what the events do not: a shell's edits, a revert.
+  const changedCount = createMemo(() =>
+    changedFileCount(store.changes.list(), store.changes.revision(), store.view().changedFiles),
+  );
+  // Read once the session is known, whether or not the Changes panel is ever opened;
+  // the store reads it again when the status changes.
+  createEffect(
+    () => store.load().status === "ready",
+    (ready) => {
+      if (ready) store.changes.request();
+    },
+  );
   const sideTabs = createMemo((): Tab<SidePanelId>[] =>
     sidePanels.map(({ id, label }) =>
       id === "changes" && changedCount() > 0
@@ -219,7 +248,13 @@ export function SessionScreen(props: {
               hidden={transcriptHidden()}
               class="flex min-h-0 flex-1 flex-col"
             >
-              <Transcript entries={store.view().transcript} synced={store.synced()} />
+              <Transcript
+                entries={store.view().transcript}
+                synced={store.synced()}
+                repos={store.repos()}
+                answers={answers}
+                onOpenFile={openFile}
+              />
               <Show when={store.view().plan.length > 0}>
                 <PlanPanel entries={store.view().plan} />
               </Show>
@@ -239,6 +274,7 @@ export function SessionScreen(props: {
             {/* Under every panel: a request must not wait unseen behind a tab. */}
             <PermissionBar
               pending={pending()}
+              answers={answers}
               onResolve={(requestId, decision, message) =>
                 store.resolvePermission(requestId, decision, message)
               }

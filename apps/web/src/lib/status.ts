@@ -76,6 +76,16 @@ const repoModeLabels: Record<RepoMode, string> = {
 
 export const repoModeLabel = (mode: RepoMode): string => lookup(repoModeLabels, mode) ?? mode;
 
+/** In the order they are offered; a worktree is the default (repo.rs). */
+export const repoModes: readonly RepoMode[] = ["write", "read", "live"];
+
+/**
+ * How a repo is attached unless the reader says otherwise: the home repo is
+ * edited in place, any other one gets a worktree (design spec, section 13).
+ */
+export const defaultRepoMode = (repo: { home: boolean }): Extract<RepoMode, "write" | "live"> =>
+  repo.home ? "live" : "write";
+
 // `expired` is nobody answering; it reads as "No longer needed", never after "by".
 const sourceLabels: Record<Exclude<DecisionSource, "expired">, string> = {
   user: "you",
@@ -97,6 +107,7 @@ const messageable: readonly SessionStatus[] = [
   "cancelled",
 ];
 const resumable: readonly SessionStatus[] = ["failed", "cancelled"];
+const attachable: readonly SessionStatus[] = ["running", "waiting", "review"];
 
 const among = (list: readonly SessionStatus[], status: SessionStatus | undefined): boolean =>
   status !== undefined && list.includes(status);
@@ -108,6 +119,9 @@ export const canStop = (status: SessionStatus | undefined): boolean => among(sto
 
 export const canMessage = (status: SessionStatus | undefined): boolean =>
   among(messageable, status);
+
+/** True while a repo can be attached to the session (api.rs, "Attaching mid-session"). */
+export const canAttach = (status: SessionStatus | undefined): boolean => among(attachable, status);
 
 /** True when a message restarts the agent instead of joining a live conversation. */
 export const resumesOnMessage = (status: SessionStatus | undefined): boolean =>

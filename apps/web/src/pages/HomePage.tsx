@@ -20,9 +20,11 @@ export default function HomePage() {
       <Composer
         runners={runners()}
         registry={app.repos()}
+        sets={app.repoSets()}
         disabled={app.health().status !== "ready"}
         onRegisterRepo={(request) => app.registerRepo(request)}
         onRemoveRepo={(id) => app.removeRepo(id)}
+        onCloneRepo={(id) => app.cloneRepo(id)}
         onRetryRepos={() => app.loadRepos()}
         onCreate={async (request) => {
           const session = await app.createSession(request);

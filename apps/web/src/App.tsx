@@ -1,5 +1,14 @@
 import { useLocation } from "@solidjs/router";
-import { Errored, Match, onSettled, Show, Switch, useContext, type ParentProps } from "solid-js";
+import {
+  Errored,
+  Loading,
+  Match,
+  onSettled,
+  Show,
+  Switch,
+  useContext,
+  type ParentProps,
+} from "solid-js";
 import { ConnectionIndicator } from "./components/ConnectionIndicator";
 import { SessionList } from "./components/SessionList";
 import { errorMessage } from "./lib/errors";
@@ -96,9 +105,18 @@ function Shell(props: ParentProps) {
               <a href="/" class="flex min-h-11 min-w-11 items-center text-base font-semibold">
                 Calin
               </a>
-              <a href="/" class="hidden min-h-11 items-center text-sm text-accent lg:flex">
-                New session
-              </a>
+              <span class="flex items-center gap-4">
+                <a href="/" class="hidden min-h-11 items-center text-sm text-accent lg:flex">
+                  New session
+                </a>
+                <a
+                  href="/settings"
+                  class="flex min-h-11 min-w-11 items-center justify-end text-sm text-accent"
+                  aria-current={location.pathname === "/settings" ? "page" : undefined}
+                >
+                  Settings
+                </a>
+              </span>
             </header>
             <nav aria-label="Sessions" class="min-h-0 flex-1 overflow-y-auto overscroll-contain">
               <SessionsPanel />
@@ -107,11 +125,16 @@ function Shell(props: ParentProps) {
           {/* At home on a phone the composer shares the screen with the list above it. */}
           <main
             class={[
-              "flex min-h-0 flex-col lg:flex-1",
+              // `min-w-0`: a long unbreakable line in a session (code, a branch name) must
+              // scroll or be cut where it is, not push the side pane out of the window.
+              "flex min-h-0 min-w-0 flex-col lg:flex-1",
               atHome() ? "max-h-[65dvh] lg:max-h-none" : "flex-1",
             ]}
           >
-            {props.children}
+            {/* A page whose code is fetched on its first visit (see router.ts) shows this meanwhile. */}
+            <Loading fallback={<p class="p-3 text-sm text-muted">Loading…</p>}>
+              {props.children}
+            </Loading>
           </main>
         </div>
       </Show>

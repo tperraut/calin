@@ -14,7 +14,10 @@ export type BufferLoad =
 
 /**
  * What stands between a buffer and the file on disk.
- * `conflict`: a save was refused because the file changed since it was loaded.
+ * `conflict`: a save was refused with 409. The server's message says why; of
+ * its causes (api.rs) only two can happen here, the file changed since it was
+ * loaded or it exists again after being deleted, because nothing is ever sent
+ * for a repo attached `read`. `message` is the server's, shown as it is.
  * `changed`: the file changed on disk while the buffer has unsaved edits.
  * `deleted`: the file is gone from disk; saving creates it again.
  * `error`: a save or a reload failed for another reason.
@@ -87,7 +90,10 @@ export type Buffers = {
   dismiss(key: string): void;
   /** A `file_changed` event named this file. Reloads it quietly, or says so when there are unsaved edits. */
   changedOnDisk(target: FileTarget, deleted: boolean): Promise<void>;
-  /** Creates an empty file, then opens it. Rejects with the server's error (409: it already exists). */
+  /**
+   * Creates an empty file, then opens it. Rejects with the server's error
+   * (409: it already exists). Nothing is sent for a repo attached `read`.
+   */
   create(target: FileTarget): Promise<void>;
 };
 
@@ -385,6 +391,10 @@ export function createBuffers(deps: BuffersDeps): Buffers {
       else adopt(entry, content);
     },
     async create(target) {
+      // Of the three refusals a write can meet (api.rs), this one is known beforehand: it is never sent.
+      if (deps.readOnly(target)) {
+        throw new Error("This repo is attached read-only: nothing can be created in it.");
+      }
       await deps.write(target, { text: "" });
       open(target);
     },

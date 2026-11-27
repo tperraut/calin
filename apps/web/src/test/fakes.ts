@@ -40,6 +40,14 @@ export function makeRepo(id: string, patch: Partial<Repo> = {}): Repo {
     path: `/code/${id}`,
     default_branch: "main",
     remote_url: null,
+    available: true,
+    declared: false,
+    home: false,
+    url: null,
+    setup: null,
+    checks: [],
+    cloning: false,
+    problem: null,
     ...patch,
   };
 }
@@ -138,9 +146,15 @@ export function fakeApi(routes: Partial<Api> = {}): Api {
     Promise.reject(new Error(`fakeApi: ${name} was called but not stubbed`));
   return {
     health: missing("health"),
+    getSettings: missing("getSettings"),
+    putSettings: missing("putSettings"),
     listRepos: missing("listRepos"),
     registerRepo: missing("registerRepo"),
+    refreshRepos: missing("refreshRepos"),
+    cloneRepo: missing("cloneRepo"),
     removeRepo: missing("removeRepo"),
+    // Sets are a convenience on top of the repo list: none unless a test says so.
+    listRepoSets: () => Promise.resolve([]),
     listSessions: missing("listSessions"),
     createSession: missing("createSession"),
     getSession: missing("getSession"),
@@ -148,6 +162,7 @@ export function fakeApi(routes: Partial<Api> = {}): Api {
     interruptSession: missing("interruptSession"),
     stopSession: missing("stopSession"),
     resolvePermission: missing("resolvePermission"),
+    attachRepo: missing("attachRepo"),
     getChanges: missing("getChanges"),
     getDiff: missing("getDiff"),
     listTree: missing("listTree"),
@@ -177,3 +192,15 @@ export function deferred<T = void>() {
 }
 
 export const conflict = (message: string): HttpError => new HttpError(409, message, true);
+export const badRequest = (message: string): HttpError => new HttpError(400, message, true);
+
+/** A repo the home repo declares that has no clone on this machine yet. */
+export const makeMissingRepo = (id: string, patch: Partial<Repo> = {}): Repo =>
+  makeRepo(id, {
+    path: "",
+    default_branch: null,
+    available: false,
+    declared: true,
+    url: `git@example.com:you/${id}.git`,
+    ...patch,
+  });

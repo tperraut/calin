@@ -1,15 +1,20 @@
-import { createSignal, createUniqueId, For, Show } from "solid-js";
+import { createSignal, createUniqueId, For, Show, useContext } from "solid-js";
 import { compactCount, formatCost } from "../lib/format";
 import { createRequest } from "../lib/request";
-import { canInterrupt, canStop, permissionModeLook, repoModeLabel } from "../lib/status";
+import { canAttach, canInterrupt, canStop, permissionModeLook, repoModeLabel } from "../lib/status";
+import { AppContext } from "../state/app";
 import type { SessionStore } from "../state/sessionStore";
+import { AttachRepo } from "./AttachRepo";
 import { SessionStatusBadge } from "./Badge";
 
 /**
- * Title, status and the two ways to halt a session. Neither button changes
- * anything by itself: the status follows the session's events.
+ * Title, status, the two ways to halt a session, and its repos with the way
+ * to add one. No button changes anything by itself: the status and the repo
+ * set follow the session's events.
  */
 export function SessionHeader(props: { store: SessionStore }) {
+  const app = useContext(AppContext);
+  const [attaching, setAttaching] = createSignal(false);
   const stop = createRequest(() => props.store.stop());
   const interrupt = createRequest(() => props.store.interrupt());
   // Only a phone needs the tap: from `lg` the details are always in view.
@@ -81,7 +86,7 @@ export function SessionHeader(props: { store: SessionStore }) {
                 <div
                   id={detailsId}
                   class={[
-                    "basis-full flex-wrap items-center gap-x-2 gap-y-1 pb-1 lg:flex lg:basis-auto lg:pb-0",
+                    "min-w-0 basis-full flex-wrap items-center gap-x-2 gap-y-1 pb-1 lg:flex lg:basis-auto lg:pb-0",
                     detailsOpen() ? "flex" : "hidden",
                   ]}
                 >
@@ -104,14 +109,19 @@ export function SessionHeader(props: { store: SessionStore }) {
                     when={props.store.repos().length > 0}
                     fallback={<span>No repo attached</span>}
                   >
-                    <ul aria-label="Repos" class="flex min-w-0 flex-wrap items-center gap-1">
+                    <ul
+                      aria-label="Repos"
+                      class="flex max-w-full min-w-0 flex-wrap items-center gap-1"
+                    >
                       <For each={props.store.repos()} keyed={(repo) => repo.id}>
                         {(repo) => (
                           <li
-                            class="flex min-w-0 items-center gap-1 rounded border border-line px-1.5 py-0.5"
+                            class="flex max-w-full min-w-0 items-center gap-1 rounded border border-line px-1.5 py-0.5"
                             title={repo().path}
                           >
-                            <span class="truncate font-medium text-fg">{repo().name}</span>
+                            <span class="max-w-[60%] shrink-0 truncate font-medium text-fg">
+                              {repo().name}
+                            </span>
                             <Show when={repo().primary}>
                               <span class="text-tone-active">primary</span>
                             </Show>
@@ -119,19 +129,52 @@ export function SessionHeader(props: { store: SessionStore }) {
                               when={repo().branch}
                               fallback={<span>{repoModeLabel(repo().mode).toLowerCase()}</span>}
                             >
-                              {(branch) => <span class="truncate font-mono">{branch()}</span>}
+                              {(branch) => (
+                                // Cut on screen when long; whole in the text and the title.
+                                <span class="min-w-0 truncate font-mono" title={branch()}>
+                                  {branch()}
+                                </span>
+                              )}
                             </Show>
                           </li>
                         )}
                       </For>
                     </ul>
                   </Show>
+                  <button
+                    type="button"
+                    class="inline-flex min-h-11 items-center rounded border border-line px-2 font-medium text-fg hover:border-muted disabled:cursor-not-allowed disabled:opacity-50 lg:min-h-0 lg:py-0.5"
+                    aria-expanded={attaching() ? "true" : "false"}
+                    title={
+                      canAttach(props.store.status())
+                        ? "Add a repo to this session"
+                        : "A repo can be attached while the session is running, waiting or in review"
+                    }
+                    disabled={!canAttach(props.store.status())}
+                    onClick={() => {
+                      // The list may be from another screen, or never read: ask for today's.
+                      if (!attaching()) app.loadRepos();
+                      setAttaching((open) => !open);
+                    }}
+                  >
+                    Attach repo
+                  </button>
                 </div>
               </>
             )}
           </Show>
         </div>
       </header>
+      <Show when={attaching()}>
+        <AttachRepo
+          registry={app.repos()}
+          attached={props.store.repos()}
+          enabled={canAttach(props.store.status())}
+          onAttach={(request) => props.store.attachRepo(request)}
+          onRetry={() => app.loadRepos()}
+          onClose={() => setAttaching(false)}
+        />
+      </Show>
       <Show when={interrupt.error()}>
         {(message) => (
           <p role="alert" class="border-b border-line bg-danger-soft px-3 py-2 text-sm">

@@ -7,6 +7,7 @@ import type {
   TerminalHandlers,
   TerminalRequest,
 } from "../api/terminal";
+import type { AttachRepoRequest } from "../gen/AttachRepoRequest";
 import type { FileContent } from "../gen/FileContent";
 import type { FileDiff } from "../gen/FileDiff";
 import type { PermissionDecision } from "../gen/PermissionDecision";
@@ -19,6 +20,7 @@ import type { SessionStatus } from "../gen/SessionStatus";
 import type { TreeEntry } from "../gen/TreeEntry";
 import type { WriteFileRequest } from "../gen/WriteFileRequest";
 import { errorMessage } from "../lib/errors";
+import { createRefresher, type Refresher } from "../lib/refresher";
 import { coalesce, type Schedule } from "../lib/schedule";
 import { applyEvent, emptySessionView, mergeRepos, type SessionView } from "./sessionReducer";
 
@@ -27,6 +29,26 @@ export type SessionLoad =
   | { status: "ready" }
   | { status: "not_found" }
   | { status: "error"; message: string; unreachable: boolean };
+
+/**
+ * What the session changed, as the server lists it (`GET /changes`). Shared by
+ * the Changes panel and the tab's count, so it is read here rather than in
+ * either. The store reads it again when a turn ends or a repo joins, since git
+ * may then report what no `file_changed` event announced; its readers ask for the rest.
+ */
+export type ChangesFeed = {
+  /** One entry per attached repo; `undefined` until read once. */
+  list: Accessor<readonly RepoChanges[] | undefined>;
+  /** The `changesRevision` the list accounts for: file events after it may not be in it. */
+  revision: Accessor<number>;
+  /** The server's reason when the last read failed. */
+  failure: Accessor<string | undefined>;
+  refreshing: Accessor<boolean>;
+  /** Something changed: read soon, once, however often this is called meanwhile. */
+  request(): void;
+  /** Read at once. */
+  now(): void;
+};
 
 /** Live state of one session: its record over REST, its transcript over the socket. */
 export type SessionStore = {
@@ -55,6 +77,12 @@ export type SessionStore = {
     decision: PermissionDecision,
     message?: string,
   ): Promise<void>;
+  /**
+   * Attaches a repo to the running session. Nothing is added here: the repo
+   * shows once its `repo_attached` event arrives. Rejects with the server's reason.
+   */
+  attachRepo(request: AttachRepoRequest): Promise<void>;
+  changes: ChangesFeed;
   reload(): void;
   /** Subscribes and loads; returns the function that undoes both. */
   start(): () => void;
@@ -119,6 +147,29 @@ export function createSessionStore(deps: SessionStoreDeps, id: string): SessionS
   let failed = false;
   let stopListening = (): void => {};
 
+  const [changes, setChanges] = createSignal<readonly RepoChanges[]>();
+  const [changesRevision, setChangesRevision] = createSignal(0);
+  const [changesFailure, setChangesFailure] = createSignal<string>();
+  const [changesRefreshing, setChangesRefreshing] = createSignal(false);
+  // Lives from `start` to its undoing: nothing is read for a session nobody looks at.
+  let changesRefresher: Refresher | undefined;
+
+  async function readChanges(): Promise<void> {
+    // What was folded before the question is in the answer; later events may not be.
+    const revision = current.changesRevision;
+    setChangesRefreshing(true);
+    try {
+      const loaded = await api.getChanges(id);
+      setChanges(loaded);
+      setChangesRevision(revision);
+      setChangesFailure(undefined);
+    } catch (error) {
+      setChangesFailure(errorMessage(error));
+    } finally {
+      setChangesRefreshing(false);
+    }
+  }
+
   const publish = coalesce(() => {
     setView(current);
     setSynced(caughtUp);
@@ -143,8 +194,13 @@ export function createSessionStore(deps: SessionStoreDeps, id: string): SessionS
     if (msg.op === "event") {
       const result = applyEvent(current, msg.event);
       if (result.outcome === "applied") {
+        const before = current;
         current = result.view;
         fruitlessResyncs = 0;
+        // Live only: a replay passes through every past status, and the list is read after it anyway.
+        if (caughtUp && (current.status !== before.status || current.repos !== before.repos)) {
+          changesRefresher?.request();
+        }
         publish();
       } else if (result.outcome === "gap" && !replaying) {
         resync();
@@ -220,12 +276,29 @@ export function createSessionStore(deps: SessionStoreDeps, id: string): SessionS
       if (message !== undefined && message.trim() !== "") body.message = message.trim();
       return api.resolvePermission(id, requestId, body);
     },
+    attachRepo: async (request) => {
+      await api.attachRepo(id, request);
+    },
+    changes: {
+      list: changes,
+      revision: changesRevision,
+      failure: changesFailure,
+      refreshing: changesRefreshing,
+      request: () => changesRefresher?.request(),
+      now: () => changesRefresher?.now(),
+    },
     reload() {
       setLoad({ status: "loading" });
       fetchDetail();
     },
     start() {
       active = true;
+      const refresher = createRefresher(readChanges);
+      changesRefresher = refresher;
+      // Nothing is read for a page in a background tab; what was missed is read on the way back.
+      const onVisibility = (): void => refresher.setVisible(document.visibilityState === "visible");
+      document.addEventListener("visibilitychange", onVisibility);
+      onVisibility();
       const unsubscribe = socket.subscribe(topic, onFrame, () => current.seq);
       // A failed load is retried as soon as the server answers the socket again.
       const offState = socket.onState((state) => {
@@ -239,6 +312,9 @@ export function createSessionStore(deps: SessionStoreDeps, id: string): SessionS
       return () => {
         active = false;
         stopListening();
+        document.removeEventListener("visibilitychange", onVisibility);
+        refresher.dispose();
+        changesRefresher = undefined;
       };
     },
     workspace: {

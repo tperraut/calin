@@ -601,6 +601,31 @@ describe("FilesPanel", () => {
       await act();
       expect(app.writeFile).not.toHaveBeenCalled();
     });
+
+    it("offers no way to write even once the file is gone from disk, so the server never has to refuse", async () => {
+      const app = await open();
+      await click(item(app.host, "docs"));
+      await act();
+      await click(item(app.host, "guide.md"));
+      await act();
+
+      app.disk.docs.delete("guide.md");
+      app.emit({ type: "file_changed", session_repo_id: "docs", path: "guide.md", op: "delete" });
+      await act();
+      const pane = editorPane(app.host);
+      // Said as it is, without the promise that saving would bring the file back.
+      expect(pane.textContent).toContain("This file was deleted on disk.");
+      expect(pane.textContent).not.toContain("Saving creates it again");
+      expect(saveButton(app.host).disabled).toBe(true);
+      expect(
+        [...pane.querySelectorAll("button")].map((button) => button.textContent),
+      ).not.toContain("Overwrite");
+      editorFor("guide.md").field.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "s", ctrlKey: true }),
+      );
+      await act();
+      expect(app.writeFile).not.toHaveBeenCalled();
+    });
   });
 
   describe("new file", () => {

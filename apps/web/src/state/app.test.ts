@@ -1,12 +1,19 @@
 import { flush } from "solid-js";
-import { afterEach, describe, expect, it, vi } from "vite-plus/test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import type { Api } from "../api/http";
 import type { Health } from "../gen/Health";
+import type { Repo } from "../gen/Repo";
+import type { RepoSet } from "../gen/RepoSet";
+import type { Settings } from "../gen/Settings";
 import {
+  badRequest,
+  conflict,
+  deferred,
   fakeApi,
   FakeSocket,
   immediately,
   makeDetail,
+  makeMissingRepo,
   makeRepo,
   makeSession,
   settle,
@@ -160,10 +167,11 @@ describe("app state", () => {
     expect(socket.subscriberCount("sessions")).toBe(0);
   });
 
-  it("reads the repo registry on demand, sorted by name", async () => {
+  it("reads the repo registry on demand, the home repo first and the others by name", async () => {
+    const home = makeRepo("notes", { home: true });
     const listRepos = vi
       .fn<Api["listRepos"]>()
-      .mockResolvedValue([makeRepo("web"), makeRepo("api")]);
+      .mockResolvedValue([makeRepo("web"), home, makeRepo("api")]);
     const { app } = setup({ listRepos });
     expect(app.repos()).toEqual({ status: "loading" });
     await settle();
@@ -172,7 +180,243 @@ describe("app state", () => {
     app.loadRepos();
     await settle();
     flush();
+    expect(app.repos()).toEqual({
+      status: "ready",
+      repos: [home, makeRepo("api"), makeRepo("web")],
+    });
+  });
+
+  it("reads the home repo's sets with the repos, and does without them when they fail", async () => {
+    const sets: RepoSet[] = [{ name: "storefront", repo_ids: ["api", "web"] }];
+    const listRepoSets = vi
+      .fn<Api["listRepoSets"]>()
+      .mockResolvedValueOnce(sets)
+      .mockRejectedValue(unreachable());
+    const { app } = setup({ listRepos: () => Promise.resolve([makeRepo("api")]), listRepoSets });
+    expect(app.repoSets()).toEqual([]);
+
+    app.loadRepos();
+    await settle();
+    flush();
+    expect(app.repoSets()).toEqual(sets);
+
+    // A later read that fails leaves the last known sets, and the repos, in place.
+    app.loadRepos();
+    await settle();
+    flush();
+    expect(app.repoSets()).toEqual(sets);
+    expect(app.repos().status).toBe("ready");
+  });
+
+  describe("cloning", () => {
+    beforeEach(() => vi.useFakeTimers());
+    afterEach(() => vi.useRealTimers());
+
+    /** Lets what is already resolved land, without moving the clock. */
+    const landed = async (): Promise<void> => {
+      await vi.advanceTimersByTimeAsync(0);
+      flush();
+    };
+    const repoOf = (app: ReturnType<typeof setup>["app"], id: string) => {
+      const registry = app.repos();
+      return registry.status === "ready" ? registry.repos.find((one) => one.id === id) : undefined;
+    };
+
+    it("asks for the clone, shows it at once, then reads the list every two seconds until it ends", async () => {
+      const missing = makeMissingRepo("web");
+      const listRepos = vi.fn<Api["listRepos"]>().mockResolvedValue([missing]);
+      const cloneRepo = vi.fn<Api["cloneRepo"]>().mockResolvedValue();
+      const { app } = setup({ listRepos, cloneRepo });
+      app.loadRepos();
+      await landed();
+      expect(listRepos).toHaveBeenCalledTimes(1);
+
+      // Nothing is cloning: nothing is polled.
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(listRepos).toHaveBeenCalledTimes(1);
+
+      listRepos.mockResolvedValue([{ ...missing, cloning: true }]);
+      await app.cloneRepo("web");
+      flush();
+      expect(cloneRepo).toHaveBeenCalledWith("web");
+      // 202 means it runs: the row says so before the next read.
+      expect(repoOf(app, "web")).toMatchObject({ cloning: true, available: false });
+      expect(listRepos).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(1999);
+      expect(listRepos).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(listRepos).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(listRepos).toHaveBeenCalledTimes(3);
+
+      listRepos.mockResolvedValue([makeRepo("web", { declared: true, url: missing.url })]);
+      await vi.advanceTimersByTimeAsync(2000);
+      flush();
+      expect(listRepos).toHaveBeenCalledTimes(4);
+      expect(repoOf(app, "web")).toMatchObject({ cloning: false, available: true });
+
+      // Done: the polling stops.
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(listRepos).toHaveBeenCalledTimes(4);
+    });
+
+    it("stops polling when the clone fails, and keeps the reason the server gives", async () => {
+      const missing = makeMissingRepo("web");
+      const listRepos = vi.fn<Api["listRepos"]>().mockResolvedValue([missing]);
+      const { app } = setup({ listRepos, cloneRepo: () => Promise.resolve() });
+      app.loadRepos();
+      await landed();
+
+      await app.cloneRepo("web");
+      listRepos.mockResolvedValue([{ ...missing, problem: "git clone failed: permission denied" }]);
+      await vi.advanceTimersByTimeAsync(2000);
+      flush();
+      expect(repoOf(app, "web")).toMatchObject({
+        cloning: false,
+        available: false,
+        problem: "git clone failed: permission denied",
+      });
+      const reads = listRepos.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(listRepos).toHaveBeenCalledTimes(reads);
+    });
+
+    it("passes on a refused clone and polls nothing", async () => {
+      const refusal = conflict("web has no url to clone from");
+      const listRepos = vi.fn<Api["listRepos"]>().mockResolvedValue([makeMissingRepo("web")]);
+      const { app } = setup({ listRepos, cloneRepo: () => Promise.reject(refusal) });
+      app.loadRepos();
+      await landed();
+
+      await expect(app.cloneRepo("web")).rejects.toBe(refusal);
+      flush();
+      expect(repoOf(app, "web")).toMatchObject({ cloning: false });
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(listRepos).toHaveBeenCalledTimes(1);
+    });
+
+    it("keeps polling through a read that fails, and stops with the app", async () => {
+      const cloning = makeMissingRepo("web", { cloning: true });
+      const listRepos = vi.fn<Api["listRepos"]>().mockResolvedValue([cloning]);
+      const { app } = setup({ listRepos });
+      app.loadRepos();
+      await landed();
+
+      listRepos.mockRejectedValueOnce(unreachable());
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(listRepos).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(listRepos).toHaveBeenCalledTimes(3);
+
+      for (const stop of stops.splice(0)) stop();
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(listRepos).toHaveBeenCalledTimes(3);
+    });
+
+    it("drops a read that was on its way when the clone was accepted", async () => {
+      const missing = makeMissingRepo("web");
+      const early = deferred<Repo[]>();
+      const listRepos = vi
+        .fn<Api["listRepos"]>()
+        .mockResolvedValueOnce([missing])
+        .mockReturnValueOnce(early.promise)
+        .mockResolvedValue([{ ...missing, cloning: true }]);
+      const { app } = setup({ listRepos, cloneRepo: () => Promise.resolve() });
+      app.loadRepos();
+      await landed();
+
+      app.loadRepos();
+      await app.cloneRepo("web");
+      // The answer from before the clone says "not cloning": it must not undo what is on screen.
+      early.resolve([missing]);
+      await landed();
+      expect(repoOf(app, "web")).toMatchObject({ cloning: true });
+      expect(listRepos).toHaveBeenCalledTimes(3);
+    });
+  });
+
+  it("rescans: the server's answer becomes the list, and the sets are read again", async () => {
+    const listRepoSets = vi.fn<Api["listRepoSets"]>().mockResolvedValue([]);
+    const refreshRepos = vi
+      .fn<Api["refreshRepos"]>()
+      .mockResolvedValue([makeRepo("web"), makeRepo("api")]);
+    const { app } = setup({
+      listRepos: () => Promise.resolve([makeRepo("api")]),
+      listRepoSets,
+      refreshRepos,
+    });
+    app.loadRepos();
+    await settle();
+    expect(listRepoSets).toHaveBeenCalledTimes(1);
+
+    await app.rescanRepos();
+    await settle();
+    flush();
+    expect(refreshRepos).toHaveBeenCalledTimes(1);
     expect(app.repos()).toEqual({ status: "ready", repos: [makeRepo("api"), makeRepo("web")] });
+    expect(listRepoSets).toHaveBeenCalledTimes(2);
+  });
+
+  it("reads the settings on demand, and reports a failure until they can be read", async () => {
+    const stored: Settings = { home_repo: null, scan_roots: [], clone_root: null };
+    const getSettings = vi
+      .fn<Api["getSettings"]>()
+      .mockRejectedValueOnce(unreachable())
+      .mockResolvedValue(stored);
+    const { app, socket } = setup({ getSettings });
+    expect(app.settings()).toEqual({ status: "loading" });
+    await settle();
+    expect(getSettings).not.toHaveBeenCalled();
+
+    app.loadSettings();
+    await settle();
+    flush();
+    expect(app.settings()).toEqual({ status: "error", message: "Cannot reach the server" });
+
+    socket.setState("open");
+    await settle();
+    flush();
+    expect(app.settings()).toEqual({ status: "ready", settings: stored });
+  });
+
+  it("saves the settings as the server stored them, and reads the repos again", async () => {
+    const sent: Settings = { home_repo: " /code/home", scan_roots: [], clone_root: null };
+    const stored: Settings = { home_repo: "/code/home", scan_roots: [], clone_root: "/data/repos" };
+    const putSettings = vi.fn<Api["putSettings"]>().mockResolvedValue(stored);
+    const listRepos = vi
+      .fn<Api["listRepos"]>()
+      .mockResolvedValueOnce([])
+      .mockResolvedValue([makeRepo("home", { home: true })]);
+    const { app } = setup({ putSettings, listRepos });
+    app.loadRepos();
+    await settle();
+
+    await expect(app.saveSettings(sent)).resolves.toEqual(stored);
+    await settle();
+    flush();
+    expect(putSettings).toHaveBeenCalledWith(sent);
+    expect(app.settings()).toEqual({ status: "ready", settings: stored });
+    expect(app.repos()).toEqual({ status: "ready", repos: [makeRepo("home", { home: true })] });
+  });
+
+  it("keeps the settings on screen when a save is refused", async () => {
+    const stored: Settings = { home_repo: null, scan_roots: [], clone_root: null };
+    const refusal = badRequest("home_repo: /nope is not the root of a git work tree");
+    const listRepos = vi.fn<Api["listRepos"]>().mockResolvedValue([]);
+    const { app } = setup({
+      getSettings: () => Promise.resolve(stored),
+      putSettings: () => Promise.reject(refusal),
+      listRepos,
+    });
+    app.loadSettings();
+    app.loadRepos();
+    await settle();
+
+    await expect(app.saveSettings({ ...stored, home_repo: "/nope" })).rejects.toBe(refusal);
+    flush();
+    expect(app.settings()).toEqual({ status: "ready", settings: stored });
+    expect(listRepos).toHaveBeenCalledTimes(1);
   });
 
   it("adds a registered repo and drops a removed one without reading the list again", async () => {

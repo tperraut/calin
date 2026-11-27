@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vite-plus/test";
 import type { Health } from "../gen/Health";
-import { makeDetail, makeRepo, makeSession } from "../test/fakes";
+import type { RepoSet } from "../gen/RepoSet";
+import type { Settings } from "../gen/Settings";
+import { makeDetail, makeMissingRepo, makeRepo, makeSession, makeSessionRepo } from "../test/fakes";
 import { createApi, HttpError, type FetchLike } from "./http";
 
 const json = (body: unknown, status = 200): Response =>
@@ -140,6 +142,72 @@ describe("http api", () => {
         '{"decision":"deny","message":"Not on main."}',
       ],
       ["POST", "/api/v1/sessions/s%201/permissions/p2", '{"decision":"allow"}'],
+    ]);
+  });
+
+  it("calls the settings, catalog and attach routes with their method, path and body", async () => {
+    const settings: Settings = {
+      home_repo: "/code/home",
+      scan_roots: ["/code"],
+      clone_root: null,
+    };
+    const repos = [makeRepo("home", { home: true }), makeMissingRepo("web")];
+    const sets: RepoSet[] = [{ name: "storefront", repo_ids: ["api", "web"] }];
+    const attached = makeSessionRepo("web", { session_id: "s 1" });
+    const { api, fetchFn } = setup((input) => {
+      if (input.endsWith("/settings")) return Promise.resolve(json(settings));
+      if (input.endsWith("/repos/refresh")) return Promise.resolve(json(repos));
+      if (input.endsWith("/clone")) return Promise.resolve(new Response(null, { status: 202 }));
+      if (input.endsWith("/repo-sets")) return Promise.resolve(json(sets));
+      return Promise.resolve(json(attached, 201));
+    });
+
+    await expect(api.getSettings()).resolves.toEqual(settings);
+    await expect(api.putSettings(settings)).resolves.toEqual(settings);
+    await expect(api.refreshRepos()).resolves.toEqual(repos);
+    await expect(api.cloneRepo("r/1")).resolves.toBeUndefined();
+    await expect(api.listRepoSets()).resolves.toEqual(sets);
+    await expect(api.attachRepo("s 1", { repo_id: "web", mode: "read" })).resolves.toEqual(
+      attached,
+    );
+
+    const calls = fetchFn.mock.calls.map(([input, init]) => [init?.method, input, init?.body]);
+    expect(calls).toEqual([
+      ["GET", "/api/v1/settings", undefined],
+      [
+        "PUT",
+        "/api/v1/settings",
+        '{"home_repo":"/code/home","scan_roots":["/code"],"clone_root":null}',
+      ],
+      ["POST", "/api/v1/repos/refresh", undefined],
+      ["POST", "/api/v1/repos/r%2F1/clone", undefined],
+      ["GET", "/api/v1/repo-sets", undefined],
+      ["POST", "/api/v1/sessions/s%201/repos", '{"repo_id":"web","mode":"read"}'],
+    ]);
+  });
+
+  it("surfaces the server's message when a settings, clone or attach route refuses", async () => {
+    const answers: Record<string, [number, string]> = {
+      "PUT /api/v1/settings": [400, "home_repo: /tmp/x is not the root of a git work tree"],
+      "POST /api/v1/repos/web/clone": [409, "web has no url to clone from"],
+      "DELETE /api/v1/repos/web": [409, "web is declared by the home repo"],
+      "POST /api/v1/sessions/s1/repos": [409, "web is already attached"],
+    };
+    const { api } = setup((input, init) => {
+      const [status, error] = answers[`${init?.method} ${input}`] ?? [500, "unexpected"];
+      return Promise.resolve(json({ error }, status));
+    });
+    const refused = [
+      await failureOf(api.putSettings({ home_repo: "/tmp/x", scan_roots: [], clone_root: null })),
+      await failureOf(api.cloneRepo("web")),
+      await failureOf(api.removeRepo("web")),
+      await failureOf(api.attachRepo("s1", { repo_id: "web" })),
+    ];
+    expect(refused.map((error) => [error.status, error.message, error.fromServer])).toEqual([
+      [400, "home_repo: /tmp/x is not the root of a git work tree", true],
+      [409, "web has no url to clone from", true],
+      [409, "web is declared by the home repo", true],
+      [409, "web is already attached", true],
     ]);
   });
 

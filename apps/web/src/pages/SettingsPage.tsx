@@ -1,0 +1,457 @@
+import {
+  createMemo,
+  createSignal,
+  createUniqueId,
+  For,
+  Match,
+  onSettled,
+  Show,
+  Switch,
+  useContext,
+} from "solid-js";
+import { HttpError } from "../api/http";
+import type { RepoSet } from "../gen/RepoSet";
+import type { Settings } from "../gen/Settings";
+import { errorMessage } from "../lib/errors";
+import { createRequest } from "../lib/request";
+import { blameSettingsField, settingsFromForm, type SettingsBlame } from "../lib/settings";
+import { AppContext, type RepoRegistry } from "../state/app";
+
+const EXAMPLE = `# <home repo>/.calin/repos.yaml
+repos:
+  api: { url: git@github.com:you/api.git }
+  web: { url: git@github.com:you/web.git }
+sets:
+  storefront: [api, web]
+`;
+
+const hint = "text-xs text-muted";
+const fieldError = "text-sm wrap-break-word text-tone-danger";
+
+type Failure = { message: string; blame: SettingsBlame | undefined };
+
+/**
+ * The three settings, edited as a draft of what the server stores. A refusal
+ * is shown at the field it is about (see `blameSettingsField`), or by the
+ * Save button when it is about none.
+ */
+function SettingsForm(props: { stored: Settings; onSave: (next: Settings) => Promise<Settings> }) {
+  // Drafts follow the stored value: a save, or a reload, starts them over from what the server has.
+  const [homeRepo, setHomeRepo] = createSignal(() => props.stored.home_repo ?? "");
+  const [scanRoots, setScanRoots] = createSignal<readonly string[]>(() => props.stored.scan_roots);
+  const [cloneRoot, setCloneRoot] = createSignal(() => props.stored.clone_root ?? "");
+  const [newRoot, setNewRoot] = createSignal("");
+  const [busy, setBusy] = createSignal(false);
+  const [saved, setSaved] = createSignal(false);
+  const [failure, setFailure] = createSignal<Failure>();
+  const homeId = createUniqueId();
+  const rootId = createUniqueId();
+  const cloneId = createUniqueId();
+  const errorId = createUniqueId();
+
+  const errorAt = (field: SettingsBlame["field"] | undefined): string | undefined => {
+    const failed = failure();
+    return failed && failed.blame?.field === field ? failed.message : undefined;
+  };
+
+  function edited(): void {
+    setSaved(false);
+  }
+
+  function addRoot(): void {
+    const path = newRoot().trim();
+    if (path === "") return;
+    if (!scanRoots().includes(path)) setScanRoots([...scanRoots(), path]);
+    setNewRoot("");
+    edited();
+  }
+
+  async function save(): Promise<void> {
+    if (busy()) return;
+    // A path typed but not added yet is meant to be saved too.
+    const next = settingsFromForm({
+      homeRepo: homeRepo(),
+      scanRoots: [...scanRoots(), newRoot()],
+      cloneRoot: cloneRoot(),
+    });
+    setBusy(true);
+    setFailure(undefined);
+    setSaved(false);
+    try {
+      await props.onSave(next);
+      setNewRoot("");
+      setSaved(true);
+    } catch (error) {
+      const message = errorMessage(error);
+      // Only a 400 is about what was typed (api.rs); anything else is about the request.
+      const invalid = error instanceof HttpError && error.status === 400;
+      setFailure({ message, blame: invalid ? blameSettingsField(message, next) : undefined });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <form
+      aria-label="Settings"
+      class="flex flex-col gap-5"
+      onSubmit={(event) => {
+        event.preventDefault();
+        void save();
+      }}
+    >
+      <div class="flex flex-col gap-1.5">
+        <label for={homeId} class="text-sm font-medium">
+          Home repo
+        </label>
+        <input
+          id={homeId}
+          type="text"
+          class="field h-11 px-3 font-mono"
+          placeholder="/home/you/code/home"
+          autocomplete="off"
+          autocapitalize="off"
+          spellcheck={false}
+          value={homeRepo()}
+          aria-invalid={errorAt("home_repo") === undefined ? undefined : "true"}
+          aria-describedby={errorAt("home_repo") === undefined ? undefined : `${errorId}-home`}
+          onInput={(event) => {
+            setHomeRepo(event.currentTarget.value);
+            edited();
+          }}
+        />
+        <Show when={errorAt("home_repo")}>
+          {(message) => (
+            <p id={`${errorId}-home`} role="alert" class={fieldError}>
+              {message()}
+            </p>
+          )}
+        </Show>
+        <p class={hint}>
+          Path, on the server, of the git repo every session is launched from. Empty for none.
+        </p>
+      </div>
+
+      <fieldset class="flex flex-col gap-1.5">
+        <legend class="mb-1.5 text-sm font-medium">Scan roots</legend>
+        <Show
+          when={scanRoots().length > 0}
+          fallback={<p class="text-sm text-muted">No scan root yet.</p>}
+        >
+          <ul aria-label="Scan roots" class="divide-y divide-line rounded-md border border-line">
+            <For each={scanRoots()}>
+              {(root) => (
+                <li class="flex items-center gap-2 pl-3">
+                  <span
+                    class={[
+                      "min-w-0 flex-1 truncate font-mono text-sm",
+                      { "text-tone-danger": failure()?.blame?.scanRoot === root },
+                    ]}
+                    title={root}
+                  >
+                    {root}
+                  </span>
+                  <button
+                    type="button"
+                    class="btn border-transparent px-2 text-sm"
+                    aria-label={`Remove ${root}`}
+                    onClick={() => {
+                      setScanRoots(scanRoots().filter((one) => one !== root));
+                      edited();
+                    }}
+                  >
+                    Remove
+                  </button>
+                </li>
+              )}
+            </For>
+          </ul>
+        </Show>
+        <div class="flex gap-2">
+          <label for={rootId} class="sr-only">
+            Add a scan root
+          </label>
+          <input
+            id={rootId}
+            type="text"
+            class="field h-11 min-w-0 flex-1 px-3 font-mono"
+            placeholder="/home/you/code"
+            autocomplete="off"
+            autocapitalize="off"
+            spellcheck={false}
+            value={newRoot()}
+            aria-invalid={errorAt("scan_roots") === undefined ? undefined : "true"}
+            aria-describedby={errorAt("scan_roots") === undefined ? undefined : `${errorId}-scan`}
+            onInput={(event) => {
+              setNewRoot(event.currentTarget.value);
+              edited();
+            }}
+            onKeyDown={(event) => {
+              // Enter adds the path; saving is the button's job.
+              if (event.key !== "Enter" || newRoot().trim() === "") return;
+              event.preventDefault();
+              addRoot();
+            }}
+          />
+          <button type="button" class="btn" disabled={newRoot().trim() === ""} onClick={addRoot}>
+            Add
+          </button>
+        </div>
+        <Show when={errorAt("scan_roots")}>
+          {(message) => (
+            <p id={`${errorId}-scan`} role="alert" class={fieldError}>
+              {message()}
+            </p>
+          )}
+        </Show>
+        <p class={hint}>
+          Folders searched for local clones of the repos the home repo declares, matched by their
+          git URL.
+        </p>
+      </fieldset>
+
+      <div class="flex flex-col gap-1.5">
+        <label for={cloneId} class="text-sm font-medium">
+          Clone root
+        </label>
+        <input
+          id={cloneId}
+          type="text"
+          class="field h-11 px-3 font-mono"
+          placeholder="Server default: <data dir>/repos"
+          autocomplete="off"
+          autocapitalize="off"
+          spellcheck={false}
+          value={cloneRoot()}
+          aria-invalid={errorAt("clone_root") === undefined ? undefined : "true"}
+          aria-describedby={errorAt("clone_root") === undefined ? undefined : `${errorId}-clone`}
+          onInput={(event) => {
+            setCloneRoot(event.currentTarget.value);
+            edited();
+          }}
+        />
+        <Show when={errorAt("clone_root")}>
+          {(message) => (
+            <p id={`${errorId}-clone`} role="alert" class={fieldError}>
+              {message()}
+            </p>
+          )}
+        </Show>
+        <p class={hint}>
+          Where a declared repo with no local clone is cloned to. Empty for the server's default.
+        </p>
+      </div>
+
+      <div class="flex flex-wrap items-center justify-end gap-3">
+        <Show when={errorAt(undefined)}>
+          {(message) => (
+            <p role="alert" class={["min-w-0 flex-1 basis-48", fieldError]}>
+              {message()}
+            </p>
+          )}
+        </Show>
+        <Show when={saved()}>
+          <p role="status" class="min-w-0 flex-1 text-sm text-tone-success">
+            Saved.
+          </p>
+        </Show>
+        <button type="submit" class="btn btn-primary" disabled={busy()}>
+          {busy() ? "Saving…" : "Save"}
+        </button>
+      </div>
+    </form>
+  );
+}
+
+const count = (n: number, one: string, many: string): string => `${n} ${n === 1 ? one : many}`;
+
+/** What the home repo declares, as the repo list and the sets report it. Read-only. */
+function HomeRepoSummary(props: {
+  homeRepo: string;
+  registry: RepoRegistry;
+  sets: readonly RepoSet[];
+  onRescan: () => Promise<void>;
+  onRetry: () => void;
+}) {
+  const rescan = createRequest(() => props.onRescan());
+  const repos = () => (props.registry.status === "ready" ? props.registry.repos : undefined);
+  const loadError = () => (props.registry.status === "error" ? props.registry : undefined);
+  const totals = createMemo(() => {
+    const declared = (repos() ?? []).filter((repo) => repo.declared);
+    const found = declared.filter((repo) => repo.available).length;
+    return { declared: declared.length, found, missing: declared.length - found };
+  });
+  const problem = (): string | null => repos()?.find((repo) => repo.home)?.problem ?? null;
+
+  return (
+    <>
+      <div class="flex items-center justify-between gap-2">
+        <p class="min-w-0 truncate font-mono text-sm text-muted" title={props.homeRepo}>
+          {props.homeRepo}
+        </p>
+        <button
+          type="button"
+          class="btn shrink-0"
+          title="Read the home repo's list again and look for clones under the scan roots"
+          disabled={rescan.busy()}
+          onClick={() => void rescan.run()}
+        >
+          {rescan.busy() ? "Rescanning…" : "Rescan"}
+        </button>
+      </div>
+      <Show when={rescan.error()}>
+        {(message) => (
+          <p role="alert" class={fieldError}>
+            Could not rescan: {message()}
+          </p>
+        )}
+      </Show>
+      <Switch>
+        <Match when={props.registry.status === "loading"}>
+          <p class="text-sm text-muted">Reading the repo list…</p>
+        </Match>
+        <Match when={loadError()}>
+          {(failure) => (
+            <p role="alert" class="flex items-center justify-between gap-2 text-sm">
+              <span class="min-w-0">The repo list could not be loaded: {failure().message}</span>
+              <button type="button" class="btn" onClick={() => props.onRetry()}>
+                Retry
+              </button>
+            </p>
+          )}
+        </Match>
+        <Match when={true}>
+          <Show when={problem()}>
+            {(message) => (
+              <p
+                role="alert"
+                class="rounded-md border border-tone-danger bg-danger-soft px-3 py-2 text-sm wrap-break-word"
+              >
+                {message()}
+              </p>
+            )}
+          </Show>
+          <dl class="grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-1 text-sm">
+            <dt class="text-muted">Declared</dt>
+            <dd>{count(totals().declared, "repo", "repos")}</dd>
+            <dt class="text-muted">Found locally</dt>
+            <dd>{totals().found}</dd>
+            <dt class="text-muted">Not cloned</dt>
+            <dd class={{ "text-tone-attention": totals().missing > 0 }}>{totals().missing}</dd>
+            <dt class="text-muted">Sets</dt>
+            <dd>
+              <Show when={props.sets.length > 0} fallback="none">
+                <ul class="flex flex-col gap-0.5">
+                  <For each={props.sets} keyed={(set) => set.name}>
+                    {(set) => (
+                      <li>
+                        <span class="font-medium">{set().name}</span>{" "}
+                        <span class="text-muted">
+                          ({count(set().repo_ids.length, "repo", "repos")})
+                        </span>
+                      </li>
+                    )}
+                  </For>
+                </ul>
+              </Show>
+            </dd>
+          </dl>
+        </Match>
+      </Switch>
+    </>
+  );
+}
+
+function HomeRepoExplained() {
+  return (
+    <>
+      <p class="text-sm">
+        A home repo is the git repo you start every session from. It lists your other repos by name
+        in <span class="font-mono">.calin/repos.yaml</span>, optionally grouped into sets, so a
+        session can attach the ones its task touches. Set its path above once the file exists; a
+        minimal one looks like this:
+      </p>
+      <pre
+        tabindex="0"
+        aria-label="Example repos.yaml"
+        class="overflow-x-auto rounded-md bg-sunken p-3 font-mono text-xs"
+      >
+        {EXAMPLE}
+      </pre>
+    </>
+  );
+}
+
+/** `/settings`: where this machine keeps its repos, and what the home repo declares. */
+export default function SettingsPage() {
+  const app = useContext(AppContext);
+  const summaryId = createUniqueId();
+
+  onSettled(() => {
+    app.loadSettings();
+    app.loadRepos();
+  });
+
+  const stored = () => {
+    const state = app.settings();
+    return state.status === "ready" ? state.settings : undefined;
+  };
+  const failed = () => {
+    const state = app.settings();
+    return state.status === "error" ? state : undefined;
+  };
+
+  return (
+    <section class="min-h-0 flex-1 overflow-y-auto overscroll-contain">
+      <div class="mx-auto flex w-full max-w-2xl flex-col gap-5 px-3 py-3 lg:px-4 lg:py-8">
+        <header class="flex items-center gap-2">
+          <a href="/" aria-label="Back to sessions" class="btn border-transparent px-0 lg:hidden">
+            <span aria-hidden="true">←</span>
+          </a>
+          <h1 class="text-lg font-semibold">Settings</h1>
+        </header>
+        <Switch>
+          <Match when={failed()}>
+            {(failure) => (
+              <div role="alert" class="flex flex-col items-start gap-2 text-sm">
+                <p>The settings could not be loaded: {failure().message}</p>
+                <button type="button" class="btn" onClick={() => app.loadSettings()}>
+                  Try again
+                </button>
+              </div>
+            )}
+          </Match>
+          <Match when={stored()}>
+            {(settings) => (
+              <>
+                <SettingsForm stored={settings()} onSave={(next) => app.saveSettings(next)} />
+                <section
+                  aria-labelledby={summaryId}
+                  class="flex flex-col gap-3 border-t border-line pt-4"
+                >
+                  <h2 id={summaryId} class="text-sm font-medium">
+                    Home repo catalog
+                  </h2>
+                  <Show when={settings().home_repo} fallback={<HomeRepoExplained />}>
+                    {(homeRepo) => (
+                      <HomeRepoSummary
+                        homeRepo={homeRepo()}
+                        registry={app.repos()}
+                        sets={app.repoSets()}
+                        onRescan={() => app.rescanRepos()}
+                        onRetry={() => app.loadRepos()}
+                      />
+                    )}
+                  </Show>
+                </section>
+              </>
+            )}
+          </Match>
+          <Match when={true}>
+            <p class="text-sm text-muted">Loading settings…</p>
+          </Match>
+        </Switch>
+      </div>
+    </section>
+  );
+}

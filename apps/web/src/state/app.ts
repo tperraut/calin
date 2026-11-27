@@ -6,9 +6,12 @@ import type { CreateSessionRequest } from "../gen/CreateSessionRequest";
 import type { Health } from "../gen/Health";
 import type { RegisterRepoRequest } from "../gen/RegisterRepoRequest";
 import type { Repo } from "../gen/Repo";
+import type { RepoSet } from "../gen/RepoSet";
 import type { Session } from "../gen/Session";
+import type { Settings } from "../gen/Settings";
 import { errorMessage } from "../lib/errors";
 import { coalesce, type Schedule } from "../lib/schedule";
+import { createCatalog, type RepoRegistry } from "./catalog";
 import { createSessionStore, type SessionStore } from "./sessionStore";
 import { upsertSession } from "./sessionsList";
 
@@ -17,10 +20,12 @@ export type HealthState =
   | { status: "ready"; health: Health }
   | { status: "unreachable" };
 
-/** The repos the server knows, as `GET /repos` last answered. */
-export type RepoRegistry =
+export type { RepoRegistry } from "./catalog";
+
+/** The machine's settings, as the server last answered. */
+export type SettingsState =
   | { status: "loading" }
-  | { status: "ready"; repos: readonly Repo[] }
+  | { status: "ready"; settings: Settings }
   | { status: "error"; message: string };
 
 export type AppServices = {
@@ -41,13 +46,24 @@ export type AppState = {
   sessionsLoaded: Accessor<boolean>;
   /** The server's reason when it refused the `sessions` topic. */
   sessionsError: Accessor<string | undefined>;
-  /** By name. Stays `loading` until a screen calls `loadRepos`. */
+  /** The home repo first, then by name. Stays `loading` until a screen calls `loadRepos`. */
   repos: Accessor<RepoRegistry>;
-  /** Reads the registry, and keeps it fresh across reconnects from then on. */
+  /** The home repo's named groups of repos; read with the repos. */
+  repoSets: Accessor<readonly RepoSet[]>;
+  /** Reads the repos and the sets, and keeps them fresh across reconnects from then on. */
   loadRepos(): void;
   registerRepo(request: RegisterRepoRequest): Promise<Repo>;
   /** Forgets the registry entry; the clone on disk is untouched. */
   removeRepo(id: string): Promise<void>;
+  /** Starts cloning a declared repo; `repos` follows the clone until it ends. */
+  cloneRepo(id: string): Promise<void>;
+  /** Has the server re-read the home repo's list and rescan. */
+  rescanRepos(): Promise<void>;
+  /** Stays `loading` until a screen calls `loadSettings`. */
+  settings: Accessor<SettingsState>;
+  loadSettings(): void;
+  /** Replaces the settings. Rejects with the server's reason; the repos follow a change. */
+  saveSettings(settings: Settings): Promise<Settings>;
   /** A clock that ticks slowly, for relative times. */
   now: Accessor<number>;
   createSession(request: CreateSessionRequest): Promise<Session>;
@@ -70,7 +86,7 @@ export function createAppState(services: AppServices): AppState {
   const [sessions, setSessions] = createSignal<readonly Session[]>([]);
   const [sessionsLoaded, setSessionsLoaded] = createSignal(false);
   const [sessionsError, setSessionsError] = createSignal<string>();
-  const [repos, setRepos] = createSignal<RepoRegistry>({ status: "loading" });
+  const [settings, setSettings] = createSignal<SettingsState>({ status: "loading" });
   const [now, setNow] = createSignal(Date.now());
 
   let list: readonly Session[] = [];
@@ -85,27 +101,24 @@ export function createAppState(services: AppServices): AppState {
     publishSessions();
   }
 
-  let registry: readonly Repo[] | undefined;
-  let reposWanted = false;
-  let reposInFlight = false;
-  function publishRepos(next: readonly Repo[]): void {
-    // api.rs: the registry is listed by name.
-    registry = next.toSorted((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
-    setRepos({ status: "ready", repos: registry });
-  }
-  function loadRepos(): void {
-    reposWanted = true;
-    if (reposInFlight) return;
-    reposInFlight = true;
-    api.listRepos().then(
+  const catalog = createCatalog(api);
+
+  let settingsKnown = false;
+  let settingsWanted = false;
+  let settingsInFlight = false;
+  function loadSettings(): void {
+    if (settingsInFlight) return;
+    settingsInFlight = true;
+    api.getSettings().then(
       (loaded) => {
-        reposInFlight = false;
-        publishRepos(loaded);
+        settingsInFlight = false;
+        settingsKnown = true;
+        setSettings({ status: "ready", settings: loaded });
       },
       (error: unknown) => {
-        reposInFlight = false;
-        // A list that was read once stays usable through an outage.
-        if (!registry) setRepos({ status: "error", message: errorMessage(error) });
+        settingsInFlight = false;
+        // Settings that were read once stay on screen through an outage.
+        if (!settingsKnown) setSettings({ status: "error", message: errorMessage(error) });
       },
     );
   }
@@ -135,21 +148,26 @@ export function createAppState(services: AppServices): AppState {
     sessions,
     sessionsLoaded,
     sessionsError,
-    repos,
-    loadRepos() {
-      if (!registry) setRepos({ status: "loading" });
-      loadRepos();
+    repos: catalog.repos,
+    repoSets: catalog.sets,
+    loadRepos: () => catalog.load(),
+    registerRepo: (request) => catalog.register(request),
+    removeRepo: (id) => catalog.remove(id),
+    cloneRepo: (id) => catalog.clone(id),
+    rescanRepos: () => catalog.rescan(),
+    settings,
+    loadSettings() {
+      settingsWanted = true;
+      if (!settingsKnown) setSettings({ status: "loading" });
+      loadSettings();
     },
-    async registerRepo(request) {
-      const repo = await api.registerRepo(request);
-      // Without a list to add to, the server's own is the only complete one.
-      if (registry) publishRepos([...registry.filter((one) => one.id !== repo.id), repo]);
-      else loadRepos();
-      return repo;
-    },
-    async removeRepo(id) {
-      await api.removeRepo(id);
-      if (registry) publishRepos(registry.filter((one) => one.id !== id));
+    async saveSettings(next) {
+      const stored = await api.putSettings(next);
+      settingsKnown = true;
+      setSettings({ status: "ready", settings: stored });
+      // api.rs: a change re-reads the home repo and rescans, so the repo list is another one now.
+      catalog.invalidate();
+      return stored;
     },
     now,
     async createSession(request) {
@@ -171,11 +189,13 @@ export function createAppState(services: AppServices): AppState {
     retry() {
       if (!healthKnown) setHealth({ status: "loading" });
       loadHealth();
-      if (reposWanted && !registry) loadRepos();
+      catalog.reload({ missingOnly: true });
+      if (settingsWanted && !settingsKnown) loadSettings();
       if (sessionsError() !== undefined) socket.resync(TOPIC_SESSIONS, 0);
       socket.reconnectNow();
     },
     start() {
+      catalog.setActive(true);
       let opens = 0;
       const offState = socket.onState((state) => {
         setConnection(state);
@@ -183,7 +203,8 @@ export function createAppState(services: AppServices): AppState {
         opens += 1;
         // After a reconnect the server may be another build with other runners.
         if (opens > 1 || !healthKnown) loadHealth();
-        if (reposWanted && (opens > 1 || !registry)) loadRepos();
+        catalog.reload({ missingOnly: opens === 1 });
+        if (settingsWanted && !settingsKnown) loadSettings();
       });
       const unsubscribe = socket.subscribe(TOPIC_SESSIONS, (msg) => {
         if (msg.op === "session_upserted") {
@@ -208,6 +229,7 @@ export function createAppState(services: AppServices): AppState {
       window.addEventListener("online", wake);
 
       return () => {
+        catalog.setActive(false);
         offState();
         unsubscribe();
         clearInterval(clock);

@@ -207,6 +207,82 @@ describe("ChangesPanel", () => {
     expect(all[4].textContent).toBe("cliNo changes");
   });
 
+  it("gives the repo name its room and lets a long branch name give way", async () => {
+    const branch = "calin/add-a-health-check-endpoint-and-cover-it-with-a-test-and-update-the-docs";
+    const { host } = await open(
+      {
+        getChanges: () =>
+          Promise.resolve([
+            repo("api", [file("a.txt")], { branch }),
+            repo("design-system", [], { branch }),
+          ]),
+      },
+      [makeSessionRepo("api", { primary: true, branch }), makeSessionRepo("design-system")],
+    );
+    for (const [group, name] of [
+      [groups(host)[0], "api"],
+      [groups(host)[1], "design-system"],
+    ] as const) {
+      const repoName = find(group, '[data-part="repo"]');
+      const branchName = find(group, '[data-part="branch"]');
+      // The repo name never shrinks for the branch: it is cut only past its own share of the row.
+      expect(repoName.textContent).toBe(name);
+      expect(repoName.classList.contains("shrink-0")).toBe(true);
+      expect(repoName.classList.contains("min-w-0")).toBe(false);
+      // The branch takes what is left, and is the one that is cut short.
+      expect(branchName.classList.contains("min-w-0")).toBe(true);
+      expect(branchName.classList.contains("truncate")).toBe(true);
+      expect(branchName.classList.contains("shrink-0")).toBe(false);
+      // Cut on screen only: the whole name is its text, for a screen reader, and its tooltip.
+      expect(branchName.textContent).toBe(branch);
+      expect(branchName.title).toBe(branch);
+      // Both sit in the same row, the name first.
+      expect(repoName.parentElement).toBe(branchName.parentElement);
+      expect(repoName.nextElementSibling).toBe(branchName);
+    }
+    // With the keyboard on the row, the branch shows in full.
+    const header = find(groups(host)[0], "h3 button");
+    expect(header.classList.contains("group")).toBe(true);
+    expect(find(header, '[data-part="branch"]').className).toContain(
+      "group-focus-visible:whitespace-normal",
+    );
+    // The totals keep their place at the end of the row.
+    expect(header.lastElementChild?.classList.contains("shrink-0")).toBe(true);
+  });
+
+  it("has no branch element for a repo without a session branch", async () => {
+    const { host } = await open({
+      getChanges: () => Promise.resolve([repo("api", [file("a.txt")])]),
+    });
+    expect(groups(host)[0].querySelector('[data-part="branch"]')).toBeNull();
+    expect(find(groups(host)[0], '[data-part="repo"]').textContent).toBe("api");
+  });
+
+  it("shows the list the session already holds while it asks for a fresh one", async () => {
+    const fresh = deferred<RepoChanges[]>();
+    const getChanges = vi
+      .fn<Api["getChanges"]>()
+      .mockResolvedValueOnce([repo("api", [file("old.txt")])])
+      .mockReturnValueOnce(fresh.promise);
+    const workspace = await openWorkspace({ routes: { getChanges }, repos: api });
+    // Read before the panel exists, as the session screen does for the tab's count.
+    workspace.store.changes.now();
+    await act();
+    const host = mount(() => (
+      <ChangesPanel store={workspace.store} active={workspace.active()} links={workspace.links} />
+    ));
+    flush();
+    // No "Loading changes…": what is known shows at once, and opening asks again.
+    expect(host.textContent).toContain("old.txt");
+    expect(host.textContent).not.toContain("Loading changes…");
+    expect(getChanges).toHaveBeenCalledTimes(2);
+
+    fresh.resolve([repo("api", [file("new.txt")])]);
+    await act();
+    expect(host.textContent).toContain("new.txt");
+    expect(host.textContent).not.toContain("old.txt");
+  });
+
   it("refreshes, debounced, when a file changes, and at once on the refresh button", async () => {
     const getChanges = vi.fn<Api["getChanges"]>().mockResolvedValue([repo("api", [])]);
     const { host, emit } = await open({ getChanges });

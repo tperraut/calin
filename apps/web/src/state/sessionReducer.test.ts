@@ -889,6 +889,7 @@ describe("changed files", () => {
         by: "agent",
         agentId: "a1",
         ts: 1000,
+        revision: 1,
       },
       {
         key: "sr1\nby-you.ts",
@@ -898,6 +899,7 @@ describe("changed files", () => {
         by: "user",
         agentId: null,
         ts: 1001,
+        revision: 2,
       },
       {
         key: "\n/tmp/scratch.txt",
@@ -907,7 +909,211 @@ describe("changed files", () => {
         by: "agent",
         agentId: "a1",
         ts: 1002,
+        revision: 3,
       },
     ]);
+  });
+});
+
+describe("a permission request that names its tool call", () => {
+  const asks = (view: SessionView, itemId: string) => {
+    const entry = view.transcript.find((one) => one.key === `item:${itemId}`);
+    return entry?.kind === "item" ? entry.permissions : undefined;
+  };
+  const started = { type: "item_started", item: toolItem("t1", null) } as const;
+  const asked = {
+    type: "permission_requested",
+    request: request("p1", { item_id: "t1" }),
+  } as const;
+  const answer = (
+    by: "user" | "policy" | "expired",
+    decision: "allow" | "deny",
+    message: string | null = null,
+  ): EventBody => ({ type: "permission_resolved", request_id: "p1", decision, by, message });
+
+  it("goes into that call's card instead of a row of its own, and still waits in the bar", () => {
+    const view = fold(log(started, asked));
+    expect(kinds(view)).toEqual(["item"]);
+    expect(asks(view, "t1")).toEqual([
+      { request: request("p1", { item_id: "t1" }), outcome: { state: "pending" }, ts: 1001 },
+    ]);
+    expect(view.pendingPermissions.map((one) => one.request.id)).toEqual(["p1"]);
+  });
+
+  it.each([
+    [
+      "allowed by the reader",
+      answer("user", "allow"),
+      { state: "resolved", decision: "allow", by: "user", message: null },
+    ],
+    [
+      "denied by the reader, with the reason",
+      answer("user", "deny", "Not on main."),
+      { state: "resolved", decision: "deny", by: "user", message: "Not on main." },
+    ],
+    [
+      "allowed by policy",
+      answer("policy", "allow"),
+      { state: "resolved", decision: "allow", by: "policy", message: null },
+    ],
+    [
+      "expired",
+      answer("expired", "deny", "the turn ended"),
+      { state: "lapsed", message: "the turn ended" },
+    ],
+  ])("records the outcome in the card: %s", (_name, resolution, outcome) => {
+    const view = fold(log(started, asked, resolution));
+    expect(kinds(view)).toEqual(["item"]);
+    expect(asks(view, "t1")?.map((one) => one.outcome)).toEqual([outcome]);
+    expect(view.pendingPermissions).toEqual([]);
+  });
+
+  it("keeps the outcome when the call then completes, and through its output", () => {
+    const view = fold(
+      log(
+        started,
+        asked,
+        answer("user", "allow"),
+        { type: "item_delta", item_id: "t1", delta: { kind: "output", text: "ok\n" } },
+        { type: "item_completed", item: toolItem("t1", "ok\n", "completed") },
+      ),
+    );
+    expect(items(view)).toEqual([toolItem("t1", "ok\n", "completed")]);
+    expect(asks(view, "t1")?.map((one) => one.outcome.state)).toEqual(["resolved"]);
+  });
+
+  it("lapses in the card when the turn ends unanswered, and takes the server's note after", () => {
+    const ended = fold(log(started, asked, status("review")));
+    expect(asks(ended, "t1")?.map((one) => one.outcome)).toEqual([
+      { state: "lapsed", message: null },
+    ]);
+    expect(ended.pendingPermissions).toEqual([]);
+    expect(ended.transcript[0]).toMatchObject({ interrupted: true });
+
+    const noted = fold(log(started, asked, status("review"), answer("expired", "deny", "stopped")));
+    expect(asks(noted, "t1")?.map((one) => one.outcome)).toEqual([
+      { state: "lapsed", message: "stopped" },
+    ]);
+  });
+
+  it("keeps a row of its own when it names no call, a call it never saw, or one that is no tool", () => {
+    const view = fold(
+      log(
+        { type: "item_started", item: textItem("m1", "Hello") },
+        { type: "permission_requested", request: request("p1") },
+        { type: "permission_requested", request: request("p2", { item_id: "ghost" }) },
+        { type: "permission_requested", request: request("p3", { item_id: "m1" }) },
+      ),
+    );
+    expect(kinds(view)).toEqual(["item", "permission", "permission", "permission"]);
+    expect(asks(view, "m1")).toBeUndefined();
+  });
+
+  it("moves into the card when its call arrives after it", () => {
+    const early = log(asked, started);
+    const view = fold(early);
+    expect(kinds(view)).toEqual(["item"]);
+    expect(asks(view, "t1")).toEqual([
+      { request: request("p1", { item_id: "t1" }), outcome: { state: "pending" }, ts: 1000 },
+    ]);
+    const answered = fold(log(asked, started, answer("user", "deny", "No.")));
+    expect(asks(answered, "t1")?.map((one) => one.outcome.state)).toEqual(["resolved"]);
+  });
+
+  it("holds several requests for one call, each with its own outcome, and replaces a repeat", () => {
+    const second = {
+      type: "permission_requested",
+      request: request("p2", { item_id: "t1" }),
+    } as const;
+    const view = fold(log(started, asked, second, asked, answer("user", "allow")));
+    expect(asks(view, "t1")?.map((one) => [one.request.id, one.outcome.state])).toEqual([
+      ["p2", "pending"],
+      ["p1", "resolved"],
+    ]);
+    expect(view.pendingPermissions.map((one) => one.request.id)).toEqual(["p2"]);
+  });
+
+  it("does not mutate the view it is given", () => {
+    const before = fold(log(started, asked));
+    const snapshot = structuredClone(before);
+    applyEvent(before, {
+      ...log(answer("user", "allow"))[0],
+      seq: before.seq + 1,
+    });
+    expect(before).toEqual(snapshot);
+  });
+});
+
+describe("a repo attached while the session is under way", () => {
+  const attach = (name: string, agentId: string | null = null): [string | null, EventBody] => [
+    agentId,
+    { type: "repo_attached", repo: makeSessionRepo(name) },
+  ];
+  const repoRows = (view: SessionView) =>
+    view.transcript.flatMap((entry) =>
+      entry.kind === "repo" ? [[entry.repo.name, entry.by, entry.agentId]] : [],
+    );
+
+  it("is not a transcript row while the session is being prepared", () => {
+    const view = fold(
+      log(
+        status("queued"),
+        [null, { type: "user_message", text: "Fix it" }],
+        status("preparing"),
+        attach("api"),
+        attach("web"),
+      ),
+    );
+    expect(view.turnStarted).toBe(false);
+    expect(repoRows(view)).toEqual([]);
+    expect(view.repos.map((repo) => repo.name)).toEqual(["api", "web"]);
+  });
+
+  it("is a row once the first turn began, saying who attached it", () => {
+    const view = fold(
+      log(
+        status("preparing"),
+        attach("api"),
+        status("running"),
+        [null, { type: "agent_spawned", agent }],
+        attach("web"),
+        attach("docs", AGENT),
+      ),
+    );
+    expect(view.turnStarted).toBe(true);
+    expect(repoRows(view)).toEqual([
+      ["web", "user", null],
+      ["docs", "agent", AGENT],
+    ]);
+    expect(view.transcript.at(-1)).toEqual({
+      kind: "repo",
+      key: "event:e6",
+      ts: 1005,
+      repo: makeSessionRepo("docs"),
+      by: "agent",
+      agentId: AGENT,
+    });
+    expect(view.repos.map((repo) => repo.name)).toEqual(["api", "web", "docs"]);
+  });
+
+  it("stays a row through review and a later turn, and counts a first item as the turn having begun", () => {
+    const later = fold(log(status("running"), status("review"), attach("web"), status("running")));
+    expect(repoRows(later)).toEqual([["web", "user", null]]);
+
+    const fromItem = fold(
+      log({ type: "item_started", item: textItem("m1", "Hi") }, attach("web", AGENT)),
+    );
+    expect(repoRows(fromItem)).toEqual([["web", "agent", AGENT]]);
+  });
+
+  it("is not news when the session already has the repo", () => {
+    const view = fold(
+      log(status("preparing"), attach("api"), status("running"), attach("web"), [
+        null,
+        { type: "repo_attached", repo: makeSessionRepo("api", { branch: "calin/fix" }) },
+      ]),
+    );
+    expect(repoRows(view)).toEqual([["web", "user", null]]);
+    expect(view.repos.find((repo) => repo.name === "api")?.branch).toBe("calin/fix");
   });
 });

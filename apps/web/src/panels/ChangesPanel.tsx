@@ -16,7 +16,6 @@ import { createMediaQuery, createWidth, WIDE_QUERY } from "../lib/media";
 import { loadDiffLayout, saveDiffLayout, type DiffLayoutChoice } from "../lib/prefs";
 import type { Tone } from "../lib/status";
 import {
-  createRefresher,
   diffContent,
   filesLabel,
   findFile,
@@ -133,11 +132,24 @@ function RepoGroup(props: {
   onSelect: (target: FileTarget) => void;
 }) {
   const totals = () => repoTotals(props.repo);
+  // The repo name is what the reader looks for: it keeps its width, and the
+  // branch takes what is left. Cut short on screen only: the whole name is the
+  // element's text and its title, and shows in full while the row has the keyboard focus.
   const name = () => (
     <>
-      <span class="truncate font-semibold">{props.repo.name}</span>
+      <span data-part="repo" class="max-w-[60%] shrink-0 truncate font-semibold">
+        {props.repo.name}
+      </span>
       <Show when={props.repo.branch}>
-        {(branch) => <span class="truncate font-mono text-xs text-muted">{branch()}</span>}
+        {(branch) => (
+          <span
+            data-part="branch"
+            class="min-w-0 flex-1 truncate font-mono text-xs text-muted group-focus-visible:wrap-anywhere group-focus-visible:whitespace-normal"
+            title={branch()}
+          >
+            {branch()}
+          </span>
+        )}
       </Show>
     </>
   );
@@ -157,7 +169,7 @@ function RepoGroup(props: {
           <button
             type="button"
             aria-expanded={props.open ? "true" : "false"}
-            class="flex min-h-11 w-full items-center gap-2 bg-surface px-3 text-left text-sm -outline-offset-2"
+            class="group flex min-h-11 w-full items-center gap-2 bg-surface px-3 text-left text-sm -outline-offset-2"
             onClick={() => props.onToggle()}
           >
             <span
@@ -201,16 +213,17 @@ function Notice(props: { text: string }) {
 /**
  * What the session changed, measured against each repo's base and grouped by
  * repo, with the diff of the selected file. The list is the server's (`GET
- * /changes`); `file_changed` events only say when to ask again.
+ * /changes`), held by the session's store; `file_changed` events only say
+ * when to ask again, and only while this panel is the one on screen.
  */
 export default function ChangesPanel(props: PanelProps) {
   const wide = createMediaQuery(WIDE_QUERY);
   let root: HTMLDivElement | undefined;
   const width = createWidth(() => root);
 
-  const [changes, setChanges] = createSignal<readonly RepoChanges[]>();
-  const [failure, setFailure] = createSignal<string>();
-  const [refreshing, setRefreshing] = createSignal(false);
+  const changes = () => props.store.changes.list();
+  const failure = () => props.store.changes.failure();
+  const refreshing = () => props.store.changes.refreshing();
   const [selected, setSelected] = createSignal<FileTarget>();
   const [diff, setDiff] = createSignal<DiffState>({ status: "idle" });
   const [closed, setClosed] = createSignal<ReadonlySet<string>>(new Set());
@@ -242,52 +255,44 @@ export default function ChangesPanel(props: PanelProps) {
     }
   }
 
-  async function refresh(): Promise<void> {
-    setRefreshing(true);
-    try {
-      const loaded = await props.store.workspace.changes();
-      setChanges(loaded);
-      setFailure(undefined);
-      // The file on screen may be one of those that changed.
-      if (selection && findFile(loaded, selection)) void loadDiff(selection, true);
-    } catch (error) {
-      setFailure(errorMessage(error));
-    } finally {
-      setRefreshing(false);
-    }
-  }
+  // The file on screen may be one of those that changed.
+  createEffect(
+    () => changes(),
+    (loaded) => {
+      if (loaded && selection && findFile(loaded, selection)) void loadDiff(selection, true);
+    },
+    { defer: true },
+  );
 
-  const refresher = createRefresher(refresh);
-  // Nothing is fetched for a panel behind another one, nor for a page in a background tab.
+  // Nothing is fetched for a panel behind another one, nor for a page in a
+  // background tab: what the events announced meanwhile is read on the way back.
   let active = false;
+  let missed = false;
   const onScreen = (): boolean => active && document.visibilityState === "visible";
+  const catchUp = (): void => {
+    if (!missed || !onScreen()) return;
+    missed = false;
+    props.store.changes.now();
+  };
 
   createEffect(
     () => props.active,
     (next) => {
       active = next;
-      refresher.setVisible(onScreen());
+      catchUp();
     },
   );
   onSettled(() => {
-    const onVisibility = (): void => refresher.setVisible(onScreen());
-    document.addEventListener("visibilitychange", onVisibility);
-    refresher.now();
-    return () => {
-      document.removeEventListener("visibilitychange", onVisibility);
-      refresher.dispose();
-    };
+    document.addEventListener("visibilitychange", catchUp);
+    // Opening the panel is asking what changed: a shell's edits announce nothing.
+    props.store.changes.now();
+    return () => document.removeEventListener("visibilitychange", catchUp);
   });
   createEffect(
     () => props.store.view().changesRevision,
-    () => refresher.request(),
-    { defer: true },
-  );
-  createEffect(
-    () => props.store.status(),
-    (status, previous) => {
-      // The first status is the session loading, not something that happened to its files.
-      if (status !== undefined && previous !== undefined) refresher.request();
+    () => {
+      if (onScreen()) props.store.changes.request();
+      else missed = true;
     },
     { defer: true },
   );
@@ -385,7 +390,7 @@ export default function ChangesPanel(props: PanelProps) {
             aria-label="Refresh the changes"
             title="Refresh the changes"
             disabled={refreshing()}
-            onClick={() => refresher.now()}
+            onClick={() => props.store.changes.now()}
           >
             <span aria-hidden="true" class={{ pulse: refreshing() }}>
               ↻
@@ -397,7 +402,7 @@ export default function ChangesPanel(props: PanelProps) {
             {(message) => (
               <div role="alert" class="flex flex-col items-start gap-2 p-3 text-sm">
                 <p>The changes could not be loaded: {message()}</p>
-                <button type="button" class="btn" onClick={() => refresher.now()}>
+                <button type="button" class="btn" onClick={() => props.store.changes.now()}>
                   Try again
                 </button>
               </div>

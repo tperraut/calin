@@ -1,11 +1,12 @@
-import { createSignal, createUniqueId, For, Show } from "solid-js";
+import { createMemo, createSignal, createUniqueId, For, Show } from "solid-js";
 import type { CreateSessionRequest } from "../gen/CreateSessionRequest";
 import type { PermissionMode } from "../gen/PermissionMode";
 import type { RegisterRepoRequest } from "../gen/RegisterRepoRequest";
 import type { Repo } from "../gen/Repo";
+import type { RepoSet } from "../gen/RepoSet";
 import { errorMessage } from "../lib/errors";
 import { loadComposerPrefs, saveComposerPrefs, type RepoChoice } from "../lib/prefs";
-import { permissionModeLook, permissionModes } from "../lib/status";
+import { defaultRepoMode, permissionModeLook, permissionModes } from "../lib/status";
 import type { RepoRegistry } from "../state/app";
 import { RepoPicker } from "./RepoPicker";
 
@@ -14,23 +15,44 @@ export const isSubmitChord = (event: KeyboardEvent): boolean =>
   event.key === "Enter" && (event.ctrlKey || event.metaKey);
 
 /**
+ * What is attached given what the reader picked or the last session remembered.
+ * Repos that left the catalog or are not cloned are dropped. With nothing
+ * picked, or nothing left of it, a session starts in the home repo, edited in
+ * place (design spec, section 13); an empty list the reader made stays empty.
+ */
+export function attachedRepos(
+  picked: readonly RepoChoice[] | undefined,
+  repos: readonly Repo[],
+): readonly RepoChoice[] {
+  const usable = (picked ?? []).filter((choice) =>
+    repos.some((repo) => repo.id === choice.repoId && repo.available),
+  );
+  if (picked !== undefined && (picked.length === 0 || usable.length > 0)) return usable;
+  const home = repos.find((repo) => repo.home && repo.available);
+  return home ? [{ repoId: home.id, mode: defaultRepoMode(home) }] : [];
+}
+
+/**
  * The form that starts a session. `runners` comes from `GET /health`, default
- * first, and `registry` from `GET /repos`. `onCreate` resolves once the session
- * exists and rejects with the reason. The choices of the last session started
- * here are the starting point of the next one.
+ * first, `registry` from `GET /repos` and `sets` from `GET /repo-sets`.
+ * `onCreate` resolves once the session exists and rejects with the reason. The
+ * choices of the last session started here are the starting point of the next one.
  */
 export function Composer(props: {
   runners: readonly string[];
   registry: RepoRegistry;
+  sets: readonly RepoSet[];
   disabled?: boolean;
   onCreate: (request: CreateSessionRequest) => Promise<void>;
   onRegisterRepo: (request: RegisterRepoRequest) => Promise<Repo>;
   onRemoveRepo: (id: string) => Promise<void>;
+  onCloneRepo: (id: string) => Promise<void>;
   onRetryRepos: () => void;
 }) {
   const initial = loadComposerPrefs();
   const [prompt, setPrompt] = createSignal("");
-  const [choices, setChoices] = createSignal<readonly RepoChoice[]>(initial.repos);
+  // `undefined` until the reader picks: nothing is remembered, so the default applies.
+  const [choices, setChoices] = createSignal<readonly RepoChoice[] | undefined>(initial.repos);
   const [permissionMode, setPermissionMode] = createSignal<PermissionMode>(initial.permissionMode);
   const [runner, setRunner] = createSignal(initial.runner ?? "");
   const [model, setModel] = createSignal("");
@@ -46,12 +68,10 @@ export function Composer(props: {
   // A remembered runner the server no longer offers gives way to its default (the first).
   const selectedRunner = (): string | undefined =>
     props.runners.includes(runner()) ? runner() : props.runners[0];
-  // A remembered repo that left the registry is not attached; nothing is, until the registry is read.
-  const chosen = (): readonly RepoChoice[] => {
-    const registry = props.registry;
-    if (registry.status !== "ready") return [];
-    return choices().filter((choice) => registry.repos.some((repo) => repo.id === choice.repoId));
-  };
+  // Nothing is attached until the registry is read.
+  const chosen = createMemo((): readonly RepoChoice[] =>
+    props.registry.status === "ready" ? attachedRepos(choices(), props.registry.repos) : [],
+  );
   const blocked = (): boolean => props.disabled === true || busy();
 
   async function submit(): Promise<void> {
@@ -73,7 +93,7 @@ export function Composer(props: {
       await props.onCreate(request);
       // Without a registry nothing could be attached; that is no reason to forget the last choices.
       const remembered = props.registry.status === "ready" ? repos : choices();
-      saveComposerPrefs({ repos: remembered.slice(), permissionMode: mode, runner: usedRunner });
+      saveComposerPrefs({ repos: remembered?.slice(), permissionMode: mode, runner: usedRunner });
       setPrompt("");
     } catch (reason) {
       setError(errorMessage(reason));
@@ -121,10 +141,12 @@ export function Composer(props: {
       {/* Outside the form above: registering a repo is a form of its own, and forms do not nest. */}
       <RepoPicker
         registry={props.registry}
+        sets={props.sets}
         choices={chosen()}
         onChange={setChoices}
         onRegister={props.onRegisterRepo}
         onRemove={props.onRemoveRepo}
+        onClone={props.onCloneRepo}
         onRetry={props.onRetryRepos}
       />
 

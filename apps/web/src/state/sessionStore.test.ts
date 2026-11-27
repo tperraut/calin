@@ -1,8 +1,12 @@
 import { flush } from "solid-js";
-import { describe, expect, it, vi } from "vite-plus/test";
+import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import type { Api } from "../api/http";
+import type { EventBody } from "../gen/EventBody";
+import type { RepoChanges } from "../gen/RepoChanges";
 import type { Session } from "../gen/Session";
+import type { SessionStatus } from "../gen/SessionStatus";
 import {
+  conflict,
   fakeApi,
   FakeSocket,
   immediately,
@@ -278,6 +282,174 @@ describe("session store", () => {
       ["s1", "p2", { decision: "deny", message: "Not on main." }],
       ["s1", "p3", { decision: "deny" }],
     ]);
+  });
+
+  it("attaches a repo to its own session without adding it: the event does that", async () => {
+    const attachRepo = vi
+      .fn<Api["attachRepo"]>()
+      .mockResolvedValueOnce(makeSessionRepo("web"))
+      .mockRejectedValue(conflict("web is already attached"));
+    const { socket, store } = setup({ attachRepo });
+
+    await expect(store.attachRepo({ repo_id: "repo-web", mode: "read" })).resolves.toBeUndefined();
+    flush();
+    expect(attachRepo).toHaveBeenCalledWith("s1", { repo_id: "repo-web", mode: "read" });
+    // The server answered, but the repo set follows the log.
+    expect(store.repos()).toEqual([]);
+
+    socket.emit(TOPIC, {
+      op: "event",
+      topic: TOPIC,
+      event: makeEvent(1, { type: "repo_attached", repo: makeSessionRepo("web") }),
+    });
+    flush();
+    expect(store.repos()).toEqual([makeSessionRepo("web")]);
+
+    await expect(store.attachRepo({ repo_id: "repo-web" })).rejects.toMatchObject({
+      status: 409,
+      message: "web is already attached",
+    });
+  });
+
+  describe("changes", () => {
+    const listing = (...paths: string[]): RepoChanges[] => [
+      {
+        session_repo_id: "api",
+        name: "api",
+        branch: null,
+        base_ref: null,
+        files: paths.map((path) => ({
+          path,
+          old_path: null,
+          status: "modified",
+          added: 1,
+          removed: 0,
+          binary: false,
+        })),
+        added: paths.length,
+        removed: 0,
+      },
+    ];
+
+    function live(getChanges: Api["getChanges"]) {
+      const made = setup({ getChanges });
+      let seq = 0;
+      const emit = (body: EventBody) => {
+        seq += 1;
+        made.socket.emit(TOPIC, { op: "event", topic: TOPIC, event: makeEvent(seq, body) });
+      };
+      const status = (value: SessionStatus) =>
+        emit({ type: "session_status", status: value, reason: null });
+      const caughtUp = () => made.subscribed(seq);
+      return { ...made, emit, status, caughtUp };
+    }
+
+    afterEach(() => vi.useRealTimers());
+
+    it("reads nothing until asked, then holds the server's list and the revision it accounts for", async () => {
+      const getChanges = vi.fn<Api["getChanges"]>().mockResolvedValue(listing("a.rs"));
+      const { store, emit } = live(getChanges);
+      await settle();
+      expect(getChanges).not.toHaveBeenCalled();
+      expect(store.changes.list()).toBeUndefined();
+
+      emit({ type: "file_changed", session_repo_id: "api", path: "a.rs", op: "edit" });
+      store.changes.now();
+      flush();
+      expect(store.changes.refreshing()).toBe(true);
+      // Named while the list was on its way: not known to be in it.
+      emit({ type: "file_changed", session_repo_id: "api", path: "b.rs", op: "edit" });
+      await settle();
+      flush();
+      expect(getChanges).toHaveBeenCalledWith("s1");
+      expect(store.changes.list()).toEqual(listing("a.rs"));
+      expect(store.changes.revision()).toBe(1);
+      expect(store.changes.refreshing()).toBe(false);
+      expect(store.view().changesRevision).toBe(2);
+    });
+
+    it("reads again when the status changes or a repo joins, live only, and debounced", async () => {
+      const getChanges = vi.fn<Api["getChanges"]>().mockResolvedValue(listing());
+      const { status, emit, caughtUp } = live(getChanges);
+      vi.useFakeTimers();
+
+      // The replay passes through old statuses: none of them is news.
+      status("preparing");
+      status("running");
+      vi.advanceTimersByTime(5000);
+      expect(getChanges).not.toHaveBeenCalled();
+
+      caughtUp();
+      status("waiting");
+      status("running");
+      vi.advanceTimersByTime(499);
+      expect(getChanges).not.toHaveBeenCalled();
+      vi.advanceTimersByTime(1);
+      expect(getChanges).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(0);
+
+      // A turn that ends: a shell may have changed files no event named.
+      status("review");
+      vi.advanceTimersByTime(500);
+      expect(getChanges).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(0);
+
+      emit({ type: "repo_attached", repo: makeSessionRepo("web") });
+      vi.advanceTimersByTime(500);
+      expect(getChanges).toHaveBeenCalledTimes(3);
+      await vi.advanceTimersByTimeAsync(0);
+
+      // A file event alone asks nothing here: whoever shows the list decides.
+      emit({ type: "file_changed", session_repo_id: "api", path: "a.rs", op: "edit" });
+      emit({ type: "user_message", text: "and now?" });
+      vi.advanceTimersByTime(5000);
+      expect(getChanges).toHaveBeenCalledTimes(3);
+    });
+
+    it("keeps the last list when a read fails, with the server's reason, and stops with the store", async () => {
+      const getChanges = vi
+        .fn<Api["getChanges"]>()
+        .mockResolvedValueOnce(listing("a.rs"))
+        .mockRejectedValueOnce(conflict("the worktree is being prepared"))
+        .mockResolvedValue(listing("a.rs", "b.rs"));
+      const { store, stop } = live(getChanges);
+      store.changes.now();
+      await settle();
+      store.changes.now();
+      await settle();
+      flush();
+      expect(store.changes.failure()).toBe("the worktree is being prepared");
+      expect(store.changes.list()).toEqual(listing("a.rs"));
+
+      store.changes.now();
+      await settle();
+      flush();
+      expect(store.changes.failure()).toBeUndefined();
+      expect(store.changes.list()).toEqual(listing("a.rs", "b.rs"));
+
+      stop();
+      store.changes.now();
+      store.changes.request();
+      await settle();
+      expect(getChanges).toHaveBeenCalledTimes(3);
+    });
+
+    it("reads nothing while the page is in a background tab, and catches up on the way back", async () => {
+      const getChanges = vi.fn<Api["getChanges"]>().mockResolvedValue(listing());
+      const { status, caughtUp } = live(getChanges);
+      caughtUp();
+      vi.useFakeTimers();
+      const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
+      document.dispatchEvent(new Event("visibilitychange"));
+
+      status("review");
+      vi.advanceTimersByTime(5000);
+      expect(getChanges).not.toHaveBeenCalled();
+
+      visibility.mockReturnValue("visible");
+      document.dispatchEvent(new Event("visibilitychange"));
+      expect(getChanges).toHaveBeenCalledTimes(1);
+    });
   });
 
   it("unsubscribes and ignores late answers once stopped", async () => {

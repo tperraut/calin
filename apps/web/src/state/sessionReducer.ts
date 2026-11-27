@@ -27,6 +27,9 @@ export type PermissionOutcome =
   | { state: "resolved"; decision: PermissionDecision; by: Answerer; message: string | null }
   | { state: "lapsed"; message: string | null };
 
+/** A permission request made for one tool call, shown in that call's card. */
+export type ToolPermission = { request: PermissionRequest; outcome: PermissionOutcome; ts: number };
+
 /** One row of the transcript. `key` is stable for the life of the row. */
 export type TranscriptEntry =
   | { kind: "user"; key: string; ts: number; text: string }
@@ -38,6 +41,8 @@ export type TranscriptEntry =
       item: Item;
       /** True when the turn ended while the item was still `running`; it will not finish. */
       interrupted: boolean;
+      /** The requests that named this tool call as their `item_id`, oldest first. Absent when none did. */
+      permissions?: readonly ToolPermission[];
     }
   | {
       kind: "permission";
@@ -47,6 +52,16 @@ export type TranscriptEntry =
       agentId: string | null;
       request: PermissionRequest;
       outcome: PermissionOutcome;
+    }
+  | {
+      /** A repo that joined after the session's first turn began; the starting set is not news. */
+      kind: "repo";
+      key: string;
+      ts: number;
+      repo: SessionRepo;
+      /** Who attached it: the reader, or an agent through the tool endpoint (api.rs). */
+      by: "user" | "agent";
+      agentId: string | null;
     }
   | { kind: "error"; key: string; ts: number; agentId: string | null; message: string };
 
@@ -70,6 +85,8 @@ export type FileChange = {
   by: "agent" | "user";
   agentId: string | null;
   ts: number;
+  /** The `changesRevision` this change brought the view to. */
+  revision: number;
 };
 
 /** Everything the session screen shows, as a fold of the session's event log. */
@@ -78,6 +95,8 @@ export type SessionView = {
   readonly seq: number;
   readonly status: SessionStatus | null;
   readonly statusReason: string | null;
+  /** True once an agent turn began: repos attached from then on were added to a session under way. */
+  readonly turnStarted: boolean;
   readonly agents: readonly Agent[];
   /** Sum of the latest totals of every agent that reported usage. */
   readonly usage: Usage | null;
@@ -86,7 +105,7 @@ export type SessionView = {
   readonly plan: readonly PlanEntry[];
   /** Repos attached by events, the primary one first. The store adds those the REST record lists. */
   readonly repos: readonly SessionRepo[];
-  /** Oldest first. Each one also has a `permission` row in the transcript. */
+  /** Oldest first. Each one also shows in the transcript: in its tool call's card, or in a row of its own. */
   readonly pendingPermissions: readonly PendingPermission[];
   /** One entry per file, in the order they were first touched. */
   readonly changedFiles: readonly FileChange[];
@@ -98,6 +117,7 @@ export const emptySessionView: SessionView = {
   seq: 0,
   status: null,
   statusReason: null,
+  turnStarted: false,
   agents: [],
   usage: null,
   usageByAgent: {},
@@ -140,9 +160,33 @@ function findItem(transcript: readonly TranscriptEntry[], itemId: string): numbe
   return transcript.findLastIndex((entry) => entry.kind === "item" && entry.key === key);
 }
 
+/** True for the row, or the tool card, that shows the request `requestId`. */
+const showsRequest = (entry: TranscriptEntry, requestId: string): boolean =>
+  entry.kind === "permission"
+    ? entry.request.id === requestId
+    : entry.kind === "item" &&
+      entry.permissions?.some((asked) => asked.request.id === requestId) === true;
+
 function putItem(view: SessionView, event: Event, item: Item): SessionView {
   const index = findItem(view.transcript, item.id);
   const existing = index === -1 ? undefined : view.transcript[index];
+  let transcript = view.transcript;
+  let permissions = existing?.kind === "item" ? existing.permissions : undefined;
+  if (!existing && item.content.kind === "tool") {
+    // A request that arrived before its tool call waits in a row of its own; it moves into the card.
+    const early = view.pendingPermissions.filter((one) => one.request.item_id === item.id);
+    if (early.length > 0) {
+      transcript = transcript.filter(
+        (entry) =>
+          entry.kind !== "permission" || !early.some((one) => one.request.id === entry.request.id),
+      );
+      permissions = early.map((one) => ({
+        request: one.request,
+        outcome: { state: "pending" },
+        ts: one.ts,
+      }));
+    }
+  }
   const entry: TranscriptEntry = {
     kind: "item",
     key: itemKey(item.id),
@@ -151,10 +195,13 @@ function putItem(view: SessionView, event: Event, item: Item): SessionView {
     agentId: event.agent_id,
     item,
     interrupted: false,
+    ...(permissions ? { permissions } : {}),
   };
-  const transcript =
-    index === -1 ? [...view.transcript, entry] : withEntry(view.transcript, index, entry);
-  return { ...view, transcript };
+  return {
+    ...view,
+    turnStarted: true,
+    transcript: existing ? withEntry(transcript, index, entry) : [...transcript, entry],
+  };
 }
 
 function appendDelta(item: Item, delta: ItemDelta): Item | undefined {
@@ -216,19 +263,29 @@ export function mergeRepos(
   return attached.length === 0 ? seed : attached.reduce(upsertRepo, seed.slice());
 }
 
+const lapsed: PermissionOutcome = { state: "lapsed", message: null };
+
 /** The turn ended: running items become interrupted, unanswered requests lapse. */
 function closeTurn(view: SessionView): SessionView {
-  const open = (entry: TranscriptEntry): boolean =>
-    (entry.kind === "item" && entry.item.status === "running" && !entry.interrupted) ||
-    (entry.kind === "permission" && entry.outcome.state === "pending");
-  if (!view.transcript.some(open)) return view;
+  const running = (entry: TranscriptEntry): boolean =>
+    entry.kind === "item" && entry.item.status === "running" && !entry.interrupted;
+  const asking = (entry: TranscriptEntry): boolean =>
+    entry.kind === "permission"
+      ? entry.outcome.state === "pending"
+      : entry.kind === "item" &&
+        entry.permissions?.some((asked) => asked.outcome.state === "pending") === true;
+  if (!view.transcript.some((entry) => running(entry) || asking(entry))) return view;
   const transcript = view.transcript.map((entry): TranscriptEntry => {
-    if (!open(entry)) return entry;
-    return entry.kind === "item"
-      ? { ...entry, interrupted: true }
-      : entry.kind === "permission"
-        ? { ...entry, outcome: { state: "lapsed", message: null } }
-        : entry;
+    if (entry.kind === "permission") return asking(entry) ? { ...entry, outcome: lapsed } : entry;
+    if (entry.kind !== "item" || !(running(entry) || asking(entry))) return entry;
+    const closed = { ...entry, interrupted: entry.interrupted || running(entry) };
+    if (!entry.permissions) return closed;
+    return {
+      ...closed,
+      permissions: entry.permissions.map((asked) =>
+        asked.outcome.state === "pending" ? { ...asked, outcome: lapsed } : asked,
+      ),
+    };
   });
   return { ...view, transcript, pendingPermissions: [] };
 }
@@ -238,6 +295,31 @@ function requestPermission(
   event: Event,
   request: PermissionRequest,
 ): SessionView {
+  const pending: PendingPermission = {
+    request,
+    agentId: event.agent_id,
+    ts: event.ts,
+    seq: event.seq,
+  };
+  const pendingPermissions = [
+    ...view.pendingPermissions.filter((one) => one.request.id !== request.id),
+    pending,
+  ];
+  // permission.rs: `item_id` names the tool call the request is for; the two are one card.
+  const itemIndex = request.item_id === null ? -1 : findItem(view.transcript, request.item_id);
+  const call = itemIndex === -1 ? undefined : view.transcript[itemIndex];
+  if (call?.kind === "item" && call.item.content.kind === "tool") {
+    const asked: ToolPermission = { request, outcome: { state: "pending" }, ts: event.ts };
+    const others = (call.permissions ?? []).filter((one) => one.request.id !== request.id);
+    return {
+      ...view,
+      transcript: withEntry(view.transcript, itemIndex, {
+        ...call,
+        permissions: [...others, asked],
+      }),
+      pendingPermissions,
+    };
+  }
   const key = permissionKey(request.id);
   const entry: TranscriptEntry = {
     kind: "permission",
@@ -247,22 +329,13 @@ function requestPermission(
     request,
     outcome: { state: "pending" },
   };
-  const pending: PendingPermission = {
-    request,
-    agentId: event.agent_id,
-    ts: event.ts,
-    seq: event.seq,
-  };
   // Ids are unique within a session; a repeat replaces the row instead of doubling it.
   const index = view.transcript.findLastIndex((one) => one.key === key);
   return {
     ...view,
     transcript:
       index === -1 ? [...view.transcript, entry] : withEntry(view.transcript, index, entry),
-    pendingPermissions: [
-      ...view.pendingPermissions.filter((one) => one.request.id !== request.id),
-      pending,
-    ],
+    pendingPermissions,
   };
 }
 
@@ -270,19 +343,27 @@ function resolvePermission(
   view: SessionView,
   body: Extract<EventBody, { type: "permission_resolved" }>,
 ): SessionView {
-  const key = permissionKey(body.request_id);
-  const index = view.transcript.findLastIndex((one) => one.key === key);
+  const index = view.transcript.findLastIndex((one) => showsRequest(one, body.request_id));
   const entry = index === -1 ? undefined : view.transcript[index];
-  // An answer to a request this log never showed has no row to update.
-  if (entry?.kind !== "permission") return view;
+  // An answer to a request this log never showed has nothing to update.
+  if (!entry || (entry.kind !== "permission" && entry.kind !== "item")) return view;
   // permission.rs: `expired` is the server closing a request nobody answered.
   const outcome: PermissionOutcome =
     body.by === "expired"
       ? { state: "lapsed", message: body.message }
       : { state: "resolved", decision: body.decision, by: body.by, message: body.message };
+  const answered: TranscriptEntry =
+    entry.kind === "permission"
+      ? { ...entry, outcome }
+      : {
+          ...entry,
+          permissions: entry.permissions?.map((asked) =>
+            asked.request.id === body.request_id ? { ...asked, outcome } : asked,
+          ),
+        };
   return {
     ...view,
-    transcript: withEntry(view.transcript, index, { ...entry, outcome }),
+    transcript: withEntry(view.transcript, index, answered),
     pendingPermissions: view.pendingPermissions.filter((one) => one.request.id !== body.request_id),
   };
 }
@@ -302,6 +383,7 @@ function changeFile(
     by: event.agent_id === null ? "user" : "agent",
     agentId: event.agent_id,
     ts: event.ts,
+    revision: view.changesRevision + 1,
   };
   const index = view.changedFiles.findIndex((one) => one.key === key);
   return {
@@ -318,7 +400,13 @@ function applyBody(view: SessionView, event: Event): SessionView {
   if (!body) return view;
   switch (body.type) {
     case "session_status": {
-      const next = { ...view, status: body.status, statusReason: body.reason };
+      const next = {
+        ...view,
+        status: body.status,
+        statusReason: body.reason,
+        // manager: the session is `running` from its first turn on, after its starting repos are attached.
+        turnStarted: view.turnStarted || body.status === "running",
+      };
       return turnOver.includes(body.status) ? closeTurn(next) : next;
     }
     case "user_message": {
@@ -355,8 +443,21 @@ function applyBody(view: SessionView, event: Event): SessionView {
         tokens_in: body.tokens_in,
         tokens_out: body.tokens_out,
       });
-    case "repo_attached":
-      return { ...view, repos: upsertRepo(view.repos, body.repo) };
+    case "repo_attached": {
+      const next = { ...view, repos: upsertRepo(view.repos, body.repo) };
+      // The starting set is not news, and neither is a repo the session already has.
+      if (!view.turnStarted || view.repos.some((repo) => repo.id === body.repo.id)) return next;
+      const entry: TranscriptEntry = {
+        kind: "repo",
+        key: `event:${event.id}`,
+        ts: event.ts,
+        repo: body.repo,
+        // api.rs: an agent's own request carries its id; the reader's carries none.
+        by: event.agent_id === null ? "user" : "agent",
+        agentId: event.agent_id,
+      };
+      return { ...next, transcript: [...next.transcript, entry] };
+    }
     case "permission_requested":
       return requestPermission(view, event, body.request);
     case "permission_resolved":

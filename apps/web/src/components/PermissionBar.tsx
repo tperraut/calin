@@ -1,6 +1,6 @@
 import { createMemo, createSignal, createUniqueId, Show } from "solid-js";
 import type { PermissionDecision } from "../gen/PermissionDecision";
-import { errorMessage } from "../lib/errors";
+import { createPermissionAnswers, type PermissionAnswers } from "../state/permissionAnswers";
 import type { PendingPermission } from "../state/sessionReducer";
 
 type Announcement = { seq: number; text: string };
@@ -14,15 +14,18 @@ export function PermissionBar(props: {
   /** Oldest first. Empty while the transcript is still replaying. */
   pending: readonly PendingPermission[];
   onResolve: (requestId: string, decision: PermissionDecision, message?: string) => Promise<void>;
+  /** Shared with the transcript's cards when both can answer; the bar keeps its own otherwise. */
+  answers?: PermissionAnswers;
 }) {
+  const answers =
+    props.answers ??
+    createPermissionAnswers((requestId, decision, message) =>
+      props.onResolve(requestId, decision, message),
+    );
   // The request the reader stepped to; the oldest one until they do, and again once it is answered.
   const [picked, setPicked] = createSignal<string>();
   const [denying, setDenying] = createSignal<string>();
   const [reason, setReason] = createSignal("");
-  const [inFlight, setInFlight] = createSignal<string>();
-  // Answers the server accepted whose event has not arrived yet: asking twice would be a 409.
-  const [sent, setSent] = createSignal<ReadonlySet<string>>(new Set());
-  const [failure, setFailure] = createSignal<{ requestId: string; message: string }>();
   const reasonId = createUniqueId();
   let reasonField: HTMLInputElement | undefined;
 
@@ -34,11 +37,15 @@ export function PermissionBar(props: {
   const currentId = (): string | undefined => current()?.request.id;
   const waiting = (): boolean => {
     const id = currentId();
-    return id !== undefined && (inFlight() === id || sent().has(id));
+    return id !== undefined && answers.waiting(id);
+  };
+  const sending = (): boolean => {
+    const id = currentId();
+    return id !== undefined && answers.sending(id);
   };
   const error = (): string | undefined => {
-    const failed = failure();
-    return failed && failed.requestId === currentId() ? failed.message : undefined;
+    const id = currentId();
+    return id === undefined ? undefined : answers.error(id);
   };
 
   // Each request is read out once, when it arrives: the text only changes for a newer one.
@@ -66,18 +73,10 @@ export function PermissionBar(props: {
     const requestId = currentId();
     if (requestId === undefined || waiting()) return;
     const message = decision === "deny" ? reason().trim() : "";
-    setInFlight(requestId);
-    setFailure(undefined);
-    try {
-      await props.onResolve(requestId, decision, message === "" ? undefined : message);
-      setSent((ids) => new Set(ids).add(requestId));
-      setDenying(undefined);
-      setReason("");
-    } catch (cause) {
-      setFailure({ requestId, message: errorMessage(cause) });
-    } finally {
-      setInFlight(undefined);
-    }
+    const taken = await answers.answer(requestId, decision, message === "" ? undefined : message);
+    if (!taken) return;
+    setDenying(undefined);
+    setReason("");
   }
 
   return (
@@ -152,7 +151,7 @@ export function PermissionBar(props: {
                 <div class="flex items-center justify-end gap-2">
                   <Show when={waiting()}>
                     <span class="mr-auto text-xs text-muted">
-                      {inFlight() === undefined ? "Sent, waiting for the agent…" : "Sending…"}
+                      {sending() ? "Sending…" : "Sent, waiting for the agent…"}
                     </span>
                   </Show>
                   <button

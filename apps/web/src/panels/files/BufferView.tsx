@@ -98,7 +98,10 @@ export function BufferView(props: {
       case "deleted":
         return {
           tone: "attention",
-          text: "This file was deleted on disk. Saving creates it again.",
+          // Nothing is ever saved into a repo attached `read`, so nothing is promised there.
+          text: props.readOnly
+            ? "This file was deleted on disk."
+            : "This file was deleted on disk. Saving creates it again.",
           actions: [dismiss],
         };
       default:

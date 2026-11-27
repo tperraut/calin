@@ -429,6 +429,14 @@ describe("buffers", () => {
     expect(buffers.list()).toHaveLength(1);
   });
 
+  it("creates nothing in a repo attached read-only: the request that would be refused is never sent", async () => {
+    const { buffers, write } = setup();
+    const fresh: FileTarget = { sessionRepoId: "docs", path: "new.md" };
+    await expect(buffers.create(fresh)).rejects.toThrow("attached read-only");
+    expect(write).not.toHaveBeenCalled();
+    expect(buffers.list()).toHaveLength(0);
+  });
+
   it("stores the open tabs and the active one as paths, and restores them", async () => {
     const first = setup();
     await first.opened(main);

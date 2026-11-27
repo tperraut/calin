@@ -1,4 +1,5 @@
 import type { ApiError } from "../gen/ApiError";
+import type { AttachRepoRequest } from "../gen/AttachRepoRequest";
 import type { CreateSessionRequest } from "../gen/CreateSessionRequest";
 import type { FileContent } from "../gen/FileContent";
 import type { FileDiff } from "../gen/FileDiff";
@@ -6,10 +7,13 @@ import type { Health } from "../gen/Health";
 import type { RegisterRepoRequest } from "../gen/RegisterRepoRequest";
 import type { Repo } from "../gen/Repo";
 import type { RepoChanges } from "../gen/RepoChanges";
+import type { RepoSet } from "../gen/RepoSet";
 import type { ResolvePermissionRequest } from "../gen/ResolvePermissionRequest";
 import type { SendMessageRequest } from "../gen/SendMessageRequest";
 import type { Session } from "../gen/Session";
 import type { SessionDetail } from "../gen/SessionDetail";
+import type { SessionRepo } from "../gen/SessionRepo";
+import type { Settings } from "../gen/Settings";
 import type { TreeEntry } from "../gen/TreeEntry";
 import type { WriteFileRequest } from "../gen/WriteFileRequest";
 
@@ -43,11 +47,20 @@ export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>
 
 export interface Api {
   health(): Promise<Health>;
-  /** The registry, sorted by name. */
+  getSettings(): Promise<Settings>;
+  /** Replaces the stored settings; answers with them as stored. 400 names what is wrong. */
+  putSettings(body: Settings): Promise<Settings>;
+  /** Hand-registered repos and those the home repo declares: the home repo first, then by name. */
   listRepos(): Promise<Repo[]>;
   registerRepo(body: RegisterRepoRequest): Promise<Repo>;
-  /** Removes the registry entry only; the clone on disk is untouched. */
+  /** Re-reads the home repo's list and rescans; answers with the new repo list. */
+  refreshRepos(): Promise<Repo[]>;
+  /** Starts cloning a declared repo; it reports `cloning` until it is `available`. */
+  cloneRepo(id: string): Promise<void>;
+  /** Removes the registry entry only; the clone on disk is untouched. 409 for a declared repo. */
   removeRepo(id: string): Promise<void>;
+  /** The home repo's named groups of repos, in its order. */
+  listRepoSets(): Promise<RepoSet[]>;
   listSessions(): Promise<Session[]>;
   createSession(body: CreateSessionRequest): Promise<SessionDetail>;
   getSession(id: string): Promise<SessionDetail>;
@@ -55,6 +68,8 @@ export interface Api {
   interruptSession(id: string): Promise<void>;
   stopSession(id: string): Promise<void>;
   resolvePermission(id: string, requestId: string, body: ResolvePermissionRequest): Promise<void>;
+  /** Attaches a repo to a session that is running, waiting or in review; 409 otherwise. */
+  attachRepo(id: string, body: AttachRepoRequest): Promise<SessionRepo>;
   /** What the session changed, one entry per attached repo. */
   getChanges(id: string): Promise<RepoChanges[]>;
   /** Both sides of one changed file. `path` is relative to the repo root (api.rs, Semantics). */
@@ -136,9 +151,14 @@ export function createApi(
 
   return {
     health: () => json<Health>("GET", "/health"),
+    getSettings: () => json<Settings>("GET", "/settings"),
+    putSettings: (body) => json<Settings>("PUT", "/settings", body),
     listRepos: () => json<Repo[]>("GET", "/repos"),
     registerRepo: (body) => json<Repo>("POST", "/repos", body),
+    refreshRepos: () => json<Repo[]>("POST", "/repos/refresh"),
+    cloneRepo: (id) => empty("POST", `/repos/${encodeURIComponent(id)}/clone`),
     removeRepo: (id) => empty("DELETE", `/repos/${encodeURIComponent(id)}`),
+    listRepoSets: () => json<RepoSet[]>("GET", "/repo-sets"),
     listSessions: () => json<Session[]>("GET", "/sessions"),
     createSession: (body) => json<SessionDetail>("POST", "/sessions", body),
     getSession: (id) => json<SessionDetail>("GET", session(id)),
@@ -147,6 +167,7 @@ export function createApi(
     stopSession: (id) => empty("POST", `${session(id)}/stop`),
     resolvePermission: (id, requestId, body) =>
       empty("POST", `${session(id)}/permissions/${encodeURIComponent(requestId)}`, body),
+    attachRepo: (id, body) => json<SessionRepo>("POST", `${session(id)}/repos`, body),
     getChanges: (id) => json<RepoChanges[]>("GET", `${session(id)}/changes`),
     getDiff: (id, repo, path) => json<FileDiff>("GET", inRepo(id, repo, "diff", path)),
     listTree: (id, repo, path) => json<TreeEntry[]>("GET", inRepo(id, repo, "tree", path)),

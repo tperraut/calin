@@ -196,8 +196,22 @@
   }
 }
 
+/*
+ * The cursor of a message still being written, after whatever its last block
+ * is. Drawn here so the text of the message stays the message. The second
+ * `content` gives it an empty spoken form where that syntax is known.
+ */
+.markdown-streaming > :last-child::after,
+.markdown-streaming:empty::after {
+  content: "▍";
+  content: "▍" / "";
+  color: var(--muted);
+}
+
 @media (prefers-reduced-motion: no-preference) {
-  .pulse {
+  .pulse,
+  .markdown-streaming > :last-child::after,
+  .markdown-streaming:empty::after {
     animation: pulse 1.6s ease-in-out infinite;
   }
 }

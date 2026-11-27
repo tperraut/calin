@@ -1,11 +1,12 @@
 import { useBeforeLeave } from "@solidjs/router";
-import { createMemo, createSignal, Errored, For, Loading, Show } from "solid-js";
+import { createMemo, Errored, For, Loading, Show } from "solid-js";
 import { errorMessage } from "../lib/errors";
 import type { SessionStore } from "../state/sessionStore";
 import {
   sessionPath,
   sidePanels,
   type FileRequest,
+  type FileTarget,
   type PanelLinks,
   type SidePanel,
   type SidePanelId,
@@ -58,7 +59,10 @@ export function PanelHost(props: {
   store: SessionStore;
   /** The panel on screen; none while the transcript has the screen or the side pane is collapsed. */
   panel: SidePanelId | undefined;
-  onPanel: (panel: SidePanelId) => void;
+  /** The last file asked for, by a panel or by the transcript; see `PanelLinks.fileRequest`. */
+  fileRequest: FileRequest | undefined;
+  /** A panel asks for a file: the screen records the request and shows the Files panel. */
+  onOpenFile: (target: FileTarget) => void;
   ref: (element: HTMLDivElement) => void;
 }) {
   // Grows only: a panel joins when it is first shown.
@@ -68,16 +72,10 @@ export function PanelHost(props: {
     return panel === undefined || seen.has(panel) ? seen : new Set(seen).add(panel);
   });
 
-  const [fileRequest, setFileRequest] = createSignal<FileRequest>();
-  let requests = 0;
   let unsaved: string | undefined;
   const links: PanelLinks = {
-    openFile(target) {
-      requests += 1;
-      setFileRequest({ target, seq: requests });
-      props.onPanel("files");
-    },
-    fileRequest,
+    openFile: (target) => props.onOpenFile(target),
+    fileRequest: () => props.fileRequest,
     setUnsavedWork(description) {
       unsaved = description;
     },

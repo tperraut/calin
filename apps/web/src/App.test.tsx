@@ -4,8 +4,11 @@ import { App } from "./App";
 import type { Api } from "./api/http";
 import type { Health } from "./gen/Health";
 import { createAppState } from "./state/app";
+import type { Item } from "./gen/Item";
 import type { PermissionRequest } from "./gen/PermissionRequest";
+import type { Repo } from "./gen/Repo";
 import type { RepoChanges } from "./gen/RepoChanges";
+import type { Settings } from "./gen/Settings";
 import type { SessionRepo } from "./gen/SessionRepo";
 import type { SessionStatus } from "./gen/SessionStatus";
 import type { OpenTerminal } from "./api/terminal";
@@ -18,6 +21,7 @@ import {
   immediately,
   makeDetail,
   makeEvent,
+  makeMissingRepo,
   makeRepo,
   makeSession,
   makeSessionRepo,
@@ -26,6 +30,7 @@ import {
   unreachable,
 } from "./test/fakes";
 import {
+  choose,
   click,
   control,
   find,
@@ -861,8 +866,9 @@ describe("App", () => {
         null,
       );
       caughtUp();
-      // The tab counts the files the events named, wherever they are.
-      expect(tab("Changes").textContent).toBe("Changes3");
+      // The server's list was read: the tab counts it, not the events. The file
+      // outside every repo is no change of the session's.
+      expect(tab("Changes").textContent).toBe("Changes2");
       // File changes never show up as transcript rows.
       expect(find(main, '[role="log"]').textContent).not.toContain("src/health.rs");
     });
@@ -1246,5 +1252,686 @@ describe("App", () => {
       getSession: () => Promise.resolve(makeDetail(makeSession("s1"))),
     });
     expect(find(host, "main").textContent).toContain("Page not found");
+  });
+});
+
+describe("App: settings and the catalog", () => {
+  const stored: Settings = { home_repo: "/code/notes", scan_roots: ["/code"], clone_root: null };
+  const home = makeRepo("notes", { home: true });
+  const api = makeRepo("api", { declared: true });
+  const web = makeMissingRepo("web");
+
+  it("reaches the settings from the header, and comes back", async () => {
+    setViewportWidth(PHONE);
+    const getSettings = vi.fn<Api["getSettings"]>().mockResolvedValue(stored);
+    const { host } = await start("/", { getSettings, listRepos: () => Promise.resolve([home]) });
+    const link = findByText<HTMLAnchorElement>(find(host, "aside"), "a", "Settings");
+    expect(link.getAttribute("href")).toBe("/settings");
+    expect(getSettings).not.toHaveBeenCalled();
+
+    await click(link);
+    await vi.waitFor(() => expect(location.pathname).toBe("/settings"));
+    await act();
+    const main = find(host, "main");
+    expect(find(main, "h1").textContent).toBe("Settings");
+    expect(control(main, "Home repo").value).toBe("/code/notes");
+    // On a phone the page has the screen: the sessions list steps aside.
+    expect(find(host, "aside").classList.contains("hidden")).toBe(true);
+    expect(main.querySelector("textarea")).toBeNull();
+
+    await click(find<HTMLAnchorElement>(main, 'a[aria-label="Back to sessions"]'));
+    await vi.waitFor(() => expect(location.pathname).toBe("/"));
+    await act();
+    expect(find(host, "main").querySelector("textarea")).not.toBeNull();
+  });
+
+  it("opens the settings at their own address, beside the sessions on a wide screen", async () => {
+    const { host } = await start("/settings", { getSettings: () => Promise.resolve(stored) });
+    expect(find(host, "main").textContent).toContain("Scan roots");
+    expect(find(host, "aside").textContent).toContain("Calin");
+    expect(
+      findByText<HTMLAnchorElement>(find(host, "aside"), "a", "Settings").getAttribute(
+        "aria-current",
+      ),
+    ).toBe("page");
+  });
+
+  it("starts a session in the home repo by default, with a set's repos added on request", async () => {
+    const created = makeSession("new", 5000, { status: "queued" });
+    const createSession = vi.fn<Api["createSession"]>().mockResolvedValue(makeDetail(created));
+    const { host } = await start("/", {
+      // In whatever order the server answers, the home repo leads.
+      listRepos: () => Promise.resolve([web, api, home]),
+      listRepoSets: () => Promise.resolve([{ name: "storefront", repo_ids: ["api", "web"] }]),
+      createSession,
+      getSession: () => Promise.resolve(makeDetail(created)),
+    });
+    const main = find(host, "main");
+    const names = [...main.querySelectorAll("section ul > li > div:first-child > label")].map(
+      (label) => label.textContent,
+    );
+    expect(names).toEqual(["notesHomePrimary/code/notes", "api/code/api", "webnot cloned"]);
+
+    await click(findByText(main, "button", "storefront"));
+    expect(main.textContent).toContain("storefront: web is not cloned and was left out.");
+    type(find<HTMLTextAreaElement>(main, "textarea"), "Rename the endpoint");
+    await click(findByText(main, "button", "Start"));
+    expect(createSession).toHaveBeenCalledWith({
+      prompt: "Rename the endpoint",
+      permission_mode: "ask",
+      repos: [
+        { repo_id: "notes", mode: "live" },
+        { repo_id: "api", mode: "write" },
+      ],
+      runner: "mock",
+    });
+  });
+
+  describe("cloning a repo", () => {
+    beforeEach(() => vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] }));
+    afterEach(() => vi.useRealTimers());
+
+    const row = (main: HTMLElement) => {
+      const found = findByText(main, "section ul > li", "web");
+      return {
+        box: find<HTMLInputElement>(found, 'input[type="checkbox"]'),
+        text: () => found.textContent,
+        cloneButton: () => found.querySelector<HTMLButtonElement>('button[aria-label="Clone web"]'),
+      };
+    };
+    const tick = async (ms: number): Promise<void> => {
+      await vi.advanceTimersByTimeAsync(ms);
+      flush();
+    };
+
+    it("asks for it, reads the list every two seconds while it runs, and stops when it is done", async () => {
+      const listRepos = vi.fn<Api["listRepos"]>().mockResolvedValue([home, api, web]);
+      const cloneRepo = vi.fn<Api["cloneRepo"]>().mockResolvedValue();
+      const { host } = await start("/", { listRepos, cloneRepo });
+      const main = find(host, "main");
+      const repo = row(main);
+      expect(repo.box.disabled).toBe(true);
+      expect(listRepos).toHaveBeenCalledTimes(1);
+      // Nothing is cloning: nothing is polled.
+      await tick(10_000);
+      expect(listRepos).toHaveBeenCalledTimes(1);
+
+      listRepos.mockResolvedValue([home, api, { ...web, cloning: true }]);
+      const button = repo.cloneButton();
+      if (!button) throw new Error("web cannot be cloned");
+      await click(button);
+      expect(cloneRepo).toHaveBeenCalledWith("web");
+      expect(repo.text()).toContain("Cloning…");
+      expect(repo.cloneButton()).toBeNull();
+
+      await tick(1999);
+      expect(listRepos).toHaveBeenCalledTimes(1);
+      await tick(1);
+      expect(listRepos).toHaveBeenCalledTimes(2);
+      await tick(2000);
+      expect(listRepos).toHaveBeenCalledTimes(3);
+      expect(repo.text()).toContain("Cloning…");
+      expect(repo.box.disabled).toBe(true);
+
+      listRepos.mockResolvedValue([home, api, makeRepo("web", { declared: true, url: web.url })]);
+      await tick(2000);
+      expect(listRepos).toHaveBeenCalledTimes(4);
+      const cloned = row(main);
+      expect(cloned.text()).not.toContain("Cloning…");
+      expect(cloned.text()).toContain("/code/web");
+      expect(cloned.box.disabled).toBe(false);
+
+      await tick(20_000);
+      expect(listRepos).toHaveBeenCalledTimes(4);
+    });
+
+    it("shows why a clone failed and stops asking, until it is tried again", async () => {
+      const listRepos = vi.fn<Api["listRepos"]>().mockResolvedValue([home, web]);
+      const cloneRepo = vi.fn<Api["cloneRepo"]>().mockResolvedValue();
+      const { host } = await start("/", { listRepos, cloneRepo });
+      const main = find(host, "main");
+
+      listRepos.mockResolvedValue([home, { ...web, cloning: true }]);
+      const button = row(main).cloneButton();
+      if (!button) throw new Error("web cannot be cloned");
+      await click(button);
+      await tick(2000);
+      const failed: Repo = { ...web, problem: "git clone failed: could not read from remote" };
+      listRepos.mockResolvedValue([home, failed]);
+      await tick(2000);
+
+      const repo = row(main);
+      expect(repo.text()).toContain("git clone failed: could not read from remote");
+      expect(repo.text()).not.toContain("Cloning…");
+      expect(repo.box.disabled).toBe(true);
+      const reads = listRepos.mock.calls.length;
+      await tick(20_000);
+      expect(listRepos).toHaveBeenCalledTimes(reads);
+
+      // The row offers the clone again.
+      const again = repo.cloneButton();
+      if (!again) throw new Error("the clone is not offered again");
+      await click(again);
+      expect(cloneRepo).toHaveBeenCalledTimes(2);
+      expect(row(main).text()).toContain("Cloning…");
+    });
+  });
+});
+
+describe("App: attaching a repo to a session under way", () => {
+  const attached = [makeSessionRepo("api", { primary: true, repo_id: "api" })];
+  const catalog = [
+    makeRepo("notes", { home: true }),
+    makeRepo("api"),
+    makeRepo("docs"),
+    makeMissingRepo("mobile"),
+    makeRepo("web"),
+  ];
+  const attachButton = (main: HTMLElement) =>
+    findByText<HTMLButtonElement>(find(main, "header"), "button", "Attach repo");
+  const picker = (main: HTMLElement) =>
+    find<HTMLFormElement>(main, 'form[aria-label="Attach a repo"]');
+  const chips = (main: HTMLElement) =>
+    [...find(main, "header").querySelectorAll('ul[aria-label="Repos"] > li')].map(
+      (chip) => chip.textContent,
+    );
+
+  it("offers it while the session is running, waiting or in review, and at no other time", async () => {
+    const { main, emit, caughtUp } = await openSession("/s/s1", {}, "queued", attached);
+    caughtUp();
+    const button = attachButton(main);
+    const expected = {
+      queued: false,
+      preparing: false,
+      running: true,
+      waiting: true,
+      review: true,
+      shipping: false,
+      done: false,
+      failed: false,
+      cancelled: false,
+    } as const;
+    for (const [status, can] of Object.entries(expected)) {
+      emit({ type: "session_status", status: status as SessionStatus, reason: null }, null);
+      expect([status, !button.disabled]).toEqual([status, can]);
+    }
+    expect(button.title).toBe(
+      "A repo can be attached while the session is running, waiting or in review",
+    );
+  });
+
+  it("picks among the cloned repos not yet attached, sends the request, and waits for the event", async () => {
+    const attachRepo = vi
+      .fn<Api["attachRepo"]>()
+      .mockResolvedValue(makeSessionRepo("web", { repo_id: "web", mode: "read" }));
+    const listRepos = vi.fn<Api["listRepos"]>().mockResolvedValue(catalog);
+    const { main, emit, caughtUp } = await openSession(
+      "/s/s1",
+      { attachRepo, listRepos },
+      "running",
+      attached,
+    );
+    emit({ type: "session_status", status: "running", reason: null }, null);
+    caughtUp();
+    expect(main.querySelector('form[aria-label="Attach a repo"]')).toBeNull();
+    expect(listRepos).not.toHaveBeenCalled();
+
+    await click(attachButton(main));
+    expect(attachButton(main).getAttribute("aria-expanded")).toBe("true");
+    const form = picker(main);
+    const repo = control<HTMLSelectElement>(form, "Repo to attach");
+    // Not the one already attached, nor the one that is not cloned.
+    expect([...repo.options].map((option) => option.textContent)).toEqual([
+      "notes (home)",
+      "docs",
+      "web",
+    ]);
+    const mode = control<HTMLSelectElement>(form, "Attached as");
+    expect([...mode.options].map((option) => option.textContent)).toEqual([
+      "Worktree",
+      "Read only",
+      "Edit in place",
+    ]);
+    // The home repo is edited in place unless told otherwise; any other repo gets a worktree.
+    expect(mode.value).toBe("live");
+    choose(repo, "web");
+    expect(mode.value).toBe("write");
+    choose(mode, "read");
+
+    await click(findByText(form, "button", "Attach"));
+    expect(attachRepo).toHaveBeenCalledWith("s1", { repo_id: "web", mode: "read" });
+    expect(main.querySelector('form[aria-label="Attach a repo"]')).toBeNull();
+    // The server said yes, but the repo set is the log's: nothing is added before the event.
+    expect(chips(main)).toEqual(["apiprimaryworktree"]);
+    expect(find(main, '[role="log"]').textContent).not.toContain("attached");
+
+    emit(
+      { type: "repo_attached", repo: makeSessionRepo("web", { repo_id: "web", mode: "read" }) },
+      null,
+    );
+    expect(chips(main)).toEqual(["apiprimaryworktree", "webread only"]);
+    expect(find(main, '[role="log"]').textContent).toContain(
+      "Repo web attached by you · Read only",
+    );
+
+    // It is no longer offered.
+    await click(attachButton(main));
+    expect(
+      [...control<HTMLSelectElement>(picker(main), "Repo to attach").options].map(
+        (option) => option.value,
+      ),
+    ).toEqual(["notes", "docs"]);
+    await click(findByText(picker(main), "button", "Cancel"));
+    expect(main.querySelector('form[aria-label="Attach a repo"]')).toBeNull();
+  });
+
+  it("shows the server's message when the attach is refused, and keeps the picker open", async () => {
+    const attachRepo = vi
+      .fn<Api["attachRepo"]>()
+      .mockRejectedValue(conflict("docs is attached to another session in place"));
+    const { main, emit, caughtUp } = await openSession(
+      "/s/s1",
+      { attachRepo, listRepos: () => Promise.resolve(catalog) },
+      "running",
+      attached,
+    );
+    emit({ type: "session_status", status: "review", reason: null }, null);
+    caughtUp();
+    await click(attachButton(main));
+    choose(control<HTMLSelectElement>(picker(main), "Repo to attach"), "docs");
+    await click(findByText(picker(main), "button", "Attach"));
+
+    expect(attachRepo).toHaveBeenCalledWith("s1", { repo_id: "docs", mode: "write" });
+    expect(find(picker(main), '[role="alert"]').textContent).toBe(
+      "docs is attached to another session in place",
+    );
+    expect(findByText<HTMLButtonElement>(picker(main), "button", "Attach").disabled).toBe(false);
+    expect(chips(main)).toEqual(["apiprimaryworktree"]);
+  });
+
+  it("says so when there is nothing left to attach, or the list cannot be read", async () => {
+    const listRepos = vi
+      .fn<Api["listRepos"]>()
+      .mockRejectedValueOnce(unreachable())
+      .mockResolvedValue([makeRepo("api"), makeMissingRepo("mobile")]);
+    const { main, emit, caughtUp } = await openSession("/s/s1", { listRepos }, "running", attached);
+    emit({ type: "session_status", status: "running", reason: null }, null);
+    caughtUp();
+    await click(attachButton(main));
+    expect(find(picker(main), '[role="alert"]').textContent).toContain(
+      "The repos could not be loaded: Cannot reach the server",
+    );
+    expect(findByText<HTMLButtonElement>(picker(main), "button", "Attach").disabled).toBe(true);
+
+    await click(findByText(picker(main), "button", "Retry"));
+    await act();
+    expect(picker(main).textContent).toContain(
+      "Every repo that is cloned on this machine is already attached to this session.",
+    );
+    expect(findByText<HTMLButtonElement>(picker(main), "button", "Attach").disabled).toBe(true);
+  });
+
+  it("closes the picker to further attaching once the session can take none", async () => {
+    const attachRepo = vi.fn<Api["attachRepo"]>().mockResolvedValue(makeSessionRepo("web"));
+    const { main, emit, caughtUp } = await openSession(
+      "/s/s1",
+      { attachRepo, listRepos: () => Promise.resolve(catalog) },
+      "running",
+      attached,
+    );
+    emit({ type: "session_status", status: "running", reason: null }, null);
+    caughtUp();
+    await click(attachButton(main));
+    emit({ type: "session_status", status: "done", reason: null }, null);
+
+    const submit = findByText<HTMLButtonElement>(picker(main), "button", "Attach");
+    expect(submit.disabled).toBe(true);
+    expect(picker(main).textContent).toContain(
+      "A repo can be attached while the session is running, waiting or in review.",
+    );
+    await click(submit);
+    expect(attachRepo).not.toHaveBeenCalled();
+  });
+
+  it("says in the transcript who attached a repo, for those attached after the first turn began", async () => {
+    const { main, emit, caughtUp } = await openSession("/s/s1");
+    emit({ type: "session_status", status: "preparing", reason: null }, null);
+    emit({ type: "repo_attached", repo: makeSessionRepo("api", { primary: true }) }, null);
+    emit({ type: "session_status", status: "running", reason: null }, null);
+    emit({ type: "repo_attached", repo: makeSessionRepo("web") }, null);
+    emit({ type: "repo_attached", repo: makeSessionRepo("docs", { mode: "read" }) }, "a1");
+    caughtUp();
+
+    const rows = [...find(main, '[role="log"]').querySelectorAll("ol > li")].map(
+      (row) => row.textContent,
+    );
+    // The repo the session started with is not news.
+    expect(rows).toEqual([
+      "Repo web attached by you · Worktree",
+      "Repo docs attached by the agent · Read only",
+    ]);
+  });
+
+  describe("the panels", () => {
+    const web = makeSessionRepo("web", { repo_id: "web" });
+    const listing = (...repos: string[]): RepoChanges[] =>
+      repos.map((name) => ({
+        session_repo_id: name,
+        name,
+        branch: null,
+        base_ref: null,
+        files: [
+          {
+            path: `${name}.md`,
+            old_path: null,
+            status: "modified",
+            added: 1,
+            removed: 0,
+            binary: false,
+          },
+        ],
+        added: 1,
+        removed: 0,
+      }));
+
+    it("Changes lists the new repo without a reload", async () => {
+      const getChanges = vi.fn<Api["getChanges"]>().mockResolvedValue(listing("api"));
+      const { main, emit, caughtUp } = await openSession(
+        "/s/s1/changes",
+        { getChanges },
+        "running",
+        attached,
+      );
+      emit({ type: "session_status", status: "running", reason: null }, null);
+      caughtUp();
+      await shown(main, "api.md");
+      const panel = find(main, 'section[aria-label="Changed files"]');
+      expect(panel.querySelector('section[aria-label="web"]')).toBeNull();
+
+      getChanges.mockResolvedValue(listing("api", "web"));
+      emit({ type: "repo_attached", repo: web }, null);
+      await shown(panel, "web.md");
+      expect(find(panel, 'section[aria-label="web"]').textContent).toContain("web.md");
+      expect(panel.textContent).toContain("2 files changed in 2 of 2 repos");
+    });
+
+    it("Files shows the new repo as a root of the tree, and reads it when opened", async () => {
+      const listTree = vi.fn<Api["listTree"]>((_id, repo) =>
+        Promise.resolve([
+          { name: `${repo}.md`, path: `${repo}.md`, kind: "file", size: 1, ignored: false },
+        ]),
+      );
+      const { main, emit, caughtUp } = await openSession(
+        "/s/s1/files",
+        { listTree },
+        "running",
+        attached,
+      );
+      emit({ type: "session_status", status: "running", reason: null }, null);
+      caughtUp();
+      await shown(main, "api.md");
+      const roots = () =>
+        [...main.querySelectorAll('[role="treeitem"][aria-level="1"]')].map((root) =>
+          root.textContent.trim(),
+        );
+      expect(roots()).toHaveLength(1);
+
+      emit({ type: "repo_attached", repo: web }, null);
+      expect(roots()).toHaveLength(2);
+      expect(roots()[1]).toContain("web");
+      await click(findByText(main, '[role="treeitem"][aria-level="1"]', "web"));
+      await shown(main, "web.md");
+      expect(listTree).toHaveBeenCalledWith("s1", "web", "");
+    });
+
+    it("Terminal offers the new repo as a place to start a shell", async () => {
+      const { main, emit, caughtUp, shells } = await openSession(
+        "/s/s1/terminal",
+        {},
+        "running",
+        attached,
+      );
+      emit({ type: "session_status", status: "running", reason: null }, null);
+      caughtUp();
+      // One repo: the first shell starts in it without asking.
+      await vi.waitFor(() => expect(shells).toHaveLength(1));
+      expect(main.querySelector('form[aria-label="New terminal"]')).toBeNull();
+
+      emit({ type: "repo_attached", repo: web }, null);
+      await click(findByText(main, "button", "New terminal"));
+      const form = find<HTMLFormElement>(main, 'form[aria-label="New terminal"]');
+      const where = find<HTMLSelectElement>(form, "select");
+      expect([...where.options].map((option) => option.value)).toEqual(["api", "web"]);
+      choose(where, "web");
+      await click(findByText(form, "button", "Start"));
+      await vi.waitFor(() => expect(shells).toHaveLength(2));
+      expect(shells[1].request.sessionRepoId).toBe("web");
+    });
+  });
+});
+
+describe("App: the Changes tab's count", () => {
+  beforeEach(() => vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] }));
+  afterEach(() => vi.useRealTimers());
+
+  const listing = (...paths: string[]): RepoChanges[] => [
+    {
+      session_repo_id: "api",
+      name: "api",
+      branch: null,
+      base_ref: null,
+      files: paths.map((path) => ({
+        path,
+        old_path: null,
+        status: "modified",
+        added: 1,
+        removed: 0,
+        binary: false,
+      })),
+      added: paths.length,
+      removed: 0,
+    },
+  ];
+  const tick = async (ms: number): Promise<void> => {
+    await vi.advanceTimersByTimeAsync(ms);
+    flush();
+  };
+
+  it("counts the events until the server's list is read, then the list, with no panel ever opened", async () => {
+    // The agent edited two files through its shell: no event names them.
+    const getChanges = vi
+      .fn<Api["getChanges"]>()
+      .mockResolvedValue(listing("a.rs", "shell-1.rs", "shell-2.rs"));
+    const { main, emit, caughtUp, tab } = await openSession("/s/s1", { getChanges }, "running", [
+      makeSessionRepo("api", { primary: true }),
+    ]);
+    emit({ type: "session_status", status: "running", reason: null }, null);
+    emit({ type: "file_changed", session_repo_id: "api", path: "a.rs", op: "edit" });
+    caughtUp();
+    // Not read yet: the count is what the events named.
+    expect(getChanges).not.toHaveBeenCalled();
+    expect(tab("Changes").textContent).toBe("Changes1");
+
+    await tick(500);
+    expect(getChanges).toHaveBeenCalledTimes(1);
+    expect(tab("Changes").textContent).toBe("Changes3");
+    // The panel itself was never loaded.
+    expect(main.querySelector('section[aria-label="Changed files"]')).toBeNull();
+
+    // An edit the list does not hold yet is added to it, once.
+    emit({ type: "file_changed", session_repo_id: "api", path: "b.rs", op: "create" });
+    emit({ type: "file_changed", session_repo_id: "api", path: "b.rs", op: "edit" });
+    emit({ type: "file_changed", session_repo_id: "api", path: "a.rs", op: "edit" });
+    expect(tab("Changes").textContent).toBe("Changes4");
+    await tick(5000);
+    expect(getChanges).toHaveBeenCalledTimes(1);
+
+    // The turn ends: the list is read again, panel or no panel. One file was reverted meanwhile.
+    getChanges.mockResolvedValue(listing("a.rs", "b.rs"));
+    emit({ type: "session_status", status: "review", reason: null }, null);
+    expect(getChanges).toHaveBeenCalledTimes(1);
+    await tick(500);
+    expect(getChanges).toHaveBeenCalledTimes(2);
+    expect(tab("Changes").textContent).toBe("Changes2");
+  });
+
+  it("shows no count when the server lists nothing, whatever the events said", async () => {
+    const getChanges = vi.fn<Api["getChanges"]>().mockResolvedValue(listing());
+    const { emit, caughtUp, tab } = await openSession("/s/s1", { getChanges });
+    emit({ type: "file_changed", session_repo_id: "api", path: "a.rs", op: "edit" });
+    caughtUp();
+    expect(tab("Changes").textContent).toBe("Changes1");
+    await tick(500);
+    // Written, then undone: git has nothing to show.
+    expect(tab("Changes").textContent).toBe("Changes");
+  });
+
+  it("keeps the events' count when the list cannot be read", async () => {
+    const getChanges = vi.fn<Api["getChanges"]>().mockRejectedValue(unreachable());
+    const { emit, caughtUp, tab } = await openSession("/s/s1", { getChanges });
+    emit({ type: "file_changed", session_repo_id: "api", path: "a.rs", op: "edit" });
+    caughtUp();
+    await tick(500);
+    expect(getChanges).toHaveBeenCalledTimes(1);
+    expect(tab("Changes").textContent).toBe("Changes1");
+  });
+});
+
+describe("App: a tool call, its permission and its files", () => {
+  const repos = [makeSessionRepo("api", { primary: true })];
+  const call = (status: Item["status"], locations: string[] = []): Item => ({
+    id: "t1",
+    status,
+    content: {
+      kind: "tool",
+      name: "Edit",
+      tool_kind: "edit",
+      title: "notes.md",
+      input: { file_path: "/sessions/s1/api/notes.md" },
+      output: null,
+      locations,
+    },
+  });
+  const request: PermissionRequest = {
+    id: "p1",
+    tool_name: "Edit",
+    tool_kind: "edit",
+    title: "notes.md",
+    input: { file_path: "/sessions/s1/api/notes.md" },
+    item_id: "t1",
+  };
+
+  it("asks in the call's card and in the bar, and an answer in one holds the other", async () => {
+    const resolvePermission = vi.fn<Api["resolvePermission"]>().mockResolvedValue();
+    const { main, emit, caughtUp } = await openSession("/s/s1", { resolvePermission });
+    emit({ type: "session_status", status: "running", reason: null }, null);
+    emit({ type: "item_started", item: call("running") });
+    emit({ type: "permission_requested", request });
+    emit({ type: "session_status", status: "waiting", reason: null }, null);
+    caughtUp();
+
+    const log = find(main, '[role="log"]');
+    // One card for the call and its request, not two.
+    expect(log.querySelectorAll("ol > li")).toHaveLength(1);
+    const question = find(log, '[data-permission="pending"]');
+    expect(question.textContent).toContain("Allow this?");
+    const bar = find(main, 'section[aria-label="Permission request"]');
+    expect(bar.textContent).toContain("Allow this?");
+    // The bar's two buttons are the only ones named plainly Allow and Deny.
+    const named = (name: string) =>
+      [...main.querySelectorAll("button")].filter(
+        (button) => (button.getAttribute("aria-label") ?? button.textContent.trim()) === name,
+      );
+    expect(named("Allow")).toEqual([findByText(bar, "button", "Allow")]);
+    expect(named("Deny")).toEqual([findByText(bar, "button", "Deny")]);
+
+    await click(find(question, 'button[aria-label="Allow notes.md"]'));
+    expect(resolvePermission).toHaveBeenCalledTimes(1);
+    expect(resolvePermission).toHaveBeenCalledWith("s1", "p1", { decision: "allow" });
+    // Sent from the card: the bar knows, and will not send a second answer.
+    expect(findByText<HTMLButtonElement>(bar, "button", "Allow").disabled).toBe(true);
+    expect(findByText<HTMLButtonElement>(bar, "button", "Deny").disabled).toBe(true);
+    expect(bar.textContent).toContain("Sent, waiting for the agent…");
+
+    emit({
+      type: "permission_resolved",
+      request_id: "p1",
+      decision: "allow",
+      by: "user",
+      message: null,
+    });
+    emit({ type: "session_status", status: "running", reason: null }, null);
+    emit({ type: "item_completed", item: call("completed") });
+    expect(main.querySelector('section[aria-label="Permission request"]')).toBeNull();
+    expect(log.querySelectorAll("ol > li")).toHaveLength(1);
+    expect(find(log, "[data-permission]").textContent).toBe("Allowed by you");
+    expect(log.textContent).not.toContain("Allow this?");
+  });
+
+  it("records a denial given in the bar, with its reason, in the call's card", async () => {
+    const resolvePermission = vi.fn<Api["resolvePermission"]>().mockResolvedValue();
+    const { main, emit, caughtUp } = await openSession("/s/s1", { resolvePermission });
+    emit({ type: "item_started", item: call("running") });
+    emit({ type: "permission_requested", request });
+    emit({ type: "session_status", status: "waiting", reason: null }, null);
+    caughtUp();
+    const bar = find(main, 'section[aria-label="Permission request"]');
+    await click(findByText(bar, "button", "Deny"));
+    type(control(bar, "Reason for the agent"), "Not that file.");
+    await click(findByText(bar, "button", "Confirm deny"));
+    // The card's own buttons hold while the answer is on its way to the log.
+    const log = find(main, '[role="log"]');
+    expect(find<HTMLButtonElement>(log, 'button[aria-label="Allow notes.md"]').disabled).toBe(true);
+
+    emit({
+      type: "permission_resolved",
+      request_id: "p1",
+      decision: "deny",
+      by: "user",
+      message: "Not that file.",
+    });
+    emit({ type: "item_completed", item: call("declined") });
+    expect(find(log, "[data-permission]").textContent).toBe("Denied by you: Not that file.");
+    expect(find(log, "summary").textContent).toContain("Declined");
+  });
+
+  it("opens a file the call names in the Files panel", async () => {
+    setViewportWidth(PHONE);
+    const { main, emit, caughtUp, tab } = await openSession(
+      "/s/s1",
+      {
+        listTree: () => Promise.resolve([]),
+        readFile: (_id, _repo, path) =>
+          Promise.resolve({
+            path,
+            text: "hello\n",
+            binary: false,
+            too_large: false,
+            size: 6,
+            hash: "h1",
+          }),
+      },
+      "running",
+      repos,
+    );
+    emit({
+      type: "item_completed",
+      item: call("completed", ["/sessions/s1/api/docs/notes.md", "/var/log/syslog"]),
+    });
+    caughtUp();
+    const card = find<HTMLDetailsElement>(find(main, '[role="log"]'), "details");
+    card.open = true;
+    card.dispatchEvent(new Event("toggle"));
+    flush();
+    const files = find(card, 'ul[aria-label="Files of this tool call"]');
+    expect([...files.children].map((row) => row.textContent)).toEqual([
+      "api/docs/notes.md",
+      "/var/log/syslog",
+    ]);
+
+    await click(find(files, "button"));
+    await vi.waitFor(() => expect(location.pathname).toBe("/s/s1/files"));
+    expect(tab("Files").getAttribute("aria-selected")).toBe("true");
+    await vi.waitFor(() => expect(editorFor("docs/notes.md").field.value).toBe("hello\n"));
   });
 });

@@ -9,16 +9,21 @@ export type RepoChoice = { repoId: string; mode: ComposerRepoMode };
 
 /** What the composer starts from: the choices of the last session started in this browser. */
 export type ComposerPrefs = {
-  /** In order; the first is the primary repo. */
-  repos: RepoChoice[];
+  /**
+   * In order; the first is the primary repo. Absent until a session was
+   * started here: the composer's own default applies (the home repo, if any).
+   */
+  repos?: RepoChoice[];
   permissionMode: PermissionMode;
   /** Absent until a runner was used: the server's default applies. */
   runner?: string;
 };
 
-export const defaultComposerPrefs = (): ComposerPrefs => ({ repos: [], permissionMode: "ask" });
+export const defaultComposerPrefs = (): ComposerPrefs => ({ permissionMode: "ask" });
 
-const COMPOSER_KEY = "calin.composer.v1";
+const COMPOSER_KEY = "calin.composer.v2";
+// Written before there was a home repo: its repo list is not a choice made against one, so it is not read.
+const COMPOSER_KEY_V1 = "calin.composer.v1";
 const SIDE_PANE_KEY = "calin.sidePane.v1";
 const DIFF_LAYOUT_KEY = "calin.diffLayout.v1";
 const EDITOR_WRAP_KEY = "calin.editorWrap.v1";
@@ -52,12 +57,14 @@ function repoChoice(value: unknown): RepoChoice | undefined {
 
 /** Whatever is stored is checked field by field: it may come from another build. */
 export function loadComposerPrefs(): ComposerPrefs {
-  const stored = read(COMPOSER_KEY);
+  const current = read(COMPOSER_KEY);
+  const stored = isRecord(current) ? current : read(COMPOSER_KEY_V1);
   const prefs = defaultComposerPrefs();
   if (!isRecord(stored)) return prefs;
-  if (Array.isArray(stored.repos)) {
+  if (isRecord(current) && Array.isArray(current.repos)) {
     const seen = new Set<string>();
-    for (const value of stored.repos) {
+    prefs.repos = [];
+    for (const value of current.repos) {
       const choice = repoChoice(value);
       if (!choice || seen.has(choice.repoId)) continue;
       seen.add(choice.repoId);

@@ -3,9 +3,21 @@ import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import type { CreateSessionRequest } from "../gen/CreateSessionRequest";
 import type { RegisterRepoRequest } from "../gen/RegisterRepoRequest";
 import type { Repo } from "../gen/Repo";
+import type { RepoSet } from "../gen/RepoSet";
 import type { RepoRegistry } from "../state/app";
-import { conflict, deferred, makeRepo } from "../test/fakes";
-import { choose, click, control, find, findByText, mount, type, unmountAll } from "../test/render";
+import { conflict, deferred, makeMissingRepo, makeRepo } from "../test/fakes";
+import {
+  choose,
+  click,
+  control,
+  find,
+  findByText,
+  mount,
+  PHONE,
+  setViewportWidth,
+  type,
+  unmountAll,
+} from "../test/render";
 import { Composer } from "./Composer";
 
 afterEach(unmountAll);
@@ -16,6 +28,8 @@ function setup(
   options: {
     repos?: Repo[];
     registry?: RepoRegistry;
+    sets?: RepoSet[];
+    onCloneRepo?: (id: string) => Promise<void>;
     onCreate?: (request: CreateSessionRequest) => Promise<void>;
     onRegisterRepo?: (request: RegisterRepoRequest) => Promise<Repo>;
     onRemoveRepo?: (id: string) => Promise<void>;
@@ -29,19 +43,25 @@ function setup(
     options.onRegisterRepo ?? (() => Promise.reject(new Error("not stubbed"))),
   );
   const onRemoveRepo = vi.fn(options.onRemoveRepo ?? (() => Promise.resolve()));
+  const onCloneRepo = vi.fn(options.onCloneRepo ?? (() => Promise.resolve()));
   const onRetryRepos = vi.fn();
   const host = mount(() => (
     <Composer
       runners={["mock", "claude"]}
       registry={registry()}
+      sets={options.sets ?? []}
       onCreate={onCreate}
       onRegisterRepo={onRegisterRepo}
       onRemoveRepo={onRemoveRepo}
+      onCloneRepo={onCloneRepo}
       onRetryRepos={onRetryRepos}
     />
   ));
+  const rows = (): HTMLElement[] => [...host.querySelectorAll<HTMLElement>("section ul > li")];
+  /** The names in the list, top to bottom. */
+  const names = (): string[] => rows().map((row) => find(row, "label span span span").textContent);
   const repoRow = (name: string): HTMLElement => {
-    const row = findByText(host, "label", `/code/${name}`).closest("li");
+    const row = rows().find((one) => find(one, "label span span span").textContent === name);
     if (!row) throw new Error(`no row for ${name}`);
     return row;
   };
@@ -59,7 +79,9 @@ function setup(
     onCreate,
     onRegisterRepo,
     onRemoveRepo,
+    onCloneRepo,
     onRetryRepos,
+    names,
     repoRow,
     start,
     pick: (name: string) => click(control(repoRow(name), name)),
@@ -201,7 +223,7 @@ describe("Composer", () => {
 
   it("forgets a remembered repo that left the registry, and a runner the server dropped", async () => {
     localStorage.setItem(
-      "calin.composer.v1",
+      "calin.composer.v2",
       JSON.stringify({
         repos: [
           { repoId: "gone", mode: "live" },
@@ -236,7 +258,7 @@ describe("Composer", () => {
   });
 
   it("starts from the defaults when what is stored makes no sense", async () => {
-    localStorage.setItem("calin.composer.v1", '{"repos":"api","permissionMode":"yolo","runner":7}');
+    localStorage.setItem("calin.composer.v2", '{"repos":"api","permissionMode":"yolo","runner":7}');
     const { start } = setup();
     expect(await start()).toEqual({
       prompt: "Fix the login",
@@ -377,5 +399,407 @@ describe("Composer", () => {
     expect(host.textContent).toContain("The repos could not be loaded: Cannot reach the server");
     await click(findByText(host, "button", "Retry"));
     expect(onRetryRepos).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("Composer: the catalog", () => {
+  const home = makeRepo("notes", { home: true });
+  const api = makeRepo("api", { declared: true, url: "git@example.com:you/api.git" });
+  const web = makeMissingRepo("web");
+  const tools = makeRepo("tools");
+  const catalog = [home, api, tools, web];
+  const box = (row: HTMLElement) => find<HTMLInputElement>(row, 'input[type="checkbox"]');
+
+  it("lists the home repo first, marked Home, and says where a repo is only when that helps", () => {
+    const { names, repoRow } = setup({ repos: catalog });
+    expect(names()).toEqual(["notes", "api", "tools", "web"]);
+    expect(repoRow("notes").textContent).toContain("Home");
+    expect(repoRow("api").textContent).not.toContain("Home");
+    // An ordinary repo: its name and its path, nothing about where it comes from.
+    expect(find(repoRow("api"), "label").textContent).toBe("api/code/api");
+    expect(find(repoRow("tools"), "label").textContent).toBe("tools/code/tools");
+    expect(find(repoRow("web"), "label").textContent).toBe("webnot cloned");
+  });
+
+  it("starts in the home repo, primary and edited in place, when nothing is remembered", async () => {
+    const { host, repoRow, start } = setup({ repos: catalog });
+    expect(box(repoRow("notes")).checked).toBe(true);
+    expect(repoRow("notes").textContent).toContain("Primary");
+    expect(find<HTMLSelectElement>(repoRow("notes"), "select").value).toBe("live");
+    expect(host.textContent).toContain("The agent starts in notes, the primary repo.");
+    expect(box(repoRow("api")).checked).toBe(false);
+
+    expect((await start()).repos).toEqual([{ repo_id: "notes", mode: "live" }]);
+  });
+
+  it("adds the other repos after the home repo, as worktrees", async () => {
+    const { pick, start } = setup({ repos: catalog });
+    await pick("tools");
+    await pick("api");
+    expect((await start()).repos).toEqual([
+      { repo_id: "notes", mode: "live" },
+      { repo_id: "tools", mode: "write" },
+      { repo_id: "api", mode: "write" },
+    ]);
+  });
+
+  it("lets the reader untick the home repo, and remembers that they did", async () => {
+    const first = setup({ repos: catalog });
+    await first.pick("notes");
+    expect(box(first.repoRow("notes")).checked).toBe(false);
+    expect((await first.start()).repos).toEqual([]);
+    unmountAll();
+
+    // An empty selection the reader made is a selection: the default does not come back over it.
+    const second = setup({ repos: catalog });
+    expect(box(second.repoRow("notes")).checked).toBe(false);
+    // Ticked again, it is the primary repo again, edited in place.
+    await second.pick("api");
+    await second.pick("notes");
+    expect((await second.start()).repos).toEqual([
+      { repo_id: "notes", mode: "live" },
+      { repo_id: "api", mode: "write" },
+    ]);
+  });
+
+  it("has no default without a home repo, or while the home repo is not available", async () => {
+    const none = setup({ repos: [api, tools] });
+    expect((await none.start()).repos).toEqual([]);
+    unmountAll();
+
+    const missing = setup({ repos: [{ ...home, available: false, path: "" }, api] });
+    expect(box(missing.repoRow("notes")).checked).toBe(false);
+    expect((await missing.start()).repos).toEqual([]);
+  });
+
+  it("applies the default once the catalog arrives", async () => {
+    const { setRegistry, repoRow, start } = setup({ registry: { status: "loading" } });
+    setRegistry({ status: "ready", repos: catalog });
+    flush();
+    expect(box(repoRow("notes")).checked).toBe(true);
+    expect((await start()).repos).toEqual([{ repo_id: "notes", mode: "live" }]);
+  });
+
+  it("drops remembered repos that are gone or not cloned, and remembers what is left", async () => {
+    localStorage.setItem(
+      "calin.composer.v2",
+      JSON.stringify({
+        repos: [
+          { repoId: "gone", mode: "write" },
+          { repoId: "web", mode: "write" },
+          { repoId: "tools", mode: "live" },
+        ],
+        permissionMode: "ask",
+      }),
+    );
+    const { repoRow, start } = setup({ repos: catalog });
+    expect(box(repoRow("web")).checked).toBe(false);
+    expect(repoRow("tools").textContent).toContain("Primary");
+    // Something of the remembered selection is left: the home default does not apply.
+    expect(box(repoRow("notes")).checked).toBe(false);
+    expect((await start()).repos).toEqual([{ repo_id: "tools", mode: "live" }]);
+    expect(JSON.parse(localStorage.getItem("calin.composer.v2") ?? "{}")).toMatchObject({
+      repos: [{ repoId: "tools", mode: "live" }],
+    });
+  });
+
+  it("falls back to the home repo when nothing of the remembered selection is left", async () => {
+    localStorage.setItem(
+      "calin.composer.v2",
+      JSON.stringify({ repos: [{ repoId: "gone", mode: "write" }], permissionMode: "ask" }),
+    );
+    const { start } = setup({ repos: catalog });
+    expect((await start()).repos).toEqual([{ repo_id: "notes", mode: "live" }]);
+  });
+
+  it("keeps the mode and the runner of a session started before there was a home repo, not its repos", async () => {
+    localStorage.setItem(
+      "calin.composer.v1",
+      JSON.stringify({
+        repos: [{ repoId: "tools", mode: "write" }],
+        permissionMode: "accept_edits",
+        runner: "claude",
+      }),
+    );
+    const { start } = setup({ repos: catalog });
+    expect(await start()).toEqual({
+      prompt: "Fix the login",
+      permission_mode: "accept_edits",
+      repos: [{ repo_id: "notes", mode: "live" }],
+      runner: "claude",
+    });
+  });
+
+  it("does not let a repo that is not cloned be selected", async () => {
+    const { repoRow, start } = setup({ repos: catalog });
+    const row = repoRow("web");
+    expect(box(row).disabled).toBe(true);
+    expect(row.textContent).toContain("not cloned");
+    await click(box(row));
+    expect(box(row).checked).toBe(false);
+    expect(row.querySelector("select")).toBeNull();
+    expect((await start()).repos).toEqual([{ repo_id: "notes", mode: "live" }]);
+  });
+
+  it("offers to clone a declared repo that has a url, and shows the clone running", async () => {
+    const asked = deferred();
+    const noUrl = makeMissingRepo("vendor", { url: null });
+    const { repoRow, setRegistry, onCloneRepo } = setup({
+      repos: [...catalog, noUrl],
+      onCloneRepo: () => asked.promise,
+    });
+    // Nothing to clone from: the row says so by offering nothing.
+    expect(repoRow("vendor").textContent).toContain("not cloned");
+    expect(repoRow("vendor").querySelector("button")).toBeNull();
+    // An available repo is not cloned again.
+    expect(repoRow("api").querySelector('button[aria-label="Clone api"]')).toBeNull();
+
+    await click(find(repoRow("web"), 'button[aria-label="Clone web"]'));
+    expect(onCloneRepo).toHaveBeenCalledWith("web");
+    expect(find(repoRow("web"), '[role="status"]').textContent).toBe("Cloning…");
+    expect(repoRow("web").querySelector('button[aria-label="Clone web"]')).toBeNull();
+
+    // The server took it: the catalog says the clone is running.
+    setRegistry({ status: "ready", repos: [home, api, tools, { ...web, cloning: true }] });
+    asked.resolve();
+    await click(repoRow("web"));
+    expect(find(repoRow("web"), '[role="status"]').textContent).toBe("Cloning…");
+    expect(box(repoRow("web")).disabled).toBe(true);
+
+    // Done: it is a repo like the others.
+    setRegistry({
+      status: "ready",
+      repos: [home, api, tools, makeRepo("web", { declared: true, url: web.url })],
+    });
+    flush();
+    expect(repoRow("web").querySelector('[role="status"]')).toBeNull();
+    expect(repoRow("web").textContent).not.toContain("not cloned");
+    expect(box(repoRow("web")).disabled).toBe(false);
+  });
+
+  it("shows why a clone failed, from the request or from the repo, and offers it again", async () => {
+    const { repoRow, setRegistry, onCloneRepo } = setup({
+      repos: catalog,
+      onCloneRepo: () => Promise.reject(conflict("web is already being cloned")),
+    });
+    await click(find(repoRow("web"), 'button[aria-label="Clone web"]'));
+    expect(find(repoRow("web"), '[role="alert"]').textContent).toBe("web is already being cloned");
+    expect(repoRow("web").querySelector('[role="status"]')).toBeNull();
+
+    // The clone itself failed: the repo carries the reason.
+    setRegistry({
+      status: "ready",
+      repos: [home, api, tools, { ...web, problem: "git clone failed: repository not found" }],
+    });
+    flush();
+    expect(repoRow("web").textContent).toContain("git clone failed: repository not found");
+    onCloneRepo.mockResolvedValue();
+    await click(find(repoRow("web"), 'button[aria-label="Clone web"]'));
+    expect(onCloneRepo).toHaveBeenCalledTimes(2);
+    expect(repoRow("web").querySelector('[role="alert"]')).toBeNull();
+  });
+
+  it("shows a repo's problem even when the repo can be used", () => {
+    const { repoRow } = setup({
+      repos: [{ ...home, problem: ".calin/repos.yaml: mapping values are not allowed here" }],
+    });
+    expect(repoRow("notes").textContent).toContain("mapping values are not allowed here");
+    expect(box(repoRow("notes")).disabled).toBe(false);
+  });
+
+  it("offers Remove for a repo registered by hand only", () => {
+    const { repoRow } = setup({ repos: catalog });
+    const remove = (name: string) =>
+      repoRow(name).querySelector(`button[aria-label="Remove ${name} from the registry"]`);
+    expect(remove("tools")).not.toBeNull();
+    // What the home repo declares goes when it stops declaring it; the home repo is a setting.
+    expect(remove("api")).toBeNull();
+    expect(remove("web")).toBeNull();
+    expect(remove("notes")).toBeNull();
+  });
+
+  describe("sets", () => {
+    const docs = makeRepo("docs", { declared: true });
+    const sets: RepoSet[] = [
+      { name: "storefront", repo_ids: ["api", "web", "docs"] },
+      { name: "all", repo_ids: ["api", "docs", "tools", "unknown"] },
+    ];
+    const withSets = () => setup({ repos: [home, api, docs, tools, web], sets });
+    const chip = (host: HTMLElement, name: string) =>
+      findByText<HTMLButtonElement>(find(host, '[aria-label="Repo sets"]'), "button", name);
+
+    it("are offered as chips, and none without a home repo that has some", () => {
+      const { host } = withSets();
+      const chips = [...find(host, '[aria-label="Repo sets"]').querySelectorAll("button")];
+      // How many of its repos can be attached, out of how many when some cannot.
+      expect(chips.map((one) => one.textContent)).toEqual(["storefront2/3", "all3"]);
+      expect(chips.map((one) => one.getAttribute("aria-pressed"))).toEqual(["false", "false"]);
+      unmountAll();
+      expect(setup({ repos: catalog }).host.querySelector('[aria-label="Repo sets"]')).toBeNull();
+    });
+
+    it("add their available repos as worktrees to what is selected, and say what was left out", async () => {
+      const { host, pick, start, setRegistry } = withSets();
+      await pick("docs");
+      choose(find<HTMLSelectElement>(host, "ul > li:nth-child(3) select"), "live");
+
+      await click(chip(host, "storefront"));
+      expect(chip(host, "storefront").getAttribute("aria-pressed")).toBe("true");
+      expect(find(host, 'section [role="status"]').textContent).toBe(
+        "storefront: web is not cloned and was left out.",
+      );
+      // Once the missing repo is cloned there is nothing left to say.
+      setRegistry({
+        status: "ready",
+        repos: [home, api, docs, tools, makeRepo("web", { declared: true })],
+      });
+      flush();
+      expect(host.querySelector('section [role="status"]')).toBeNull();
+      // What was selected stays as it was; the set's other repos join as worktrees.
+      expect((await start()).repos).toEqual([
+        { repo_id: "notes", mode: "live" },
+        { repo_id: "docs", mode: "live" },
+        { repo_id: "api", mode: "write" },
+      ]);
+    });
+
+    it("remove their repos when chosen again", async () => {
+      const { host, pick, start } = withSets();
+      await click(chip(host, "all"));
+      // Every repo of storefront that can be attached is selected too.
+      expect(chip(host, "storefront").getAttribute("aria-pressed")).toBe("true");
+      expect(host.querySelector('section [role="status"]')).toBeNull();
+      expect((await start()).repos.map((repo) => repo.repo_id)).toEqual([
+        "notes",
+        "api",
+        "docs",
+        "tools",
+      ]);
+
+      await click(chip(host, "storefront"));
+      expect(chip(host, "storefront").getAttribute("aria-pressed")).toBe("false");
+      expect(chip(host, "all").getAttribute("aria-pressed")).toBe("false");
+      expect((await start()).repos.map((repo) => repo.repo_id)).toEqual(["notes", "tools"]);
+
+      // Unticking one of a set's repos by hand turns the chip off.
+      await click(chip(host, "storefront"));
+      await pick("api");
+      expect(chip(host, "storefront").getAttribute("aria-pressed")).toBe("false");
+    });
+
+    it("say so when none of a set's repos is cloned, and select nothing", async () => {
+      const { host, start } = setup({
+        repos: [home, web, makeMissingRepo("mobile")],
+        sets: [{ name: "apps", repo_ids: ["web", "mobile"] }],
+      });
+      await click(chip(host, "apps"));
+      expect(chip(host, "apps").getAttribute("aria-pressed")).toBe("false");
+      expect(find(host, 'section [role="status"]').textContent).toBe(
+        "apps: web and mobile are not cloned and were left out.",
+      );
+      expect((await start()).repos).toEqual([{ repo_id: "notes", mode: "live" }]);
+    });
+  });
+
+  describe("with many repos", () => {
+    const many = [
+      home,
+      ...["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "Theta"].map((name) =>
+        makeRepo(name),
+      ),
+    ];
+
+    it("gets a filter box from nine repos on, and none below", () => {
+      expect(setup({ repos: many }).host.querySelector('input[type="search"]')).not.toBeNull();
+      unmountAll();
+      expect(
+        setup({ repos: many.slice(0, 8) }).host.querySelector('input[type="search"]'),
+      ).toBeNull();
+    });
+
+    it("filters by name, whatever the case, and keeps what is selected selected", async () => {
+      const { host, names, pick, start } = setup({ repos: many });
+      const filter = control(host, "Filter repos");
+      await pick("beta");
+
+      type(filter, "  ETA ");
+      expect(names()).toEqual(["beta", "zeta", "eta", "Theta"]);
+      await pick("zeta");
+
+      type(filter, "nothing like it");
+      expect(names()).toEqual([]);
+      expect(host.textContent).toContain('No repo matches "nothing like it".');
+
+      type(filter, "");
+      expect(names()).toHaveLength(9);
+      expect((await start()).repos.map((repo) => repo.repo_id)).toEqual(["notes", "beta", "zeta"]);
+    });
+  });
+
+  describe("on a phone", () => {
+    const fold = (host: HTMLElement) =>
+      find<HTMLButtonElement>(host, "section button[aria-controls]");
+    const folded = (host: HTMLElement): boolean => {
+      const body = document.getElementById(fold(host).getAttribute("aria-controls") ?? "");
+      if (!body) throw new Error("the fold controls nothing");
+      return body.hidden === true;
+    };
+
+    it("folds the list behind what is selected, so the prompt and Start stay in reach", async () => {
+      localStorage.setItem(
+        "calin.composer.v2",
+        JSON.stringify({
+          repos: [
+            { repoId: "notes", mode: "live" },
+            { repoId: "api", mode: "write" },
+            { repoId: "tools", mode: "write" },
+          ],
+          permissionMode: "ask",
+        }),
+      );
+      setViewportWidth(PHONE);
+      const { host, start } = setup({ repos: catalog });
+      expect(fold(host).textContent).toContain("notes + 2 repos");
+      expect(fold(host).getAttribute("aria-expanded")).toBe("false");
+      expect(folded(host)).toBe(true);
+      // Nothing of the list stands between the prompt and Start.
+      expect(find(host, "ul").closest("[hidden]")).not.toBeNull();
+
+      // Folded or not, what is selected is what is attached.
+      expect((await start()).repos).toHaveLength(3);
+
+      await click(fold(host));
+      expect(fold(host).getAttribute("aria-expanded")).toBe("true");
+      expect(folded(host)).toBe(false);
+      await click(fold(host));
+      expect(folded(host)).toBe(true);
+    });
+
+    it("folds on the home repo alone, and says so", () => {
+      setViewportWidth(PHONE);
+      const { host } = setup({ repos: catalog });
+      expect(fold(host).textContent).toContain("notes");
+      expect(fold(host).textContent).not.toContain("+");
+      expect(folded(host)).toBe(true);
+    });
+
+    it("stays open while nothing is selected, and under the reader's hand once something is", async () => {
+      setViewportWidth(PHONE);
+      const { host, pick } = setup({ repos: [api, tools] });
+      expect(fold(host).textContent).toContain("none selected");
+      expect(folded(host)).toBe(false);
+
+      await pick("api");
+      await pick("tools");
+      // Picking does not fold the list away mid-choice.
+      expect(folded(host)).toBe(false);
+      expect(fold(host).textContent).toContain("api + 1 repo");
+    });
+
+    it("is not folded on a wide screen", () => {
+      const { host } = setup({ repos: catalog });
+      expect(host.querySelector("section button[aria-controls]")).toBeNull();
+      expect(find(host, "ul").closest("[hidden]")).toBeNull();
+    });
   });
 });
