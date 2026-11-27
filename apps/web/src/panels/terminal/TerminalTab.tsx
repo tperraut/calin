@@ -198,7 +198,7 @@ export function TerminalTab(props: {
         {(end) => (
           <div
             role="status"
-            class="flex flex-wrap items-center gap-2 border-b border-line bg-attention-soft px-3 py-2 text-sm"
+            class="flex flex-wrap items-center gap-2 border-b border-line bg-sunken px-3 py-2 text-sm"
           >
             <p class="min-w-0 flex-1 basis-48">{endText(end())}</p>
             <button type="button" class="btn px-3 text-sm" onClick={restart}>

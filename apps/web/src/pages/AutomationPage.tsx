@@ -327,7 +327,7 @@ function AutomationEditor(props: {
         <span>
           <span class="block font-medium">Enabled</span>
           <span class="block text-xs text-muted">
-            Off, it never fires by itself; Run now still works.
+            When off, it never fires by itself; Run now still works.
           </span>
         </span>
       </label>

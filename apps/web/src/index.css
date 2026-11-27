@@ -164,10 +164,11 @@
     opacity: 0.5;
   }
 
-  /* A toggle that is on. */
+  /* A toggle that is on: filled, so the state does not rest on the hue alone. */
   .btn[aria-pressed="true"] {
     border-color: var(--accent);
-    color: var(--accent);
+    background: var(--accent-soft);
+    color: var(--fg);
   }
 
   .btn-primary {
@@ -187,6 +188,22 @@
     background: var(--sunken);
     color: var(--muted);
     opacity: 1;
+  }
+
+  /* A link of the app's own navigation; the page it leads to, when open, reads as current. */
+  .nav-link {
+    display: flex;
+    min-height: 44px;
+    align-items: center;
+    color: var(--accent);
+    font-size: 0.875rem;
+  }
+
+  .nav-link[aria-current="page"] {
+    color: var(--fg);
+    font-weight: 600;
+    text-decoration: underline 2px var(--accent);
+    text-underline-offset: 6px;
   }
 
   /* One option of a radio group shown as a row of boxes: the checked one carries the accent. */

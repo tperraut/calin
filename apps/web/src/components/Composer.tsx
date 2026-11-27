@@ -385,7 +385,10 @@ export function Composer(props: {
 
       {/* Stays in view while the choices above scroll, so a session is always one tap away. */}
       <div class="sticky bottom-0 flex items-center justify-between gap-3 border-t border-line bg-surface py-3">
-        <p class="text-xs text-muted">Ctrl+Enter (⌘+Enter on a Mac) starts the session.</p>
+        {/* A keyboard shortcut means nothing on a touch screen; there the line only takes room. */}
+        <p class="text-xs text-muted pointer-coarse:invisible">
+          Ctrl+Enter (⌘+Enter on a Mac) starts the session.
+        </p>
         <button
           type="submit"
           form={formId}

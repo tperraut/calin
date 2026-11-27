@@ -183,12 +183,12 @@ function Shell(props: ParentProps) {
                   Calin
                 </a>
                 <span class="flex items-center gap-4">
-                  <a href="/" class="hidden min-h-11 items-center text-sm text-accent lg:flex">
+                  <a href="/" class="nav-link hidden lg:flex">
                     New session
                   </a>
                   <a
                     href="/settings"
-                    class="flex min-h-11 min-w-11 items-center justify-end text-sm text-accent"
+                    class="nav-link min-w-11 justify-end"
                     aria-current={location.pathname === "/settings" ? "page" : undefined}
                   >
                     Settings
@@ -199,14 +199,14 @@ function Shell(props: ParentProps) {
               <div class="flex items-center gap-4 border-b border-line px-3">
                 <a
                   href="/automations"
-                  class="flex min-h-11 items-center text-sm text-accent"
+                  class="nav-link"
                   aria-current={location.pathname.startsWith("/automations") ? "page" : undefined}
                 >
                   Automations
                 </a>
                 <a
                   href="/usage"
-                  class="flex min-h-11 items-center text-sm text-accent"
+                  class="nav-link"
                   aria-current={location.pathname === "/usage" ? "page" : undefined}
                 >
                   Usage
@@ -225,7 +225,8 @@ function Shell(props: ParentProps) {
                 // `min-w-0`: a long unbreakable line in a session (code, a branch name) must
                 // scroll or be cut where it is, not push the side pane out of the window.
                 "flex min-h-0 min-w-0 flex-col lg:flex-1",
-                atHome() ? "max-h-[65dvh] lg:max-h-none" : "flex-1",
+                // Half the phone's height: the list above must show more than a couple of sessions.
+                atHome() ? "max-h-[50dvh] lg:max-h-none" : "flex-1",
               ]}
             >
               {/* A page whose code is fetched on its first visit (see router.ts) shows this meanwhile. */}

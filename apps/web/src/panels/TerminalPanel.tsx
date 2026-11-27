@@ -129,7 +129,7 @@ export default function TerminalPanel(props: PanelProps) {
       <Show when={choosing()}>
         <form
           aria-label="New terminal"
-          class="flex flex-wrap items-end gap-2 border-b border-line bg-attention-soft p-3"
+          class="flex flex-wrap items-end gap-2 border-b border-line bg-sunken p-3"
           onSubmit={(event) => {
             event.preventDefault();
             start(chosenRepo());
