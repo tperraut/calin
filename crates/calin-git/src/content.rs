@@ -21,7 +21,7 @@ pub(crate) fn hash(bytes: &[u8]) -> String {
     hex(Sha256::digest(bytes).as_slice())
 }
 
-fn hex(digest: &[u8]) -> String {
+pub(crate) fn hex(digest: &[u8]) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(digest.len() * 2);
     for byte in digest {

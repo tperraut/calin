@@ -131,23 +131,29 @@ impl SessionManager {
             Some(_) => FileOp::Edit,
             None => FileOp::Create,
         };
-        let (dir, path) = (PathBuf::from(repo.path), path.to_owned());
-        let content = blocking(move || {
-            Ok(calin_git::write_file(
-                &dir,
-                &path,
-                &request.text,
-                request.expected_hash.as_deref(),
-            )?)
-        })
-        .await?;
-        let changed = EventBody::FileChanged {
-            session_repo_id: Some(repo.id),
-            path: content.path.clone(),
-            op,
+        let (dir, path) = (PathBuf::from(&repo.path), path.to_owned());
+        let save = async {
+            let content = blocking(move || {
+                Ok(calin_git::write_file(
+                    &dir,
+                    &path,
+                    &request.text,
+                    request.expected_hash.as_deref(),
+                )?)
+            })
+            .await?;
+            let changed = EventBody::FileChanged {
+                session_repo_id: Some(repo.id.clone()),
+                path: content.path.clone(),
+                op,
+            };
+            self.store()
+                .append(session_id, EventDraft::new(changed))
+                .await?;
+            Ok(content)
         };
-        self.store()
-            .append(session_id, EventDraft::new(changed))
+        let content = self
+            .user_save(session_id, &repo, save, |content| &content.path)
             .await?;
         Ok(content)
     }

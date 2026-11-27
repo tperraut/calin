@@ -89,6 +89,7 @@ mod github;
 mod path;
 mod repo;
 mod setup;
+mod state;
 #[cfg(test)]
 mod testing;
 mod worktree;
@@ -106,4 +107,5 @@ pub use github::{GitHub, PullRequestInfo};
 pub use path::resolve_path;
 pub use repo::{CloneInfo, head_commit, inspect_clone};
 pub use setup::{SetupEnd, SetupRun, run_setup};
+pub use state::{FileState, file_states};
 pub use worktree::{Worktree, WorktreeOutcome, create_worktree, remove_worktree};

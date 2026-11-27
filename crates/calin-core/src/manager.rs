@@ -9,8 +9,10 @@
 
 mod delivery;
 mod driver;
+mod unreported;
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
@@ -157,6 +159,9 @@ struct Inner {
     /// Where agents reach Calin's tools, without the token: known once the
     /// server has bound its port. Until then agents start without tools.
     tool_endpoint: Mutex<Option<String>>,
+    /// What each running agent's repos looked like at its last turn end,
+    /// to find the changes it made without a tool call (`unreported.rs`).
+    trackers: unreported::Trackers,
     /// The command queue of every running driver. Commands are sent and
     /// drivers retire under this lock, so a command is never queued on a
     /// driver that has already decided to end.
@@ -363,6 +368,7 @@ impl SessionManager {
                 watcher: Mutex::new(None),
                 tokens: Arc::default(),
                 tool_endpoint: Mutex::new(None),
+                trackers: Mutex::new(HashMap::new()),
                 drivers: Mutex::new(HashMap::new()),
             }),
         };
@@ -925,6 +931,27 @@ impl SessionManager {
     /// A session, its agents, its repo set and its pull requests.
     pub async fn get(&self, session_id: &str) -> Result<SessionDetail> {
         self.inner.store.session(session_id).await
+    }
+
+    /// Runs `save`, the user's write of a file of `repo` and its record,
+    /// apart from the end of the agent's turn, then brings the snapshot of
+    /// that file up to date: the agent is never credited with the user's
+    /// save. `path` names the file once it is saved.
+    pub(crate) async fn user_save<T>(
+        &self,
+        session_id: &str,
+        repo: &SessionRepo,
+        save: impl Future<Output = Result<T>>,
+        path: impl FnOnce(&T) -> &str,
+    ) -> Result<T> {
+        let Some(mut tracker) = unreported::current(&self.inner.trackers, session_id).await else {
+            return save.await;
+        };
+        let saved = save.await?;
+        if let Err(err) = tracker.saved(repo, path(&saved)).await {
+            tracing::warn!(session = %session_id, repo = %repo.name, %err, "could not take the user's save into the snapshot");
+        }
+        Ok(saved)
     }
 
     /// Hands a command to the session's driver, starting one if the session

@@ -22,6 +22,7 @@ use tokio::sync::{mpsc, oneshot};
 use ulid::Ulid;
 
 use super::delivery::{self, ShipPlan, Shipped};
+use super::unreported::{self, MAX_CHANGES_PER_TURN, Tracker};
 use super::{
     Command, Dispatched, DispatchedRepo, Inner, NoteOutcome, NoteTarget, Reply, SessionManager,
     agent_ended, closed, expired, has_turn, is_closed, no_attaching, no_longer_active, no_shipping,
@@ -900,6 +901,11 @@ impl Driver {
                     {
                         self.notes.push(briefing::attach_note(repo));
                     }
+                    // Tracked from now on, before anyone is told it is there.
+                    let tracker = unreported::tracker(&self.inner.trackers, &self.session_id);
+                    if let (Ok(repo), Some(tracker)) = (&result, tracker) {
+                        tracker.lock().await.attached(&self.session_id, repo).await;
+                    }
                     let _ = attaching.reply.send(result);
                 }
                 self.next_attach().await
@@ -941,6 +947,12 @@ impl Driver {
         self.resume_status().await?;
         // What the agent is handed, which may say more than the user wrote.
         let text = briefing::with_notes(std::mem::take(&mut self.notes), text);
+        // What the repos hold now is not this turn's doing: neither what was
+        // there when the agent starts, nor what the user changed in a
+        // terminal or another editor since its last turn.
+        let mut tracker = unreported::fresh(&self.inner.trackers, &self.session_id).await;
+        unreported::baseline(&mut tracker, &self.session_id, &self.repos).await;
+        drop(tracker);
         if let Some(handle) = &self.handle {
             let sent = handle.send_message(text);
             if sent.is_err() {
@@ -1076,7 +1088,8 @@ impl Driver {
         if !interrupted && let Some(next) = self.pending.pop_front() {
             // The log has no event for the end of a turn but the agent's
             // status: one turn ends and the next begins, each with its cause.
-            self.set_agent_status(AgentStatus::Idle).await?;
+            let ended = self.set_agent_status(AgentStatus::Idle).await?;
+            self.report_unreported(ended).await?;
             self.cause = Some(next.event_id);
             self.set_agent_status(AgentStatus::Running).await?;
             self.resume_status().await?;
@@ -1091,8 +1104,55 @@ impl Driver {
             return Ok(());
         }
         self.in_turn = false;
-        self.set_agent_status(AgentStatus::Idle).await?;
+        let ended = self.set_agent_status(AgentStatus::Idle).await?;
+        self.report_unreported(ended).await?;
         self.rest().await
+    }
+
+    /// Appends a `file_changed` for each change the turn made that no tool
+    /// call reported, caused by `ended`, the event that ended the turn. The
+    /// shell does not say which subagent ran a command: they are the lead's.
+    async fn report_unreported(&mut self, ended: Option<String>) -> Result<()> {
+        let Some(tracker) = unreported::tracker(&self.inner.trackers, &self.session_id) else {
+            return Ok(());
+        };
+        let tracker = tracker.lock_owned().await;
+        self.report_unreported_with(tracker, ended).await
+    }
+
+    async fn report_unreported_with(
+        &mut self,
+        mut tracker: tokio::sync::OwnedMutexGuard<Tracker>,
+        ended: Option<String>,
+    ) -> Result<()> {
+        let repos = self.repos.clone();
+        // Held while appending, so that a save in between is not lost.
+        let found = tracker.end_turn(&self.session_id, &repos).await;
+        let parent = ended.or_else(|| self.cause.clone());
+        for (repo, changes) in found {
+            let more = changes.len().saturating_sub(MAX_CHANGES_PER_TURN);
+            for (path, op) in changes.into_iter().take(MAX_CHANGES_PER_TURN) {
+                let changed = EventBody::FileChanged {
+                    session_repo_id: Some(repo.id.clone()),
+                    path,
+                    op,
+                };
+                self.append(self.by_agent(changed).parent(parent.clone()))
+                    .await?;
+            }
+            if more > 0 {
+                let error = EventBody::Error {
+                    message: format!(
+                        "{more} more files changed in {} during this turn than are listed \
+                         one by one; the Changes view shows them all.",
+                        repo.name
+                    ),
+                };
+                self.append(self.by_agent(error).parent(parent.clone()))
+                    .await?;
+            }
+        }
+        Ok(())
     }
 
     /// The agent has nothing left to do for now: the session is in `review`
@@ -1131,6 +1191,7 @@ impl Driver {
     /// only ever true of that process.
     fn drop_agent(&mut self) {
         self.handle = None;
+        unreported::forget(&self.inner.trackers, &self.session_id);
         self.token = None;
         self.granted.clear();
         // Its next start is told about every repo in its system prompt.
@@ -1138,6 +1199,12 @@ impl Driver {
     }
 
     async fn agent_exited(&mut self) -> Result<()> {
+        // An agent that exits mid-turn ends that turn: what it changed is
+        // looked for once its status says so.
+        let tracker = match unreported::tracker(&self.inner.trackers, &self.session_id) {
+            Some(tracker) if self.in_turn => Some(tracker.lock_owned().await),
+            _ => None,
+        };
         self.drop_agent();
         self.in_turn = false;
         self.interrupted = false;
@@ -1145,7 +1212,10 @@ impl Driver {
         self.expire_permissions().await?;
         // Whatever it left running inside its process went with it.
         self.close_subagents(AgentStatus::Stopped).await?;
-        self.set_agent_status(AgentStatus::Done).await?;
+        let ended = self.set_agent_status(AgentStatus::Done).await?;
+        if let Some(tracker) = tracker {
+            self.report_unreported_with(tracker, ended).await?;
+        }
         match self.pending.pop_front() {
             // Messages are still waiting: the next turn starts the agent again.
             Some(next) => self.begin_turn(next.text, next.event_id).await,
@@ -1506,20 +1576,19 @@ impl Driver {
     }
 
     /// Moves the lead agent to `status`, unless it has none, is already
-    /// there, or has ended for good.
-    async fn set_agent_status(&mut self, status: AgentStatus) -> Result<()> {
+    /// there, or has ended for good. Returns the event's id when one was appended.
+    async fn set_agent_status(&mut self, status: AgentStatus) -> Result<Option<String>> {
         let Some(lead) = &self.lead else {
-            return Ok(());
+            return Ok(None);
         };
         let restarting = status == AgentStatus::Running;
         if lead.status == status || (agent_ended(lead.status) && !restarting) {
-            return Ok(());
+            return Ok(None);
         }
         let draft = self
             .by_agent(EventBody::AgentStatus { status })
             .parent(self.cause.clone());
-        self.append(draft).await?;
-        Ok(())
+        Ok(Some(self.append(draft).await?.id.clone()))
     }
 
     /// A draft attributed to the lead agent, when there is one.
@@ -2127,17 +2196,36 @@ impl Driver {
         if item.status != ItemStatus::Completed {
             return Ok(());
         }
+        let tracker = unreported::tracker(&self.inner.trackers, &self.session_id);
         for location in locations {
             let (session_repo_id, path) = locate(&self.repos, location);
+            // The file as the call left it, so that the turn's end reports
+            // it again only if it changed after this.
+            let repo = session_repo_id
+                .as_ref()
+                .and_then(|id| self.repos.iter().find(|repo| repo.id == *id))
+                .filter(|repo| tracker.is_some() && unreported::is_tracked(repo))
+                .cloned();
+            let state = match repo {
+                Some(repo) => {
+                    let (repo_id, rel) = (repo.id.clone(), path.clone());
+                    let state = blocking(move || Ok(unreported::state_of(&repo, &rel)));
+                    state.await.ok().flatten().map(|state| (repo_id, state))
+                }
+                None => None,
+            };
             let changed = EventBody::FileChanged {
                 session_repo_id,
-                path,
+                path: path.clone(),
                 op,
             };
             // By whoever made the call: the lead or one of its subagents.
             let draft = as_agent(completed.agent_id.clone(), changed);
             self.append(draft.parent(Some(completed.id.clone())))
                 .await?;
+            if let (Some(tracker), Some((repo_id, state))) = (&tracker, state) {
+                tracker.lock().await.reported(&repo_id, &path, state);
+            }
         }
         Ok(())
     }

@@ -21,6 +21,7 @@ use crate::testing::{git, git_repo, write_file};
 mod attach;
 mod orchestration;
 mod shipping;
+mod unreported;
 
 const TIMEOUT: Duration = Duration::from_secs(20);
 

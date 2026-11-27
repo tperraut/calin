@@ -770,14 +770,24 @@ async fn a_child_reports_each_time_it_comes_to_rest_and_the_parent_takes_a_turn_
     assert!(handed.ends_with(&merge), "{handed}");
 
     let child_events = until_label(&manager, &child.id, child_before, "message_sent:report").await;
+    // The commit was made through the shell: the turn's end finds it.
     assert_eq!(
         labels(&child_events),
         [
             "agent_status:idle",
+            "file_changed:create",
             "session_status:review",
             "message_sent:report"
         ]
     );
+    assert_eq!(
+        child_events[1].parent_id.as_ref(),
+        Some(&child_events[0].id)
+    );
+    assert!(matches!(
+        &child_events[1].body,
+        EventBody::FileChanged { path, op: FileOp::Create, .. } if path == "docs.md"
+    ));
     let (sent_event, report) = sent(&child_events)[0];
     assert_eq!(sent_event.agent_id.as_ref(), Some(&child.agent.agent_id));
     assert_eq!(report.kind, MessageKind::Report);
