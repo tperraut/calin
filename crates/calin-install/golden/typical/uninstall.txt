@@ -1,0 +1,21 @@
+1. Stop Calin and keep it from starting at boot [root]
+   systemctl disable --now calin.service
+2. Remove the unit [root]
+   rm -f /etc/systemd/system/calin.service
+3. Make systemd forget the unit [root]
+   systemctl daemon-reload
+4. Remove the environment file, which holds the client secret [root]
+   rm -f /etc/calin/calin.env && rmdir --ignore-fail-on-non-empty /etc/calin
+5. Remove the Caddy site [root]
+   rm -f /etc/caddy/conf.d/calin.caddy
+6. Reload Caddy so it stops serving the domain (the import line in /etc/caddy/Caddyfile can stay) [root]
+   systemctl reload caddy
+7. Kept: the data directory /var/lib/calin, the repositories in /srv/calin, and the user `calin` with its agent logins
+
+Optional and destructive: run these only to erase everything. They cannot be undone.
+1. Delete Calin's data: sessions, their logs, sign-in sessions and device tokens [root]
+   rm -rf /var/lib/calin
+2. Delete /srv/calin and every repository in it, with any work not pushed [root]
+   rm -rf /srv/calin
+3. Delete the user `calin` and its home, with the agent CLIs' logins [root]
+   userdel --remove calin

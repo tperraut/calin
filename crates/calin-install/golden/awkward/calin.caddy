@@ -1,0 +1,18 @@
+# Calin, written by `calin server install`. Re-run it rather than editing this file.
+# The main Caddyfile loads it with: import /etc/caddy/conf.d/*.caddy
+#
+# Calin's Host and Origin guards and its rate limits rely on two things Caddy does by
+# default: it passes the Host header through unchanged and it sets X-Forwarded-For.
+# Another proxy put in Caddy's place must do both, or Calin refuses its requests.
+
+# The site address alone gives automatic HTTPS: a certificate and a redirect from HTTP.
+agents.dev-box.example.org {
+	# Enough for a file saved from the editor; larger bodies are refused.
+	request_body {
+		max_size 10MB
+	}
+	encode zstd gzip
+	# WebSocket upgrades pass through as they are. No cache directives for /api or /auth:
+	# Calin sets its own Cache-Control headers.
+	reverse_proxy 127.0.0.1:18080
+}

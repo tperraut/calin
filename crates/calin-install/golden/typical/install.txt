@@ -1,0 +1,25 @@
+1. Create the service user `calin` with a home directory and no login shell [root]
+   id -u calin >/dev/null 2>&1 || useradd --system --user-group --create-home --home-dir /home/calin --shell /usr/sbin/nologin calin
+2. Create the data directory, owned by the service user [root]
+   install -d -m 0750 -o calin -g calin /var/lib/calin
+3. Create the directories for repositories, owned by the service user [root]
+   install -d -m 0750 -o calin -g calin /srv/calin
+4. Create the configuration directories [root]
+   install -d -m 0755 -o root -g root /etc/calin /etc/caddy/conf.d
+5. Install /etc/systemd/system/calin.service [root]
+   install -m 0644 -o root -g root /root/calin-staging/calin.service /etc/systemd/system/calin.service
+6. Install /etc/calin/calin.env [root]
+   install -m 0600 -o root -g root /root/calin-staging/calin.env /etc/calin/calin.env
+7. Install /etc/caddy/conf.d/calin.caddy [root]
+   install -m 0644 -o root -g root /root/calin-staging/calin.caddy /etc/caddy/conf.d/calin.caddy
+8. Make the main Caddyfile load /etc/caddy/conf.d (adds the import line once) [root]
+   grep -qxF 'import /etc/caddy/conf.d/*.caddy' /etc/caddy/Caddyfile || echo 'import /etc/caddy/conf.d/*.caddy' >> /etc/caddy/Caddyfile
+9. Make systemd read the new unit [root]
+   systemctl daemon-reload
+10. Start Calin now and at every boot [root]
+   systemctl enable --now calin.service
+11. Reload Caddy so it serves the domain and obtains its certificate [root]
+   systemctl reload caddy
+12. Sign in the agent CLIs as `calin`: in Calin's own terminal after your first sign-in, or here (then `gh auth login` the same way) [root]
+   sudo -u calin -H claude
+13. Register https://calin.example.com/auth/callback as a redirect URI with your identity provider

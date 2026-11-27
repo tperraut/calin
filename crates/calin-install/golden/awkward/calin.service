@@ -1,0 +1,51 @@
+# Calin, written by `calin server install`. Re-run it rather than editing this file.
+# docs/specs/2026-11-27-remote-access.md, section 5.
+
+[Unit]
+Description=Calin, a self-hosted orchestrator for coding agents
+# Sign-in fetches the provider's metadata at startup: wait for a configured network.
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+# A dedicated unprivileged user: agents and their shells run as it.
+User=agents
+Group=agents
+WorkingDirectory=/var/lib/agents-home
+# Public mode settings (spec section 2). Root-only, mode 0600: it holds the client secret.
+EnvironmentFile=/etc/calin/calin.env
+# Agent CLIs installed per user (Claude Code's installer, for one) live in ~/.local/bin.
+Environment=PATH=/var/lib/agents-home/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+# Loopback only: the reverse proxy is the only way in (spec section 1).
+ExecStart=/opt/calin/bin/calin serve --bind 127.0.0.1:18080 --home /srv/agents/data
+Restart=on-failure
+RestartSec=5s
+# A stop signals every process of the service, so no agent or shell outlives it.
+KillMode=control-group
+
+# Hardening that leaves agents able to build, test and reach the network.
+# No privilege gain through setuid binaries or file capabilities.
+NoNewPrivileges=yes
+# A private /tmp and /var/tmp, emptied when the service stops.
+PrivateTmp=yes
+# The whole file system is read-only except the paths below.
+ProtectSystem=strict
+# Calin's data, the repositories, and the home where agent CLIs keep their logins.
+ReadWritePaths=/srv/agents/data /srv/agents/repos /opt/work /var/lib/agents-home
+# No writes to /proc/sys and /sys, no kernel modules, a read-only cgroup tree.
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+# No new setuid or setgid files, no personality switches, no realtime scheduling.
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictRealtime=yes
+# Left out on purpose:
+# ProtectHome would hide the service user's home, where agents keep logins and caches.
+# PrivateNetwork would cut agents off from their APIs, git remotes and package registries.
+# MemoryDenyWriteExecute breaks JIT runtimes such as Node.js (which runs Claude Code) and the JVM.
+# A restrictive SystemCallFilter breaks compilers, package managers and test tools.
+
+[Install]
+WantedBy=multi-user.target
