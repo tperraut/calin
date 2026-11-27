@@ -10,8 +10,9 @@ mod writer;
 mod tests;
 
 use std::sync::Arc;
+use std::time::Instant;
 
-use calin_proto::{Event, EventBody, Session, SessionDetail};
+use calin_proto::{AttachRepoRequest, Event, EventBody, PermissionMode, Session, SessionDetail};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use self::writer::{Cmd, Writer};
@@ -28,6 +29,30 @@ pub struct NewSession {
     pub title: String,
     pub prompt: String,
     pub runner: String,
+    pub permission_mode: PermissionMode,
+    /// The model the request asked for, if any.
+    pub model: Option<String>,
+    /// The repos the request asked for, in order.
+    pub repos: Vec<AttachRepoRequest>,
+}
+
+/// What a session was asked to run with, beyond what [`Session`] carries.
+/// Kept so the agent can be started again the way it was first started.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SessionSetup {
+    pub model: Option<String>,
+    pub repos: Vec<AttachRepoRequest>,
+}
+
+/// A permission request nobody answered yet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenPermission {
+    pub session_id: String,
+    pub request_id: String,
+    /// The agent that asked.
+    pub agent_id: Option<String>,
+    /// The `permission_requested` event.
+    pub event_id: String,
 }
 
 /// An event before the store gives it an id, a sequence number and a timestamp.
@@ -107,9 +132,12 @@ impl Store {
         let (commands, receiver) = mpsc::channel(COMMAND_BUFFER);
         let (ready, opened) = oneshot::channel();
         let writer_home = home.clone();
+        let (timer, wake_ups) = mpsc::unbounded_channel();
+        // Weak, so the timer never keeps the writer alive after the last handle.
+        tokio::spawn(run_timer(wake_ups, commands.downgrade()));
         std::thread::Builder::new()
             .name("calin-store".to_owned())
-            .spawn(move || match Writer::open(writer_home) {
+            .spawn(move || match Writer::open(writer_home, timer) {
                 Ok(writer) => {
                     let _ = ready.send(Ok(()));
                     writer.run(receiver);
@@ -185,7 +213,8 @@ impl Store {
     }
 
     /// Every session, newest first, and the upserts that follow: one when a
-    /// session is created and one each time its status changes.
+    /// session is created, one each time its status changes, and at most
+    /// about one a second while other events arrive.
     pub async fn subscribe_sessions(&self) -> Result<(Vec<Session>, Live<Session>)> {
         let (sessions, receiver) = self.call(|reply| Cmd::SubscribeSessions { reply }).await?;
         Ok((sessions, Live { receiver }))
@@ -196,10 +225,47 @@ impl Store {
         self.call(|reply| Cmd::Sessions { reply }).await
     }
 
-    /// A session and its agents in spawn order.
+    /// A session, its agents in spawn order and its repo set, primary first.
     pub async fn session(&self, session_id: &str) -> Result<SessionDetail> {
         let session_id = session_id.to_owned();
         self.call(|reply| Cmd::Session { session_id, reply }).await
+    }
+
+    /// What the session was created with that [`Session`] does not carry.
+    pub async fn setup(&self, session_id: &str) -> Result<SessionSetup> {
+        let session_id = session_id.to_owned();
+        self.call(|reply| Cmd::Setup { session_id, reply }).await
+    }
+
+    /// True when the repo is attached to a session that is not `done`,
+    /// `failed` or `cancelled`.
+    pub async fn repo_in_use(&self, repo_id: &str) -> Result<bool> {
+        let repo_id = repo_id.to_owned();
+        self.call(|reply| Cmd::RepoInUse { repo_id, reply }).await
+    }
+
+    /// Whether a permission request was answered. `None` when the session
+    /// never had a request with this id.
+    pub async fn permission_resolved(
+        &self,
+        session_id: &str,
+        request_id: &str,
+    ) -> Result<Option<bool>> {
+        let (session_id, request_id) = (session_id.to_owned(), request_id.to_owned());
+        self.call(|reply| Cmd::PermissionResolved {
+            session_id,
+            request_id,
+            reply,
+        })
+        .await
+    }
+
+    /// The permission requests still waiting for an answer, oldest first:
+    /// those of one session, or of every session when `session_id` is `None`.
+    pub async fn open_permissions(&self, session_id: Option<&str>) -> Result<Vec<OpenPermission>> {
+        let session_id = session_id.map(str::to_owned);
+        self.call(|reply| Cmd::OpenPermissions { session_id, reply })
+            .await
     }
 
     async fn call<T>(&self, command: impl FnOnce(oneshot::Sender<Result<T>>) -> Cmd) -> Result<T> {
@@ -209,5 +275,22 @@ impl Store {
             .await
             .map_err(|_| Error::Closed)?;
         answer.await.map_err(|_| Error::Closed)?
+    }
+}
+
+/// Turns each wake-up the writer asks for into a [`Cmd::FlushUpserts`] at
+/// that instant. Ends when the writer or the last store handle is gone.
+async fn run_timer(
+    mut wake_ups: mpsc::UnboundedReceiver<Instant>,
+    commands: mpsc::WeakSender<Cmd>,
+) {
+    while let Some(due) = wake_ups.recv().await {
+        tokio::time::sleep_until(due.into()).await;
+        let Some(commands) = commands.upgrade() else {
+            return;
+        };
+        if commands.send(Cmd::FlushUpserts).await.is_err() {
+            return;
+        }
     }
 }

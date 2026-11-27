@@ -1,33 +1,36 @@
-//! The session manager: creates sessions, runs their lead agent and turns
-//! what the agent says into appended events.
+//! The session manager: creates sessions and hands every command for one to
+//! its driver, which prepares the session's repos, runs its lead agent and
+//! turns what the agent says into appended events.
 //!
-//! Each session that may still run an agent has one driver task. Everything
-//! that changes the session goes through that task, one step at a time, so
-//! the order of a session's events never depends on a race.
+//! Each session that may still run an agent has one driver task (see
+//! `driver.rs`). Everything that changes the session goes through that task,
+//! one step at a time, so the order of a session's events never depends on a
+//! race.
 
-use std::collections::{HashMap, VecDeque};
+mod driver;
+
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
 
-use calin_agents::{AgentHandle, Exit, Runner, RunnerOutput, RunnerRegistry, StartParams};
+use calin_agents::{Runner, RunnerRegistry};
 use calin_proto::{
-    Agent, AgentKind, AgentStatus, CreateSessionRequest, Event, EventBody, Session, SessionDetail,
-    SessionStatus,
+    AgentStatus, CreateSessionRequest, DecisionSource, EventBody, PermissionDecision,
+    RegisterRepoRequest, Repo, Session, SessionDetail, SessionStatus,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
-use ulid::Ulid;
 
+use self::driver::Driver;
 use crate::error::{Error, Result};
+use crate::repos::{RepoRegistry, Reservation};
 use crate::store::{EventDraft, NewSession, Store};
 use crate::title::default_title;
 
-/// How long a stopped agent may take to exit before it is dropped.
-const STOP_GRACE: Duration = Duration::from_secs(5);
-const LEAD_ROLE: &str = "lead";
 const RESTART_REASON: &str = "server restarted";
+/// Recorded with a request that nobody answered while it could be answered.
+const EXPIRED_MESSAGE: &str = "the turn ended before this request was answered";
 
-type Reply = oneshot::Sender<Result<()>>;
+type Reply<T = ()> = oneshot::Sender<Result<T>>;
 type Drivers = HashMap<String, DriverHandle>;
 
 /// How the manager reaches a session's driver.
@@ -44,6 +47,7 @@ pub struct SessionManager {
 struct Inner {
     store: Store,
     registry: RunnerRegistry,
+    repos: RepoRegistry,
     /// The command queue of every running driver. Commands are sent and
     /// drivers retire under this lock, so a command is never queued on a
     /// driver that has already decided to end.
@@ -59,36 +63,59 @@ impl Inner {
 }
 
 enum Command {
-    /// Run the first turn of a session that was just created.
+    /// Record the prompt of a session that was just created, answer with the
+    /// session as it is then, and go on to prepare its repos and run its
+    /// first turn.
     Start {
         runner: Arc<dyn Runner>,
-        reply: Reply,
+        reservation: Option<Reservation>,
+        reply: Reply<SessionDetail>,
     },
     Message {
         text: String,
         reply: Reply,
     },
+    Interrupt {
+        reply: Reply,
+    },
     Stop {
+        reply: Reply,
+    },
+    Permission {
+        request_id: String,
+        decision: PermissionDecision,
+        message: Option<String>,
         reply: Reply,
     },
 }
 
 impl Command {
-    fn reply(self, result: Result<()>) {
-        let (Self::Start { reply, .. } | Self::Message { reply, .. } | Self::Stop { reply }) = self;
+    fn refuse(self, err: Error) {
         // The caller may have stopped waiting.
-        let _ = reply.send(result);
+        match self {
+            Self::Start { reply, .. } => {
+                let _ = reply.send(Err(err));
+            }
+            Self::Message { reply, .. }
+            | Self::Interrupt { reply }
+            | Self::Stop { reply }
+            | Self::Permission { reply, .. } => {
+                let _ = reply.send(Err(err));
+            }
+        }
     }
 }
 
 impl SessionManager {
-    /// Wraps the store and fails the sessions that a previous process left
-    /// in the middle of their work.
+    /// Wraps the store, loads the repo registry and settles the sessions
+    /// that a previous process left in the middle of their work.
     pub async fn start(store: Store, registry: RunnerRegistry) -> Result<Self> {
+        let repos = RepoRegistry::load(store.home().repos_path()).await;
         let manager = Self {
             inner: Arc::new(Inner {
                 store,
                 registry,
+                repos,
                 drivers: Mutex::new(HashMap::new()),
             }),
         };
@@ -104,7 +131,30 @@ impl SessionManager {
         &self.inner.registry
     }
 
-    /// Creates a session and starts its lead agent on the prompt.
+    /// Every registered repo, by name.
+    pub async fn list_repos(&self) -> Vec<Repo> {
+        self.inner.repos.list().await
+    }
+
+    /// Registers a local clone. `Invalid` when the path is not the root of a
+    /// git work tree or the name cannot be a folder name, `Conflict` when
+    /// the name or the clone is already registered.
+    pub async fn register_repo(&self, request: RegisterRepoRequest) -> Result<Repo> {
+        self.inner
+            .repos
+            .register(&request.path, request.name.as_deref())
+            .await
+    }
+
+    /// Forgets a repo; nothing on disk is touched. `Conflict` while it is
+    /// attached to a session that is not `done`, `failed` or `cancelled`.
+    pub async fn remove_repo(&self, repo_id: &str) -> Result<()> {
+        self.inner.repos.remove(repo_id, &self.inner.store).await
+    }
+
+    /// Creates a session and returns it as soon as its prompt is recorded,
+    /// with status `queued`. Its repos are then prepared and its lead agent
+    /// started in the background; both show up as events.
     pub async fn create_session(&self, request: CreateSessionRequest) -> Result<SessionDetail> {
         if request.prompt.trim().is_empty() {
             return Err(Error::Invalid("the prompt must not be blank".to_owned()));
@@ -118,6 +168,21 @@ impl SessionManager {
             .map(|title| title.trim().to_owned())
             .filter(|title| !title.is_empty())
             .unwrap_or_else(|| default_title(&request.prompt));
+        let model = request
+            .model
+            .map(|model| model.trim().to_owned())
+            .filter(|model| !model.is_empty());
+        // Before anything is created: every repo must exist, once.
+        let reservation = if request.repos.is_empty() {
+            None
+        } else {
+            let ids: Vec<&str> = request
+                .repos
+                .iter()
+                .map(|repo| repo.repo_id.as_str())
+                .collect();
+            Some(self.inner.repos.reserve(&ids).await?)
+        };
         let session = self
             .inner
             .store
@@ -126,30 +191,75 @@ impl SessionManager {
                 prompt: request.prompt,
                 // The runner that actually runs, which in dry run is the mock.
                 runner: runner.id().to_owned(),
+                permission_mode: request.permission_mode.unwrap_or_default(),
+                model,
+                repos: request.repos,
             })
             .await?;
-        self.command(&session.id, |reply| Command::Start { runner, reply })
-            .await?;
-        self.get(&session.id).await
+        self.command(&session.id, |reply| Command::Start {
+            runner,
+            reservation,
+            reply,
+        })
+        .await
     }
 
     /// Sends user text to the session's lead agent. It starts a turn right
-    /// away, or after the current one when the agent is busy.
+    /// away, or after the current one when the agent is busy. On a `failed`
+    /// or `cancelled` session the agent is started again and continues its
+    /// conversation.
     pub async fn send_message(&self, session_id: &str, text: &str) -> Result<()> {
         if text.trim().is_empty() {
             return Err(Error::Invalid("the message must not be blank".to_owned()));
         }
-        self.ensure_open(session_id).await?;
+        let status = self.get(session_id).await?.session.status;
+        if !takes_messages(status) {
+            return Err(closed(status));
+        }
         let text = text.to_owned();
         self.command(session_id, |reply| Command::Message { text, reply })
             .await
     }
 
+    /// Asks the agent to end its current turn. The session returns to
+    /// `review` when the agent has done so.
+    pub async fn interrupt(&self, session_id: &str) -> Result<()> {
+        let status = self.get(session_id).await?.session.status;
+        if !has_turn(status) {
+            return Err(no_turn(status));
+        }
+        self.command(session_id, |reply| Command::Interrupt { reply })
+            .await
+    }
+
     /// Ends the session's agent and cancels the session.
     pub async fn stop(&self, session_id: &str) -> Result<()> {
-        self.ensure_open(session_id).await?;
+        let status = self.get(session_id).await?.session.status;
+        if is_closed(status) {
+            return Err(closed(status));
+        }
         self.command(session_id, |reply| Command::Stop { reply })
             .await
+    }
+
+    /// Answers a permission request. `Missing` when the session never had
+    /// such a request, `Conflict` when it was already answered.
+    pub async fn resolve_permission(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        decision: PermissionDecision,
+        message: Option<String>,
+    ) -> Result<()> {
+        self.get(session_id).await?;
+        let request_id = request_id.to_owned();
+        self.command(session_id, |reply| Command::Permission {
+            request_id,
+            decision,
+            message,
+            reply,
+        })
+        .await
     }
 
     /// Ends every agent without recording anything, for a clean exit. The
@@ -168,22 +278,18 @@ impl SessionManager {
         self.inner.store.sessions().await
     }
 
-    /// A session and its agents.
+    /// A session, its agents and its repo set.
     pub async fn get(&self, session_id: &str) -> Result<SessionDetail> {
         self.inner.store.session(session_id).await
     }
 
-    async fn ensure_open(&self, session_id: &str) -> Result<()> {
-        let status = self.get(session_id).await?.session.status;
-        if is_closed(status) {
-            return Err(closed(status));
-        }
-        Ok(())
-    }
-
     /// Hands a command to the session's driver, starting one if the session
     /// has none (after a restart, or once its agent exited).
-    async fn command(&self, session_id: &str, make: impl FnOnce(Reply) -> Command) -> Result<()> {
+    async fn command<T>(
+        &self,
+        session_id: &str,
+        make: impl FnOnce(Reply<T>) -> Command,
+    ) -> Result<T> {
         let (reply, answer) = oneshot::channel();
         let command = make(reply);
         {
@@ -198,45 +304,52 @@ impl SessionManager {
                 drivers.insert(session_id.to_owned(), driver);
             }
         }
-        // A driver that ended before answering found the session closed.
+        // A driver that ended before answering could not go on.
         answer.await.unwrap_or_else(|_| Err(no_longer_active()))
     }
 
     fn spawn_driver(&self, session_id: &str) -> DriverHandle {
         let (sender, commands) = mpsc::unbounded_channel();
-        let driver = Driver {
-            inner: Arc::clone(&self.inner),
-            session_id: session_id.to_owned(),
-            commands,
-            status: SessionStatus::Queued,
-            prompt: String::new(),
-            runner_id: String::new(),
-            head_seq: 0,
-            runner: None,
-            lead: None,
-            handle: None,
-            in_turn: false,
-            cause: None,
-            pending: VecDeque::new(),
-        };
+        let driver = Driver::new(Arc::clone(&self.inner), session_id.to_owned(), commands);
         DriverHandle {
             commands: sender,
             task: tokio::spawn(driver.run()),
         }
     }
 
-    /// A session that was queued, preparing or running when the process
-    /// started lost its agent with the previous process.
+    /// A session that was queued, preparing, running or waiting when the
+    /// process started lost its agent with the previous process, and a
+    /// permission request left open has nobody waiting for its answer.
     async fn recover(&self) -> Result<()> {
         let store = &self.inner.store;
+        let mut open: HashMap<String, Vec<_>> = HashMap::new();
+        for request in store.open_permissions(None).await? {
+            open.entry(request.session_id.clone())
+                .or_default()
+                .push(request);
+        }
         for session in store.sessions().await? {
-            if !matches!(
+            let lost = matches!(
                 session.status,
-                SessionStatus::Queued | SessionStatus::Preparing | SessionStatus::Running
-            ) {
+                SessionStatus::Queued
+                    | SessionStatus::Preparing
+                    | SessionStatus::Running
+                    | SessionStatus::Waiting
+            );
+            let requests = open.remove(&session.id).unwrap_or_default();
+            if !lost && requests.is_empty() {
                 continue;
             }
             let result = async {
+                for request in requests {
+                    let mut closing =
+                        EventDraft::new(expired(request.request_id)).parent(Some(request.event_id));
+                    closing.agent_id = request.agent_id;
+                    store.append(&session.id, closing).await?;
+                }
+                if !lost {
+                    return Ok(());
+                }
                 for agent in store.session(&session.id).await?.agents {
                     if !agent_ended(agent.status) {
                         let failed = EventBody::AgentStatus {
@@ -251,12 +364,13 @@ impl SessionManager {
                     status: SessionStatus::Failed,
                     reason: Some(RESTART_REASON.to_owned()),
                 };
-                store.append(&session.id, EventDraft::new(failed)).await
+                store.append(&session.id, EventDraft::new(failed)).await?;
+                Ok::<(), Error>(())
             }
             .await;
             match result {
-                Ok(_) => {
-                    tracing::info!(session = %session.id, "failed a session cut short by a restart");
+                Ok(()) => {
+                    tracing::info!(session = %session.id, "settled a session cut short by a restart");
                 }
                 // One broken session must not keep the server from starting.
                 Err(err) => {
@@ -268,12 +382,23 @@ impl SessionManager {
     }
 }
 
-/// True once nothing can be sent to the session any more.
+/// True once the session is over for good or until the user continues it.
 fn is_closed(status: SessionStatus) -> bool {
     matches!(
         status,
         SessionStatus::Done | SessionStatus::Failed | SessionStatus::Cancelled
     )
+}
+
+/// Everything but `done` takes a message: a `failed` or `cancelled` session
+/// is continued by one (the semantics in `calin-proto/src/api.rs`).
+fn takes_messages(status: SessionStatus) -> bool {
+    status != SessionStatus::Done
+}
+
+/// True while an agent's turn is in progress.
+fn has_turn(status: SessionStatus) -> bool {
+    matches!(status, SessionStatus::Running | SessionStatus::Waiting)
 }
 
 fn agent_ended(status: AgentStatus) -> bool {
@@ -283,384 +408,32 @@ fn agent_ended(status: AgentStatus) -> bool {
     )
 }
 
+fn status_name(status: SessionStatus) -> String {
+    format!("{status:?}").to_lowercase()
+}
+
 fn closed(status: SessionStatus) -> Error {
-    let name = format!("{status:?}").to_lowercase();
-    Error::Conflict(format!("the session is {name}"))
+    Error::Conflict(format!("the session is {}", status_name(status)))
+}
+
+fn no_turn(status: SessionStatus) -> Error {
+    Error::Conflict(format!(
+        "there is no turn to interrupt: the session's status is {}",
+        status_name(status)
+    ))
 }
 
 fn no_longer_active() -> Error {
     Error::Conflict("the session is no longer active".to_owned())
 }
 
-/// The lead agent as the driver knows it.
-struct Lead {
-    id: String,
-    status: AgentStatus,
-}
-
-/// A user message waiting for the current turn to end.
-struct Queued {
-    text: String,
-    event_id: String,
-}
-
-/// The driver hit a storage error and cannot go on.
-struct Halt;
-
-enum Step {
-    Command(Command),
-    Output(Option<RunnerOutput>),
-}
-
-struct Driver {
-    inner: Arc<Inner>,
-    session_id: String,
-    commands: mpsc::UnboundedReceiver<Command>,
-    status: SessionStatus,
-    prompt: String,
-    runner_id: String,
-    head_seq: u64,
-    runner: Option<Arc<dyn Runner>>,
-    lead: Option<Lead>,
-    /// The running agent. `None` before the first turn, after the agent
-    /// exited and after a restart; the next turn starts it (again).
-    handle: Option<AgentHandle>,
-    in_turn: bool,
-    /// The user message the current turn answers: the parent of its events.
-    cause: Option<String>,
-    pending: VecDeque<Queued>,
-}
-
-impl Driver {
-    async fn run(mut self) {
-        let retired = self.drive().await;
-        if !retired {
-            self.inner.drivers().remove(&self.session_id);
-        }
-        // Off the map, so nothing new arrives; what is queued came too late.
-        self.commands.close();
-        while let Ok(command) = self.commands.try_recv() {
-            command.reply(Err(if is_closed(self.status) {
-                closed(self.status)
-            } else {
-                no_longer_active()
-            }));
-        }
-    }
-
-    /// Runs until the session closes or has no agent and nothing to do.
-    /// Returns true when the driver already took itself off the map.
-    async fn drive(&mut self) -> bool {
-        match self.inner.store.session(&self.session_id).await {
-            Ok(detail) => self.adopt(detail),
-            Err(err) => {
-                tracing::error!(session = %self.session_id, %err, "could not load the session");
-                return false;
-            }
-        }
-        loop {
-            if is_closed(self.status) {
-                return false;
-            }
-            let step = match self.handle.as_mut() {
-                Some(handle) => tokio::select! {
-                    command = self.commands.recv() => match command {
-                        Some(command) => Step::Command(command),
-                        None => return false,
-                    },
-                    output = handle.next_output() => Step::Output(output),
-                },
-                None => match self.commands.try_recv() {
-                    Ok(command) => Step::Command(command),
-                    Err(_) => {
-                        let mut drivers = self.inner.drivers();
-                        if self.commands.is_empty() {
-                            drivers.remove(&self.session_id);
-                            return true;
-                        }
-                        continue;
-                    }
-                },
-            };
-            let result = match step {
-                Step::Command(command) => self.on_command(command).await,
-                Step::Output(output) => self.on_output(output).await.map_err(|err| {
-                    tracing::error!(session = %self.session_id, %err, "could not record agent output");
-                    Halt
-                }),
-            };
-            if result.is_err() {
-                return false;
-            }
-        }
-    }
-
-    fn adopt(&mut self, detail: SessionDetail) {
-        self.status = detail.session.status;
-        self.prompt = detail.session.prompt;
-        self.runner_id = detail.session.runner;
-        self.head_seq = detail.session.head_seq;
-        self.lead = detail
-            .agents
-            .into_iter()
-            .rev()
-            .find(|agent| agent.role == LEAD_ROLE)
-            .map(|agent| Lead {
-                id: agent.id,
-                status: agent.status,
-            });
-    }
-
-    async fn on_command(&mut self, command: Command) -> std::result::Result<(), Halt> {
-        let (result, reply) = match command {
-            Command::Start { runner, reply } => {
-                self.runner = Some(runner);
-                (self.first_turn().await, reply)
-            }
-            Command::Message { text, reply } => (self.message(text).await, reply),
-            Command::Stop { reply } => (self.stop().await, reply),
-        };
-        let halt = match &result {
-            Ok(()) => Ok(()),
-            Err(err) => {
-                tracing::error!(session = %self.session_id, %err, "session command failed");
-                Err(Halt)
-            }
-        };
-        let _ = reply.send(result);
-        halt
-    }
-
-    async fn on_output(&mut self, output: Option<RunnerOutput>) -> Result<()> {
-        match output {
-            Some(RunnerOutput::Event(body)) => self.append_from_agent(body).await,
-            Some(RunnerOutput::TurnEnded) => self.turn_ended().await,
-            Some(RunnerOutput::Exited(Exit::Ok)) => {
-                self.handle = None;
-                self.in_turn = false;
-                self.set_agent_status(AgentStatus::Done).await?;
-                match self.pending.pop_front() {
-                    // Messages are still waiting: the next turn starts the agent again.
-                    Some(next) => self.begin_turn(next.text, next.event_id).await,
-                    None if self.status != SessionStatus::Review => {
-                        self.set_status(SessionStatus::Review, None).await
-                    }
-                    None => Ok(()),
-                }
-            }
-            Some(RunnerOutput::Exited(Exit::Error(message))) => self.fail(message).await,
-            None => {
-                self.fail("the agent ended without a result".to_owned())
-                    .await
-            }
-        }
-    }
-
-    async fn first_turn(&mut self) -> Result<()> {
-        self.set_status(SessionStatus::Queued, None).await?;
-        let prompt = self.prompt.clone();
-        let message = self
-            .append(EventDraft::new(EventBody::UserMessage {
-                text: prompt.clone(),
-            }))
-            .await?;
-        self.begin_turn(prompt, message.id.clone()).await
-    }
-
-    async fn message(&mut self, text: String) -> Result<()> {
-        let message = self
-            .append(EventDraft::new(EventBody::UserMessage {
-                text: text.clone(),
-            }))
-            .await?;
-        if self.in_turn {
-            self.pending.push_back(Queued {
-                text,
-                event_id: message.id.clone(),
-            });
-            Ok(())
-        } else {
-            self.begin_turn(text, message.id.clone()).await
-        }
-    }
-
-    /// Starts a turn on `text`, starting the agent first if it is not running.
-    async fn begin_turn(&mut self, text: String, cause: String) -> Result<()> {
-        self.cause = Some(cause);
-        if self.status != SessionStatus::Running {
-            self.set_status(SessionStatus::Running, None).await?;
-        }
-        if let Some(handle) = &self.handle {
-            let sent = handle.send_message(text);
-            if sent.is_err() {
-                return self.fail("the agent is no longer running".to_owned()).await;
-            }
-            self.set_agent_status(AgentStatus::Running).await?;
-        } else {
-            let runner = self
-                .runner
-                .clone()
-                .or_else(|| self.inner.registry.resolve(Some(&self.runner_id)));
-            let Some(runner) = runner else {
-                let message = format!("runner {} is not available", self.runner_id);
-                return self.fail(message).await;
-            };
-            let agent_id = match &self.lead {
-                Some(lead) => lead.id.clone(),
-                None => Ulid::generate().to_string(),
-            };
-            let started = runner.start(StartParams {
-                session_id: self.session_id.clone(),
-                agent_id: agent_id.clone(),
-                prompt: text,
-                resume: self.lead.is_some(),
-                start_seq: self.head_seq,
-            });
-            match started {
-                Ok(handle) => self.handle = Some(handle),
-                Err(err) => return self.fail(err.to_string()).await,
-            }
-            if self.lead.is_some() {
-                self.set_agent_status(AgentStatus::Running).await?;
-            } else {
-                let agent = Agent {
-                    id: agent_id.clone(),
-                    session_id: self.session_id.clone(),
-                    parent_agent_id: None,
-                    kind: AgentKind::Process,
-                    role: LEAD_ROLE.to_owned(),
-                    runner: runner.id().to_owned(),
-                    model: runner.model(),
-                    status: AgentStatus::Running,
-                    cost_usd: 0.0,
-                    tokens_in: 0,
-                    tokens_out: 0,
-                };
-                let spawned = EventBody::AgentSpawned { agent };
-                self.append(EventDraft::new(spawned).parent(self.cause.clone()))
-                    .await?;
-                self.lead = Some(Lead {
-                    id: agent_id,
-                    status: AgentStatus::Running,
-                });
-            }
-        }
-        self.in_turn = true;
-        Ok(())
-    }
-
-    async fn turn_ended(&mut self) -> Result<()> {
-        if !self.in_turn {
-            return Ok(());
-        }
-        if let Some(next) = self.pending.pop_front() {
-            self.cause = Some(next.event_id);
-            let sent = self
-                .handle
-                .as_ref()
-                .is_some_and(|handle| handle.send_message(next.text).is_ok());
-            if !sent {
-                return self.fail("the agent is no longer running".to_owned()).await;
-            }
-            return Ok(());
-        }
-        self.in_turn = false;
-        self.set_agent_status(AgentStatus::Idle).await?;
-        self.set_status(SessionStatus::Review, None).await
-    }
-
-    async fn stop(&mut self) -> Result<()> {
-        if let Some(mut handle) = self.handle.take()
-            && handle.stop().is_ok()
-        {
-            // Keep what the agent said before it noticed the request.
-            let grace = tokio::time::sleep(STOP_GRACE);
-            tokio::pin!(grace);
-            loop {
-                tokio::select! {
-                    output = handle.next_output() => match output {
-                        Some(RunnerOutput::Event(body)) => self.append_from_agent(body).await?,
-                        Some(RunnerOutput::TurnEnded) => {}
-                        Some(RunnerOutput::Exited(_)) | None => break,
-                    },
-                    // Dropping the handle ends an agent that ignores the request.
-                    () = &mut grace => break,
-                }
-            }
-        }
-        self.in_turn = false;
-        self.pending.clear();
-        self.set_agent_status(AgentStatus::Stopped).await?;
-        self.set_status(SessionStatus::Cancelled, None).await
-    }
-
-    /// Records that the agent cannot go on and fails the session.
-    async fn fail(&mut self, message: String) -> Result<()> {
-        self.handle = None;
-        self.in_turn = false;
-        self.pending.clear();
-        let mut error = EventDraft::new(EventBody::Error {
-            message: message.clone(),
-        })
-        .parent(self.cause.clone());
-        if let Some(lead) = &self.lead {
-            error = error.agent(lead.id.clone());
-        }
-        self.append(error).await?;
-        self.set_agent_status(AgentStatus::Failed).await?;
-        self.set_status(SessionStatus::Failed, Some(message)).await
-    }
-
-    async fn set_status(&mut self, status: SessionStatus, reason: Option<String>) -> Result<()> {
-        let body = EventBody::SessionStatus { status, reason };
-        self.append(EventDraft::new(body).parent(self.cause.clone()))
-            .await?;
-        Ok(())
-    }
-
-    /// Moves the lead agent to `status`, unless it has none, is already
-    /// there, or has ended for good.
-    async fn set_agent_status(&mut self, status: AgentStatus) -> Result<()> {
-        let Some(lead) = &self.lead else {
-            return Ok(());
-        };
-        let restarting = status == AgentStatus::Running;
-        if lead.status == status || (agent_ended(lead.status) && !restarting) {
-            return Ok(());
-        }
-        let draft = EventDraft::new(EventBody::AgentStatus { status })
-            .agent(lead.id.clone())
-            .parent(self.cause.clone());
-        self.append(draft).await?;
-        Ok(())
-    }
-
-    async fn append_from_agent(&mut self, body: EventBody) -> Result<()> {
-        let mut draft = EventDraft::new(body).parent(self.cause.clone());
-        if let Some(lead) = &self.lead {
-            draft = draft.agent(lead.id.clone());
-        }
-        self.append(draft).await?;
-        Ok(())
-    }
-
-    /// Appends to the session's log and keeps the driver's view of the
-    /// session in step with what it just wrote.
-    async fn append(&mut self, draft: EventDraft) -> Result<Arc<Event>> {
-        let event = self.inner.store.append(&self.session_id, draft).await?;
-        self.head_seq = event.seq;
-        match &event.body {
-            EventBody::SessionStatus { status, .. } => self.status = *status,
-            EventBody::AgentStatus { status } => {
-                if let Some(lead) = &mut self.lead
-                    && event.agent_id.as_deref() == Some(lead.id.as_str())
-                {
-                    lead.status = *status;
-                }
-            }
-            _ => {}
-        }
-        Ok(event)
+/// The closing of a request nobody answered in time.
+fn expired(request_id: String) -> EventBody {
+    EventBody::PermissionResolved {
+        request_id,
+        decision: PermissionDecision::Deny,
+        by: DecisionSource::Expired,
+        message: Some(EXPIRED_MESSAGE.to_owned()),
     }
 }
 

@@ -20,8 +20,9 @@ pub const MOCK_RUNNER_ID: &str = "mock";
 
 const MOCK_MODEL: &str = "mock-1";
 
-/// The file the scripted edit claims to change, relative to the working directory.
-const EDITED_FILE: &str = "src/lib.rs";
+/// The file the scripted edit appends to, relative to the working directory.
+/// A real file, so a dry run has something to show as a change and a diff.
+const EDITED_FILE: &str = "calin-mock-notes.md";
 
 const DEFAULT_DELAY: Duration = Duration::from_millis(40);
 
@@ -105,7 +106,7 @@ struct MockAgent {
     delay: Duration,
     start_seq: u64,
     permission_mode: PermissionMode,
-    /// The file the scripted edit touches, when the working directory is known.
+    /// The file the scripted edit appends to, when the working directory is known.
     edited: Option<PathBuf>,
     items: u64,
     turns: u64,
@@ -208,6 +209,7 @@ impl MockAgent {
                 "...\n",
                 "test result: ok. 3 passed; 0 failed\n",
             ],
+            None,
         )
         .await?;
         self.plan(1).await?;
@@ -217,17 +219,19 @@ impl MockAgent {
             .iter()
             .map(|path| path.to_string_lossy().into_owned())
             .collect();
+        let note = format!("- turn {}: {quote}\n", self.turns);
         self.tool(
             "Edit",
             ToolKind::Edit,
             EDITED_FILE,
             json!({
                 "file_path": EDITED_FILE,
-                "old_string": "todo!()",
-                "new_string": "Ok(())",
+                "old_string": "",
+                "new_string": note,
             }),
             locations,
             &[],
+            Some(note),
         )
         .await?;
         self.plan(2).await?;
@@ -239,7 +243,7 @@ impl MockAgent {
                 "You asked: \"",
                 &quote,
                 "\". ",
-                "The tests pass and the change is in src/lib.rs.",
+                "The tests pass and the change is in calin-mock-notes.md.",
             ],
         )
         .await?;
@@ -270,6 +274,8 @@ impl MockAgent {
 
     /// A tool call whose output arrives in `output` chunks. Depending on the
     /// permission mode it first asks, and completes as declined on a denial.
+    /// `note` is the line an allowed call appends to the edited file.
+    #[allow(clippy::too_many_arguments)]
     async fn tool(
         &mut self,
         name: &str,
@@ -278,6 +284,7 @@ impl MockAgent {
         input: serde_json::Value,
         locations: Vec<String>,
         output: &[&str],
+        note: Option<String>,
     ) -> Result<(), Cut> {
         let id = self.next_item_id();
         self.start_item(Item {
@@ -312,6 +319,18 @@ impl MockAgent {
                 }
                 return self.complete_item(ItemStatus::Declined).await;
             }
+        }
+        if let (Some(note), Some(path)) = (note, self.edited.clone())
+            && let Err(reason) = append_line(path, note).await
+        {
+            if let Some(Item {
+                content: ItemContent::Tool { output, .. },
+                ..
+            }) = &mut self.open
+            {
+                *output = Some(reason);
+            }
+            return self.complete_item(ItemStatus::Failed).await;
         }
         for chunk in output {
             self.delta(ItemDelta::Output {
@@ -498,6 +517,23 @@ impl Prose {
     }
 }
 
+/// Appends `line` to the file at `path`, creating the file. The directory
+/// must exist: it is the agent's working directory.
+async fn append_line(path: PathBuf, line: String) -> Result<(), String> {
+    let written = tokio::task::spawn_blocking(move || {
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|err| format!("cannot open {}: {err}", path.display()))?;
+        file.write_all(line.as_bytes())
+            .map_err(|err| format!("cannot write {}: {err}", path.display()))
+    })
+    .await;
+    written.unwrap_or_else(|err| Err(format!("the edit did not run: {err}")))
+}
+
 /// The first line of the user's text, short enough to quote.
 fn quote(text: &str) -> String {
     let line = text.trim().lines().next().unwrap_or_default().trim();
@@ -516,22 +552,64 @@ mod tests {
 
     const TIMEOUT: Duration = Duration::from_secs(5);
 
-    fn start_in(mode: PermissionMode, delay: Duration, prompt: &str) -> AgentHandle {
-        MockRunner::new(MockConfig { delay })
+    /// A running mock agent and the temporary directory it works in.
+    struct Started {
+        handle: AgentHandle,
+        dir: std::sync::Arc<tempfile::TempDir>,
+    }
+
+    impl Started {
+        fn notes_path(&self) -> PathBuf {
+            self.dir.path().join(EDITED_FILE)
+        }
+
+        /// The notes file, or `None` when the agent never wrote it.
+        fn notes(&self) -> Option<String> {
+            std::fs::read_to_string(self.notes_path()).ok()
+        }
+    }
+
+    impl std::ops::Deref for Started {
+        type Target = AgentHandle;
+
+        fn deref(&self) -> &AgentHandle {
+            &self.handle
+        }
+    }
+
+    impl std::ops::DerefMut for Started {
+        fn deref_mut(&mut self) -> &mut AgentHandle {
+            &mut self.handle
+        }
+    }
+
+    fn start_at(
+        dir: std::sync::Arc<tempfile::TempDir>,
+        mode: PermissionMode,
+        delay: Duration,
+        prompt: &str,
+    ) -> Started {
+        let handle = MockRunner::new(MockConfig { delay })
             .start(StartParams {
                 session_id: "s1".into(),
                 agent_id: "a1".into(),
                 prompt: prompt.into(),
-                cwd: "/work".into(),
+                cwd: dir.path().to_owned(),
                 permission_mode: mode,
                 start_seq: 3,
                 ..StartParams::default()
             })
-            .unwrap()
+            .unwrap();
+        Started { handle, dir }
+    }
+
+    fn start_in(mode: PermissionMode, delay: Duration, prompt: &str) -> Started {
+        let dir = std::sync::Arc::new(tempfile::tempdir().unwrap());
+        start_at(dir, mode, delay, prompt)
     }
 
     /// An agent that never asks, so a turn runs to its end unattended.
-    fn start(delay: Duration, prompt: &str) -> AgentHandle {
+    fn start(delay: Duration, prompt: &str) -> Started {
         start_in(PermissionMode::Autonomous, delay, prompt)
     }
 
@@ -724,8 +802,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_edit_names_the_file_it_touches() {
-        let mut handle = start(Duration::ZERO, "edit");
+    async fn the_edit_writes_the_file_it_names() {
+        let mut handle = start(Duration::ZERO, "edit\nmore");
+        assert_eq!(handle.notes(), None);
         let items = check_turn(&collect_turn(&mut handle).await);
         let locations: Vec<&Vec<String>> = items
             .iter()
@@ -734,7 +813,76 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(locations, [&vec![], &vec!["/work/src/lib.rs".to_owned()]]);
+        let edited = handle.notes_path().to_string_lossy().into_owned();
+        assert_eq!(locations, [&vec![], &vec![edited]]);
+        assert_eq!(handle.notes().as_deref(), Some("- turn 1: edit\n"));
+
+        // Each turn appends its own line.
+        handle.send_message("again").unwrap();
+        collect_turn(&mut handle).await;
+        assert_eq!(
+            handle.notes().as_deref(),
+            Some("- turn 1: edit\n- turn 2: again\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_denied_edit_writes_nothing() {
+        let mut handle = start_in(PermissionMode::Ask, Duration::ZERO, "deny the edit");
+        let turn = run_turn(&mut handle, |request| match request.tool_kind {
+            ToolKind::Edit => (PermissionDecision::Deny, None),
+            _ => (PermissionDecision::Allow, None),
+        })
+        .await;
+        assert_eq!(
+            tool_items(&check_turn(&turn.events)),
+            [
+                (ToolKind::Execute, ItemStatus::Completed),
+                (ToolKind::Edit, ItemStatus::Declined)
+            ]
+        );
+        assert_eq!(handle.notes(), None);
+    }
+
+    #[tokio::test]
+    async fn an_edit_that_cannot_be_written_fails_its_call_and_the_turn_goes_on() {
+        let dir = std::sync::Arc::new(tempfile::tempdir().unwrap());
+        // A directory where the file should be: the append cannot succeed.
+        std::fs::create_dir(dir.path().join(EDITED_FILE)).unwrap();
+        let mut handle = start_at(dir, PermissionMode::Autonomous, Duration::ZERO, "x");
+        let items = check_turn(&collect_turn(&mut handle).await);
+        assert_eq!(
+            tool_items(&items),
+            [
+                (ToolKind::Execute, ItemStatus::Completed),
+                (ToolKind::Edit, ItemStatus::Failed)
+            ]
+        );
+        assert_eq!(items.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn without_a_real_directory_the_edit_names_and_writes_nothing() {
+        let mut handle = MockRunner::new(MockConfig {
+            delay: Duration::ZERO,
+        })
+        .start(StartParams {
+            permission_mode: PermissionMode::Autonomous,
+            ..StartParams::default()
+        })
+        .unwrap();
+        let items = check_turn(&collect_turn(&mut handle).await);
+        assert_eq!(
+            tool_items(&items),
+            [
+                (ToolKind::Execute, ItemStatus::Completed),
+                (ToolKind::Edit, ItemStatus::Completed)
+            ]
+        );
+        assert!(items.iter().all(|item| !matches!(
+            &item.content,
+            ItemContent::Tool { locations, .. } if !locations.is_empty()
+        )));
     }
 
     #[tokio::test]
@@ -791,9 +939,16 @@ mod tests {
 
     #[tokio::test]
     async fn two_agents_produce_the_same_script() {
+        // The same directory, so the paths in the two scripts are the same too.
         let mut one = start(Duration::ZERO, "same");
-        let mut two = start(Duration::ZERO, "same");
-        assert_eq!(collect_turn(&mut one).await, collect_turn(&mut two).await);
+        let first = collect_turn(&mut one).await;
+        let mut two = start_at(
+            one.dir.clone(),
+            PermissionMode::Autonomous,
+            Duration::ZERO,
+            "same",
+        );
+        assert_eq!(first, collect_turn(&mut two).await);
     }
 
     #[tokio::test]
@@ -811,7 +966,7 @@ mod tests {
             asked,
             [
                 (ToolKind::Execute, "cargo test -q"),
-                (ToolKind::Edit, "src/lib.rs")
+                (ToolKind::Edit, "calin-mock-notes.md")
             ]
         );
         // Each request points at its tool item, and its id is its own.
@@ -830,7 +985,12 @@ mod tests {
         );
 
         // Allowed, the script is the one of an agent that never asks.
-        let mut unattended = start(Duration::ZERO, "ask");
+        let mut unattended = start_at(
+            handle.dir.clone(),
+            PermissionMode::Autonomous,
+            Duration::ZERO,
+            "ask",
+        );
         assert_eq!(turn.events, collect_turn(&mut unattended).await);
     }
 

@@ -7,9 +7,10 @@ rust-version.workspace = true
 
 [dependencies]
 calin-agents = { version = "0.0.1", path = "../calin-agents" }
+calin-git = { version = "0.0.1", path = "../calin-git" }
 calin-proto = { version = "0.0.1", path = "../calin-proto" }
 rusqlite = { version = "0.43.0", features = ["bundled"] }
-serde = "1.0.229"
+serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["sync", "time", "rt", "macros"] }

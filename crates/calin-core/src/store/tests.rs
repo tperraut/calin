@@ -2,11 +2,15 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::time::Duration;
 
-use calin_proto::{Agent, AgentKind, AgentStatus, Event, EventBody, SessionStatus};
+use calin_proto::{
+    Agent, AgentKind, AgentStatus, AttachRepoRequest, DecisionSource, Event, EventBody, FileOp,
+    PermissionDecision, PermissionMode, PermissionRequest, RepoMode, SessionRepo, SessionStatus,
+    ToolKind,
+};
 use tempfile::TempDir;
 use tokio::task::JoinSet;
 
-use super::writer::LIVE_BUFFER;
+use super::writer::{LIVE_BUFFER, UPSERT_INTERVAL};
 use super::*;
 
 const TIMEOUT: Duration = Duration::from_secs(20);
@@ -20,6 +24,9 @@ fn new_session(prompt: &str) -> NewSession {
         title: format!("title of {prompt}"),
         prompt: prompt.to_owned(),
         runner: "mock".to_owned(),
+        permission_mode: PermissionMode::Ask,
+        model: None,
+        repos: Vec::new(),
     }
 }
 
@@ -45,6 +52,7 @@ fn agent(id: &str, session_id: &str) -> Agent {
         role: "lead".to_owned(),
         runner: "mock".to_owned(),
         model: Some("mock-1".to_owned()),
+        native_session_id: None,
         status: AgentStatus::Running,
         cost_usd: 0.0,
         tokens_in: 0,
@@ -356,7 +364,47 @@ async fn unknown_sessions_are_not_found() {
     );
 }
 
-/// Two sessions with agents, usage and different statuses.
+fn session_repo(session_id: &str, name: &str, primary: bool) -> SessionRepo {
+    SessionRepo {
+        id: format!("{session_id}-{name}"),
+        session_id: session_id.to_owned(),
+        repo_id: format!("repo-{name}"),
+        name: name.to_owned(),
+        mode: if primary {
+            RepoMode::Live
+        } else {
+            RepoMode::Write
+        },
+        path: format!("/work/{name}"),
+        // The primary repo here has no branch: the second one names the session's.
+        branch: (!primary).then(|| "calin/topic-abc123".to_owned()),
+        base_ref: Some("0123abcd".to_owned()),
+        primary,
+    }
+}
+
+fn permission_request(id: &str) -> PermissionRequest {
+    PermissionRequest {
+        id: id.to_owned(),
+        tool_name: "Bash".to_owned(),
+        tool_kind: ToolKind::Execute,
+        title: "cargo test".to_owned(),
+        input: serde_json::json!({ "command": "cargo test" }),
+        item_id: None,
+    }
+}
+
+fn resolved(request_id: &str) -> EventBody {
+    EventBody::PermissionResolved {
+        request_id: request_id.to_owned(),
+        decision: PermissionDecision::Allow,
+        by: DecisionSource::User,
+        message: None,
+    }
+}
+
+/// Two sessions with agents, usage, repos, permission requests and
+/// different statuses.
 async fn populate(store: &Store) -> Vec<String> {
     let mut ids = Vec::new();
     for (index, prompt) in ["alpha", "beta"].into_iter().enumerate() {
@@ -382,6 +430,36 @@ async fn populate(store: &Store) -> Vec<String> {
         };
         store
             .append(&id, EventDraft::new(usage).agent(lead.clone()))
+            .await
+            .unwrap();
+        let announced = EventBody::AgentSession {
+            native_session_id: format!("native-{prompt}"),
+            model: Some("mock-2".to_owned()),
+        };
+        store
+            .append(&id, EventDraft::new(announced).agent(lead.clone()))
+            .await
+            .unwrap();
+        for (n, name) in ["api", "web"].into_iter().enumerate() {
+            let attached = EventBody::RepoAttached {
+                repo: session_repo(&id, name, n == 0),
+            };
+            store.append(&id, EventDraft::new(attached)).await.unwrap();
+        }
+        for request in ["answered", "open"] {
+            let asked = EventBody::PermissionRequested {
+                request: permission_request(request),
+            };
+            store
+                .append(&id, EventDraft::new(asked).agent(lead.clone()))
+                .await
+                .unwrap();
+        }
+        store
+            .append(
+                &id,
+                EventDraft::new(resolved("answered")).agent(lead.clone()),
+            )
             .await
             .unwrap();
         if index == 0 {
@@ -417,6 +495,24 @@ async fn the_index_is_rebuilt_from_the_logs() {
     }
     assert_eq!(details[0].session.status, SessionStatus::Review);
     assert_eq!(details[1].session.status, SessionStatus::Running);
+    for (detail, prompt) in details.iter().zip(["alpha", "beta"]) {
+        let id = &detail.session.id;
+        assert_eq!(
+            detail.agents[0].native_session_id,
+            Some(format!("native-{prompt}"))
+        );
+        assert_eq!(detail.agents[0].model.as_deref(), Some("mock-2"));
+        assert_eq!(
+            detail.repos,
+            [
+                session_repo(id, "api", true),
+                session_repo(id, "web", false)
+            ]
+        );
+        assert_eq!(detail.session.branch.as_deref(), Some("calin/topic-abc123"));
+    }
+    let open_before = store.open_permissions(None).await.unwrap();
+    assert_eq!(open_before.len(), 2);
     store.close().await;
     assert!(matches!(store.sessions().await, Err(Error::Closed)));
 
@@ -442,9 +538,256 @@ async fn the_index_is_rebuilt_from_the_logs() {
             logs[index][3..]
         );
     }
+    // The permission and repo projections come back with the rest.
+    assert_eq!(reopened.open_permissions(None).await.unwrap(), open_before);
+    for id in &ids {
+        let resolved = |request: &'static str| reopened.permission_resolved(id, request);
+        assert_eq!(resolved("answered").await.unwrap(), Some(true));
+        assert_eq!(resolved("open").await.unwrap(), Some(false));
+        assert_eq!(resolved("never asked").await.unwrap(), None);
+    }
+    // `alpha` is in review and `beta` running: both still hold their repos.
+    assert!(reopened.repo_in_use("repo-api").await.unwrap());
+    assert!(!reopened.repo_in_use("repo-other").await.unwrap());
     // Appending continues where the log ended.
     let next = reopened.append(&ids[1], message(9)).await.unwrap();
     assert_eq!(next.seq, logs[1].len() as u64 + 1);
+}
+
+#[tokio::test]
+async fn agent_sessions_repos_and_permissions_are_projected() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir).await;
+    let id = store
+        .create_session(new_session("project"))
+        .await
+        .unwrap()
+        .id;
+    let spawned = EventBody::AgentSpawned {
+        agent: agent("a1", &id),
+    };
+    store.append(&id, EventDraft::new(spawned)).await.unwrap();
+
+    // The first report sets the id; one without a model keeps the model.
+    let announce = |native: &str, model: Option<&str>| {
+        let body = EventBody::AgentSession {
+            native_session_id: native.to_owned(),
+            model: model.map(str::to_owned),
+        };
+        store.append(&id, EventDraft::new(body).agent("a1"))
+    };
+    announce("n1", None).await.unwrap();
+    let lead = store.session(&id).await.unwrap().agents.remove(0);
+    assert_eq!(lead.native_session_id.as_deref(), Some("n1"));
+    assert_eq!(lead.model.as_deref(), Some("mock-1"));
+    announce("n2", Some("mock-9")).await.unwrap();
+    let lead = store.session(&id).await.unwrap().agents.remove(0);
+    assert_eq!(lead.native_session_id.as_deref(), Some("n2"));
+    assert_eq!(lead.model.as_deref(), Some("mock-9"));
+
+    // Repos keep their order; the branch is the first one any repo has.
+    assert!(store.session(&id).await.unwrap().repos.is_empty());
+    for (n, name) in ["api", "web"].into_iter().enumerate() {
+        let attached = EventBody::RepoAttached {
+            repo: session_repo(&id, name, n == 0),
+        };
+        store.append(&id, EventDraft::new(attached)).await.unwrap();
+        let detail = store.session(&id).await.unwrap();
+        assert_eq!(detail.repos.len(), n + 1);
+        assert_eq!(detail.session.branch.is_some(), n == 1);
+    }
+    assert!(store.repo_in_use("repo-web").await.unwrap());
+
+    // A request is open until it is resolved, whoever resolves it.
+    assert_eq!(store.permission_resolved(&id, "p1").await.unwrap(), None);
+    let asked = EventBody::PermissionRequested {
+        request: permission_request("p1"),
+    };
+    let asked = store
+        .append(&id, EventDraft::new(asked).agent("a1"))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.open_permissions(Some(&id)).await.unwrap(),
+        [OpenPermission {
+            session_id: id.clone(),
+            request_id: "p1".to_owned(),
+            agent_id: Some("a1".to_owned()),
+            event_id: asked.id.clone(),
+        }]
+    );
+    assert_eq!(
+        store.permission_resolved(&id, "p1").await.unwrap(),
+        Some(false)
+    );
+    store
+        .append(&id, EventDraft::new(resolved("p1")).agent("a1"))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.permission_resolved(&id, "p1").await.unwrap(),
+        Some(true)
+    );
+    assert!(store.open_permissions(None).await.unwrap().is_empty());
+
+    // A file change projects nothing, and a closed session frees its repos.
+    let changed = EventBody::FileChanged {
+        session_repo_id: None,
+        path: "/tmp/x".to_owned(),
+        op: FileOp::Edit,
+    };
+    store.append(&id, EventDraft::new(changed)).await.unwrap();
+    for (closed, in_use) in [
+        (SessionStatus::Review, true),
+        (SessionStatus::Cancelled, false),
+        (SessionStatus::Running, true),
+        (SessionStatus::Failed, false),
+        (SessionStatus::Done, false),
+    ] {
+        store.append(&id, status(closed)).await.unwrap();
+        assert_eq!(store.repo_in_use("repo-web").await.unwrap(), in_use);
+    }
+}
+
+#[tokio::test]
+async fn what_a_session_was_created_with_survives_a_reindex() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir).await;
+    let wanted = vec![
+        AttachRepoRequest {
+            repo_id: "r1".to_owned(),
+            mode: Some(RepoMode::Live),
+        },
+        AttachRepoRequest {
+            repo_id: "r2".to_owned(),
+            mode: None,
+        },
+    ];
+    let configured = store
+        .create_session(NewSession {
+            permission_mode: PermissionMode::Autonomous,
+            model: Some("opus".to_owned()),
+            repos: wanted.clone(),
+            ..new_session("configured")
+        })
+        .await
+        .unwrap();
+    assert_eq!(configured.permission_mode, PermissionMode::Autonomous);
+    let plain = store.create_session(new_session("plain")).await.unwrap();
+    let expected = SessionSetup {
+        model: Some("opus".to_owned()),
+        repos: wanted,
+    };
+    assert_eq!(store.setup(&configured.id).await.unwrap(), expected);
+    assert_eq!(
+        store.setup(&plain.id).await.unwrap(),
+        SessionSetup::default()
+    );
+    assert!(matches!(
+        store.setup("01ARZ3NDEKTSV4RRFFQ69G5FAV").await,
+        Err(Error::NotFound(_))
+    ));
+    store.close().await;
+    std::fs::remove_file(store.home().db_path()).unwrap();
+
+    let reopened = open(&dir).await;
+    assert_eq!(reopened.setup(&configured.id).await.unwrap(), expected);
+    assert_eq!(
+        reopened.session(&configured.id).await.unwrap().session,
+        configured
+    );
+    assert_eq!(
+        reopened
+            .session(&plain.id)
+            .await
+            .unwrap()
+            .session
+            .permission_mode,
+        PermissionMode::Ask
+    );
+
+    // A session file written before M1 has none of the new fields.
+    let path = reopened.home().meta_path(&plain.id);
+    let mut old: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    old.as_object_mut().unwrap().remove("permission_mode");
+    std::fs::write(&path, old.to_string()).unwrap();
+    reopened.close().await;
+    std::fs::remove_file(reopened.home().db_path()).unwrap();
+    let again = open(&dir).await;
+    assert_eq!(again.session(&plain.id).await.unwrap().session, plain);
+    assert_eq!(
+        again.setup(&plain.id).await.unwrap(),
+        SessionSetup::default()
+    );
+}
+
+/// Collects the upserts of one session until none arrives for `quiet`.
+async fn upserts_until_quiet(
+    updates: &mut Live<Session>,
+    session_id: &str,
+    quiet: Duration,
+) -> Vec<Session> {
+    let mut seen = Vec::new();
+    while let Ok(upserted) = tokio::time::timeout(quiet, updates.recv()).await {
+        let session = upserted.expect("the upsert stream ended");
+        if session.id == session_id {
+            seen.push(session);
+        }
+    }
+    seen
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upserts_are_throttled_while_events_arrive_and_end_on_the_newest() {
+    const BURST: u64 = 300;
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir).await;
+    let id = store.create_session(new_session("busy")).await.unwrap().id;
+    let other = store.create_session(new_session("quiet")).await.unwrap().id;
+    let (_, mut updates) = store.subscribe_sessions().await.unwrap();
+
+    let started = std::time::Instant::now();
+    for n in 0..BURST {
+        store.append(&id, message(n)).await.unwrap();
+    }
+    let burst = started.elapsed();
+    let seen = upserts_until_quiet(&mut updates, &id, UPSERT_INTERVAL * 2).await;
+    // One per interval that the burst spanned, and the one that was owed at
+    // its end: nowhere near one per event.
+    let allowed = 2 + (burst.as_millis() / UPSERT_INTERVAL.as_millis()) as usize;
+    assert!(
+        (1..=allowed).contains(&seen.len()),
+        "{} upserts for a burst of {BURST} events in {burst:?}",
+        seen.len()
+    );
+    let last = seen.last().unwrap();
+    assert_eq!(last.head_seq, BURST);
+    assert_eq!(
+        last.updated_at,
+        store.session(&id).await.unwrap().session.updated_at
+    );
+    assert!(
+        seen.windows(2)
+            .all(|pair| pair[0].head_seq < pair[1].head_seq)
+    );
+
+    // After a quiet spell the first event is announced without delay. The
+    // next one is owed, and a status change is announced at once and settles
+    // it: no frame follows the status.
+    store.append(&id, message(BURST)).await.unwrap();
+    store.append(&id, message(BURST + 1)).await.unwrap();
+    store
+        .append(&id, status(SessionStatus::Running))
+        .await
+        .unwrap();
+    let seen = upserts_until_quiet(&mut updates, &id, UPSERT_INTERVAL * 2).await;
+    let heads: Vec<u64> = seen.iter().map(|session| session.head_seq).collect();
+    assert_eq!(heads, [BURST + 1, BURST + 3]);
+    assert_eq!(seen[1].status, SessionStatus::Running);
+
+    // The session nothing happened to was never announced again.
+    assert_eq!(store.session(&other).await.unwrap().session.head_seq, 0);
 }
 
 #[tokio::test]

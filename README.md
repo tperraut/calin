@@ -42,6 +42,7 @@ login is needed. The server only listens on loopback addresses until sign-in exi
 | `CALIN_HOME` | Data directory. Default `~/.calin`. `calin serve --home <dir>` overrides it. |
 | `CALIN_DRY_RUN=1` | Run every agent on the built-in mock runner. |
 | `CALIN_MOCK_DELAY_MS` | Delay between the mock runner's chunks. Default 40. |
+| `CALIN_CLAUDE_BIN` | Path of the Claude Code CLI. Default `claude` on `PATH`. When it runs, `claude` is the default runner; without it sessions run on the mock runner. |
 | `CALIN_LOG` | Log filter, for example `debug` or `calin_core=trace`. Default `info`. |
 
 ## License

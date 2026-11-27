@@ -41,6 +41,12 @@ impl Home {
         self.root.join("calin.lock")
     }
 
+    /// The repos registered on this machine. Configuration, not a projection
+    /// of the logs, which is why it is a file of its own and not in the index.
+    pub fn repos_path(&self) -> PathBuf {
+        self.root.join("repos.json")
+    }
+
     pub fn sessions_dir(&self) -> PathBuf {
         self.root.join("sessions")
     }
@@ -58,6 +64,12 @@ impl Home {
     /// or the runner, so a reindex reads them from here.
     pub fn meta_path(&self, session_id: &str) -> PathBuf {
         self.session_dir(session_id).join("session.json")
+    }
+
+    /// The session's work folder: the worktrees of its `write` repos, one per
+    /// repo name, and the agent's working directory when it has no repo.
+    pub fn work_dir(&self, session_id: &str) -> PathBuf {
+        self.session_dir(session_id).join("work")
     }
 }
 
@@ -122,5 +134,7 @@ mod tests {
             home.meta_path("s1"),
             PathBuf::from("/data/sessions/s1/session.json")
         );
+        assert_eq!(home.work_dir("s1"), PathBuf::from("/data/sessions/s1/work"));
+        assert_eq!(home.repos_path(), PathBuf::from("/data/repos.json"));
     }
 }

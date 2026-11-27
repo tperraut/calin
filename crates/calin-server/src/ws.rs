@@ -70,10 +70,10 @@ async fn serve(socket: WebSocket, state: AppState) {
         let reply = match frame {
             Some(Ok(Message::Text(text))) => match serde_json::from_str::<ClientMsg>(&text) {
                 Ok(message) => connection.handle(message),
-                Err(err) => Some(error(format!("unreadable frame: {err}"))),
+                Err(err) => Some(error(format!("unreadable frame: {err}"), None)),
             },
             Some(Ok(Message::Binary(_))) => {
-                Some(error("binary frames are not supported".to_owned()))
+                Some(error("binary frames are not supported".to_owned(), None))
             }
             // The protocol library answers pings itself.
             Some(Ok(Message::Ping(_) | Message::Pong(_))) => None,
@@ -94,8 +94,17 @@ async fn serve(socket: WebSocket, state: AppState) {
     let _ = writer.await;
 }
 
-fn error(message: String) -> ServerMsg {
-    ServerMsg::Error { message }
+/// An error frame. `topic` names the subscription the refused frame was
+/// about, so a client with several pending knows which one failed.
+fn error(message: String, topic: Option<&str>) -> ServerMsg {
+    ServerMsg::Error {
+        message,
+        topic: topic.map(str::to_owned),
+    }
+}
+
+fn is_topic(topic: &str) -> bool {
+    topic == TOPIC_SESSIONS || parse_session_topic(topic).is_some()
 }
 
 /// Drains the queue into the socket until the connection closes.
@@ -149,6 +158,10 @@ impl Connection {
         match message {
             ClientMsg::Ping => Some(ServerMsg::Pong),
             ClientMsg::Unsubscribe { topic } => {
+                if !is_topic(&topic) {
+                    return Some(error(format!("unknown topic {topic}"), Some(&topic)));
+                }
+                // Leaving a topic that was never joined is not an error.
                 if let Some(task) = self.topics.remove(&topic) {
                     task.abort();
                     self.retired.retain(|_, retired| !retired.is_finished());
@@ -169,7 +182,7 @@ impl Connection {
                 after_seq: after_seq.unwrap_or(0),
             }
         } else {
-            return Some(error(format!("unknown topic {topic}")));
+            return Some(error(format!("unknown topic {topic}"), Some(&topic)));
         };
         // Subscribing to a topic again restarts it from the new position.
         let previous = self
@@ -177,9 +190,8 @@ impl Connection {
             .remove(&topic)
             .or_else(|| self.retired.remove(&topic));
         if self.topics.len() >= MAX_TOPICS {
-            return Some(error(format!(
-                "too many subscriptions on one socket (limit {MAX_TOPICS})"
-            )));
+            let message = format!("too many subscriptions on one socket (limit {MAX_TOPICS})");
+            return Some(error(message, Some(&topic)));
         }
         let forwarder = Forwarder {
             store: self.store.clone(),
@@ -292,7 +304,7 @@ impl Forwarder {
                 format!("could not subscribe to {}", self.topic)
             }
         };
-        self.send(error(message)).await
+        self.send(error(message, Some(&self.topic))).await
     }
 
     /// The client missed live updates. Closing the socket makes it reconnect

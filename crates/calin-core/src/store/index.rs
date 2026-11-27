@@ -3,17 +3,18 @@
 
 use std::path::Path;
 
-use calin_proto::{Agent, Event, EventBody, Session};
+use calin_proto::{Agent, Event, EventBody, Session, SessionRepo};
 use rusqlite::types::Type;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use super::OpenPermission;
 use crate::error::Result;
 
 /// Bumped when the tables change. A database with another version is
 /// dropped and rebuilt from the logs, so there are no migrations to write.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA: &str = "
 CREATE TABLE sessions (
@@ -22,6 +23,7 @@ CREATE TABLE sessions (
     prompt            TEXT NOT NULL,
     status            TEXT NOT NULL,
     runner            TEXT NOT NULL,
+    permission_mode   TEXT NOT NULL,
     branch            TEXT,
     parent_session_id TEXT,
     root_session_id   TEXT NOT NULL,
@@ -40,6 +42,7 @@ CREATE TABLE agents (
     role            TEXT NOT NULL,
     runner          TEXT NOT NULL,
     model           TEXT,
+    native_session_id TEXT,
     status          TEXT NOT NULL,
     cost_usd        REAL NOT NULL,
     tokens_in       INTEGER NOT NULL,
@@ -60,13 +63,56 @@ CREATE TABLE events (
     PRIMARY KEY (session_id, seq)
 ) WITHOUT ROWID;
 CREATE UNIQUE INDEX events_by_id ON events (id);
+
+-- The repo set, learned from `repo_attached` events.
+CREATE TABLE session_repos (
+    id           TEXT PRIMARY KEY,
+    session_id   TEXT NOT NULL,
+    repo_id      TEXT NOT NULL,
+    name         TEXT NOT NULL,
+    mode         TEXT NOT NULL,
+    path         TEXT NOT NULL,
+    branch       TEXT,
+    base_ref     TEXT,
+    is_primary   INTEGER NOT NULL,
+    attached_seq INTEGER NOT NULL
+) WITHOUT ROWID;
+CREATE INDEX session_repos_by_session ON session_repos (session_id, attached_seq);
+CREATE INDEX session_repos_by_repo ON session_repos (repo_id);
+
+-- Permission requests and whether each was answered.
+CREATE TABLE permissions (
+    session_id TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    agent_id   TEXT,
+    -- The `permission_requested` event, the cause of the answer.
+    event_id   TEXT NOT NULL,
+    resolved   INTEGER NOT NULL,
+    PRIMARY KEY (session_id, request_id)
+) WITHOUT ROWID;
+CREATE INDEX permissions_open ON permissions (resolved, session_id);
 ";
 
+/// Every table, for dropping a database of another schema version.
+const TABLES: [&str; 5] = [
+    "permissions",
+    "session_repos",
+    "events",
+    "agents",
+    "sessions",
+];
+
+/// The tables that hold what a session's events projected, keyed by `session_id`.
+const PROJECTIONS: [&str; 4] = ["permissions", "session_repos", "events", "agents"];
+
 const SESSION_COLUMNS: &str = "id, title, prompt, status, runner, branch, parent_session_id, \
-     root_session_id, head_seq, created_at, updated_at";
+     root_session_id, head_seq, created_at, updated_at, permission_mode";
 
 const AGENT_COLUMNS: &str = "id, session_id, parent_agent_id, kind, role, runner, model, status, \
-     cost_usd, tokens_in, tokens_out";
+     cost_usd, tokens_in, tokens_out, native_session_id";
+
+const REPO_COLUMNS: &str =
+    "id, session_id, repo_id, name, mode, path, branch, base_ref, is_primary";
 
 pub(super) fn open(path: &Path) -> Result<Connection> {
     let db = Connection::open(path)?;
@@ -76,10 +122,9 @@ pub(super) fn open(path: &Path) -> Result<Connection> {
     db.pragma_update(None, "synchronous", "NORMAL")?;
     let version: i64 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version != SCHEMA_VERSION {
-        db.execute_batch(
-            "DROP TABLE IF EXISTS events; DROP TABLE IF EXISTS agents; \
-             DROP TABLE IF EXISTS sessions;",
-        )?;
+        for table in TABLES {
+            db.execute_batch(&format!("DROP TABLE IF EXISTS {table};"))?;
+        }
         db.execute_batch(SCHEMA)?;
         db.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
@@ -116,8 +161,9 @@ pub(super) fn session_ids(db: &Connection) -> Result<Vec<String>> {
 pub(super) fn insert_session(db: &Connection, session: &Session) -> Result<()> {
     db.prepare_cached(
         "INSERT OR REPLACE INTO sessions (id, title, prompt, status, runner, branch, \
-         parent_session_id, root_session_id, head_seq, created_at, updated_at, log_len) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0)",
+         parent_session_id, root_session_id, head_seq, created_at, updated_at, \
+         permission_mode, log_len) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 0)",
     )?
     .execute(params![
         session.id,
@@ -131,24 +177,33 @@ pub(super) fn insert_session(db: &Connection, session: &Session) -> Result<()> {
         session.head_seq as i64,
         session.created_at,
         session.updated_at,
+        wire_name(&session.permission_mode)?,
     ])?;
     Ok(())
 }
 
 /// Forgets a session. The log, if any, is left alone.
 pub(super) fn delete_session(db: &Connection, session_id: &str) -> Result<()> {
-    db.execute("DELETE FROM events WHERE session_id = ?1", [session_id])?;
-    db.execute("DELETE FROM agents WHERE session_id = ?1", [session_id])?;
+    delete_projections(db, session_id)?;
     db.execute("DELETE FROM sessions WHERE id = ?1", [session_id])?;
+    Ok(())
+}
+
+fn delete_projections(db: &Connection, session_id: &str) -> Result<()> {
+    for table in PROJECTIONS {
+        db.execute(
+            &format!("DELETE FROM {table} WHERE session_id = ?1"),
+            [session_id],
+        )?;
+    }
     Ok(())
 }
 
 /// Returns a session to its state before any event, keeping what it was created with.
 pub(super) fn reset_session(db: &Connection, session_id: &str) -> Result<()> {
-    db.execute("DELETE FROM events WHERE session_id = ?1", [session_id])?;
-    db.execute("DELETE FROM agents WHERE session_id = ?1", [session_id])?;
+    delete_projections(db, session_id)?;
     db.execute(
-        "UPDATE sessions SET status = 'queued', head_seq = 0, log_len = 0, \
+        "UPDATE sessions SET status = 'queued', branch = NULL, head_seq = 0, log_len = 0, \
          updated_at = created_at WHERE id = ?1",
         [session_id],
     )?;
@@ -186,6 +241,67 @@ pub(super) fn agents(db: &Connection, session_id: &str) -> Result<Vec<Agent>> {
     Ok(agents)
 }
 
+/// The repo set of a session in the order the repos were attached, which
+/// puts the primary repo first.
+pub(super) fn session_repos(db: &Connection, session_id: &str) -> Result<Vec<SessionRepo>> {
+    let mut statement = db.prepare_cached(&format!(
+        "SELECT {REPO_COLUMNS} FROM session_repos WHERE session_id = ?1 \
+         ORDER BY attached_seq, id"
+    ))?;
+    let repos = statement
+        .query_map([session_id], repo_from_row)?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(repos)
+}
+
+/// True when the repo is attached to a session that may still work in it.
+pub(super) fn repo_in_use(db: &Connection, repo_id: &str) -> Result<bool> {
+    Ok(db
+        .prepare_cached(
+            "SELECT 1 FROM session_repos r JOIN sessions s ON s.id = r.session_id \
+             WHERE r.repo_id = ?1 AND s.status NOT IN ('done', 'failed', 'cancelled') LIMIT 1",
+        )?
+        .query_row([repo_id], |_| Ok(()))
+        .optional()?
+        .is_some())
+}
+
+/// Whether a permission request was answered; `None` when there is no such request.
+pub(super) fn permission_resolved(
+    db: &Connection,
+    session_id: &str,
+    request_id: &str,
+) -> Result<Option<bool>> {
+    Ok(db
+        .prepare_cached(
+            "SELECT resolved FROM permissions WHERE session_id = ?1 AND request_id = ?2",
+        )?
+        .query_row([session_id, request_id], |row| row.get(0))
+        .optional()?)
+}
+
+/// The requests nobody answered yet, of one session or of all of them, oldest first.
+pub(super) fn open_permissions(
+    db: &Connection,
+    session_id: Option<&str>,
+) -> Result<Vec<OpenPermission>> {
+    let mut statement = db.prepare_cached(
+        "SELECT session_id, request_id, agent_id, event_id FROM permissions \
+         WHERE resolved = 0 AND (?1 IS NULL OR session_id = ?1) ORDER BY event_id",
+    )?;
+    let open = statement
+        .query_map([session_id], |row| {
+            Ok(OpenPermission {
+                session_id: row.get(0)?,
+                request_id: row.get(1)?,
+                agent_id: row.get(2)?,
+                event_id: row.get(3)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(open)
+}
+
 /// Byte offset of an event's line in its session log.
 pub(super) fn log_offset(db: &Connection, session_id: &str, seq: u64) -> Result<Option<u64>> {
     Ok(db
@@ -220,8 +336,9 @@ pub(super) fn index_event(db: &Connection, event: &Event, offset: u64, end: u64)
         EventBody::AgentSpawned { agent } => {
             db.prepare_cached(
                 "INSERT OR REPLACE INTO agents (id, session_id, parent_agent_id, kind, role, \
-                 runner, model, status, cost_usd, tokens_in, tokens_out, spawned_seq) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                 runner, model, status, cost_usd, tokens_in, tokens_out, spawned_seq, \
+                 native_session_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             )?
             .execute(params![
                 agent.id,
@@ -236,7 +353,66 @@ pub(super) fn index_event(db: &Connection, event: &Event, offset: u64, end: u64)
                 agent.tokens_in as i64,
                 agent.tokens_out as i64,
                 event.seq as i64,
+                agent.native_session_id,
             ])?;
+        }
+        EventBody::AgentSession {
+            native_session_id,
+            model,
+        } => {
+            if let Some(agent_id) = &event.agent_id {
+                // A report without a model keeps the one already known.
+                db.prepare_cached(
+                    "UPDATE agents SET native_session_id = ?1, model = COALESCE(?2, model) \
+                     WHERE id = ?3 AND session_id = ?4",
+                )?
+                .execute(params![
+                    native_session_id,
+                    model,
+                    agent_id,
+                    event.session_id
+                ])?;
+            }
+        }
+        EventBody::RepoAttached { repo } => {
+            db.prepare_cached(
+                "INSERT OR REPLACE INTO session_repos (id, session_id, repo_id, name, mode, \
+                 path, branch, base_ref, is_primary, attached_seq) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            )?
+            .execute(params![
+                repo.id,
+                event.session_id,
+                repo.repo_id,
+                repo.name,
+                wire_name(&repo.mode)?,
+                repo.path,
+                repo.branch,
+                repo.base_ref,
+                repo.primary,
+                event.seq as i64,
+            ])?;
+            // The session's branch is the one of the first repo that has one.
+            db.prepare_cached("UPDATE sessions SET branch = ?1 WHERE id = ?2 AND branch IS NULL")?
+                .execute(params![repo.branch, event.session_id])?;
+        }
+        EventBody::PermissionRequested { request } => {
+            db.prepare_cached(
+                "INSERT OR REPLACE INTO permissions (session_id, request_id, agent_id, \
+                 event_id, resolved) VALUES (?1, ?2, ?3, ?4, 0)",
+            )?
+            .execute(params![
+                event.session_id,
+                request.id,
+                event.agent_id,
+                event.id
+            ])?;
+        }
+        EventBody::PermissionResolved { request_id, .. } => {
+            db.prepare_cached(
+                "UPDATE permissions SET resolved = 1 WHERE session_id = ?1 AND request_id = ?2",
+            )?
+            .execute(params![event.session_id, request_id])?;
         }
         EventBody::AgentStatus { status } => {
             if let Some(agent_id) = &event.agent_id {
@@ -274,6 +450,7 @@ pub(super) fn index_event(db: &Connection, event: &Event, offset: u64, end: u64)
         | EventBody::ItemDelta { .. }
         | EventBody::ItemCompleted { .. }
         | EventBody::PlanUpdated { .. }
+        | EventBody::FileChanged { .. }
         | EventBody::Error { .. } => {}
     }
 
@@ -296,11 +473,16 @@ fn kind(body: &EventBody) -> &'static str {
         EventBody::UserMessage { .. } => "user_message",
         EventBody::AgentSpawned { .. } => "agent_spawned",
         EventBody::AgentStatus { .. } => "agent_status",
+        EventBody::AgentSession { .. } => "agent_session",
         EventBody::ItemStarted { .. } => "item_started",
         EventBody::ItemDelta { .. } => "item_delta",
         EventBody::ItemCompleted { .. } => "item_completed",
         EventBody::PlanUpdated { .. } => "plan_updated",
         EventBody::Usage { .. } => "usage",
+        EventBody::RepoAttached { .. } => "repo_attached",
+        EventBody::PermissionRequested { .. } => "permission_requested",
+        EventBody::PermissionResolved { .. } => "permission_resolved",
+        EventBody::FileChanged { .. } => "file_changed",
         EventBody::Error { .. } => "error",
     }
 }
@@ -337,6 +519,7 @@ fn session_from_row(row: &Row<'_>) -> rusqlite::Result<Session> {
         head_seq: uint(row, 8)?,
         created_at: row.get(9)?,
         updated_at: row.get(10)?,
+        permission_mode: from_wire_name(row, 11)?,
     })
 }
 
@@ -353,6 +536,21 @@ fn agent_from_row(row: &Row<'_>) -> rusqlite::Result<Agent> {
         cost_usd: row.get(8)?,
         tokens_in: uint(row, 9)?,
         tokens_out: uint(row, 10)?,
+        native_session_id: row.get(11)?,
+    })
+}
+
+fn repo_from_row(row: &Row<'_>) -> rusqlite::Result<SessionRepo> {
+    Ok(SessionRepo {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        repo_id: row.get(2)?,
+        name: row.get(3)?,
+        mode: from_wire_name(row, 4)?,
+        path: row.get(5)?,
+        branch: row.get(6)?,
+        base_ref: row.get(7)?,
+        primary: row.get(8)?,
     })
 }
 
@@ -383,6 +581,21 @@ mod tests {
             },
             EventBody::Error {
                 message: "x".into(),
+            },
+            EventBody::AgentSession {
+                native_session_id: "n".into(),
+                model: None,
+            },
+            EventBody::PermissionResolved {
+                request_id: "r".into(),
+                decision: calin_proto::PermissionDecision::Deny,
+                by: calin_proto::DecisionSource::Expired,
+                message: None,
+            },
+            EventBody::FileChanged {
+                session_repo_id: None,
+                path: "/x".into(),
+                op: calin_proto::FileOp::Edit,
             },
         ];
         for body in bodies {

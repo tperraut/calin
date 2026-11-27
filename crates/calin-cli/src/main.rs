@@ -65,8 +65,17 @@ async fn main() -> Result<()> {
 async fn serve(args: ServeArgs) -> Result<()> {
     let addr = parse_bind(&args.bind)?;
     let home = resolve_home(args.home)?;
+    // Finds `claude` (or `CALIN_CLAUDE_BIN`) and makes it the default runner
+    // outside dry run; the mock runner is always there.
     let registry = RunnerRegistry::new(RegistryConfig::from_env());
     let dry_run = registry.dry_run();
+    let runners = registry.ids();
+    match runners.split_first() {
+        Some((default, _)) if !dry_run => {
+            tracing::info!(runners = %runners.join(", "), %default, "runners available");
+        }
+        _ => tracing::info!("dry run: every agent runs on the mock runner"),
+    }
 
     let store = Store::open(home.clone())
         .await
