@@ -35,7 +35,8 @@ try {
   current = phone;
   let page = phone.page;
   const tab = (name) => page.getByRole("tab", { name }).first();
-  const allow = () => page.getByRole("button", { name: /^allow$/i });
+  const allowOn = (p) => p.getByRole("button", { name: /^allow$/i });
+  const allow = () => allowOn(page);
 
   await page.goto(`${base}/`);
   await page.waitForSelector(PROMPT);
@@ -192,6 +193,86 @@ try {
   check("transcript and diff are visible together on a desktop", sideBySide);
   await desktop.shot("changes");
   check("the desktop console is clean", desktop.errors.length === 0, JSON.stringify(desktop.errors).slice(0, 300));
+
+  // ---- M2: a home repo that declares the others, attach mid-session, ship.
+  const home = await repo(
+    "home-base",
+    { ".calin/repos.yaml": "repos:\n  gamma-api: {}\n  delta-web: {}\nsets:\n  pair: [gamma-api, delta-web]\n", "README.md": "# home\n" },
+    { under: "code" },
+  );
+  await repo("gamma-api", { "README.md": "# gamma api\n" }, { under: "code" });
+  await repo("delta-web", { "README.md": "# delta web\n" }, { under: "code" });
+
+  const m2 = await open(PHONE, "m2");
+  current = m2;
+  page = m2.page;
+  await page.goto(`${base}/settings`);
+  await page.waitForSelector('[aria-label="Settings"]');
+  await page.fill('input[placeholder="/home/you/code/home"]', home.path);
+  await page.fill('input[placeholder="/home/you/code"]', `${env.scratch}/code`);
+  await page.keyboard.press("Enter");
+  await page.getByRole("button", { name: /^save/i }).click();
+  let catalog = [];
+  for (let i = 0; i < 40; i++) {
+    catalog = (await api("GET", "/repos")).body;
+    if (catalog.filter((r) => r.declared && r.available).length === 2) break;
+    await page.waitForTimeout(250);
+  }
+  check(
+    "the home repo's declared repos are found on disk",
+    catalog.some((r) => r.home) && catalog.filter((r) => r.declared && r.available).length === 2,
+    JSON.stringify(catalog.map((r) => [r.name, r.home, r.declared, r.available])),
+  );
+  await m2.shot("settings");
+
+  await page.goto(`${base}/`);
+  await page.waitForSelector(PROMPT);
+  await page.fill(PROMPT, "Tidy the notes");
+  await page.waitForTimeout(500);
+  await m2.shot("composer");
+  await page.getByRole("button", { name: /^start$/i }).click();
+  await page.waitForURL(/\/s\//, { timeout: 10000 });
+  const homeSession = page.url().split("/s/")[1].split("/")[0];
+  for (let i = 0; i < 2; i++) {
+    await m2.bodyHas("Allow this?");
+    await allowOn(page).click();
+    await page.waitForTimeout(600);
+  }
+  await m2.bodyHas("Review");
+  let homeDetail = (await api("GET", `/sessions/${homeSession}`)).body;
+  check(
+    "a new session starts in the home repo, edited in place",
+    homeDetail.repos.length === 1 && homeDetail.repos[0].name === "home-base" && homeDetail.repos[0].mode === "live",
+    JSON.stringify(homeDetail.repos.map((r) => [r.name, r.mode, r.primary])),
+  );
+
+  const attached = await api("POST", `/sessions/${homeSession}/repos`, {
+    repo_id: catalog.find((r) => r.name === "gamma-api").id,
+  });
+  check("a repo can be attached to a running session", attached.status === 201, JSON.stringify(attached.body).slice(0, 120));
+  await m2.bodyHas("gamma-api", 10000);
+  check("the transcript says who attached it", /attached by you/i.test(await page.locator(TRANSCRIPT).innerText()));
+
+  // Change something in the attached worktree, then ship.
+  const written = await api("PUT", `/sessions/${homeSession}/repos/${attached.body.id}/file?path=NOTES.md`, {
+    text: "shipped from e2e\n",
+  });
+  check("a file can be created in the attached repo", written.status === 200);
+  await page.getByRole("tab", { name: /changes/i }).first().click();
+  await m2.bodyHas("NOTES.md", 15000);
+  await page.getByRole("button", { name: /open pull requests/i }).first().click();
+  await page.getByRole("button", { name: /^ship$/i }).click();
+  await m2.bodyHas("Shipping", 20000);
+  await page.waitForTimeout(500);
+  homeDetail = (await api("GET", `/sessions/${homeSession}`)).body;
+  check(
+    "shipping opens one pull request for the changed worktree only",
+    homeDetail.pull_requests.length === 1 && homeDetail.pull_requests[0].url.includes("example.invalid/gamma-api"),
+    JSON.stringify(homeDetail.pull_requests.map((p) => [p.url, p.state])),
+  );
+  check("the pull request is shown", (await page.textContent("body")).includes("#1"));
+  await m2.shot("shipping");
+  check("the M2 console is clean", m2.errors.length === 0, JSON.stringify(m2.errors).slice(0, 300));
 
   failed = env.results.some((result) => !result.ok);
 } catch (error) {

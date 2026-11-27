@@ -134,9 +134,13 @@ export async function start({ binary, shots }) {
       return { status: response.status, body: text ? JSON.parse(text) : null };
     }
 
-    /** A throwaway git clone with one commit, registered with the server. */
-    async function repo(name, files) {
-      const dir = join(scratch, "repos", name);
+    /**
+     * A throwaway git clone with one commit. By default it lives under `repos/`
+     * and is registered with the server; pass `under` to put it elsewhere and
+     * leave it unregistered, for the server to discover.
+     */
+    async function repo(name, files, { under } = {}) {
+      const dir = join(scratch, under ?? "repos", name);
       mkdirSync(dir, { recursive: true });
       for (const [file, content] of Object.entries(files)) {
         mkdirSync(join(dir, file, ".."), { recursive: true });
@@ -160,6 +164,7 @@ export async function start({ binary, shots }) {
       git("init", "-q", "-b", "main");
       git("add", "-A");
       git("commit", "-q", "-m", "initial");
+      if (under !== undefined) return { name, path: dir };
       const registered = await api("POST", "/repos", { path: dir });
       if (registered.status !== 201) throw new Error(`could not register ${name}: ${JSON.stringify(registered.body)}`);
       return registered.body;
@@ -167,6 +172,7 @@ export async function start({ binary, shots }) {
 
     return {
       base,
+      scratch,
       api,
       repo,
       check,

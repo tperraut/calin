@@ -65,15 +65,38 @@ Known gaps carried forward from M1:
 - A 409 from saving a file does not say which of its three causes it was, except in its message.
 - Real-agent runs are checked by hand; `make e2e` covers the mock runner only.
 
-## M2: Home repo and delivery (in progress, branch `m2`)
+## M2: Home repo and delivery (done 2026-11-27, except the check against real GitHub)
 
 - [x] Contract: settings, repo catalog from the home repo, clone, repo sets, attach mid-session,
-      the tool endpoint for agents
-- [ ] Core and server: settings, `.calin/repos.yaml`, scan and clone, attach mid-session, path
-      policy for attached repos, setup command, the tool endpoint, session system prompt
-- [ ] Web: settings, catalog with clone and sets, attach from the session page, M1 polish
-- [ ] Delivery: commit, push and one linked draft pull request per changed repo; PR and CI status
-- [ ] End to end: mock in `make e2e`, then a real agent attaching a repo through the tool endpoint
+      the tool endpoint for agents, ship and pull requests
+- [x] Core and server: settings, `.calin/repos.yaml`, scan and clone, attach mid-session, path
+      policy for attached repos with directory grants, setup command, the tool endpoint (MCP over
+      HTTP), session briefing in the agent's system prompt
+- [x] Web: settings, catalog with clone and sets, attach from the session page, Markdown in agent
+      text, permission prompt merged into its tool card
+- [x] Delivery: commit, push and one linked pull request per changed repo; watching state, checks
+      and reviews; "Send back to the agent"
+- [x] `make e2e` covers the home repo catalog, attach mid-session and shipping in dry run
+- [x] A real Claude Code session attached a second repo through the tool endpoint and edited it
+- [ ] Delivery against real GitHub. Everything was tested with a stand-in for `gh` and local bare
+      remotes. A first real run should check: `gh auth status` exit codes (offline currently reads
+      as "not signed in"), the shapes of `statusCheckRollup` and `reviewDecision`, that
+      `gh pr create` prints only the URL, repo resolution from a worktree, and drafts on plans
+      that refuse them. Needs a repository the owner agrees to open test pull requests in.
+
+Known gaps carried forward from M2:
+
+- Real Claude sessions show no plan: the CLI withholds its task-list tools from current models
+  unless `CLAUDE_CODE_ENABLE_TODO_TOOLS=1`. The mapping exists; Calin does not set the variable.
+- Nothing marks the start or end of a ship, so the web app waits for pull request or error
+  events and gives up after 30 seconds of silence.
+- `error` events name a repo only in prose.
+- `git push` and commit hooks run without a timeout.
+- The push remote is always `origin`; forks are not handled.
+- `PUT /settings` errors name no field; `clone_root` cannot tell a stored value from the default.
+- The agent prefers its shell over file tools in a freshly attached repo unless told otherwise;
+  the session briefing tells it, and each shell command there still waits for approval in `ask`
+  and `accept_edits`.
 
 ## Later
 
