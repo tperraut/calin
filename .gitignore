@@ -12,3 +12,9 @@ fixtures/raw/
 .metrics/
 # llvm-cov profiles written by instrumented test runs
 *.profraw
+# impeccable: per-developer config and run artifacts (PRODUCT.md, DESIGN.md and
+# .impeccable/design.json are tracked)
+.impeccable/config.local.json
+.impeccable/questions/
+.impeccable/mocks/
+.impeccable/review/
