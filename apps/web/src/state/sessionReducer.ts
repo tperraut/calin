@@ -8,6 +8,7 @@ import type { ItemDelta } from "../gen/ItemDelta";
 import type { PermissionDecision } from "../gen/PermissionDecision";
 import type { PermissionRequest } from "../gen/PermissionRequest";
 import type { PlanEntry } from "../gen/PlanEntry";
+import type { PullRequest } from "../gen/PullRequest";
 import type { SessionRepo } from "../gen/SessionRepo";
 import type { SessionStatus } from "../gen/SessionStatus";
 
@@ -63,6 +64,15 @@ export type TranscriptEntry =
       by: "user" | "agent";
       agentId: string | null;
     }
+  | {
+      /** A pull request was first opened, or was merged or closed: its other changes are not rows. */
+      kind: "pull_request";
+      key: string;
+      ts: number;
+      what: "opened" | "merged" | "closed";
+      /** As it was then: the row links to it. */
+      pullRequest: PullRequest;
+    }
   | { kind: "error"; key: string; ts: number; agentId: string | null; message: string };
 
 /** A permission request nobody has answered yet. */
@@ -111,6 +121,8 @@ export type SessionView = {
   readonly changedFiles: readonly FileChange[];
   /** Goes up by one with every `file_changed` event; watch it to know when to refetch. */
   readonly changesRevision: number;
+  /** One per repo, as the events last described it, in the order they were first seen. */
+  readonly pullRequests: readonly PullRequest[];
 };
 
 export const emptySessionView: SessionView = {
@@ -127,6 +139,7 @@ export const emptySessionView: SessionView = {
   pendingPermissions: [],
   changedFiles: [],
   changesRevision: 0,
+  pullRequests: [],
 };
 
 /**
@@ -141,8 +154,14 @@ const permissionKey = (requestId: string): string => `permission:${requestId}`;
 const fileKey = (sessionRepoId: string | null, path: string): string =>
   `${sessionRepoId ?? ""}\n${path}`;
 
-/** Statuses in which no turn is in progress: what was still open will not finish (api.rs, Semantics). */
-const turnOver: readonly SessionStatus[] = ["review", "done", "failed", "cancelled"];
+const pullRequestKey = (pullRequest: PullRequest, what: string): string =>
+  `pull_request:${pullRequest.session_repo_id}:${pullRequest.number}:${what}`;
+
+/**
+ * Statuses in which no turn is in progress: what was still open will not
+ * finish (api.rs, Semantics). `shipping` is one: a message starts a turn from it.
+ */
+const turnOver: readonly SessionStatus[] = ["review", "shipping", "done", "failed", "cancelled"];
 
 function withEntry(
   transcript: readonly TranscriptEntry[],
@@ -394,6 +413,40 @@ function changeFile(
   };
 }
 
+/**
+ * Inserts the pull request or replaces the one of its repo (a session has at
+ * most one per repo). The transcript says it once when it is opened and once
+ * when it is merged or closed: shipping again announces the same one again.
+ */
+function putPullRequest(
+  view: SessionView,
+  event: Event,
+  described: PullRequest,
+  opened: boolean,
+): SessionView {
+  // Widened on purpose, as the body is: an event that names no pull request changes nothing.
+  const pullRequest = described as PullRequest | null | undefined;
+  if (!pullRequest) return view;
+  const index = view.pullRequests.findIndex(
+    (one) => one.session_repo_id === pullRequest.session_repo_id,
+  );
+  const pullRequests =
+    index === -1 ? [...view.pullRequests, pullRequest] : view.pullRequests.with(index, pullRequest);
+  let transcript = view.transcript;
+  const news = [
+    ...(opened ? (["opened"] as const) : []),
+    ...(pullRequest.state === "merged" || pullRequest.state === "closed"
+      ? [pullRequest.state]
+      : []),
+  ];
+  for (const what of news) {
+    const key = pullRequestKey(pullRequest, what);
+    if (transcript.some((entry) => entry.key === key)) continue;
+    transcript = [...transcript, { kind: "pull_request", key, ts: event.ts, what, pullRequest }];
+  }
+  return { ...view, pullRequests, transcript };
+}
+
 function applyBody(view: SessionView, event: Event): SessionView {
   // Widened on purpose: a frame without a body must not throw in the fold.
   const body = event.body as EventBody | null | undefined;
@@ -464,6 +517,10 @@ function applyBody(view: SessionView, event: Event): SessionView {
       return resolvePermission(view, body);
     case "file_changed":
       return changeFile(view, event, body);
+    case "pull_request_opened":
+      return putPullRequest(view, event, body.pull_request, true);
+    case "pull_request_updated":
+      return putPullRequest(view, event, body.pull_request, false);
     case "error": {
       const entry: TranscriptEntry = {
         kind: "error",

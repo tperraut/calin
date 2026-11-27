@@ -8,8 +8,12 @@ import {
   Show,
   Switch,
 } from "solid-js";
+import { PullRequestLink } from "../components/PullRequests";
+import { PullRequestSection } from "../components/PullRequestSection";
+import { ShipAction } from "../components/ShipAction";
 import type { ChangedFile } from "../gen/ChangedFile";
 import type { FileDiff } from "../gen/FileDiff";
+import type { PullRequest } from "../gen/PullRequest";
 import type { RepoChanges } from "../gen/RepoChanges";
 import { errorMessage } from "../lib/errors";
 import { createMediaQuery, createWidth, WIDE_QUERY } from "../lib/media";
@@ -126,6 +130,8 @@ function FileRow(props: { file: ChangedFile; selected: boolean; onSelect: () => 
 
 function RepoGroup(props: {
   repo: RepoChanges;
+  /** The repo's pull request, once it has one: the group leads to it. */
+  pullRequest: PullRequest | undefined;
   open: boolean;
   selected: FileTarget | undefined;
   onToggle: () => void;
@@ -153,6 +159,11 @@ function RepoGroup(props: {
       </Show>
     </>
   );
+  const pullRequest = () => (
+    <Show when={props.pullRequest}>
+      {(one) => <PullRequestLink pullRequest={one()} repo={props.repo.name} class="shrink-0" />}
+    </Show>
+  );
   return (
     <section aria-label={props.repo.name} class="border-b border-line">
       <Show
@@ -162,14 +173,15 @@ function RepoGroup(props: {
           <p class="flex min-h-11 items-center gap-2 px-3 text-sm">
             {name()}
             <span class="ml-auto shrink-0 text-xs text-muted">No changes</span>
+            {pullRequest()}
           </p>
         }
       >
-        <h3>
+        <h3 class="flex items-center gap-1 bg-surface pr-3 text-sm">
           <button
             type="button"
             aria-expanded={props.open ? "true" : "false"}
-            class="group flex min-h-11 w-full items-center gap-2 bg-surface px-3 text-left text-sm -outline-offset-2"
+            class="group flex min-h-11 min-w-0 flex-1 items-center gap-2 pl-3 text-left -outline-offset-2"
             onClick={() => props.onToggle()}
           >
             <span
@@ -184,6 +196,7 @@ function RepoGroup(props: {
               <span class="text-xs text-muted">{filesLabel(totals().files)}</span>
             </span>
           </button>
+          {pullRequest()}
         </h3>
         <ul hidden={!props.open} class="divide-y divide-line border-t border-line">
           <For each={props.repo.files} keyed={(file) => file.path}>
@@ -322,6 +335,7 @@ export default function ChangesPanel(props: PanelProps) {
 
   const ordered = createMemo(() => inRepoOrder(changes() ?? [], props.store.repos()));
   const totals = createMemo(() => sessionTotals(changes() ?? []));
+  const pullRequests = createMemo(() => props.store.delivery.pullRequests());
   const selectedFile = createMemo(() => {
     const target = selected();
     const list = changes();
@@ -397,6 +411,14 @@ export default function ChangesPanel(props: PanelProps) {
             </span>
           </button>
         </div>
+        {/* On a phone the header's own is in reach from every panel; one is enough there. */}
+        <Show when={wide()}>
+          <ShipAction
+            store={props.store}
+            class="border-b border-line bg-surface px-3 py-1.5"
+            onOpen={() => props.links.openShipForm()}
+          />
+        </Show>
         <div class="min-h-0 flex-1 overflow-y-auto overscroll-contain">
           <Show when={failure()}>
             {(message) => (
@@ -407,6 +429,12 @@ export default function ChangesPanel(props: PanelProps) {
                 </button>
               </div>
             )}
+          </Show>
+          <Show when={pullRequests().length > 0}>
+            <PullRequestSection
+              store={props.store}
+              onSendBack={(text) => props.links.draftMessage(text)}
+            />
           </Show>
           <Show when={changes() !== undefined && totals().files === 0}>
             <div class="p-6 text-center">
@@ -421,6 +449,9 @@ export default function ChangesPanel(props: PanelProps) {
               {(repo) => (
                 <RepoGroup
                   repo={repo()}
+                  pullRequest={pullRequests().find(
+                    (one) => one.session_repo_id === repo().session_repo_id,
+                  )}
                   open={!closed().has(repo().session_repo_id)}
                   selected={selected()}
                   onToggle={() => toggle(repo().session_repo_id)}

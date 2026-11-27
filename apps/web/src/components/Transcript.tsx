@@ -14,6 +14,7 @@ import type { Item } from "../gen/Item";
 import type { ItemContent } from "../gen/ItemContent";
 import type { ItemStatus } from "../gen/ItemStatus";
 import type { PermissionRequest } from "../gen/PermissionRequest";
+import type { PullRequest } from "../gen/PullRequest";
 import type { SessionRepo } from "../gen/SessionRepo";
 import { locateInRepos } from "../lib/paths";
 import { decisionSourceLabel, repoModeLabel, type Look, type Tone } from "../lib/status";
@@ -22,6 +23,7 @@ import type { PermissionAnswers } from "../state/permissionAnswers";
 import type { PermissionOutcome, ToolPermission, TranscriptEntry } from "../state/sessionReducer";
 import { Badge, ItemStatusBadge } from "./Badge";
 import { Markdown } from "./Markdown";
+import { PullRequestLink } from "./PullRequests";
 
 type ToolContent = Extract<ItemContent, { kind: "tool" }>;
 
@@ -346,6 +348,32 @@ function RepoAttachedRow(props: { repo: SessionRepo; by: "user" | "agent" }) {
   );
 }
 
+/** A pull request was opened, merged or closed: one line, leading to it. */
+function PullRequestRow(props: { pullRequest: PullRequest; what: "opened" | "merged" | "closed" }) {
+  const around = useContext(SurroundingsContext);
+  const repo = (): string | undefined =>
+    around.repos().find((one) => one.id === props.pullRequest.session_repo_id)?.name;
+  return (
+    <p data-pull-request-row={props.what} class="px-1 text-xs wrap-break-word text-muted">
+      <PullRequestLink
+        pullRequest={props.pullRequest}
+        repo={repo()}
+        long={true}
+        class="lg:min-h-0"
+      />{" "}
+      {props.what}
+      <Show when={repo()}>
+        {(name) => (
+          <>
+            {" "}
+            for <span class="font-medium text-fg">{name()}</span>
+          </>
+        )}
+      </Show>
+    </p>
+  );
+}
+
 function ItemRow(props: {
   item: Item;
   interrupted: boolean;
@@ -395,6 +423,7 @@ function EntryRow(props: { entry: TranscriptEntry }) {
   const item = () => (props.entry.kind === "item" ? props.entry : undefined);
   const permission = () => (props.entry.kind === "permission" ? props.entry : undefined);
   const repo = () => (props.entry.kind === "repo" ? props.entry : undefined);
+  const pullRequest = () => (props.entry.kind === "pull_request" ? props.entry : undefined);
   const error = () => (props.entry.kind === "error" ? props.entry : undefined);
   return (
     <Switch>
@@ -413,6 +442,9 @@ function EntryRow(props: { entry: TranscriptEntry }) {
       </Match>
       <Match when={repo()}>
         {(entry) => <RepoAttachedRow repo={entry().repo} by={entry().by} />}
+      </Match>
+      <Match when={pullRequest()}>
+        {(entry) => <PullRequestRow pullRequest={entry().pullRequest} what={entry().what} />}
       </Match>
       <Match when={error()}>{(entry) => <ErrorRow message={entry().message} />}</Match>
     </Switch>

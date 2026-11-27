@@ -19,6 +19,7 @@ import { SidePane } from "../components/SidePane";
 import { Transcript } from "../components/Transcript";
 import type { SessionStatus } from "../gen/SessionStatus";
 import { changedFileCount } from "../lib/changeCount";
+import { needsAttention } from "../lib/delivery";
 import { createMediaQuery, WIDE_QUERY } from "../lib/media";
 import { canMessage, resumesOnMessage, sessionLook } from "../lib/status";
 import { PanelHost, PanelOutlet } from "../panels/PanelHost";
@@ -43,7 +44,7 @@ function closedHint(status: SessionStatus | undefined): string {
   if (status === "queued" || status === "preparing") {
     return "Messages open once the session is running";
   }
-  if (status === "shipping") return "Messages are closed while the session ships";
+  if (status === "done") return "This session is done: it can be read, not continued";
   return "This session has ended";
 }
 
@@ -116,6 +117,17 @@ export function SessionScreen(props: {
     setFileRequest({ target, seq: fileRequests });
     props.onPanel("files");
   }
+  // The ship form lives under the header; the header and the Changes panel both open it.
+  const [shipOpen, setShipOpen] = createSignal(false);
+  // A message written for the reader by another part of the screen; the message box takes it.
+  const [prefill, setPrefill] = createSignal<{ text: string; seq: number }>();
+  let prefills = 0;
+  function draftMessage(text: string): void {
+    prefills += 1;
+    setPrefill({ text, seq: prefills });
+    // On a phone the box is behind the panel that asked.
+    if (!wide()) props.onPanel("transcript");
+  }
   let panels: HTMLDivElement | undefined;
   void (
     <PanelHost
@@ -123,6 +135,8 @@ export function SessionScreen(props: {
       panel={hostedPanel()}
       fileRequest={fileRequest()}
       onOpenFile={openFile}
+      onOpenShipForm={() => setShipOpen(true)}
+      onDraftMessage={draftMessage}
       ref={(element) => (panels = element)}
     />
   );
@@ -164,12 +178,22 @@ export function SessionScreen(props: {
     store.synced() ? lastCompletedText(store.view().transcript).slice(0, ANNOUNCED_CHARS) : "",
   );
 
-  // `waiting` leads the tab title, so a background tab shows that the session needs its reader.
+  // What needs the reader leads the tab title, so a background tab shows it: a
+  // request to answer, or a pull request whose checks or review went wrong.
   const documentTitle = createMemo(() => {
     const title = store.session()?.title;
     if (title === undefined) return "Calin";
-    return store.status() === "waiting" ? `Waiting for you · ${title} · Calin` : `${title} · Calin`;
+    const status = store.status();
+    if (status === "waiting") return `Waiting for you · ${title} · Calin`;
+    if (status === "shipping" && store.delivery.pullRequests().some(needsAttention)) {
+      return `Pull request needs you · ${title} · Calin`;
+    }
+    return `${title} · Calin`;
   });
+  const doneNote = (): string =>
+    store.delivery.pullRequests().length > 0
+      ? "Done: every pull request is merged or closed. This session is now read-only."
+      : "Done: this session is now read-only.";
   createEffect(documentTitle, (title) => {
     document.title = title;
     return () => {
@@ -199,7 +223,7 @@ export function SessionScreen(props: {
         )}
       </Match>
       <Match when={true}>
-        <SessionHeader store={store} />
+        <SessionHeader store={store} shipOpen={shipOpen()} onShipOpen={setShipOpen} />
         <Show when={store.stalled()}>
           <p role="alert" class="border-b border-line bg-attention-soft px-3 py-2 text-sm">
             Part of this transcript could not be loaded. Reload the page to try again.
@@ -227,6 +251,14 @@ export function SessionScreen(props: {
             {(status) => <p>Session status: {sessionLook(status()).label}</p>}
           </Show>
           <p>{announcedMessage()}</p>
+          <Show when={store.delivery.failed() > 0}>
+            <p>
+              {store.delivery.failed() === 1
+                ? "1 repo could not be shipped."
+                : `${store.delivery.failed()} repos could not be shipped.`}{" "}
+              The transcript says why.
+            </p>
+          </Show>
         </div>
         <div class="flex min-h-0 flex-1">
           <div class="flex min-h-0 min-w-0 flex-1 flex-col">
@@ -280,10 +312,17 @@ export function SessionScreen(props: {
               }
             />
             <div hidden={transcriptHidden()}>
+              <Show when={store.status() === "done"}>
+                <p data-part="done-note" class="border-t border-line bg-sunken px-3 py-2 text-sm">
+                  {doneNote()}
+                </p>
+              </Show>
               <MessageBox
                 enabled={canMessage(store.status())}
                 closedHint={closedHint(store.status())}
                 resumes={resumesOnMessage(store.status())}
+                prefill={prefill()}
+                shown={!transcriptHidden()}
                 onSend={(text) => store.send(text)}
               />
             </div>

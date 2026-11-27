@@ -64,7 +64,7 @@ export const statusLook = (status: ChangeStatus): StatusLook =>
     tone: "neutral",
   };
 
-export const filesLabel = (count: number): string => `${count} ${count === 1 ? "file" : "files"}`;
+export { filesLabel } from "../../lib/format";
 
 /** What a diff has to show, decided once from the wire shape (repo.rs, `FileDiff`). */
 export type DiffContent =

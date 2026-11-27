@@ -1,4 +1,4 @@
-import { For } from "solid-js";
+import { For, Show } from "solid-js";
 import type { Session } from "../gen/Session";
 import { absoluteTime, relativeTime } from "../lib/format";
 import { sessionPath } from "../panels/registry";
@@ -31,6 +31,13 @@ export function SessionList(props: { sessions: readonly Session[]; now: number }
                 >
                   {relativeTime(session().created_at, props.now)}
                 </time>
+                {/* The list knows a session's status only: `shipping` is pull requests still in play. */}
+                <Show when={session().status === "shipping"}>
+                  <span aria-hidden="true">·</span>
+                  <span data-part="pull-requests" class="font-medium text-tone-active">
+                    Pull requests open
+                  </span>
+                </Show>
               </span>
             </a>
           </li>

@@ -14,6 +14,7 @@ import type { Session } from "../gen/Session";
 import type { SessionDetail } from "../gen/SessionDetail";
 import type { SessionRepo } from "../gen/SessionRepo";
 import type { Settings } from "../gen/Settings";
+import type { ShipRequest } from "../gen/ShipRequest";
 import type { TreeEntry } from "../gen/TreeEntry";
 import type { WriteFileRequest } from "../gen/WriteFileRequest";
 
@@ -70,6 +71,14 @@ export interface Api {
   resolvePermission(id: string, requestId: string, body: ResolvePermissionRequest): Promise<void>;
   /** Attaches a repo to a session that is running, waiting or in review; 409 otherwise. */
   attachRepo(id: string, body: AttachRepoRequest): Promise<SessionRepo>;
+  /**
+   * Opens, or updates, the session's pull requests. Answers at once: what it
+   * did arrives as events. 409 unless the session is in review or shipping, or
+   * when GitHub cannot be used.
+   */
+  shipSession(id: string, body: ShipRequest): Promise<void>;
+  /** Has the server look at the session's pull requests now; what changed arrives as events. */
+  refreshPullRequests(id: string): Promise<void>;
   /** What the session changed, one entry per attached repo. */
   getChanges(id: string): Promise<RepoChanges[]>;
   /** Both sides of one changed file. `path` is relative to the repo root (api.rs, Semantics). */
@@ -168,6 +177,8 @@ export function createApi(
     resolvePermission: (id, requestId, body) =>
       empty("POST", `${session(id)}/permissions/${encodeURIComponent(requestId)}`, body),
     attachRepo: (id, body) => json<SessionRepo>("POST", `${session(id)}/repos`, body),
+    shipSession: (id, body) => empty("POST", `${session(id)}/ship`, body),
+    refreshPullRequests: (id) => empty("POST", `${session(id)}/pull-requests/refresh`),
     getChanges: (id) => json<RepoChanges[]>("GET", `${session(id)}/changes`),
     getDiff: (id, repo, path) => json<FileDiff>("GET", inRepo(id, repo, "diff", path)),
     listTree: (id, repo, path) => json<TreeEntry[]>("GET", inRepo(id, repo, "tree", path)),

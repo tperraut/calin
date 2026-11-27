@@ -55,6 +55,7 @@ const health: Health = {
   version: "0.1.0",
   dry_run: false,
   runners: ["mock", "claude"],
+  github_problem: null,
 };
 
 /** Mounts the whole app at `path` over fakes, with the socket already open. */
@@ -406,7 +407,8 @@ describe("App", () => {
       running: { interrupt: true, stop: true, message: true, label: "Send" },
       waiting: { interrupt: true, stop: true, message: true, label: "Send" },
       review: { interrupt: false, stop: true, message: true, label: "Send" },
-      shipping: { interrupt: false, stop: false, message: false, label: "Send" },
+      // "While `shipping`": a message starts a turn, and the session can still be stopped.
+      shipping: { interrupt: false, stop: true, message: true, label: "Send" },
       done: { interrupt: false, stop: false, message: false, label: "Send" },
       failed: { interrupt: false, stop: false, message: true, label: "Continue" },
       cancelled: { interrupt: false, stop: false, message: true, label: "Continue" },

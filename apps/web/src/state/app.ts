@@ -40,6 +40,8 @@ export type AppServices = {
 export type AppState = {
   connection: Accessor<ConnectionState>;
   health: Accessor<HealthState>;
+  /** Why this server cannot open pull requests (`Health::github_problem`), when it says so. */
+  githubProblem: Accessor<string | undefined>;
   /** Newest first. */
   sessions: Accessor<readonly Session[]>;
   /** True once the server has sent every existing session. */
@@ -142,9 +144,15 @@ export function createAppState(services: AppServices): AppState {
     );
   }
 
+  const knownHealth = (): Health | undefined => {
+    const state = health();
+    return state.status === "ready" ? state.health : undefined;
+  };
+
   return {
     connection,
     health,
+    githubProblem: () => knownHealth()?.github_problem ?? undefined,
     sessions,
     sessionsLoaded,
     sessionsError,
@@ -183,6 +191,9 @@ export function createAppState(services: AppServices): AppState {
           listed: (wanted) => sessions().find((session) => session.id === wanted),
           schedule: services.schedule,
           openTerminal: services.openTerminal,
+          health: knownHealth,
+          checkHealth: loadHealth,
+          now,
         },
         id,
       ),

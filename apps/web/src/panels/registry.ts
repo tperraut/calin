@@ -18,6 +18,10 @@ export type PanelLinks = {
    * nothing would: the session screen asks before it navigates away.
    */
   setUnsavedWork(description: string | undefined): void;
+  /** Shows the form that opens or updates the session's pull requests; it lives under the header. */
+  openShipForm(): void;
+  /** Puts `text` in the message box and moves the focus there. Nothing is sent. */
+  draftMessage(text: string): void;
 };
 
 /**

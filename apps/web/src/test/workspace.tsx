@@ -3,6 +3,8 @@ import { createSignal, flush, type Accessor } from "solid-js";
 import type { Api } from "../api/http";
 import type { OpenTerminal } from "../api/terminal";
 import type { EventBody } from "../gen/EventBody";
+import type { Health } from "../gen/Health";
+import type { PullRequest } from "../gen/PullRequest";
 import type { SessionRepo } from "../gen/SessionRepo";
 import type { SessionStatus } from "../gen/SessionStatus";
 import type { FileRequest, FileTarget, PanelLinks } from "../panels/registry";
@@ -28,6 +30,10 @@ export type Workspace = {
   /** Files other panels were asked to open, in order. */
   opened: FileTarget[];
   unsaved: Array<string | undefined>;
+  /** How many times a panel asked for the ship form. */
+  shipForms: () => number;
+  /** Messages a panel drafted for the agent, in order. */
+  drafts: string[];
   /** Whether the panel under test is the one on screen. */
   active: Accessor<boolean>;
   setActive: (active: boolean) => void;
@@ -39,18 +45,29 @@ export async function openWorkspace(
   options: {
     routes?: Partial<Api>;
     repos?: SessionRepo[];
+    pullRequests?: PullRequest[];
     status?: SessionStatus;
     openTerminal?: OpenTerminal;
+    health?: Health;
+    now?: number;
   } = {},
 ): Promise<Workspace> {
   const socket = new FakeSocket();
   const session = makeSession("s1", 1000, { status: options.status ?? "running" });
   const api = fakeApi({
-    getSession: () => Promise.resolve(makeDetail(session, options.repos ?? [])),
+    getSession: () =>
+      Promise.resolve(makeDetail(session, options.repos ?? [], options.pullRequests ?? [])),
     ...options.routes,
   });
   const store = createSessionStore(
-    { api, socket, schedule: immediately, openTerminal: options.openTerminal },
+    {
+      api,
+      socket,
+      schedule: immediately,
+      openTerminal: options.openTerminal,
+      health: () => options.health,
+      now: () => options.now ?? 1000,
+    },
     "s1",
   );
   store.start();
@@ -63,6 +80,8 @@ export async function openWorkspace(
   const [fileRequest, setFileRequest] = createSignal<FileRequest>();
   const opened: FileTarget[] = [];
   const unsaved: Array<string | undefined> = [];
+  const drafts: string[] = [];
+  let shipForms = 0;
   return {
     store,
     socket,
@@ -83,9 +102,15 @@ export async function openWorkspace(
       openFile: (target) => opened.push(target),
       fileRequest,
       setUnsavedWork: (description) => unsaved.push(description),
+      openShipForm: () => {
+        shipForms += 1;
+      },
+      draftMessage: (text) => drafts.push(text),
     },
     opened,
     unsaved,
+    shipForms: () => shipForms,
+    drafts,
     active,
     setActive(next) {
       setActive(next);

@@ -4,7 +4,7 @@ import type { Api } from "../api/http";
 import type { ChangedFile } from "../gen/ChangedFile";
 import type { FileDiff } from "../gen/FileDiff";
 import type { RepoChanges } from "../gen/RepoChanges";
-import { conflict, deferred, makeSessionRepo, settle } from "../test/fakes";
+import { conflict, deferred, makePullRequest, makeSessionRepo, settle } from "../test/fakes";
 import { diffs, editors, resetFakeEditors } from "../test/fakeEditor";
 import {
   click,
@@ -521,5 +521,90 @@ describe("ChangesPanel", () => {
     await click(findByText(host, "button", "Open in Files"));
     expect(opened).toEqual([{ sessionRepoId: "api", path: "src/a b#.rs" }]);
     flush();
+  });
+});
+
+describe("ChangesPanel: delivery", () => {
+  const set = [
+    makeSessionRepo("api", { primary: true, branch: "calin/s1" }),
+    makeSessionRepo("web", { branch: "calin/s1" }),
+    makeSessionRepo("docs", { mode: "read" }),
+  ];
+  const listing = () =>
+    Promise.resolve([repo("api", [file("a.rs")]), repo("web", []), repo("docs", [file("d.md")])]);
+
+  async function shipped(
+    status: "review" | "shipping",
+    pullRequests = [makePullRequest("web", 7)],
+  ) {
+    const workspace = await openWorkspace({
+      routes: { getChanges: listing },
+      repos: set,
+      status,
+      pullRequests,
+    });
+    const host = mount(() => (
+      <ChangesPanel store={workspace.store} active={workspace.active()} links={workspace.links} />
+    ));
+    await act();
+    return { ...workspace, host };
+  }
+
+  it("shows no pull request section, and no link, before any exists", async () => {
+    const { host } = await shipped("review", []);
+    expect(host.querySelector('[role="region"][aria-label="Pull requests"]')).toBeNull();
+    expect(host.querySelector("[data-pull-request]")).toBeNull();
+  });
+
+  it("puts the pull requests above the file groups, and links each repo group to its own", async () => {
+    const { host, emit, caughtUp } = await shipped("shipping");
+    caughtUp();
+    emit({ type: "pull_request_opened", pull_request: makePullRequest("api", 12) });
+
+    const list = find(host, 'section[aria-label="Changed files"]');
+    const section = find(list, '[role="region"][aria-label="Pull requests"]');
+    const first = find(list, 'section[aria-label="api"]');
+    expect(section.compareDocumentPosition(first) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(find(section, '[data-part="roll-up"]').textContent).toBe("2 pull requests");
+
+    const ofApi = find<HTMLAnchorElement>(first, "h3 a[data-pull-request]");
+    expect([ofApi.textContent, ofApi.getAttribute("href")]).toEqual([
+      "#12",
+      "https://github.com/acme/api/pull/12",
+    ]);
+    // Beside the toggle, not inside it: a link in a button could not be followed.
+    expect(find(first, "h3 button").querySelector("a")).toBeNull();
+    // A repo with nothing changed keeps its one line, and its link.
+    const ofWeb = find<HTMLAnchorElement>(
+      find(list, 'section[aria-label="web"]'),
+      "a[data-pull-request]",
+    );
+    expect(ofWeb.getAttribute("href")).toBe("https://github.com/acme/web/pull/7");
+    expect(
+      find(list, 'section[aria-label="docs"]').querySelector("[data-pull-request]"),
+    ).toBeNull();
+  });
+
+  it("offers to open pull requests under the summary, and asks the screen for the form", async () => {
+    const { host, shipForms } = await shipped("review", []);
+    const action = find<HTMLButtonElement>(host, '[aria-label="Delivery"] button');
+    expect(action.textContent).toBe("Open pull requests");
+    await click(action);
+    expect(shipForms()).toBe(1);
+  });
+
+  it("hands the message for the agent over to the screen", async () => {
+    const { host, drafts } = await shipped("shipping", [
+      makePullRequest("web", 7, { checks: "failing" }),
+    ]);
+    await click(findByText(host, "button", "Send back to the agent"));
+    expect(drafts).toHaveLength(1);
+    expect(drafts[0]).toContain("- web: checks are failing on https://github.com/acme/web/pull/7");
+  });
+
+  it("leaves the action to the header on a phone", async () => {
+    setViewportWidth(PHONE);
+    const { host } = await shipped("review", []);
+    expect(host.querySelector('[aria-label="Delivery"]')).toBeNull();
   });
 });

@@ -2,23 +2,26 @@ import { flush } from "solid-js";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import type { Api } from "../api/http";
 import type { EventBody } from "../gen/EventBody";
+import type { Health } from "../gen/Health";
 import type { RepoChanges } from "../gen/RepoChanges";
 import type { Session } from "../gen/Session";
 import type { SessionStatus } from "../gen/SessionStatus";
 import {
   conflict,
+  deferred,
   fakeApi,
   FakeSocket,
   immediately,
   makeDetail,
   makeEvent,
+  makePullRequest,
   makeSession,
   makeSessionRepo,
   notFound,
   settle,
   unreachable,
 } from "../test/fakes";
-import { createSessionStore } from "./sessionStore";
+import { createSessionStore, SHIP_QUIET_MS } from "./sessionStore";
 
 const TOPIC = "session:s1";
 
@@ -460,5 +463,257 @@ describe("session store", () => {
     await settle();
     flush();
     expect(store.load()).toEqual({ status: "loading" });
+  });
+});
+
+describe("session store: delivery", () => {
+  const repos = [
+    makeSessionRepo("api", { primary: true }),
+    makeSessionRepo("web"),
+    makeSessionRepo("docs", { mode: "read" }),
+  ];
+  const changed = (id: string, files = 1): RepoChanges => ({
+    session_repo_id: id,
+    name: id,
+    branch: null,
+    base_ref: null,
+    files: Array.from({ length: files }, (_, index) => ({
+      path: `f${index}.rs`,
+      old_path: null,
+      status: "modified",
+      added: 1,
+      removed: 0,
+      binary: false,
+    })),
+    added: files,
+    removed: 0,
+  });
+  const health: Health = {
+    name: "calin",
+    version: "0.1.0",
+    dry_run: false,
+    runners: ["mock"],
+    github_problem: null,
+  };
+
+  /** A session in review whose `api` and `web` worktrees changed, with the changes list read. */
+  async function inReview(
+    routes: Partial<Api> = {},
+    options: {
+      seed?: ReturnType<typeof makePullRequest>[];
+      health?: () => Health | undefined;
+    } = {},
+  ) {
+    const socket = new FakeSocket();
+    const checkHealth = vi.fn();
+    const api = fakeApi({
+      getSession: () =>
+        Promise.resolve(
+          makeDetail(makeSession("s1", 1000, { status: "review" }), repos, options.seed ?? []),
+        ),
+      getChanges: () => Promise.resolve([changed("api", 3), changed("web"), changed("docs")]),
+      shipSession: () => Promise.resolve(),
+      ...routes,
+    });
+    const store = createSessionStore(
+      { api, socket, schedule: immediately, health: options.health, checkHealth, now: () => 5000 },
+      "s1",
+    );
+    const stop = store.start();
+    let seq = 0;
+    const emit = (body: EventBody) => {
+      seq += 1;
+      socket.emit(TOPIC, { op: "event", topic: TOPIC, event: makeEvent(seq, body) });
+      flush();
+    };
+    const caughtUp = () => {
+      socket.emit(TOPIC, { op: "subscribed", topic: TOPIC, head_seq: seq });
+      flush();
+    };
+    await settle();
+    store.changes.now();
+    await settle();
+    flush();
+    return { store, socket, stop, emit, caughtUp, checkHealth };
+  }
+  const opened = (repo: string, number: number, patch = {}): EventBody => ({
+    type: "pull_request_opened",
+    pull_request: makePullRequest(repo, number, patch),
+  });
+
+  afterEach(() => vi.useRealTimers());
+
+  it("starts from the record's pull requests and follows the events, in repo-set order", async () => {
+    const { store, emit, caughtUp } = await inReview(
+      {},
+      { seed: [makePullRequest("web", 7, { updated_at: 900 })] },
+    );
+    expect(store.delivery.pullRequests()).toEqual([makePullRequest("web", 7, { updated_at: 900 })]);
+
+    // The replay passes through the pull request's past: the record's newer value stays meanwhile.
+    emit(opened("web", 7, { state: "draft", updated_at: 100 }));
+    expect(store.delivery.pullRequests().map((one) => one.state)).toEqual(["open"]);
+    emit(opened("api", 12, { updated_at: 950 }));
+    caughtUp();
+    expect(store.delivery.pullRequests().map((one) => one.session_repo_id)).toEqual(["api", "web"]);
+    expect(store.delivery.pullRequests()[1].state).toBe("draft");
+
+    emit({
+      type: "pull_request_updated",
+      pull_request: makePullRequest("web", 7, { state: "merged", updated_at: 2000 }),
+    });
+    expect(store.delivery.pullRequests().map((one) => [one.session_repo_id, one.state])).toEqual([
+      ["api", "open"],
+      ["web", "merged"],
+    ]);
+  });
+
+  it("sends the request and stays `opening` until every repo it covers has a pull request", async () => {
+    const shipSession = vi.fn<Api["shipSession"]>().mockResolvedValue(undefined);
+    const { store, emit, caughtUp } = await inReview({ shipSession });
+    caughtUp();
+    expect(store.delivery.shipping()).toBeUndefined();
+
+    await store.delivery.ship({ title: "Add a health check", draft: true });
+    flush();
+    expect(shipSession).toHaveBeenCalledWith("s1", { title: "Add a health check", draft: true });
+    expect(store.delivery.shipping()).toBe("opening");
+    // Nothing is assumed: no pull request shows before its event.
+    expect(store.delivery.pullRequests()).toEqual([]);
+
+    emit(opened("api", 12));
+    emit({ type: "session_status", status: "shipping", reason: null });
+    expect(store.delivery.shipping()).toBe("opening");
+    emit(opened("web", 7));
+    expect(store.delivery.shipping()).toBeUndefined();
+    expect(store.delivery.failed()).toBe(0);
+  });
+
+  it("does not take a replayed pull request for the outcome of this ship", async () => {
+    const { store, emit, caughtUp } = await inReview();
+    emit(opened("api", 12));
+    void store.delivery.ship({});
+    emit(opened("web", 7));
+    caughtUp();
+    await settle();
+    flush();
+    // Both were in the log already: the ship asked just now has reported nothing yet.
+    expect(store.delivery.shipping()).toBe("updating");
+  });
+
+  it("counts the repos that failed, by the name their error carries, and lets the others carry on", async () => {
+    const { store, emit, caughtUp } = await inReview();
+    caughtUp();
+    await store.delivery.ship({});
+    emit({ type: "error", message: "web: the push was rejected (protected branch)" });
+    expect(store.delivery.failed()).toBe(1);
+    expect(store.delivery.shipping()).toBe("opening");
+    emit(opened("api", 12));
+    expect(store.delivery.shipping()).toBeUndefined();
+    expect(store.delivery.failed()).toBe(1);
+
+    // The next ship starts the count again.
+    await store.delivery.ship({});
+    flush();
+    expect(store.delivery.failed()).toBe(0);
+    expect(store.delivery.shipping()).toBe("updating");
+  });
+
+  it("counts an error that names no repo as one repo fewer to wait for", async () => {
+    const { store, emit, caughtUp } = await inReview();
+    caughtUp();
+    await store.delivery.ship({});
+    emit({ type: "error", message: "GitHub answered 502" });
+    emit({ type: "error", message: "GitHub answered 502" });
+    expect(store.delivery.shipping()).toBeUndefined();
+    expect(store.delivery.failed()).toBe(2);
+  });
+
+  it("rejects with the server's reason, stops saying it ships, and can be asked again", async () => {
+    const shipSession = vi
+      .fn<Api["shipSession"]>()
+      .mockRejectedValueOnce(conflict("the gh CLI is not signed in"))
+      .mockResolvedValue(undefined);
+    const { store, caughtUp } = await inReview({ shipSession });
+    caughtUp();
+    await expect(store.delivery.ship({})).rejects.toMatchObject({
+      status: 409,
+      message: "the gh CLI is not signed in",
+    });
+    flush();
+    expect(store.delivery.shipping()).toBeUndefined();
+    await store.delivery.ship({});
+    flush();
+    expect(store.delivery.shipping()).toBe("opening");
+  });
+
+  it("sends one request at a time, and sees events that beat the answer", async () => {
+    const answer = deferred();
+    const shipSession = vi.fn<Api["shipSession"]>().mockReturnValue(answer.promise);
+    const { store, emit, caughtUp } = await inReview({ shipSession });
+    caughtUp();
+    const first = store.delivery.ship({});
+    flush();
+    expect(store.delivery.shipping()).toBe("opening");
+    await store.delivery.ship({});
+    expect(shipSession).toHaveBeenCalledTimes(1);
+
+    emit(opened("api", 12));
+    emit(opened("web", 7));
+    expect(store.delivery.shipping()).toBeUndefined();
+    answer.resolve();
+    await first;
+    flush();
+    expect(store.delivery.shipping()).toBeUndefined();
+  });
+
+  it("stops waiting when the session goes elsewhere, or when the ship stays silent", async () => {
+    vi.useFakeTimers();
+    const { store, emit, caughtUp } = await inReview();
+    caughtUp();
+    await store.delivery.ship({});
+    emit({ type: "session_status", status: "running", reason: null });
+    expect(store.delivery.shipping()).toBeUndefined();
+
+    emit({ type: "session_status", status: "review", reason: null });
+    await store.delivery.ship({});
+    flush();
+    expect(store.delivery.shipping()).toBe("opening");
+    emit(opened("api", 12));
+    vi.advanceTimersByTime(SHIP_QUIET_MS - 1);
+    flush();
+    expect(store.delivery.shipping()).toBe("opening");
+    vi.advanceTimersByTime(1);
+    flush();
+    expect(store.delivery.shipping()).toBeUndefined();
+  });
+
+  it("says why pull requests cannot be opened, unless the server only pretends to open them", async () => {
+    let current: Health | undefined;
+    const { store, checkHealth } = await inReview({}, { health: () => current });
+    expect(store.delivery.blocked()).toBeUndefined();
+    expect(store.delivery.dryRun()).toBe(false);
+
+    current = { ...health, github_problem: "the gh CLI is not signed in" };
+    expect(store.delivery.blocked()).toBe("the gh CLI is not signed in");
+    // api.rs, "Dry run": GitHub is never called, so it cannot be in the way.
+    current = { ...health, dry_run: true, github_problem: "the gh CLI is missing" };
+    expect(store.delivery.blocked()).toBeUndefined();
+    expect(store.delivery.dryRun()).toBe(true);
+
+    store.delivery.recheck();
+    expect(checkHealth).toHaveBeenCalledTimes(1);
+    expect(store.delivery.now()).toBe(5000);
+  });
+
+  it("asks the server to look at the pull requests, and passes its refusal on", async () => {
+    const refreshPullRequests = vi
+      .fn<Api["refreshPullRequests"]>()
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(conflict("GitHub cannot be reached"));
+    const { store } = await inReview({ refreshPullRequests });
+    await expect(store.delivery.refresh()).resolves.toBeUndefined();
+    expect(refreshPullRequests).toHaveBeenCalledWith("s1");
+    await expect(store.delivery.refresh()).rejects.toThrow("GitHub cannot be reached");
   });
 });

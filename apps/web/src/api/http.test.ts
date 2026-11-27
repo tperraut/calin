@@ -28,7 +28,13 @@ async function failureOf(promise: Promise<unknown>): Promise<HttpError> {
 
 describe("http api", () => {
   it("calls every route of the table with its method, path and body", async () => {
-    const health: Health = { name: "calin", version: "0.1.0", dry_run: false, runners: ["mock"] };
+    const health: Health = {
+      name: "calin",
+      version: "0.1.0",
+      dry_run: false,
+      runners: ["mock"],
+      github_problem: null,
+    };
     const detail = makeDetail(makeSession("s 1"));
     const { api, fetchFn } = setup((input, init) => {
       if (input.endsWith("/health")) return Promise.resolve(json(health));
@@ -56,6 +62,46 @@ describe("http api", () => {
       ["POST", "/api/v1/sessions/s%201/messages", '{"text":"hi"}'],
       ["POST", "/api/v1/sessions/s%201/stop", undefined],
     ]);
+  });
+
+  it("ships a session and asks for its pull requests to be looked at, both answered with no body", async () => {
+    const { api, fetchFn } = setup(() => Promise.resolve(new Response(null, { status: 202 })));
+
+    await expect(
+      api.shipSession("s 1", { title: "Add a health check", body: "Closes #4", draft: false }),
+    ).resolves.toBeUndefined();
+    await expect(api.shipSession("s 1", {})).resolves.toBeUndefined();
+    await expect(api.refreshPullRequests("s 1")).resolves.toBeUndefined();
+
+    const calls = fetchFn.mock.calls.map(([input, init]) => [init?.method, input, init?.body]);
+    expect(calls).toEqual([
+      [
+        "POST",
+        "/api/v1/sessions/s%201/ship",
+        '{"title":"Add a health check","body":"Closes #4","draft":false}',
+      ],
+      // Every field is optional: the server fills in the session's title and opens drafts.
+      ["POST", "/api/v1/sessions/s%201/ship", "{}"],
+      ["POST", "/api/v1/sessions/s%201/pull-requests/refresh", undefined],
+    ]);
+  });
+
+  it("gives the server's reason when a ship or a refresh is refused", async () => {
+    const { api } = setup((input) =>
+      Promise.resolve(
+        input.endsWith("/ship")
+          ? json({ error: "the gh CLI is not signed in" }, 409)
+          : json({ error: "session not found" }, 404),
+      ),
+    );
+    const refused = await failureOf(api.shipSession("s1", {}));
+    expect([refused.status, refused.message, refused.fromServer]).toEqual([
+      409,
+      "the gh CLI is not signed in",
+      true,
+    ]);
+    const missing = await failureOf(api.refreshPullRequests("nope"));
+    expect([missing.status, missing.message]).toEqual([404, "session not found"]);
   });
 
   it("surfaces the server's own message from an ApiError", async () => {

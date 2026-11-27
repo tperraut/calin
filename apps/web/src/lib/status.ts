@@ -98,14 +98,24 @@ export const decisionSourceLabel = (by: Exclude<DecisionSource, "expired">): str
 
 // The lists below restate the "Semantics" section of calin-proto/src/api.rs.
 const interruptible: readonly SessionStatus[] = ["running", "waiting"];
-const stoppable: readonly SessionStatus[] = ["queued", "preparing", "running", "waiting", "review"];
+const stoppable: readonly SessionStatus[] = [
+  "queued",
+  "preparing",
+  "running",
+  "waiting",
+  "review",
+  "shipping",
+];
+// "While `shipping`": a message starts a turn as it does in `review`.
 const messageable: readonly SessionStatus[] = [
   "running",
   "review",
+  "shipping",
   "waiting",
   "failed",
   "cancelled",
 ];
+const shippable: readonly SessionStatus[] = ["review", "shipping"];
 const resumable: readonly SessionStatus[] = ["failed", "cancelled"];
 const attachable: readonly SessionStatus[] = ["running", "waiting", "review"];
 
@@ -122,6 +132,9 @@ export const canMessage = (status: SessionStatus | undefined): boolean =>
 
 /** True while a repo can be attached to the session (api.rs, "Attaching mid-session"). */
 export const canAttach = (status: SessionStatus | undefined): boolean => among(attachable, status);
+
+/** True while the session's pull requests can be opened or updated (api.rs, "Shipping"). */
+export const canShip = (status: SessionStatus | undefined): boolean => among(shippable, status);
 
 /** True when a message restarts the agent instead of joining a live conversation. */
 export const resumesOnMessage = (status: SessionStatus | undefined): boolean =>

@@ -5,7 +5,7 @@ import type { PermissionDecision } from "../gen/PermissionDecision";
 import type { FileTarget } from "../panels/registry";
 import { createPermissionAnswers } from "../state/permissionAnswers";
 import type { PermissionOutcome, ToolPermission, TranscriptEntry } from "../state/sessionReducer";
-import { conflict, deferred, makeSessionRepo } from "../test/fakes";
+import { conflict, deferred, makePullRequest, makeSessionRepo } from "../test/fakes";
 import { click, find, findByText, mount, unmountAll } from "../test/render";
 import { Transcript } from "./Transcript";
 
@@ -725,5 +725,60 @@ describe("Transcript: reasoning, Markdown and attached repos", () => {
       "Repo docs attached by the agent · Read only",
       "Repo ops attached by you · Edit in place",
     ]);
+  });
+});
+
+describe("Transcript: pull requests", () => {
+  const row = (
+    what: "opened" | "merged" | "closed",
+    pullRequest = makePullRequest("api", 12),
+  ): TranscriptEntry => ({
+    kind: "pull_request",
+    key: `pull_request:${pullRequest.session_repo_id}:${pullRequest.number}:${what}`,
+    ts: 0,
+    what,
+    pullRequest,
+  });
+  const repos = [makeSessionRepo("api", { primary: true }), makeSessionRepo("web")];
+
+  it("says in one line that a pull request was opened, for which repo, and leads to it", () => {
+    const host = mount(() => <Transcript entries={[row("opened")]} synced={true} repos={repos} />);
+    const line = find(host, '[data-pull-request-row="opened"]');
+    expect(line.textContent).toBe("Pull request #12 opened for api");
+    const link = find<HTMLAnchorElement>(line, "a");
+    expect(link.textContent).toBe("Pull request #12");
+    expect([link.getAttribute("href"), link.target, link.rel]).toEqual([
+      "https://github.com/acme/api/pull/12",
+      "_blank",
+      "noopener noreferrer",
+    ]);
+  });
+
+  it("says when it was merged or closed", () => {
+    const host = mount(() => (
+      <Transcript
+        entries={[
+          row("merged", makePullRequest("api", 12, { state: "merged" })),
+          row("closed", makePullRequest("web", 7, { state: "closed" })),
+        ]}
+        synced={true}
+        repos={repos}
+      />
+    ));
+    expect(
+      [...host.querySelectorAll("[data-pull-request-row]")].map((line) => line.textContent),
+    ).toEqual(["Pull request #12 merged for api", "Pull request #7 closed for web"]);
+  });
+
+  it("does not link a pull request that dry run made up, and copes with a repo it does not know", () => {
+    const madeUp = makePullRequest("ghost", 1, {
+      url: "https://example.invalid/acme/ghost/pull/1",
+    });
+    const host = mount(() => (
+      <Transcript entries={[row("opened", madeUp)]} synced={true} repos={repos} />
+    ));
+    const line = find(host, "[data-pull-request-row]");
+    expect(line.textContent).toBe("Pull request #1 opened");
+    expect(line.querySelector("a")).toBeNull();
   });
 });

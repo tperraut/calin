@@ -8,17 +8,22 @@ import type {
   TerminalRequest,
 } from "../api/terminal";
 import type { AttachRepoRequest } from "../gen/AttachRepoRequest";
+import type { EventBody } from "../gen/EventBody";
 import type { FileContent } from "../gen/FileContent";
 import type { FileDiff } from "../gen/FileDiff";
+import type { Health } from "../gen/Health";
 import type { PermissionDecision } from "../gen/PermissionDecision";
+import type { PullRequest } from "../gen/PullRequest";
 import type { RepoChanges } from "../gen/RepoChanges";
 import type { ResolvePermissionRequest } from "../gen/ResolvePermissionRequest";
 import type { Session } from "../gen/Session";
 import type { SessionDetail } from "../gen/SessionDetail";
 import type { SessionRepo } from "../gen/SessionRepo";
 import type { SessionStatus } from "../gen/SessionStatus";
+import type { ShipRequest } from "../gen/ShipRequest";
 import type { TreeEntry } from "../gen/TreeEntry";
 import type { WriteFileRequest } from "../gen/WriteFileRequest";
+import { mergePullRequests, shipPlan } from "../lib/delivery";
 import { errorMessage } from "../lib/errors";
 import { createRefresher, type Refresher } from "../lib/refresher";
 import { coalesce, type Schedule } from "../lib/schedule";
@@ -48,6 +53,35 @@ export type ChangesFeed = {
   request(): void;
   /** Read at once. */
   now(): void;
+};
+
+/**
+ * What follows review: the session's pull requests and the request that opens
+ * them. Nothing here is assumed done: a pull request shows when its event arrives.
+ */
+export type Delivery = {
+  /** In repo-set order: the REST record's, kept current by `pull_request_*` events. */
+  pullRequests: Accessor<readonly PullRequest[]>;
+  /** Why this server cannot open pull requests (`Health::github_problem`), when it cannot. */
+  blocked: Accessor<string | undefined>;
+  /** Asks the server again whether it can: the reader may have fixed what was wrong. */
+  recheck(): void;
+  /** True when pull requests are only recorded, never opened (api.rs, "Dry run"). */
+  dryRun: Accessor<boolean>;
+  /**
+   * Set from the request to ship until every repo it covers has reported, as
+   * a pull request event or as an error: `opening` when the session had no
+   * pull request yet, `updating` when it did.
+   */
+  shipping: Accessor<"opening" | "updating" | undefined>;
+  /** Repos the last ship asked from this page reported an error for. */
+  failed: Accessor<number>;
+  /** Rejects with the server's reason when the request is refused. */
+  ship(request: ShipRequest): Promise<void>;
+  /** Has the server look at the pull requests now; what changed arrives as events. */
+  refresh(): Promise<void>;
+  /** A clock that ticks slowly, for "updated 5 min ago". */
+  now: Accessor<number>;
 };
 
 /** Live state of one session: its record over REST, its transcript over the socket. */
@@ -83,6 +117,7 @@ export type SessionStore = {
    */
   attachRepo(request: AttachRepoRequest): Promise<void>;
   changes: ChangesFeed;
+  delivery: Delivery;
   reload(): void;
   /** Subscribes and loads; returns the function that undoes both. */
   start(): () => void;
@@ -113,6 +148,12 @@ export type SessionStoreDeps = {
   schedule?: Schedule;
   /** Absent where no terminal can be opened (most tests): asking for one reports an error. */
   openTerminal?: OpenTerminal;
+  /** The server as `GET /health` last described it, if it did. */
+  health?: () => Health | undefined;
+  /** Reads `GET /health` again. */
+  checkHealth?: () => void;
+  /** The app's clock; a still one where none is given. */
+  now?: Accessor<number>;
 };
 
 const noTerminal: OpenTerminal = (_request, handlers) => {
@@ -124,6 +165,32 @@ const noTerminal: OpenTerminal = (_request, handlers) => {
 
 /** Resubscriptions in a row that brought nothing new before giving up. */
 const MAX_FRUITLESS_RESYNCS = 3;
+
+/**
+ * How long a ship may stay silent before the page stops waiting for it. The
+ * contract has no event for "the ship is over", and one that reuses a pull
+ * request with nothing to push may report nothing at all.
+ */
+export const SHIP_QUIET_MS = 30_000;
+
+/** A ship under way, as far as the events have told. */
+type ShipWatch = {
+  kind: "opening" | "updating";
+  /** Repos the ship covers whose outcome has not arrived, id to name. */
+  waiting: Map<string, string>;
+  /** Every repo the ship covers, id to name: an `error` event names its repo in words only. */
+  covered: ReadonlyMap<string, string>;
+  failed: Set<string>;
+  /** Errors that named none of the covered repos: each still stands for one repo. */
+  unnamedFailures: number;
+  timer: ReturnType<typeof setTimeout> | undefined;
+};
+
+/** True when `message` holds `name` as a whole word, as in "could not push api: …". */
+function mentions(message: string, name: string): boolean {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(^|[^\\w-])${escaped}($|[^\\w-])`).test(message);
+}
 
 export function createSessionStore(deps: SessionStoreDeps, id: string): SessionStore {
   const { api, socket } = deps;
@@ -147,6 +214,10 @@ export function createSessionStore(deps: SessionStoreDeps, id: string): SessionS
   let failed = false;
   let stopListening = (): void => {};
 
+  // Mirrors of two signals, for what is decided outside the screen's own updates.
+  let loadedDetail: SessionDetail | undefined;
+  let loadedChanges: readonly RepoChanges[] = [];
+
   const [changes, setChanges] = createSignal<readonly RepoChanges[]>();
   const [changesRevision, setChangesRevision] = createSignal(0);
   const [changesFailure, setChangesFailure] = createSignal<string>();
@@ -160,6 +231,7 @@ export function createSessionStore(deps: SessionStoreDeps, id: string): SessionS
     setChangesRefreshing(true);
     try {
       const loaded = await api.getChanges(id);
+      loadedChanges = loaded;
       setChanges(loaded);
       setChangesRevision(revision);
       setChangesFailure(undefined);
@@ -176,6 +248,93 @@ export function createSessionStore(deps: SessionStoreDeps, id: string): SessionS
     setStalled(fruitlessResyncs >= MAX_FRUITLESS_RESYNCS);
     setSubscriptionError(refusal);
   }, deps.schedule);
+
+  const [shipping, setShipping] = createSignal<"opening" | "updating">();
+  const [shipFailures, setShipFailures] = createSignal(0);
+  let shipWatch: ShipWatch | undefined;
+
+  function endShip(): void {
+    if (!shipWatch) return;
+    clearTimeout(shipWatch.timer);
+    shipWatch = undefined;
+    setShipping(undefined);
+  }
+
+  /** Ends the watch once every covered repo has reported; keeps waiting, for a while, otherwise. */
+  function settleShip(watch: ShipWatch): void {
+    clearTimeout(watch.timer);
+    if (watch.waiting.size <= watch.unnamedFailures) {
+      endShip();
+    } else {
+      watch.timer = setTimeout(endShip, SHIP_QUIET_MS);
+    }
+  }
+
+  /** api.rs, "Shipping": each covered repo answers with a pull request event or an `error` naming it. */
+  function watchShip(watch: ShipWatch, body: EventBody): void {
+    if (body.type === "pull_request_opened" || body.type === "pull_request_updated") {
+      watch.waiting.delete(body.pull_request.session_repo_id);
+    } else if (body.type === "error") {
+      // The longest name first, so `web-admin` is not taken for `web`.
+      const named = [...watch.covered]
+        .toSorted(([, a], [, b]) => b.length - a.length)
+        .find(([, name]) => mentions(body.message, name));
+      if (named) {
+        watch.failed.add(named[0]);
+        watch.waiting.delete(named[0]);
+      } else {
+        watch.unnamedFailures += 1;
+      }
+      setShipFailures(Math.min(watch.failed.size + watch.unnamedFailures, watch.covered.size));
+    } else if (body.type === "session_status") {
+      // The session went elsewhere (a turn began, it was stopped): the ship is no longer the news.
+      if (body.status !== "review" && body.status !== "shipping") {
+        endShip();
+        return;
+      }
+    } else {
+      return;
+    }
+    settleShip(watch);
+  }
+
+  const sessionRepos = (): readonly SessionRepo[] =>
+    mergeRepos(loadedDetail?.repos ?? [], current.repos);
+
+  async function ship(request: ShipRequest): Promise<void> {
+    if (shipWatch) return;
+    const known = mergePullRequests(
+      loadedDetail?.pull_requests ?? [],
+      current.pullRequests,
+      sessionRepos(),
+      caughtUp,
+    );
+    const covered = new Map(
+      shipPlan(sessionRepos(), loadedChanges, known).steps.map((step) => [
+        step.repo.id,
+        step.repo.name,
+      ]),
+    );
+    // Watching starts before the request: the first events may beat its answer here.
+    const watch: ShipWatch = {
+      kind: known.length > 0 ? "updating" : "opening",
+      waiting: new Map(covered),
+      covered,
+      failed: new Set(),
+      unnamedFailures: 0,
+      timer: undefined,
+    };
+    shipWatch = watch;
+    setShipping(watch.kind);
+    setShipFailures(0);
+    try {
+      await api.shipSession(id, request);
+    } catch (error) {
+      if (shipWatch === watch) endShip();
+      throw error;
+    }
+    if (shipWatch === watch) settleShip(watch);
+  }
 
   function resync(): void {
     if (fruitlessResyncs >= MAX_FRUITLESS_RESYNCS) {
@@ -201,6 +360,8 @@ export function createSessionStore(deps: SessionStoreDeps, id: string): SessionS
         if (caughtUp && (current.status !== before.status || current.repos !== before.repos)) {
           changesRefresher?.request();
         }
+        // Live only as well: a replayed pull request is not this ship's.
+        if (caughtUp && shipWatch) watchShip(shipWatch, msg.event.body);
         publish();
       } else if (result.outcome === "gap" && !replaying) {
         resync();
@@ -231,6 +392,7 @@ export function createSessionStore(deps: SessionStoreDeps, id: string): SessionS
       (loaded) => {
         if (!active) return;
         failed = false;
+        loadedDetail = loaded;
         setDetail(loaded);
         setLoad({ status: "ready" });
       },
@@ -252,6 +414,8 @@ export function createSessionStore(deps: SessionStoreDeps, id: string): SessionS
   }
 
   const session = (): Session | undefined => deps.listed?.(id) ?? detail()?.session;
+  const repos = (): readonly SessionRepo[] => mergeRepos(detail()?.repos ?? [], view().repos);
+  const stillClock = Date.now();
 
   return {
     id,
@@ -260,7 +424,7 @@ export function createSessionStore(deps: SessionStoreDeps, id: string): SessionS
     // Mid-replay the fold passes through every past status; the record is steadier.
     status: () => (synced() ? view().status : null) ?? session()?.status,
     view,
-    repos: () => mergeRepos(detail()?.repos ?? [], view().repos),
+    repos,
     synced,
     stalled,
     subscriptionError,
@@ -286,6 +450,23 @@ export function createSessionStore(deps: SessionStoreDeps, id: string): SessionS
       refreshing: changesRefreshing,
       request: () => changesRefresher?.request(),
       now: () => changesRefresher?.now(),
+    },
+    delivery: {
+      pullRequests: () =>
+        mergePullRequests(detail()?.pull_requests ?? [], view().pullRequests, repos(), synced()),
+      blocked() {
+        const health = deps.health?.();
+        // api.rs, "Dry run": nothing reaches GitHub then, so its being unusable is no obstacle.
+        if (!health || health.dry_run) return undefined;
+        return health.github_problem ?? undefined;
+      },
+      recheck: () => deps.checkHealth?.(),
+      dryRun: () => deps.health?.()?.dry_run === true,
+      shipping,
+      failed: shipFailures,
+      ship,
+      refresh: () => api.refreshPullRequests(id),
+      now: deps.now ?? (() => stillClock),
     },
     reload() {
       setLoad({ status: "loading" });
@@ -315,6 +496,7 @@ export function createSessionStore(deps: SessionStoreDeps, id: string): SessionS
         document.removeEventListener("visibilitychange", onVisibility);
         refresher.dispose();
         changesRefresher = undefined;
+        endShip();
       };
     },
     workspace: {

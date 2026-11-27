@@ -4,8 +4,9 @@ import type { Event } from "../gen/Event";
 import type { EventBody } from "../gen/EventBody";
 import type { Item } from "../gen/Item";
 import type { PermissionRequest } from "../gen/PermissionRequest";
+import type { PullRequest } from "../gen/PullRequest";
 import type { SessionStatus } from "../gen/SessionStatus";
-import { makeSessionRepo } from "../test/fakes";
+import { makePullRequest, makeSessionRepo } from "../test/fakes";
 import {
   applyEvent,
   applyEvents,
@@ -660,7 +661,7 @@ describe("permissions", () => {
     expect(after.seq).toBe(2);
   });
 
-  it.each(["review", "failed", "cancelled", "done"] as const)(
+  it.each(["review", "shipping", "failed", "cancelled", "done"] as const)(
     "lets unanswered requests lapse when the session goes to %s",
     (ended) => {
       const view = fold(
@@ -1115,5 +1116,156 @@ describe("a repo attached while the session is under way", () => {
     );
     expect(repoRows(view)).toEqual([["web", "user", null]]);
     expect(view.repos.find((repo) => repo.name === "api")?.branch).toBe("calin/fix");
+  });
+});
+
+describe("pull requests", () => {
+  const opened = (repo: string, number: number, patch: Partial<PullRequest> = {}): EventBody => ({
+    type: "pull_request_opened",
+    pull_request: makePullRequest(repo, number, patch),
+  });
+  const updated = (repo: string, number: number, patch: Partial<PullRequest> = {}): EventBody => ({
+    type: "pull_request_updated",
+    pull_request: makePullRequest(repo, number, patch),
+  });
+  const rows = (view: SessionView) =>
+    view.transcript.flatMap((entry) =>
+      entry.kind === "pull_request"
+        ? [`#${entry.pullRequest.number} ${entry.what} (${entry.pullRequest.session_repo_id})`]
+        : [],
+    );
+
+  it("starts with none", () => {
+    expect(emptySessionView.pullRequests).toEqual([]);
+  });
+
+  it("inserts the pull request of each repo as it is opened, in the order they came", () => {
+    const view = fold(log(status("review"), opened("web", 7), opened("api", 12)));
+    expect(view.pullRequests).toEqual([makePullRequest("web", 7), makePullRequest("api", 12)]);
+  });
+
+  it("replaces a repo's pull request with each update, always the full value, and keeps its place", () => {
+    const view = fold(
+      log(
+        opened("api", 12, { state: "draft" }),
+        opened("web", 7, { state: "draft" }),
+        updated("api", 12, { state: "open", checks: "pending", updated_at: 2000 }),
+        updated("api", 12, { state: "open", checks: "failing", updated_at: 3000 }),
+      ),
+    );
+    expect(view.pullRequests).toEqual([
+      makePullRequest("api", 12, { state: "open", checks: "failing", updated_at: 3000 }),
+      makePullRequest("web", 7, { state: "draft" }),
+    ]);
+  });
+
+  it("keeps one pull request per repo: another one opened for it takes its place", () => {
+    const view = fold(log(opened("api", 12, { state: "closed" }), opened("api", 13)));
+    expect(view.pullRequests).toEqual([makePullRequest("api", 13)]);
+  });
+
+  it("takes an update for a pull request it never saw opened", () => {
+    const view = fold(log(updated("api", 12, { checks: "passing" })));
+    expect(view.pullRequests).toEqual([makePullRequest("api", 12, { checks: "passing" })]);
+    expect(rows(view)).toEqual([]);
+  });
+
+  it("says in the transcript when one is opened, and when it is merged or closed, and nothing else", () => {
+    const view = fold(
+      log(
+        status("review"),
+        opened("api", 12, { state: "draft" }),
+        opened("web", 7, { state: "draft" }),
+        status("shipping"),
+        updated("api", 12, { state: "draft", checks: "pending" }),
+        updated("api", 12, { state: "open", checks: "failing" }),
+        updated("api", 12, { state: "open", checks: "passing", review: "approved" }),
+        updated("api", 12, { state: "merged", checks: "passing", review: "approved" }),
+        updated("web", 7, { state: "closed" }),
+        status("done"),
+      ),
+    );
+    expect(rows(view)).toEqual([
+      "#12 opened (api)",
+      "#7 opened (web)",
+      "#12 merged (api)",
+      "#7 closed (web)",
+    ]);
+    // Only these rows: a pull request event is never a message of its own.
+    expect(view.transcript).toHaveLength(4);
+    const [row] = view.transcript;
+    expect(row).toMatchObject({
+      kind: "pull_request",
+      key: "pull_request:api:12:opened",
+      ts: 1001,
+      what: "opened",
+      pullRequest: makePullRequest("api", 12, { state: "draft" }),
+    });
+  });
+
+  it("does not say it twice when shipping again announces the same pull request, or an update repeats", () => {
+    const first = log(
+      opened("api", 12),
+      updated("api", 12, { checks: "pending" }),
+      // Shipping again: the open pull request of the branch is found, and announced.
+      opened("api", 12, { checks: "pending" }),
+      updated("api", 12, { state: "merged" }),
+      updated("api", 12, { state: "merged", review: "approved" }),
+    );
+    const view = fold(first);
+    expect(rows(view)).toEqual(["#12 opened (api)", "#12 merged (api)"]);
+
+    // A replay delivers what was already applied: nothing is added, the view is the same one.
+    const replayed = applyEvents(view, first);
+    expect(replayed.view).toBe(view);
+    expect(rows(replayed.view)).toEqual(["#12 opened (api)", "#12 merged (api)"]);
+  });
+
+  it("says both at once for a pull request found already merged", () => {
+    expect(rows(fold(log(opened("api", 12, { state: "merged" }))))).toEqual([
+      "#12 opened (api)",
+      "#12 merged (api)",
+    ]);
+  });
+
+  it("keeps a state, a check result or a review this build has no name for", () => {
+    const strange = {
+      ...makePullRequest("api", 12),
+      state: "queued",
+      checks: "skipped",
+      review: "dismissed",
+      merge_queue_position: 3,
+    } as unknown as PullRequest;
+    const view = fold(
+      log(
+        { type: "pull_request_opened", pull_request: strange },
+        { type: "user_message", text: "x" },
+      ),
+    );
+    expect(view.pullRequests).toEqual([strange]);
+    expect(rows(view)).toEqual(["#12 opened (api)"]);
+    expect(view.seq).toBe(2);
+  });
+
+  it("ignores a pull request event that names no pull request, and keeps its place in the sequence", () => {
+    const [broken, next] = log({ type: "pull_request_updated" } as unknown as EventBody, {
+      type: "user_message",
+      text: "still works",
+    });
+    const view = fold([broken, next]);
+    expect(view.pullRequests).toEqual([]);
+    expect(view.seq).toBe(2);
+    expect(view.transcript.map((entry) => entry.kind)).toEqual(["user"]);
+  });
+
+  it("does not mutate the view it is given", () => {
+    const before = fold(log(opened("api", 12)));
+    const frozen = structuredClone(before);
+    const [, event] = log(
+      { type: "user_message", text: "x" },
+      updated("api", 12, { state: "merged" }),
+    );
+    applyEvent(before, event);
+    expect(before).toEqual(frozen);
   });
 });

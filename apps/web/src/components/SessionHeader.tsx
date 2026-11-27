@@ -1,4 +1,12 @@
-import { createSignal, createUniqueId, For, Show, useContext } from "solid-js";
+import {
+  createEffect,
+  createMemo,
+  createSignal,
+  createUniqueId,
+  For,
+  Show,
+  useContext,
+} from "solid-js";
 import { compactCount, formatCost } from "../lib/format";
 import { createRequest } from "../lib/request";
 import { canAttach, canInterrupt, canStop, permissionModeLook, repoModeLabel } from "../lib/status";
@@ -6,13 +14,22 @@ import { AppContext } from "../state/app";
 import type { SessionStore } from "../state/sessionStore";
 import { AttachRepo } from "./AttachRepo";
 import { SessionStatusBadge } from "./Badge";
+import { PullRequestChips } from "./PullRequests";
+import { currentShipPlan, ShipAction, shipOffered } from "./ShipAction";
+import { ShipForm } from "./ShipForm";
 
 /**
- * Title, status, the two ways to halt a session, and its repos with the way
- * to add one. No button changes anything by itself: the status and the repo
- * set follow the session's events.
+ * Title, status, the two ways to halt a session, its repos with the way to add
+ * one, and what follows review: the way to open its pull requests, then the
+ * pull requests themselves. No button changes anything by itself: the status,
+ * the repo set and the pull requests follow the session's events.
  */
-export function SessionHeader(props: { store: SessionStore }) {
+export function SessionHeader(props: {
+  store: SessionStore;
+  /** Whether the ship form is asked for; it shows only while the session can be shipped. */
+  shipOpen: boolean;
+  onShipOpen: (open: boolean) => void;
+}) {
   const app = useContext(AppContext);
   const [attaching, setAttaching] = createSignal(false);
   const stop = createRequest(() => props.store.stop());
@@ -24,6 +41,13 @@ export function SessionHeader(props: { store: SessionStore }) {
   const title = (): string => props.store.session()?.title ?? "Session";
   const pendingCount = (): number =>
     props.store.synced() ? props.store.view().pendingPermissions.length : 0;
+  const plan = createMemo(() => currentShipPlan(props.store));
+  const shippable = createMemo(() => shipOffered(props.store, plan()));
+  const hasPullRequests = (): boolean => props.store.delivery.pullRequests().length > 0;
+  // A form left open must not come back by itself the next time the session is in review.
+  createEffect(shippable, (offered) => {
+    if (!offered) props.onShipOpen(false);
+  });
   const repoCount = (): string => {
     const count = props.store.repos().length;
     return count === 0 ? "no repo" : count === 1 ? "1 repo" : `${count} repos`;
@@ -164,7 +188,22 @@ export function SessionHeader(props: { store: SessionStore }) {
             )}
           </Show>
         </div>
+        <Show when={shippable() || hasPullRequests()}>
+          <div class="flex flex-wrap items-center gap-x-2 gap-y-1 pt-1 text-xs text-muted">
+            <ShipAction
+              store={props.store}
+              open={props.shipOpen}
+              onOpen={() => props.onShipOpen(!props.shipOpen)}
+            />
+            <Show when={hasPullRequests()}>
+              <PullRequestChips store={props.store} />
+            </Show>
+          </div>
+        </Show>
       </header>
+      <Show when={props.shipOpen && shippable()}>
+        <ShipForm store={props.store} plan={plan()} onClose={() => props.onShipOpen(false)} />
+      </Show>
       <Show when={attaching()}>
         <AttachRepo
           registry={app.repos()}

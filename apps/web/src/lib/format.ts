@@ -27,6 +27,14 @@ export function compactCount(count: number): string {
   return `${trimZero((count / 1_000_000).toFixed(1))}M`;
 }
 
+export const filesLabel = (count: number): string => `${count} ${count === 1 ? "file" : "files"}`;
+
+/** "api", "api and web", "api, web and docs". */
+export function listInWords(items: readonly string[]): string {
+  if (items.length <= 1) return items.join("");
+  return `${items.slice(0, -1).join(", ")} and ${items[items.length - 1]}`;
+}
+
 /** Costs under a dollar keep four decimals, so a fraction of a cent does not read as free. */
 export function formatCost(usd: number): string {
   return `$${usd.toFixed(usd > 0 && usd < 1 ? 4 : 2)}`;

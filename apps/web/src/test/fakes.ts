@@ -3,6 +3,7 @@ import { HttpError, type Api } from "../api/http";
 import type { ConnectionState, Cursor, SocketClient, TopicHandler, TopicMsg } from "../api/socket";
 import type { Event } from "../gen/Event";
 import type { EventBody } from "../gen/EventBody";
+import type { PullRequest } from "../gen/PullRequest";
 import type { Repo } from "../gen/Repo";
 import type { Session } from "../gen/Session";
 import type { SessionDetail } from "../gen/SessionDetail";
@@ -27,11 +28,35 @@ export function makeSession(id: string, createdAt = 1000, patch: Partial<Session
   };
 }
 
-export const makeDetail = (session: Session, repos: SessionRepo[] = []): SessionDetail => ({
+export const makeDetail = (
+  session: Session,
+  repos: SessionRepo[] = [],
+  pullRequests: PullRequest[] = [],
+): SessionDetail => ({
   session,
   agents: [],
   repos,
+  pull_requests: pullRequests,
 });
+
+/** The pull request of the session repo `sessionRepoId`: an open one with nothing reported yet. */
+export function makePullRequest(
+  sessionRepoId: string,
+  number: number,
+  patch: Partial<PullRequest> = {},
+): PullRequest {
+  return {
+    session_repo_id: sessionRepoId,
+    number,
+    url: `https://github.com/acme/${sessionRepoId}/pull/${number}`,
+    title: "Add a health check",
+    state: "open",
+    checks: "none",
+    review: "none",
+    updated_at: 1000,
+    ...patch,
+  };
+}
 
 export function makeRepo(id: string, patch: Partial<Repo> = {}): Repo {
   return {
@@ -163,6 +188,8 @@ export function fakeApi(routes: Partial<Api> = {}): Api {
     stopSession: missing("stopSession"),
     resolvePermission: missing("resolvePermission"),
     attachRepo: missing("attachRepo"),
+    shipSession: missing("shipSession"),
+    refreshPullRequests: missing("refreshPullRequests"),
     getChanges: missing("getChanges"),
     getDiff: missing("getDiff"),
     listTree: missing("listTree"),

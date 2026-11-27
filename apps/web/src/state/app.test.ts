@@ -21,7 +21,13 @@ import {
 } from "../test/fakes";
 import { createAppState } from "./app";
 
-const health: Health = { name: "calin", version: "0.1.0", dry_run: true, runners: ["mock"] };
+const health: Health = {
+  name: "calin",
+  version: "0.1.0",
+  dry_run: true,
+  runners: ["mock"],
+  github_problem: null,
+};
 
 const stops: Array<() => void> = [];
 
@@ -117,6 +123,26 @@ describe("app state", () => {
     flush();
     expect(app.health()).toEqual({ status: "ready", health });
     expect(read).toHaveBeenCalledTimes(2);
+  });
+
+  it("says why pull requests cannot be opened once the server does, and follows a reconnect", async () => {
+    const read = vi
+      .fn<Api["health"]>()
+      .mockResolvedValueOnce({ ...health, github_problem: "the gh CLI is not signed in" })
+      .mockResolvedValue(health);
+    const { app, socket } = setup({ health: read });
+    // Not known yet: nothing is claimed.
+    expect(app.githubProblem()).toBeUndefined();
+    await settle();
+    flush();
+    expect(app.githubProblem()).toBe("the gh CLI is not signed in");
+
+    socket.setState("open");
+    socket.setState("reconnecting");
+    socket.setState("open");
+    await settle();
+    flush();
+    expect(app.githubProblem()).toBeUndefined();
   });
 
   it("keeps the last health through an outage and refreshes it after a reconnect", async () => {

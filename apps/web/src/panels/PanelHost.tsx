@@ -63,6 +63,8 @@ export function PanelHost(props: {
   fileRequest: FileRequest | undefined;
   /** A panel asks for a file: the screen records the request and shows the Files panel. */
   onOpenFile: (target: FileTarget) => void;
+  onOpenShipForm: () => void;
+  onDraftMessage: (text: string) => void;
   ref: (element: HTMLDivElement) => void;
 }) {
   // Grows only: a panel joins when it is first shown.
@@ -79,6 +81,8 @@ export function PanelHost(props: {
     setUnsavedWork(description) {
       unsaved = description;
     },
+    openShipForm: () => props.onOpenShipForm(),
+    draftMessage: (text) => props.onDraftMessage(text),
   };
 
   // A link to another session or to the home page would drop the panels and
