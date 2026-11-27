@@ -55,6 +55,12 @@ export interface SocketClient {
   resync(topic: string, afterSeq: number): void;
   state(): ConnectionState;
   onState(listener: (state: ConnectionState) => void): () => void;
+  /**
+   * Calls `listener` when a connection attempt ends before it opened. A browser
+   * is not told why (a refused sign-in and a network failure look alike), so
+   * the listener finds out over HTTP; the socket keeps retrying meanwhile.
+   */
+  onRefused(listener: () => void): () => void;
   /** Skips the backoff delay, for example when the page becomes visible again. */
   reconnectNow(): void;
   close(): void;
@@ -92,6 +98,7 @@ export function createSocket(options: SocketOptions = {}): SocketClient {
   // Topics whose last `subscribe` was refused: the server holds nothing to leave.
   const refused = new Set<string>();
   const stateListeners = new Set<(state: ConnectionState) => void>();
+  const refusedListeners = new Set<() => void>();
 
   let ws: WebSocketLike | null = null;
   let state: ConnectionState = "connecting";
@@ -218,8 +225,14 @@ export function createSocket(options: SocketOptions = {}): SocketClient {
       const msg = parseFrame(event.data);
       if (msg) dispatch(msg);
     };
-    socket.onclose = drop;
-    socket.onerror = drop;
+    const lost = (): void => {
+      // Only an attempt that opened ever sets "open".
+      const neverOpened = state !== "open";
+      drop();
+      if (neverOpened) for (const listener of refusedListeners) listener();
+    };
+    socket.onclose = lost;
+    socket.onerror = lost;
   }
 
   function start(): void {
@@ -257,6 +270,10 @@ export function createSocket(options: SocketOptions = {}): SocketClient {
     onState(listener) {
       stateListeners.add(listener);
       return () => stateListeners.delete(listener);
+    },
+    onRefused(listener) {
+      refusedListeners.add(listener);
+      return () => refusedListeners.delete(listener);
     },
     reconnectNow() {
       if (reconnectTimer === undefined) return;

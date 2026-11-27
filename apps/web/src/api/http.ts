@@ -1,11 +1,17 @@
 import type { AnswerQuestionRequest } from "../gen/AnswerQuestionRequest";
 import type { ApiError } from "../gen/ApiError";
 import type { AttachRepoRequest } from "../gen/AttachRepoRequest";
+import type { AuthSessionInfo } from "../gen/AuthSessionInfo";
+import type { CreateDeviceTokenRequest } from "../gen/CreateDeviceTokenRequest";
+import type { CreatedDeviceToken } from "../gen/CreatedDeviceToken";
 import type { CreateSessionRequest } from "../gen/CreateSessionRequest";
+import type { DeviceTokenInfo } from "../gen/DeviceTokenInfo";
 import type { FileContent } from "../gen/FileContent";
 import type { FileDiff } from "../gen/FileDiff";
 import type { Graph } from "../gen/Graph";
 import type { Health } from "../gen/Health";
+import type { Me } from "../gen/Me";
+import type { PublicHealth } from "../gen/PublicHealth";
 import type { RegisterRepoRequest } from "../gen/RegisterRepoRequest";
 import type { Repo } from "../gen/Repo";
 import type { RepoChanges } from "../gen/RepoChanges";
@@ -25,6 +31,10 @@ import type { WriteFileRequest } from "../gen/WriteFileRequest";
 
 /** Mount point of every route in `crates/calin-proto/src/api.rs`. */
 export const API_BASE = "/api/v1";
+
+/** Where a browser goes to sign in, outside `/api/v1` (api.rs). */
+export const AUTH_LOGIN_PATH = "/auth/login";
+const AUTH_LOGOUT_PATH = "/auth/logout";
 
 /**
  * A failed request. `status` is 0 when no response arrived. `fromServer` is
@@ -52,7 +62,32 @@ export const UNREACHABLE_MESSAGE = "Cannot reach the server";
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
 export interface Api {
+  /**
+   * Who is calling and in which mode. Rejects with a 401 `HttpError` when
+   * sign-in is required and absent.
+   */
+  me(): Promise<Me>;
+  /** Ends this browser's session (`POST /auth/logout`, outside `/api/v1`). */
+  logout(): Promise<void>;
+  /**
+   * Calls `listener` whenever any request is answered 401: the one place a
+   * missing or ended sign-in is noticed. Returns the function that stops it.
+   */
+  onUnauthorized(listener: () => void): () => void;
+  /**
+   * The server's description. A reduced `PublicHealth` means the caller is not
+   * signed in: it is reported to `onUnauthorized` and rejected as a 401.
+   */
   health(): Promise<Health>;
+  /** The signed-in identity's browser sessions, the current one first. 409 in local mode. */
+  listAuthSessions(): Promise<AuthSessionInfo[]>;
+  /** 404 when it is already gone. */
+  revokeAuthSession(id: string): Promise<void>;
+  /** The signed-in identity's device tokens, newest first. 409 in local mode. */
+  listDeviceTokens(): Promise<DeviceTokenInfo[]>;
+  /** The answer carries the secret, which the server never shows again. */
+  createDeviceToken(body: CreateDeviceTokenRequest): Promise<CreatedDeviceToken>;
+  revokeDeviceToken(id: string): Promise<void>;
   getSettings(): Promise<Settings>;
   /** Replaces the stored settings; answers with them as stored. 400 names what is wrong. */
   putSettings(body: Settings): Promise<Settings>;
@@ -135,12 +170,27 @@ async function failure(response: Response): Promise<HttpError> {
   return new HttpError(response.status, message, false);
 }
 
+/** `PublicHealth` is what an unauthenticated caller gets from `/health` (api.rs). */
+function isPublicHealth(value: Health | PublicHealth): value is PublicHealth {
+  return "auth" in value && !("version" in value);
+}
+
+export const SIGNED_OUT_MESSAGE = "Not signed in";
+
 export function createApi(
   fetchFn: FetchLike = (input, init) => fetch(input, init),
   base: string = API_BASE,
 ): Api {
-  async function send(method: Method, path: string, body?: unknown): Promise<Response> {
+  const unauthorizedListeners = new Set<() => void>();
+
+  function notifyUnauthorized(): void {
+    for (const listener of unauthorizedListeners) listener();
+  }
+
+  /** `url` is absolute on this origin; `base` applies only through `send`. */
+  async function sendTo(url: string, method: Method, body?: unknown): Promise<Response> {
     const headers: Record<string, string> = { Accept: "application/json" };
+    // The session cookie travels on its own (same origin): it is HttpOnly and the app never holds it.
     const init: RequestInit = { method, headers };
     if (body !== undefined) {
       headers["Content-Type"] = "application/json";
@@ -148,13 +198,21 @@ export function createApi(
     }
     let response: Response;
     try {
-      response = await fetchFn(base + path, init);
+      response = await fetchFn(url, init);
     } catch {
       throw new HttpError(0, UNREACHABLE_MESSAGE, false);
+    }
+    if (response.status === 401) {
+      const refusal = await failure(response);
+      notifyUnauthorized();
+      throw refusal.fromServer ? refusal : new HttpError(401, SIGNED_OUT_MESSAGE, false);
     }
     if (!response.ok) throw await failure(response);
     return response;
   }
+
+  const send = (method: Method, path: string, body?: unknown): Promise<Response> =>
+    sendTo(base + path, method, body);
 
   async function json<T>(method: Method, path: string, body?: unknown): Promise<T> {
     const response = await send(method, path, body);
@@ -176,8 +234,28 @@ export function createApi(
     `${session(id)}/repos/${encodeURIComponent(sessionRepoId)}/${route}` +
     (path === "" ? "" : `?path=${encodeURIComponent(path)}`);
 
+  const tokens = (id: string) => `/tokens/${encodeURIComponent(id)}`;
+
   return {
-    health: () => json<Health>("GET", "/health"),
+    me: () => json<Me>("GET", "/me"),
+    async logout() {
+      await sendTo(AUTH_LOGOUT_PATH, "POST");
+    },
+    onUnauthorized(listener) {
+      unauthorizedListeners.add(listener);
+      return () => unauthorizedListeners.delete(listener);
+    },
+    async health() {
+      const loaded = await json<Health | PublicHealth>("GET", "/health");
+      if (!isPublicHealth(loaded)) return loaded;
+      notifyUnauthorized();
+      throw new HttpError(401, SIGNED_OUT_MESSAGE, false);
+    },
+    listAuthSessions: () => json<AuthSessionInfo[]>("GET", "/auth/sessions"),
+    revokeAuthSession: (id) => empty("DELETE", `/auth/sessions/${encodeURIComponent(id)}`),
+    listDeviceTokens: () => json<DeviceTokenInfo[]>("GET", "/tokens"),
+    createDeviceToken: (body) => json<CreatedDeviceToken>("POST", "/tokens", body),
+    revokeDeviceToken: (id) => empty("DELETE", tokens(id)),
     getSettings: () => json<Settings>("GET", "/settings"),
     putSettings: (body) => json<Settings>("PUT", "/settings", body),
     listRepos: () => json<Repo[]>("GET", "/repos"),

@@ -26,6 +26,8 @@ export default defineConfig({
     proxy: {
       // `make dev-server` listens here; `ws: true` carries /api/v1/ws through.
       "/api": { target: "http://127.0.0.1:4680", ws: true },
+      // Sign-in in public mode: the browser navigates to these (api.rs).
+      "/auth": { target: "http://127.0.0.1:4680" },
     },
   },
   test: {

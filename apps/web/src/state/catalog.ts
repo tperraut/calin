@@ -43,6 +43,8 @@ export type Catalog = {
   rescan(): Promise<void>;
   /** While inactive nothing is polled. */
   setActive(active: boolean): void;
+  /** Drops what was read, as when the sign-in ended; nothing is read again until `load`. */
+  forget(): void;
 };
 
 export function createCatalog(api: Api): Catalog {
@@ -153,6 +155,14 @@ export function createCatalog(api: Api): Catalog {
     setActive(next) {
       active = next;
       schedulePoll();
+    },
+    forget() {
+      wanted = false;
+      registry = undefined;
+      active = false;
+      schedulePoll();
+      setRepos({ status: "loading" });
+      setSets([]);
     },
   };
 }

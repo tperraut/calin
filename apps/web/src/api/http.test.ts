@@ -502,4 +502,98 @@ describe("http api", () => {
       expect(error.message).toBe("Cannot reach the server");
     });
   });
+
+  describe("sign-in", () => {
+    it("calls the account routes with their method and path", async () => {
+      const token = { id: "t1", name: "laptop", created_at: 1, last_used_at: null };
+      const { api, fetchFn } = setup((input, init) => {
+        if (init?.method === "DELETE" || input === "/auth/logout") {
+          return Promise.resolve(new Response(null, { status: 204 }));
+        }
+        if (input.endsWith("/me")) {
+          return Promise.resolve(
+            json({ mode: "public", identity: "me@x.org", device_token: false }),
+          );
+        }
+        if (input.endsWith("/auth/sessions")) return Promise.resolve(json([]));
+        if (init?.method === "POST") {
+          return Promise.resolve(json({ info: token, token: "calin_secret" }, 201));
+        }
+        return Promise.resolve(json([token]));
+      });
+
+      await expect(api.me()).resolves.toEqual({
+        mode: "public",
+        identity: "me@x.org",
+        device_token: false,
+      });
+      await api.logout();
+      await api.listAuthSessions();
+      await api.revokeAuthSession("a/b");
+      await api.listDeviceTokens();
+      await expect(api.createDeviceToken({ name: "laptop" })).resolves.toEqual({
+        info: token,
+        token: "calin_secret",
+      });
+      await api.revokeDeviceToken("t1");
+
+      const calls = fetchFn.mock.calls.map(([input, init]) => [init?.method, input, init?.body]);
+      expect(calls).toEqual([
+        ["GET", "/api/v1/me", undefined],
+        // Outside /api/v1: the browser navigates to its siblings (api.rs).
+        ["POST", "/auth/logout", undefined],
+        ["GET", "/api/v1/auth/sessions", undefined],
+        ["DELETE", "/api/v1/auth/sessions/a%2Fb", undefined],
+        ["GET", "/api/v1/tokens", undefined],
+        ["POST", "/api/v1/tokens", JSON.stringify({ name: "laptop" })],
+        ["DELETE", "/api/v1/tokens/t1", undefined],
+      ]);
+    });
+
+    it("tells every listener about a 401, from any route, and still rejects", async () => {
+      const { api } = setup((input) =>
+        input.endsWith("/settings")
+          ? Promise.resolve(json({ error: "sign-in required" }, 401))
+          : Promise.resolve(new Response("nope", { status: 401 })),
+      );
+      const heard = vi.fn();
+      const stop = api.onUnauthorized(heard);
+
+      const fromServer = await failureOf(api.getSettings());
+      expect([fromServer.status, fromServer.message, fromServer.fromServer]).toEqual([
+        401,
+        "sign-in required",
+        true,
+      ]);
+      const bare = await failureOf(api.me());
+      expect([bare.status, bare.message, bare.unreachable]).toEqual([401, "Not signed in", false]);
+      expect(heard).toHaveBeenCalledTimes(2);
+
+      stop();
+      await failureOf(api.listSessions());
+      expect(heard).toHaveBeenCalledTimes(2);
+    });
+
+    it("does not take other failures for a sign-in that ended", async () => {
+      const { api } = setup((input) =>
+        input.endsWith("/me")
+          ? Promise.reject(new TypeError("Failed to fetch"))
+          : Promise.resolve(json({ error: "not possible in local mode" }, 409)),
+      );
+      const heard = vi.fn();
+      api.onUnauthorized(heard);
+      expect((await failureOf(api.me())).unreachable).toBe(true);
+      expect((await failureOf(api.listDeviceTokens())).status).toBe(409);
+      expect(heard).not.toHaveBeenCalled();
+    });
+
+    it("takes the reduced health of a caller who is not signed in for a 401", async () => {
+      const { api } = setup(() => Promise.resolve(json({ name: "calin", auth: "required" })));
+      const heard = vi.fn();
+      api.onUnauthorized(heard);
+      const error = await failureOf(api.health());
+      expect(error.status).toBe(401);
+      expect(heard).toHaveBeenCalledTimes(1);
+    });
+  });
 });

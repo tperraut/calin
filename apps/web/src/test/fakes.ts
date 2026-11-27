@@ -2,6 +2,7 @@
 import { HttpError, type Api } from "../api/http";
 import type { ConnectionState, Cursor, SocketClient, TopicHandler, TopicMsg } from "../api/socket";
 import type { Event } from "../gen/Event";
+import type { Me } from "../gen/Me";
 import type { EventBody } from "../gen/EventBody";
 import type { PullRequest } from "../gen/PullRequest";
 import type { Repo } from "../gen/Repo";
@@ -115,7 +116,10 @@ export class FakeSocket implements SocketClient {
   readonly resyncs: Array<{ topic: string; afterSeq: number }> = [];
   reconnects = 0;
   private readonly topics = new Map<string, Set<{ handler: TopicHandler; cursor?: Cursor }>>();
+  /** True once the app let go of the socket for good. */
+  closed = false;
   private readonly listeners = new Set<(state: ConnectionState) => void>();
+  private readonly refusedListeners = new Set<() => void>();
 
   subscribe(topic: string, handler: TopicHandler, cursor?: Cursor): () => void {
     const subscriber = { handler, cursor };
@@ -145,7 +149,20 @@ export class FakeSocket implements SocketClient {
     this.reconnects += 1;
   }
 
-  close(): void {}
+  onRefused(listener: () => void): () => void {
+    this.refusedListeners.add(listener);
+    return () => this.refusedListeners.delete(listener);
+  }
+
+  close(): void {
+    this.closed = true;
+  }
+
+  /** A connection attempt ended before it opened, as a refused upgrade does. */
+  refuse(): void {
+    this.setState("reconnecting");
+    for (const listener of this.refusedListeners) listener();
+  }
 
   setState(state: ConnectionState): void {
     this.current = state;
@@ -188,12 +205,26 @@ export const quickWorkflow: WorkflowInfo = {
   problem: null,
 };
 
-/** An `Api` whose routes all fail unless the test supplies them. */
+export const localMe: Me = { mode: "local", identity: null, device_token: false };
+
+/**
+ * An `Api` whose routes all fail unless the test supplies them. It is in local
+ * mode unless `me` says otherwise, and like the real one it reports any 401 a
+ * route rejects with to `onUnauthorized`.
+ */
 export function fakeApi(routes: Partial<Api> = {}): Api {
   const missing = (name: string) => () =>
     Promise.reject(new Error(`fakeApi: ${name} was called but not stubbed`));
-  return {
+  const listeners = new Set<() => void>();
+  const api: Api = {
+    me: () => Promise.resolve(localMe),
+    logout: missing("logout"),
     health: missing("health"),
+    listAuthSessions: missing("listAuthSessions"),
+    revokeAuthSession: missing("revokeAuthSession"),
+    listDeviceTokens: missing("listDeviceTokens"),
+    createDeviceToken: missing("createDeviceToken"),
+    revokeDeviceToken: missing("revokeDeviceToken"),
     getSettings: missing("getSettings"),
     putSettings: missing("putSettings"),
     listRepos: missing("listRepos"),
@@ -226,8 +257,30 @@ export function fakeApi(routes: Partial<Api> = {}): Api {
     readFile: missing("readFile"),
     writeFile: missing("writeFile"),
     ...routes,
+    onUnauthorized(listener) {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
   };
+  const watched: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(api)) {
+    if (key === "onUnauthorized" || typeof value !== "function") {
+      watched[key] = value;
+      continue;
+    }
+    const route = value as (...args: unknown[]) => unknown;
+    watched[key] = (...args: unknown[]) =>
+      Promise.resolve(route(...args)).catch((error: unknown) => {
+        if (error instanceof HttpError && error.status === 401) {
+          for (const listener of listeners) listener();
+        }
+        throw error;
+      });
+  }
+  return watched as unknown as Api;
 }
+
+export const signedOut = (): HttpError => new HttpError(401, "Not signed in", false);
 
 export const unreachable = (): HttpError => new HttpError(0, "Cannot reach the server", false);
 export const notFound = (): HttpError => new HttpError(404, "session not found", true);

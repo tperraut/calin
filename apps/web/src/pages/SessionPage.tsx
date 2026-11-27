@@ -158,6 +158,7 @@ export function SessionScreen(props: {
       onOpenPanel={(panel) => props.onPanel(panel)}
       onShowAgent={showAgent}
       onShowItem={showItem}
+      onUnsavedWork={(description) => app.setUnsavedWork(description)}
       ref={(element) => (panels = element)}
     />
   );

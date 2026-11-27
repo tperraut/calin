@@ -10,6 +10,7 @@ import {
   useContext,
 } from "solid-js";
 import { HttpError } from "../api/http";
+import { AccessSettings } from "../components/AccessSettings";
 import type { RepoSet } from "../gen/RepoSet";
 import type { Settings } from "../gen/Settings";
 import { errorMessage } from "../lib/errors";
@@ -575,6 +576,10 @@ export default function SettingsPage() {
             <p class="text-sm text-muted">Loading settings…</p>
           </Match>
         </Switch>
+        {/* Local mode has nobody to sign in, and these routes answer 409 there (api.rs). */}
+        <Show when={app.auth().status === "signed_in"}>
+          <AccessSettings />
+        </Show>
       </div>
     </section>
   );

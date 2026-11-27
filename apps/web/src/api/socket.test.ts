@@ -476,4 +476,42 @@ describe("socket client", () => {
       { op: "subscribe", topic: "session:s1", after_seq: 3 },
     ]);
   });
+
+  describe("refusals", () => {
+    it("reports an attempt that ended before it opened, and keeps retrying", () => {
+      const client = connect();
+      const refused = vi.fn();
+      client.onRefused(refused);
+      client.subscribe("sessions", () => {});
+
+      latest().hangUp();
+      expect(refused).toHaveBeenCalledTimes(1);
+      expect(client.state()).toBe("reconnecting");
+
+      vi.advanceTimersByTime(100);
+      expect(FakeWebSocket.sockets).toHaveLength(2);
+    });
+
+    it("does not report a connection that opened and then dropped", () => {
+      const client = connect();
+      const refused = vi.fn();
+      client.onRefused(refused);
+      client.subscribe("sessions", () => {});
+      latest().accept();
+
+      latest().hangUp();
+      expect(refused).not.toHaveBeenCalled();
+    });
+
+    it("stops for good when the listener closes it", () => {
+      const client = connect();
+      client.onRefused(() => client.close());
+      client.subscribe("sessions", () => {});
+
+      latest().hangUp();
+      vi.advanceTimersByTime(10_000);
+      client.reconnectNow();
+      expect(FakeWebSocket.sockets).toHaveLength(1);
+    });
+  });
 });

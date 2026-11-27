@@ -51,8 +51,9 @@ afterEach(() => {
 });
 
 describe("app state", () => {
-  it("lists sessions from the sessions topic, newest first", () => {
+  it("lists sessions from the sessions topic, newest first", async () => {
     const { socket, app, upsert, titles } = setup();
+    await settle();
     expect(socket.subscriberCount("sessions")).toBe(1);
 
     upsert("a", 100);
@@ -66,8 +67,9 @@ describe("app state", () => {
     expect(app.sessionsLoaded()).toBe(true);
   });
 
-  it("updates a listed session in place", () => {
+  it("updates a listed session in place", async () => {
     const { app, upsert, titles } = setup();
+    await settle();
     upsert("a", 100);
     upsert("b", 200);
 
@@ -81,6 +83,7 @@ describe("app state", () => {
     const created = makeSession("new", 500, { title: "Fresh" });
     const createSession = vi.fn<Api["createSession"]>().mockResolvedValue(makeDetail(created));
     const { app, upsert, titles } = setup({ createSession });
+    await settle();
     upsert("old", 100);
 
     const request = { prompt: "go", runner: "mock", repos: [] };
@@ -520,8 +523,9 @@ describe("app state", () => {
     expect(app.repos()).toEqual({ status: "ready", repos: [makeRepo("api")] });
   });
 
-  it("says so when the server refuses the sessions topic, and asks again on retry", () => {
+  it("says so when the server refuses the sessions topic, and asks again on retry", async () => {
     const { app, socket } = setup();
+    await settle();
     socket.emit("sessions", { op: "error", topic: "sessions", message: "not allowed" });
     flush();
     expect(app.sessionsError()).toBe("not allowed");

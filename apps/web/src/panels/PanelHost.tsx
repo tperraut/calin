@@ -69,6 +69,8 @@ export function PanelHost(props: {
   onOpenPanel: (panel: PanelId) => void;
   onShowAgent: (agentId: string) => void;
   onShowItem: (itemId: string) => void;
+  /** What unsaved work the panels hold, for whoever must not lose it too (the sign-in screen). */
+  onUnsavedWork?: (description: string | undefined) => void;
   ref: (element: HTMLDivElement) => void;
 }) {
   // Grows only: a panel joins when it is first shown.
@@ -84,6 +86,7 @@ export function PanelHost(props: {
     fileRequest: () => props.fileRequest,
     setUnsavedWork(description) {
       unsaved = description;
+      props.onUnsavedWork?.(description);
     },
     openShipForm: () => props.onOpenShipForm(),
     draftMessage: (text) => props.onDraftMessage(text),
