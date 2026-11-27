@@ -227,7 +227,33 @@ try {
   // ---- M2: a home repo that declares the others, attach mid-session, ship.
   const home = await repo(
     "home-base",
-    { ".calin/repos.yaml": "repos:\n  gamma-api: {}\n  delta-web: {}\nsets:\n  pair: [gamma-api, delta-web]\n", "README.md": "# home\n" },
+    {
+      ".calin/repos.yaml": "repos:\n  gamma-api: {}\n  delta-web: {}\nsets:\n  pair: [gamma-api, delta-web]\n",
+      ".calin/workflows/implement.yaml": [
+        "version: 1",
+        "name: Implement and ship",
+        "nodes:",
+        "  - { id: start, type: start }",
+        '  - { id: implement, type: agent, prompt: "{{task}}" }',
+        '  - { id: tests, type: check, command: "true" }',
+        "  - { id: retry, type: loop, max: 2 }",
+        '  - { id: fix, type: agent, prompt: "Fix the checks: {{nodes.tests.output}}" }',
+        '  - { id: gate, type: gate, message: "Open pull requests?" }',
+        "  - { id: ship, type: ship }",
+        "  - { id: ok, type: end }",
+        "edges:",
+        "  - { from: start, to: implement }",
+        "  - { from: implement.done, to: tests }",
+        "  - { from: tests.pass, to: gate }",
+        "  - { from: tests.fail, to: retry }",
+        "  - { from: retry.repeat, to: fix }",
+        "  - { from: fix.done, to: tests }",
+        "  - { from: gate.approve, to: ship }",
+        "  - { from: ship.done, to: ok }",
+        "",
+      ].join("\n"),
+      "README.md": "# home\n",
+    },
     { under: "code" },
   );
   await repo("gamma-api", { "README.md": "# gamma api\n" }, { under: "code" });
@@ -303,6 +329,47 @@ try {
   check("the pull request is shown", (await page.textContent("body")).includes("#1"));
   await m2.shot("shipping");
   check("the M2 console is clean", m2.errors.length === 0, JSON.stringify(m2.errors).slice(0, 300));
+
+  // ---- M4: a workflow run with a check, a gate and a ship step.
+  const workflows = (await api("GET", "/workflows")).body;
+  check(
+    "the home repo's workflow is listed and valid",
+    workflows.some((w) => w.id === "implement" && w.graph && !w.problem) && workflows[0].id === "quick",
+    JSON.stringify(workflows.map((w) => [w.id, w.problem])),
+  );
+  const flow = await api("POST", "/sessions", {
+    prompt: "Add a changelog entry",
+    workflow: "implement",
+    permission_mode: "autonomous",
+    repos: [{ repo_id: catalog.find((r) => r.name === "delta-web").id }],
+  });
+  check("a session can be started with a workflow", flow.status === 201, JSON.stringify(flow.body).slice(0, 120));
+  const flowId = flow.body.session.id;
+  const m4 = await open(DESKTOP, "m4");
+  current = m4;
+  page = m4.page;
+  await page.goto(`${base}/s/${flowId}`);
+  await page.waitForSelector('[aria-label="Workflow gate"]', { timeout: 30000 });
+  check("the run stops at its gate and the session waits", (await page.textContent("body")).includes("Open pull requests?"));
+  await page.getByRole("tab", { name: /^graph/i }).first().click();
+  await page.waitForSelector('[aria-label="Workflow graph"]', { timeout: 15000 });
+  await page.waitForTimeout(700);
+  await m4.shot("workflow-at-gate");
+  await page.getByLabel("Comment (optional)").fill("ship it");
+  await page.getByRole("button", { name: /^approve$/i }).click();
+  await m4.bodyHas("Shipping", 30000);
+  await page.waitForTimeout(700);
+  const run = (await api("GET", `/sessions/${flowId}/workflow`)).body;
+  check(
+    "the run went implement, tests, gate, ship and succeeded",
+    run.status === "success" && ["implement", "tests", "gate", "ship"].every((id) => run.nodes.find((n) => n.id === id)?.state === "finished"),
+    JSON.stringify(run.nodes.map((n) => [n.id, n.state, n.last_port])),
+  );
+  check("the loop it never needed stayed idle", run.nodes.find((n) => n.id === "retry")?.state === "idle");
+  const flowDetail = (await api("GET", `/sessions/${flowId}`)).body;
+  check("the ship step opened a pull request", flowDetail.pull_requests.length === 1);
+  await m4.shot("workflow-done");
+  check("the M4 console is clean", m4.errors.length === 0, JSON.stringify(m4.errors).slice(0, 300));
 
   failed = env.results.some((result) => !result.ok);
 } catch (error) {

@@ -123,19 +123,43 @@ Known gaps carried forward from M3:
 - A stopped or failed turn is not scanned for shell-made changes.
 - Timeline marks and arrow hit areas are smaller than 44 px.
 
-## M4: Workflows (in progress)
+## M4: Workflows (done 2026-11-27, except a second agent runner)
 
 - [x] Spec: `docs/specs/2026-11-27-workflows.md`
 - [x] `calin-workflow`: parsing, validation, templates and the engine, as a pure library
-- [ ] Contract, then core and server: workflows from the home repo, a run inside a session,
-      checks, gates, parallel branches, budget
-- [ ] Web: workflow select, the Workflow view with the run overlaid
-- [ ] ACP runner for one more agent
-- [ ] Queue and parallel limit
+- [x] Core and server: workflows from the home repo with lazy reload, a run inside a session
+      (agent turns, checks, loops, gates, questions, parallel and fresh children, commit, ship),
+      budget, the run projection
+- [x] The queue: at most `max_parallel` root sessions preparing or running
+- [x] Web: workflow select, the Workflow view with the run overlaid, gates
+- [x] `make e2e` covers a workflow run with a check, a gate and a ship step (40 checks)
+- [ ] ACP runner for one more agent. Waiting on which agent CLI to target; none besides
+      `claude` is installed here.
+- [ ] A workflow run with the real Claude Code runner. So far it ran with the mock only.
+
+Known gaps carried forward from M4:
+
+- No editor for workflow files; they are written by hand in the home repo.
+- A run interrupted by a server restart is closed as failed, not resumed.
+- The loop limit travels to the web app inside the node's label ("Up to N times").
+- `question_answered` carries no comment; a gate's comment is visible only in its node outcome.
+- A file named `quick.yaml` is listed as invalid beside the built-in, so that id appears twice.
+- The sessions list cannot show why a session is queued; the session page can.
+
+## M5: Remote access (in progress)
+
+- [x] Spec: `docs/specs/2026-11-27-remote-access.md`
+- [ ] `calin-auth`: OpenID Connect sign-in, sessions, device tokens, as a library
+- [ ] Server: public mode, the `/auth` routes, guarding every route and socket, device tokens
+- [ ] Web: sign-in redirect, sessions and device tokens in Settings
+- [ ] Installable phone app and Web Push
+- [ ] `calin server install` / `check` / `uninstall`
+- [ ] Desktop app (needs WebKitGTK development packages installed with root)
+- [ ] Checks that need the owner: a real provider and domain, a real phone
 
 ## Later
 
-M5 sign-in, server install, PWA, desktop · M6 integrations
+M6 integrations
 
 ## Decisions since the spec
 
