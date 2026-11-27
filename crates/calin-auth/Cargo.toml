@@ -1,0 +1,37 @@
+[package]
+name = "calin-auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+base64 = "0.23.1"
+bytes = "1.12.2"
+http-body-util = "0.1.5"
+# The provider is reached with hyper over rustls with the `ring` provider and
+# the roots compiled into webpki-roots: nothing here needs OpenSSL, CMake or
+# a C++ compiler, which the servers Calin targets do not have. Keep default
+# features off on hyper-rustls and rustls; they would bring aws-lc in.
+hyper = { version = "1.13.0", features = ["client", "http1"] }
+hyper-rustls = { version = "0.27.10", default-features = false, features = ["ring", "http1", "tls12"] }
+hyper-util = { version = "0.1.21", features = ["client-legacy", "http1", "tokio"] }
+ring = "0.17.14"
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+subtle = "2.6.1"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["sync", "rt", "time"] }
+tracing = "0.1.44"
+url = "2.5.9"
+webpki-roots = "1.0.12"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+# Only to generate an RSA key for the test provider; ring cannot.
+rsa = "0.10.0"
+tempfile = "3.27.0"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
