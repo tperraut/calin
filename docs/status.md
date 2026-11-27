@@ -160,7 +160,10 @@ Known gaps carried forward from M4:
       routes, triggers for waiting, review, failed and merged, notification settings
 - [x] `calin server install`, `check` and `uninstall`
 - [x] `make e2e` signs in through a stand-in provider against the real binary (14 checks)
-- [ ] Desktop app. Needs the WebKitGTK development packages installed with root.
+- [ ] Desktop app. Needs these installed with root first (Tauri 2's own list for Fedora, checked
+      2026-11-28 against https://v2.tauri.app/start/prerequisites/):
+      `sudo dnf install webkit2gtk4.1-devel openssl-devel curl wget file libappindicator-gtk3-devel librsvg2-devel libxdo-devel`
+      and `sudo dnf group install "c-development"`.
 - [ ] Checks that need the owner: a real provider and domain; a real server (the generated Caddy
       file has never been validated by Caddy); a real phone for install and notifications.
 
