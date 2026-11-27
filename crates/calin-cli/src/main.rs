@@ -4,7 +4,7 @@
 
 use std::ffi::OsString;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -338,6 +338,15 @@ fn parse_bind(bind: &str) -> Result<SocketAddr> {
     Ok(addr)
 }
 
+/// `path` from the current directory, unless it already is absolute.
+fn absolute(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    let cwd = std::env::current_dir().context("cannot read the current directory")?;
+    Ok(cwd.join(path))
+}
+
 fn init_logging() {
     let requested = std::env::var(ENV_LOG).unwrap_or_else(|_| DEFAULT_LOG.to_owned());
     let (filter, rejected) = match EnvFilter::try_new(&requested) {
@@ -408,6 +417,19 @@ mod tests {
         };
         assert_eq!(args.bind, "[::1]:9");
         assert_eq!(args.home, Some(PathBuf::from("/tmp/x")));
+    }
+
+    #[test]
+    fn a_relative_path_is_taken_from_the_current_directory() {
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            absolute(Path::new("staging/x")).unwrap(),
+            cwd.join("staging/x")
+        );
+        assert_eq!(
+            absolute(Path::new("/srv/calin")).unwrap(),
+            Path::new("/srv/calin")
+        );
     }
 
     #[test]

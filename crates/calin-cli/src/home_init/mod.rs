@@ -17,6 +17,8 @@ use anyhow::{Context as _, Result, anyhow, bail};
 
 pub use repos_yaml::Found;
 
+use crate::absolute;
+
 const REPOS_FILE: &str = ".calin/repos.yaml";
 const LINK_SCRIPT: &str = "scripts/link-claude.sh";
 
@@ -230,14 +232,6 @@ fn git_init(git: &OsString, root: &Path) -> Result<()> {
         );
     }
     Ok(())
-}
-
-fn absolute(path: &Path) -> Result<PathBuf> {
-    if path.is_absolute() {
-        return Ok(path.to_path_buf());
-    }
-    let cwd = std::env::current_dir().context("cannot read the current directory")?;
-    Ok(cwd.join(path))
 }
 
 /// An I/O error as a plain sentence: "Cannot create /x: permission denied."
