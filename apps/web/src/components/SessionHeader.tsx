@@ -10,6 +10,7 @@ import {
 import { compactCount, formatCost } from "../lib/format";
 import { createRequest } from "../lib/request";
 import { canAttach, canInterrupt, canStop, permissionModeLook, repoModeLabel } from "../lib/status";
+import { sessionPath } from "../panels/registry";
 import { AppContext } from "../state/app";
 import type { SessionStore } from "../state/sessionStore";
 import { AttachRepo } from "./AttachRepo";
@@ -48,6 +49,8 @@ export function SessionHeader(props: {
   createEffect(shippable, (offered) => {
     if (!offered) props.onShipOpen(false);
   });
+  const tree = createMemo(() => props.store.tree());
+  const parentId = (): string | undefined => props.store.session()?.parent_session_id ?? undefined;
   const repoCount = (): string => {
     const count = props.store.repos().length;
     return count === 0 ? "no repo" : count === 1 ? "1 repo" : `${count} repos`;
@@ -188,6 +191,47 @@ export function SessionHeader(props: {
             )}
           </Show>
         </div>
+        <Show when={parentId() !== undefined || tree().children.length > 0}>
+          <div
+            data-part="family"
+            class="flex flex-wrap items-center gap-x-2 gap-y-1 pt-0.5 text-xs text-muted"
+          >
+            <Show when={parentId()}>
+              {(id) => (
+                <a
+                  href={sessionPath(id())}
+                  class="inline-flex min-h-11 max-w-full min-w-0 items-center gap-1 lg:min-h-0"
+                >
+                  <span class="shrink-0">Child of</span>
+                  <span class="truncate font-medium text-accent underline underline-offset-4">
+                    {tree().parent?.title ?? "its parent session"}
+                  </span>
+                </a>
+              )}
+            </Show>
+            <Show when={tree().children.length > 0}>
+              <ul
+                aria-label="Child sessions"
+                // One row on a phone, scrolled sideways: several children must not push the panels down.
+                class="flex max-w-full min-w-0 items-center gap-1 [scrollbar-width:none] overflow-x-auto lg:flex-wrap lg:overflow-visible"
+              >
+                <For each={tree().children} keyed={(child) => child.id}>
+                  {(child) => (
+                    <li class="max-w-[80%] min-w-0 shrink-0 lg:max-w-full lg:shrink">
+                      <a
+                        href={sessionPath(child().id)}
+                        class="flex min-h-11 max-w-full min-w-0 items-center gap-1.5 rounded border border-line px-1.5 hover:border-muted lg:min-h-0 lg:py-0.5"
+                      >
+                        <span class="truncate font-medium text-fg">{child().title}</span>
+                        <SessionStatusBadge status={child().status} />
+                      </a>
+                    </li>
+                  )}
+                </For>
+              </ul>
+            </Show>
+          </div>
+        </Show>
         <Show when={shippable() || hasPullRequests()}>
           <div class="flex flex-wrap items-center gap-x-2 gap-y-1 pt-1 text-xs text-muted">
             <ShipAction

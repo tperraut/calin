@@ -189,6 +189,7 @@ export function createAppState(services: AppServices): AppState {
           api,
           socket,
           listed: (wanted) => sessions().find((session) => session.id === wanted),
+          sessions,
           schedule: services.schedule,
           openTerminal: services.openTerminal,
           health: knownHealth,

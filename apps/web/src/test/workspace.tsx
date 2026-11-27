@@ -5,9 +5,10 @@ import type { OpenTerminal } from "../api/terminal";
 import type { EventBody } from "../gen/EventBody";
 import type { Health } from "../gen/Health";
 import type { PullRequest } from "../gen/PullRequest";
+import type { Session } from "../gen/Session";
 import type { SessionRepo } from "../gen/SessionRepo";
 import type { SessionStatus } from "../gen/SessionStatus";
-import type { FileRequest, FileTarget, PanelLinks } from "../panels/registry";
+import type { FileRequest, FileTarget, PanelId, PanelLinks } from "../panels/registry";
 import { createSessionStore, type SessionStore } from "../state/sessionStore";
 import {
   fakeApi,
@@ -34,6 +35,10 @@ export type Workspace = {
   shipForms: () => number;
   /** Messages a panel drafted for the agent, in order. */
   drafts: string[];
+  /** Panels, agents and items a panel asked the screen to show, in order. */
+  panels: PanelId[];
+  shownAgents: string[];
+  shownItems: string[];
   /** Whether the panel under test is the one on screen. */
   active: Accessor<boolean>;
   setActive: (active: boolean) => void;
@@ -50,6 +55,8 @@ export async function openWorkspace(
     openTerminal?: OpenTerminal;
     health?: Health;
     now?: number;
+    /** What the `sessions` topic lists, for the session's tree. */
+    sessions?: () => readonly Session[];
   } = {},
 ): Promise<Workspace> {
   const socket = new FakeSocket();
@@ -66,6 +73,7 @@ export async function openWorkspace(
       schedule: immediately,
       openTerminal: options.openTerminal,
       health: () => options.health,
+      sessions: options.sessions,
       now: () => options.now ?? 1000,
     },
     "s1",
@@ -81,6 +89,9 @@ export async function openWorkspace(
   const opened: FileTarget[] = [];
   const unsaved: Array<string | undefined> = [];
   const drafts: string[] = [];
+  const panels: PanelId[] = [];
+  const shownAgents: string[] = [];
+  const shownItems: string[] = [];
   let shipForms = 0;
   return {
     store,
@@ -106,11 +117,17 @@ export async function openWorkspace(
         shipForms += 1;
       },
       draftMessage: (text) => drafts.push(text),
+      openPanel: (panel) => panels.push(panel),
+      showAgent: (agentId) => shownAgents.push(agentId),
+      showItem: (itemId) => shownItems.push(itemId),
     },
     opened,
     unsaved,
     shipForms: () => shipForms,
     drafts,
+    panels,
+    shownAgents,
+    shownItems,
     active,
     setActive(next) {
       setActive(next);

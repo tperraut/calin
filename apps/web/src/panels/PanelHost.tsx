@@ -7,6 +7,7 @@ import {
   sidePanels,
   type FileRequest,
   type FileTarget,
+  type PanelId,
   type PanelLinks,
   type SidePanel,
   type SidePanelId,
@@ -65,6 +66,9 @@ export function PanelHost(props: {
   onOpenFile: (target: FileTarget) => void;
   onOpenShipForm: () => void;
   onDraftMessage: (text: string) => void;
+  onOpenPanel: (panel: PanelId) => void;
+  onShowAgent: (agentId: string) => void;
+  onShowItem: (itemId: string) => void;
   ref: (element: HTMLDivElement) => void;
 }) {
   // Grows only: a panel joins when it is first shown.
@@ -83,6 +87,9 @@ export function PanelHost(props: {
     },
     openShipForm: () => props.onOpenShipForm(),
     draftMessage: (text) => props.onDraftMessage(text),
+    openPanel: (panel) => props.onOpenPanel(panel),
+    showAgent: (agentId) => props.onShowAgent(agentId),
+    showItem: (itemId) => props.onShowItem(itemId),
   };
 
   // A link to another session or to the home page would drop the panels and

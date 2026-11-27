@@ -3,6 +3,7 @@ import type { Health } from "../gen/Health";
 import type { RepoSet } from "../gen/RepoSet";
 import type { Settings } from "../gen/Settings";
 import { makeDetail, makeMissingRepo, makeRepo, makeSession, makeSessionRepo } from "../test/fakes";
+import { makeGraph, makeTimeline } from "../test/orchestration";
 import { createApi, HttpError, type FetchLike } from "./http";
 
 const json = (body: unknown, status = 200): Response =>
@@ -283,6 +284,49 @@ describe("http api", () => {
       [409, "session is not running", true],
       [409, "request was already answered", true],
       [404, "unknown request", true],
+    ]);
+  });
+
+  it("answers a question and reads the graph and the timeline of a session's tree", async () => {
+    const graph = makeGraph();
+    const timeline = makeTimeline();
+    const { api, fetchFn } = setup((input, init) => {
+      if (init?.method === "POST") return Promise.resolve(new Response(null, { status: 202 }));
+      return Promise.resolve(json(input.includes("/graph") ? graph : timeline));
+    });
+
+    await expect(api.answerQuestion("s 1", "q/1", { answer: "Header" })).resolves.toBeUndefined();
+    await expect(api.getGraph("s 1")).resolves.toEqual(graph);
+    // `at` is Unix milliseconds, sent whole.
+    await expect(api.getGraph("s 1", 1_800_000_012_345.6)).resolves.toEqual(graph);
+    await expect(api.getTimeline("s 1")).resolves.toEqual(timeline);
+
+    const calls = fetchFn.mock.calls.map(([input, init]) => [init?.method, input, init?.body]);
+    expect(calls).toEqual([
+      ["POST", "/api/v1/sessions/s%201/questions/q%2F1", '{"answer":"Header"}'],
+      ["GET", "/api/v1/sessions/s%201/graph", undefined],
+      ["GET", "/api/v1/sessions/s%201/graph?at=1800000012346", undefined],
+      ["GET", "/api/v1/sessions/s%201/timeline", undefined],
+    ]);
+  });
+
+  it("gives the server's reason when a question cannot be answered or a graph cannot be read", async () => {
+    const { api } = setup((input) =>
+      Promise.resolve(
+        input.includes("/questions/")
+          ? json({ error: "question was already answered" }, 409)
+          : json({ error: "session not found" }, 404),
+      ),
+    );
+    const failures = await Promise.all([
+      failureOf(api.answerQuestion("s1", "q1", { answer: "x" })),
+      failureOf(api.getGraph("nope")),
+      failureOf(api.getTimeline("nope")),
+    ]);
+    expect(failures.map((error) => [error.status, error.message, error.fromServer])).toEqual([
+      [409, "question was already answered", true],
+      [404, "session not found", true],
+      [404, "session not found", true],
     ]);
   });
 

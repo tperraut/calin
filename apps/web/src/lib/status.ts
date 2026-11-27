@@ -1,3 +1,4 @@
+import type { AgentStatus } from "../gen/AgentStatus";
 import type { DecisionSource } from "../gen/DecisionSource";
 import type { ItemStatus } from "../gen/ItemStatus";
 import type { PermissionMode } from "../gen/PermissionMode";
@@ -30,6 +31,20 @@ const itemLooks: Record<ItemStatus, Look> = {
   declined: { label: "Declined", tone: "attention" },
 };
 
+const agentLooks: Record<AgentStatus, Look> = {
+  starting: { label: "Starting", tone: "active" },
+  running: { label: "Running", tone: "active" },
+  idle: { label: "Idle", tone: "neutral" },
+  done: { label: "Done", tone: "success" },
+  failed: { label: "Failed", tone: "danger" },
+  stopped: { label: "Stopped", tone: "neutral" },
+};
+
+/** Statuses after which an agent does nothing more. */
+const agentOver: readonly AgentStatus[] = ["done", "failed", "stopped"];
+
+export const agentFinished = (status: AgentStatus): boolean => agentOver.includes(status);
+
 export type PlanLook = { label: string; mark: string };
 
 const planLooks: Record<PlanStatus, PlanLook> = {
@@ -44,6 +59,9 @@ const lookup = <T>(table: Record<string, T>, key: string): T | undefined => tabl
 
 export const sessionLook = (status: SessionStatus): Look =>
   lookup(sessionLooks, status) ?? { label: status, tone: "neutral" };
+
+export const agentLook = (status: AgentStatus): Look =>
+  lookup(agentLooks, status) ?? { label: status, tone: "neutral" };
 
 export const itemLook = (status: ItemStatus): Look =>
   lookup(itemLooks, status) ?? { label: status, tone: "neutral" };

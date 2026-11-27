@@ -1,4 +1,5 @@
 import type { Agent } from "../gen/Agent";
+import type { AgentMessage } from "../gen/AgentMessage";
 import type { DecisionSource } from "../gen/DecisionSource";
 import type { Event } from "../gen/Event";
 import type { EventBody } from "../gen/EventBody";
@@ -9,6 +10,7 @@ import type { PermissionDecision } from "../gen/PermissionDecision";
 import type { PermissionRequest } from "../gen/PermissionRequest";
 import type { PlanEntry } from "../gen/PlanEntry";
 import type { PullRequest } from "../gen/PullRequest";
+import type { Question } from "../gen/Question";
 import type { SessionRepo } from "../gen/SessionRepo";
 import type { SessionStatus } from "../gen/SessionStatus";
 
@@ -30,6 +32,15 @@ export type PermissionOutcome =
 
 /** A permission request made for one tool call, shown in that call's card. */
 export type ToolPermission = { request: PermissionRequest; outcome: PermissionOutcome; ts: number };
+
+/**
+ * Where a question stands. `expired`: the session ended before anyone answered
+ * (event.rs), so the answer is no longer needed.
+ */
+export type QuestionOutcome =
+  | { state: "pending" }
+  | { state: "answered"; answer: string; by: Answerer }
+  | { state: "expired" };
 
 /** One row of the transcript. `key` is stable for the life of the row. */
 export type TranscriptEntry =
@@ -73,7 +84,36 @@ export type TranscriptEntry =
       /** As it was then: the row links to it. */
       pullRequest: PullRequest;
     }
+  | {
+      /** A message between two participants of the session tree, as this session saw it. */
+      kind: "message";
+      key: string;
+      ts: number;
+      /** The agent of this session it concerns: the sender of one sent, the recipient of one received. */
+      agentId: string | null;
+      /** `sent`: it left this session (`message_sent`). `received`: it arrived here. */
+      direction: "sent" | "received";
+      message: AgentMessage;
+    }
+  | {
+      kind: "question";
+      key: string;
+      ts: number;
+      /** The agent that asked. */
+      agentId: string | null;
+      question: Question;
+      outcome: QuestionOutcome;
+    }
   | { kind: "error"; key: string; ts: number; agentId: string | null; message: string };
+
+/** A question an agent asked that nobody has answered yet. */
+export type OpenQuestion = {
+  question: Question;
+  agentId: string | null;
+  ts: number;
+  /** `seq` of the event that asked, so a newer question can be told from an older one. */
+  seq: number;
+};
 
 /** A permission request nobody has answered yet. */
 export type PendingPermission = {
@@ -123,6 +163,15 @@ export type SessionView = {
   readonly changesRevision: number;
   /** One per repo, as the events last described it, in the order they were first seen. */
   readonly pullRequests: readonly PullRequest[];
+  /** Oldest first. Each one also shows in the transcript, where it was asked. */
+  readonly openQuestions: readonly OpenQuestion[];
+  /**
+   * Subagent id to the id of the tool call that started it, for the subagents
+   * whose call could be told; the transcript groups a subagent's rows under it.
+   */
+  readonly subagentCalls: Readonly<Record<string, string>>;
+  /** Event id to item id, for the delegation (`task`) tool calls: what an `agent_spawned` may name as its cause. */
+  readonly taskStarts: Readonly<Record<string, string>>;
 };
 
 export const emptySessionView: SessionView = {
@@ -140,6 +189,9 @@ export const emptySessionView: SessionView = {
   changedFiles: [],
   changesRevision: 0,
   pullRequests: [],
+  openQuestions: [],
+  subagentCalls: {},
+  taskStarts: {},
 };
 
 /**
@@ -151,6 +203,8 @@ export type ApplyResult = { view: SessionView; outcome: ApplyOutcome };
 
 const itemKey = (itemId: string): string => `item:${itemId}`;
 const permissionKey = (requestId: string): string => `permission:${requestId}`;
+const messageKey = (messageId: string): string => `message:${messageId}`;
+const questionKey = (questionId: string): string => `question:${questionId}`;
 const fileKey = (sessionRepoId: string | null, path: string): string =>
   `${sessionRepoId ?? ""}\n${path}`;
 
@@ -216,10 +270,115 @@ function putItem(view: SessionView, event: Event, item: Item): SessionView {
     interrupted: false,
     ...(permissions ? { permissions } : {}),
   };
+  // A delegation call is what a subagent's `agent_spawned` may point back to.
+  const taskStarts =
+    !existing && item.content.kind === "tool" && item.content.tool_kind === "task"
+      ? { ...view.taskStarts, [event.id]: item.id }
+      : view.taskStarts;
   return {
     ...view,
     turnStarted: true,
+    taskStarts,
     transcript: existing ? withEntry(transcript, index, entry) : [...transcript, entry],
+  };
+}
+
+/**
+ * The tool call that started `agent`. The contract does not name it, so: the
+ * call whose start event the `agent_spawned` gives as its cause, when it does;
+ * otherwise the parent's newest delegation call still running and not yet
+ * taken by another subagent.
+ */
+function callOf(view: SessionView, event: Event, agent: Agent): string | undefined {
+  const named = event.parent_id === null ? undefined : view.taskStarts[event.parent_id];
+  if (named !== undefined) return named;
+  const taken = new Set(Object.values(view.subagentCalls));
+  const call = view.transcript.findLast(
+    (entry) =>
+      entry.kind === "item" &&
+      entry.agentId === agent.parent_agent_id &&
+      entry.item.status === "running" &&
+      entry.item.content.kind === "tool" &&
+      entry.item.content.tool_kind === "task" &&
+      !taken.has(entry.item.id),
+  );
+  return call?.kind === "item" ? call.item.id : undefined;
+}
+
+function spawnAgent(view: SessionView, event: Event, agent: Agent): SessionView {
+  const others = view.agents.filter((one) => one.id !== agent.id);
+  const next = { ...view, agents: [...others, agent] };
+  if (agent.kind !== "subagent" || view.subagentCalls[agent.id] !== undefined) return next;
+  const call = callOf(view, event, agent);
+  return call === undefined
+    ? next
+    : { ...next, subagentCalls: { ...view.subagentCalls, [agent.id]: call } };
+}
+
+/**
+ * A message that left this session or arrived in it. One id is one row: a note
+ * to this session's own user is both sent and received here (event.rs).
+ */
+function putMessage(
+  view: SessionView,
+  event: Event,
+  described: AgentMessage,
+  direction: "sent" | "received",
+): SessionView {
+  // Widened on purpose, as the body is: an event that carries no message changes nothing.
+  const message = described as AgentMessage | null | undefined;
+  if (!message) return view;
+  const key = messageKey(message.id);
+  if (view.transcript.some((entry) => entry.key === key)) return view;
+  const entry: TranscriptEntry = {
+    kind: "message",
+    key,
+    ts: event.ts,
+    agentId: direction === "sent" ? message.from_agent_id : message.to_agent_id,
+    direction,
+    message,
+  };
+  return { ...view, transcript: [...view.transcript, entry] };
+}
+
+function askQuestion(view: SessionView, event: Event, question: Question): SessionView {
+  const key = questionKey(question.id);
+  const entry: TranscriptEntry = {
+    kind: "question",
+    key,
+    ts: event.ts,
+    agentId: event.agent_id,
+    question,
+    outcome: { state: "pending" },
+  };
+  const open: OpenQuestion = { question, agentId: event.agent_id, ts: event.ts, seq: event.seq };
+  // Ids are unique within a session; a repeat replaces the row instead of doubling it.
+  const index = view.transcript.findLastIndex((one) => one.key === key);
+  return {
+    ...view,
+    transcript:
+      index === -1 ? [...view.transcript, entry] : withEntry(view.transcript, index, entry),
+    openQuestions: [...view.openQuestions.filter((one) => one.question.id !== question.id), open],
+  };
+}
+
+function answerQuestion(
+  view: SessionView,
+  body: Extract<EventBody, { type: "question_answered" }>,
+): SessionView {
+  const openQuestions = view.openQuestions.filter((one) => one.question.id !== body.question_id);
+  const index = view.transcript.findLastIndex((one) => one.key === questionKey(body.question_id));
+  const entry = index === -1 ? undefined : view.transcript[index];
+  // An answer to a question this log never showed has no row to update.
+  if (entry?.kind !== "question") return { ...view, openQuestions };
+  const outcome: QuestionOutcome =
+    body.by === "expired"
+      ? { state: "expired" }
+      : { state: "answered", answer: body.answer, by: body.by };
+  return {
+    ...view,
+    transcript: withEntry(view.transcript, index, { ...entry, outcome }),
+    openQuestions,
   };
 }
 
@@ -471,10 +630,8 @@ function applyBody(view: SessionView, event: Event): SessionView {
       };
       return { ...view, transcript: [...view.transcript, entry] };
     }
-    case "agent_spawned": {
-      const others = view.agents.filter((agent) => agent.id !== body.agent.id);
-      return { ...view, agents: [...others, body.agent] };
-    }
+    case "agent_spawned":
+      return spawnAgent(view, event, body.agent);
     case "agent_status":
       return patchAgent(view, event.agent_id, { status: body.status });
     case "agent_session":
@@ -521,6 +678,14 @@ function applyBody(view: SessionView, event: Event): SessionView {
       return putPullRequest(view, event, body.pull_request, true);
     case "pull_request_updated":
       return putPullRequest(view, event, body.pull_request, false);
+    case "message_sent":
+      return putMessage(view, event, body.message, "sent");
+    case "message_received":
+      return putMessage(view, event, body.message, "received");
+    case "question_asked":
+      return askQuestion(view, event, body.question);
+    case "question_answered":
+      return answerQuestion(view, body);
     case "error": {
       const entry: TranscriptEntry = {
         kind: "error",

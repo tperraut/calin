@@ -1,0 +1,322 @@
+/*
+ * The session graph and the timeline. Colors are the app's own tokens, so both
+ * follow the system theme; the series colors of the timeline are stepped per
+ * theme (validated for color-vision deficiencies on each surface).
+ */
+.orch {
+  --series-read: #2a78d6;
+  --series-write: #eb6834;
+  --series-run: #1baf7a;
+  --series-task: #eda100;
+  --series-think: #e87ba4;
+  --series-other: var(--muted);
+}
+
+@media (prefers-color-scheme: dark) {
+  .orch {
+    --series-read: #3987e5;
+    --series-write: #d95926;
+    --series-run: #199e70;
+    --series-task: #c98500;
+    --series-think: #d55181;
+  }
+}
+
+.graph-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: grab;
+  background: var(--bg);
+}
+
+.graph-canvas[data-dragging] {
+  cursor: grabbing;
+}
+
+.gnode {
+  cursor: pointer;
+  outline: none;
+}
+
+.gnode .gshape {
+  fill: var(--surface);
+  stroke: var(--line);
+  stroke-width: 1.25;
+}
+
+.gnode[data-kind="user"] .gshape {
+  fill: var(--accent-soft);
+  stroke: var(--accent);
+}
+
+.gnode[data-kind="repo"] .gshape {
+  fill: var(--sunken);
+  stroke: var(--muted);
+}
+
+.gnode .gown {
+  display: none;
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 2;
+}
+
+.gnode[data-own] .gown {
+  display: inline;
+}
+
+.gnode[data-selected] .gshape {
+  fill: var(--accent-soft);
+  stroke: var(--accent);
+  stroke-width: 2;
+}
+
+.gnode:focus-visible .gshape {
+  stroke: var(--accent);
+  stroke-width: 3;
+}
+
+.gnode:focus-visible .gfocus {
+  display: inline;
+}
+
+.gnode .gfocus {
+  display: none;
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 2;
+  stroke-dasharray: 3 3;
+}
+
+.gnode text {
+  fill: var(--fg);
+  font-family: var(--font-sans);
+  pointer-events: none;
+}
+
+.gnode .gtitle {
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.gnode .gsub {
+  fill: var(--muted);
+  font-size: 11px;
+}
+
+.gnode .gcost {
+  fill: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+}
+
+.gmark[data-tone="neutral"] {
+  color: var(--tone-neutral);
+}
+
+.gmark[data-tone="active"] {
+  color: var(--tone-active);
+}
+
+.gmark[data-tone="attention"] {
+  color: var(--tone-attention);
+}
+
+.gmark[data-tone="success"] {
+  color: var(--tone-success);
+}
+
+.gmark[data-tone="danger"] {
+  color: var(--tone-danger);
+}
+
+.gedge .gline {
+  fill: none;
+  stroke: var(--muted);
+  stroke-width: 1.5;
+  pointer-events: none;
+}
+
+/* Never painted, still hit: `pointer-events: stroke` does not ask for visibility. */
+.gedge .ghit {
+  visibility: hidden;
+  fill: none;
+  stroke: transparent;
+  stroke-width: 18;
+  pointer-events: stroke;
+  cursor: pointer;
+}
+
+/*
+ * Each kind has its own arrowhead (see the markers in GraphView) and weight as
+ * well as its color. Solid lines on purpose: dashed strokes cost frames while
+ * panning a large graph (measured on the stress page under 4x CPU throttling).
+ */
+.gedge[data-kind="link"] .gline {
+  stroke: var(--line);
+}
+
+.gedge[data-kind="spawned"] .gline {
+  stroke: var(--muted);
+}
+
+.gedge[data-kind="dispatched"] .gline {
+  stroke: var(--fg);
+  stroke-width: 2;
+}
+
+.gedge[data-kind="message"] .gline {
+  stroke: var(--tone-active);
+  stroke-width: 1.25;
+}
+
+.gedge[data-kind="report"] .gline {
+  stroke: var(--tone-success);
+  stroke-width: 2;
+}
+
+.gedge[data-kind="changed"] .gline {
+  stroke: var(--tone-attention);
+  stroke-width: 1.25;
+}
+
+.gedge[data-selected] .gline {
+  stroke-width: 3.5;
+}
+
+.gedge .gcount rect {
+  fill: var(--surface);
+  stroke: var(--line);
+}
+
+.gedge .gcount text {
+  fill: var(--fg);
+  font-family: var(--font-sans);
+  font-size: 10.5px;
+  font-weight: 600;
+  text-anchor: middle;
+  pointer-events: none;
+}
+
+.gpulse {
+  fill: var(--accent);
+  stroke: var(--surface);
+  stroke-width: 1.5;
+  pointer-events: none;
+}
+
+/* Zoomed far out: shapes only. */
+.lod .gnode text,
+.lod .gmark,
+.lod .gcount {
+  display: none;
+}
+
+.lod .gline {
+  marker-end: none;
+}
+
+/* Timeline. */
+.tl-turn {
+  fill: var(--sunken);
+  stroke: var(--line);
+}
+
+.tl-tool[data-series="read"] {
+  fill: var(--series-read);
+}
+
+.tl-tool[data-series="write"] {
+  fill: var(--series-write);
+}
+
+.tl-tool[data-series="run"] {
+  fill: var(--series-run);
+}
+
+.tl-tool[data-series="task"] {
+  fill: var(--series-task);
+}
+
+.tl-tool[data-series="think"] {
+  fill: var(--series-think);
+}
+
+.tl-tool[data-series="other"] {
+  fill: var(--series-other);
+}
+
+.tl-waiting {
+  fill: url(#tl-hatch);
+  stroke: var(--tone-attention);
+}
+
+.tl-span {
+  cursor: pointer;
+  outline: none;
+}
+
+.tl-span[data-selected] > rect:first-of-type,
+.tl-span:focus-visible > rect:first-of-type {
+  stroke: var(--accent);
+  stroke-width: 2.5;
+}
+
+.tl-span[data-status="failed"] > rect:first-of-type {
+  stroke: var(--tone-danger);
+  stroke-width: 1.5;
+}
+
+.tl-label {
+  fill: var(--fg);
+  font-family: var(--font-sans);
+  font-size: 10px;
+  pointer-events: none;
+}
+
+.tl-tick line {
+  stroke: var(--line);
+}
+
+.tl-tick text {
+  fill: var(--muted);
+  font-family: var(--font-sans);
+  font-size: 10px;
+}
+
+.tl-arrow {
+  cursor: pointer;
+  outline: none;
+}
+
+.tl-arrow line {
+  stroke: var(--muted);
+  stroke-width: 1;
+}
+
+.tl-arrow .tl-marker {
+  fill: var(--fg);
+  stroke: var(--surface);
+  stroke-width: 2;
+  paint-order: stroke;
+}
+
+.tl-arrow[data-selected] line,
+.tl-arrow:focus-visible line {
+  stroke: var(--accent);
+  stroke-width: 3;
+}
+
+.tl-arrow[data-selected] .tl-marker,
+.tl-arrow:focus-visible .tl-marker {
+  fill: var(--accent);
+}
+
+.tl-hit {
+  fill: transparent;
+  stroke: none;
+}

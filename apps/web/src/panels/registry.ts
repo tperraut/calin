@@ -22,6 +22,12 @@ export type PanelLinks = {
   openShipForm(): void;
   /** Puts `text` in the message box and moves the focus there. Nothing is sent. */
   draftMessage(text: string): void;
+  /** Shows another panel of this session. */
+  openPanel(panel: PanelId): void;
+  /** Shows the transcript with only the rows of one of this session's agents. */
+  showAgent(agentId: string): void;
+  /** Shows the transcript scrolled to one item (a tool call, a message of the agent). */
+  showItem(itemId: string): void;
 };
 
 /**
@@ -35,7 +41,7 @@ export type PanelLinks = {
  */
 export type PanelProps = { store: SessionStore; active: boolean; links: PanelLinks };
 
-export type SidePanelId = "changes" | "files" | "terminal";
+export type SidePanelId = "changes" | "files" | "terminal" | "graph";
 
 /** The transcript is the session itself; the others are the panels beside it. */
 export type PanelId = "transcript" | SidePanelId;
@@ -58,6 +64,7 @@ export const sidePanels: readonly SidePanel[] = [
   { id: "changes", label: "Changes", component: lazy(() => import("./ChangesPanel")) },
   { id: "files", label: "Files", component: lazy(() => import("./FilesPanel")) },
   { id: "terminal", label: "Terminal", component: lazy(() => import("./TerminalPanel")) },
+  { id: "graph", label: "Graph", component: lazy(() => import("./GraphPanel")) },
 ];
 
 export const sidePanelIds: readonly string[] = sidePanels.map((panel) => panel.id);
@@ -65,6 +72,17 @@ export const sidePanelIds: readonly string[] = sidePanels.map((panel) => panel.i
 /** The panel an address segment names; the transcript when there is none. */
 export function panelFromSegment(segment: string | undefined): PanelId {
   return sidePanels.find((panel) => panel.id === segment)?.id ?? "transcript";
+}
+
+/** The session an address is in, if it is in one. */
+export function sessionIdFromPath(pathname: string): string | undefined {
+  const match = /^\/s\/([^/]+)/.exec(pathname);
+  if (!match) return undefined;
+  try {
+    return decodeURIComponent(match[1]);
+  } catch {
+    return undefined;
+  }
 }
 
 /** Address of a session, on the given panel. */

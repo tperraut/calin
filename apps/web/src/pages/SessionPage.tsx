@@ -14,13 +14,15 @@ import { MessageBox } from "../components/MessageBox";
 import { PanelTabs, tabId, tabPanelId, type Tab } from "../components/PanelTabs";
 import { PermissionBar } from "../components/PermissionBar";
 import { PlanPanel } from "../components/PlanPanel";
+import { QuestionBar } from "../components/QuestionBar";
 import { SessionHeader } from "../components/SessionHeader";
 import { SidePane } from "../components/SidePane";
-import { Transcript } from "../components/Transcript";
+import { Transcript, type RevealRequest } from "../components/Transcript";
 import type { SessionStatus } from "../gen/SessionStatus";
 import { changedFileCount } from "../lib/changeCount";
 import { needsAttention } from "../lib/delivery";
 import { createMediaQuery, WIDE_QUERY } from "../lib/media";
+import { speakerFor } from "../lib/messages";
 import { canMessage, resumesOnMessage, sessionLook } from "../lib/status";
 import { PanelHost, PanelOutlet } from "../panels/PanelHost";
 import {
@@ -34,10 +36,11 @@ import {
 } from "../panels/registry";
 import { AppContext } from "../state/app";
 import { createPermissionAnswers } from "../state/permissionAnswers";
-import type { PendingPermission, TranscriptEntry } from "../state/sessionReducer";
+import type { OpenQuestion, PendingPermission, TranscriptEntry } from "../state/sessionReducer";
 
 const ANNOUNCED_CHARS = 300;
 const NONE_PENDING: readonly PendingPermission[] = [];
+const NO_QUESTIONS: readonly OpenQuestion[] = [];
 
 function closedHint(status: SessionStatus | undefined): string {
   if (status === undefined) return "Loading…";
@@ -128,6 +131,21 @@ export function SessionScreen(props: {
     // On a phone the box is behind the panel that asked.
     if (!wide()) props.onPanel("transcript");
   }
+  // The one agent whose rows the transcript shows; the graph can set it, the transcript's own control too.
+  const [agentFilter, setAgentFilter] = createSignal<string | null>(null);
+  const [reveal, setReveal] = createSignal<RevealRequest>();
+  let reveals = 0;
+  function showAgent(agentId: string): void {
+    setAgentFilter(agentId);
+    // In the wide layout the transcript is already beside the panel that asked.
+    if (!wide()) props.onPanel("transcript");
+  }
+  function showItem(itemId: string): void {
+    reveals += 1;
+    setAgentFilter(null);
+    setReveal({ itemId, seq: reveals });
+    if (!wide()) props.onPanel("transcript");
+  }
   let panels: HTMLDivElement | undefined;
   void (
     <PanelHost
@@ -137,6 +155,9 @@ export function SessionScreen(props: {
       onOpenFile={openFile}
       onOpenShipForm={() => setShipOpen(true)}
       onDraftMessage={draftMessage}
+      onOpenPanel={(panel) => props.onPanel(panel)}
+      onShowAgent={showAgent}
+      onShowItem={showItem}
       ref={(element) => (panels = element)}
     />
   );
@@ -149,6 +170,13 @@ export function SessionScreen(props: {
   // A replay passes through every request ever made; only the caught-up list is worth showing.
   const pending = (): readonly PendingPermission[] =>
     store.synced() ? store.view().pendingPermissions : NONE_PENDING;
+
+  // One thing at a time above the message box: a permission holds a tool call, so it goes first.
+  const questions = (): readonly OpenQuestion[] =>
+    store.synced() && pending().length === 0 ? store.view().openQuestions : NO_QUESTIONS;
+  const speaker = createMemo(() =>
+    speakerFor(store.session(), store.view().agents, store.tree().sessions),
+  );
 
   // The server's list, once read, sees what the events do not: a shell's edits, a revert.
   const changedCount = createMemo(() =>
@@ -286,6 +314,12 @@ export function SessionScreen(props: {
                 repos={store.repos()}
                 answers={answers}
                 onOpenFile={openFile}
+                agents={store.view().agents}
+                subagentCalls={store.view().subagentCalls}
+                speaker={speaker()}
+                filter={agentFilter()}
+                onFilter={setAgentFilter}
+                reveal={reveal()}
               />
               <Show when={store.view().plan.length > 0}>
                 <PlanPanel entries={store.view().plan} />
@@ -310,6 +344,11 @@ export function SessionScreen(props: {
               onResolve={(requestId, decision, message) =>
                 store.resolvePermission(requestId, decision, message)
               }
+            />
+            <QuestionBar
+              questions={questions()}
+              onAnswer={(questionId, answer) => store.answerQuestion(questionId, answer)}
+              compact={transcriptHidden()}
             />
             <div hidden={transcriptHidden()}>
               <Show when={store.status() === "done"}>

@@ -844,10 +844,12 @@ describe("App", () => {
         "Changes",
         "Files",
         "Terminal",
+        "Graph",
       ]);
       expect(tabs.map((one) => one.getAttribute("aria-selected"))).toEqual([
         "false",
         "true",
+        "false",
         "false",
         "false",
       ]);
@@ -930,7 +932,7 @@ describe("App", () => {
     it("has one tab stop, and arrows that move between tabs without selecting", async () => {
       const { main, tab } = await openSession("/s/s1/files");
       const tabs = [...main.querySelectorAll<HTMLButtonElement>('[role="tab"]')];
-      expect(tabs.map((one) => one.tabIndex)).toEqual([-1, -1, 0, -1]);
+      expect(tabs.map((one) => one.tabIndex)).toEqual([-1, -1, 0, -1, -1]);
       const press = (key: string) => {
         document.activeElement?.dispatchEvent(
           new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true }),
@@ -941,19 +943,21 @@ describe("App", () => {
       press("ArrowRight");
       expect(document.activeElement).toBe(tab("Terminal"));
       press("ArrowRight");
+      expect(document.activeElement).toBe(tab("Graph"));
+      press("ArrowRight");
       expect(document.activeElement).toBe(tab("Transcript"));
       press("ArrowLeft");
-      expect(document.activeElement).toBe(tab("Terminal"));
+      expect(document.activeElement).toBe(tab("Graph"));
       press("Home");
       expect(document.activeElement).toBe(tab("Transcript"));
       press("End");
-      expect(document.activeElement).toBe(tab("Terminal"));
+      expect(document.activeElement).toBe(tab("Graph"));
       // Focus moved; the open panel did not.
       expect(location.pathname).toBe("/s/s1/files");
 
       await click(tab("Terminal"));
       expect(location.pathname).toBe("/s/s1/terminal");
-      expect(tabs.map((one) => one.tabIndex)).toEqual([-1, -1, -1, 0]);
+      expect(tabs.map((one) => one.tabIndex)).toEqual([-1, -1, -1, 0, -1]);
     });
   });
 
@@ -963,13 +967,14 @@ describe("App", () => {
       const pane = find(main, 'aside[aria-label="Workspace panels"]');
       const tabs = [...pane.querySelectorAll<HTMLButtonElement>('[role="tab"]')];
       // The transcript is not a tab here: it is always on the left.
-      expect(tabs.map((one) => one.textContent)).toEqual(["Changes", "Files", "Terminal"]);
+      expect(tabs.map((one) => one.textContent)).toEqual(["Changes", "Files", "Terminal", "Graph"]);
       expect(tabs.map((one) => one.getAttribute("aria-selected"))).toEqual([
         "false",
         "false",
         "false",
+        "false",
       ]);
-      expect(tabs.map((one) => one.tabIndex)).toEqual([0, -1, -1]);
+      expect(tabs.map((one) => one.tabIndex)).toEqual([0, -1, -1, -1]);
       expect(find(pane, '[role="tablist"]').getAttribute("aria-orientation")).toBe("vertical");
       expect(main.querySelector('[role="tabpanel"]')).toBeNull();
       expect(main.querySelector('[role="separator"]')).toBeNull();

@@ -7,6 +7,7 @@ import type { PermissionRequest } from "../gen/PermissionRequest";
 import type { PullRequest } from "../gen/PullRequest";
 import type { SessionStatus } from "../gen/SessionStatus";
 import { makePullRequest, makeSessionRepo } from "../test/fakes";
+import { makeMessage, makeSubagent } from "../test/orchestration";
 import {
   applyEvent,
   applyEvents,
@@ -1267,5 +1268,237 @@ describe("pull requests", () => {
     );
     applyEvent(before, event);
     expect(before).toEqual(frozen);
+  });
+});
+
+describe("applyEvent: messages between agents", () => {
+  const dispatch = makeMessage("m1", { kind: "dispatch", body: "Add /health" });
+  const note = makeMessage("m2", {
+    kind: "note",
+    from_session_id: "s2",
+    from_agent_id: "a2",
+    to_session_id: "s1",
+    to_agent_id: "a1",
+  });
+
+  it("shows a message sent from this session and one received in it, each on its side", () => {
+    const view = fold(
+      log({ type: "message_sent", message: dispatch }, [
+        null,
+        { type: "message_received", message: note },
+      ]),
+    );
+    expect(view.transcript).toEqual([
+      {
+        kind: "message",
+        key: "message:m1",
+        ts: 1000,
+        agentId: "a1",
+        direction: "sent",
+        message: dispatch,
+      },
+      {
+        kind: "message",
+        key: "message:m2",
+        ts: 1001,
+        agentId: "a1",
+        direction: "received",
+        message: note,
+      },
+    ]);
+  });
+
+  it("never shows the same message twice: a note to this session's user is sent and received here", () => {
+    const toUser = makeMessage("m3", { to_session_id: "s1", to_agent_id: null, body: "Half way." });
+    const view = fold(
+      log(
+        { type: "message_sent", message: toUser },
+        [null, { type: "message_received", message: toUser }],
+        { type: "message_sent", message: toUser },
+      ),
+    );
+    expect(view.transcript).toHaveLength(1);
+    expect(view.transcript[0]).toMatchObject({ kind: "message", direction: "sent", agentId: "a1" });
+    expect(view.seq).toBe(3);
+  });
+
+  it("attributes a received message to the agent it is for, and none when it is for the user", () => {
+    const fromUserElsewhere = makeMessage("m4", {
+      from_agent_id: null,
+      to_session_id: "s1",
+      to_agent_id: null,
+    });
+    const view = fold(
+      log(
+        [null, { type: "message_received", message: note }],
+        [null, { type: "message_received", message: fromUserElsewhere }],
+      ),
+    );
+    expect(
+      view.transcript.map((entry) => (entry.kind === "message" ? entry.agentId : "?")),
+    ).toEqual(["a1", null]);
+  });
+
+  it("ignores an event that carries no message, and keeps its place in the sequence", () => {
+    const view = fold(
+      log({ type: "message_sent" } as unknown as EventBody, { type: "user_message", text: "x" }),
+    );
+    expect(kinds(view)).toEqual(["user"]);
+    expect(view.seq).toBe(2);
+  });
+});
+
+describe("applyEvent: questions", () => {
+  const question = { id: "q1", text: "Header or footer?", options: ["Header", "Footer"] };
+
+  it("keeps an asked question open and shows it where it was asked", () => {
+    const view = fold(
+      log(
+        { type: "user_message", text: "go" },
+        { type: "question_asked", question },
+        status("waiting"),
+      ),
+    );
+    expect(view.openQuestions).toEqual([{ question, agentId: "a1", ts: 1001, seq: 2 }]);
+    expect(view.transcript[1]).toEqual({
+      kind: "question",
+      key: "question:q1",
+      ts: 1001,
+      agentId: "a1",
+      question,
+      outcome: { state: "pending" },
+    });
+    // Waiting on the user is not the end of a turn: the question stays open.
+    expect(view.status).toBe("waiting");
+  });
+
+  it("closes the question with the user's answer", () => {
+    const view = fold(
+      log(
+        { type: "question_asked", question },
+        { type: "question_answered", question_id: "q1", answer: "Header", by: "user" },
+      ),
+    );
+    expect(view.openQuestions).toEqual([]);
+    expect(view.transcript).toHaveLength(1);
+    expect(view.transcript[0]).toMatchObject({
+      kind: "question",
+      outcome: { state: "answered", answer: "Header", by: "user" },
+    });
+  });
+
+  it("shows a question the session ended before as no longer needed, not as answered", () => {
+    const view = fold(
+      log(
+        { type: "question_asked", question },
+        { type: "question_answered", question_id: "q1", answer: "", by: "expired" },
+      ),
+    );
+    expect(view.openQuestions).toEqual([]);
+    expect(view.transcript[0]).toMatchObject({ kind: "question", outcome: { state: "expired" } });
+  });
+
+  it("keeps several questions open, oldest first, and closes the one that is answered", () => {
+    const second = { id: "q2", text: "Which color?", options: [] };
+    const view = fold(
+      log(
+        { type: "question_asked", question },
+        { type: "question_asked", question: second },
+        { type: "question_answered", question_id: "q1", answer: "Footer", by: "user" },
+      ),
+    );
+    expect(view.openQuestions.map((one) => one.question.id)).toEqual(["q2"]);
+    expect(kinds(view)).toEqual(["question", "question"]);
+  });
+
+  it("ignores an answer to a question the log never asked", () => {
+    const view = fold(
+      log({ type: "question_answered", question_id: "nope", answer: "x", by: "user" }),
+    );
+    expect(view.transcript).toEqual([]);
+    expect(view.openQuestions).toEqual([]);
+  });
+});
+
+describe("applyEvent: subagents", () => {
+  const task = (id: string, state: Item["status"] = "running"): Item => ({
+    id,
+    status: state,
+    content: {
+      kind: "tool",
+      name: "Task",
+      tool_kind: "task",
+      title: `task ${id}`,
+      input: {},
+      output: null,
+      locations: [],
+    },
+  });
+  const sub = (id: string, role: string): Agent => makeSubagent(id, role);
+
+  it("adds a subagent to the session and attributes what it emits to it", () => {
+    const view = fold(
+      log(
+        { type: "agent_spawned", agent },
+        { type: "item_started", item: task("t1") },
+        ["a1", { type: "agent_spawned", agent: sub("sub1", "explorer") }],
+        ["sub1", { type: "item_started", item: toolItem("t1a", null) }],
+        ["sub1", { type: "error", message: "rate limited" }],
+        ["sub1", { type: "usage", cost_usd: 0.01, tokens_in: 10, tokens_out: 2 }],
+        ["sub1", { type: "agent_status", status: "done" }],
+      ),
+    );
+    expect(view.agents.map((one) => [one.id, one.kind, one.status, one.cost_usd])).toEqual([
+      ["a1", "process", "starting", 0],
+      ["sub1", "subagent", "done", 0.01],
+    ]);
+    expect(view.transcript.map((entry) => ("agentId" in entry ? entry.agentId : null))).toEqual([
+      "a1",
+      "sub1",
+      "sub1",
+    ]);
+  });
+
+  it("links a subagent to its parent's newest delegation call still running", () => {
+    const view = fold(
+      log(
+        { type: "agent_spawned", agent },
+        { type: "item_started", item: task("t0") },
+        { type: "item_completed", item: task("t0", "completed") },
+        { type: "item_started", item: task("t1") },
+        ["a1", { type: "agent_spawned", agent: sub("sub1", "explorer") }],
+        { type: "item_started", item: task("t2") },
+        ["a1", { type: "agent_spawned", agent: sub("sub2", "reviewer") }],
+        // A third one with no call left to claim.
+        ["a1", { type: "agent_spawned", agent: sub("sub3", "tester") }],
+      ),
+    );
+    expect(view.subagentCalls).toEqual({ sub1: "t1", sub2: "t2" });
+  });
+
+  it("prefers the call the spawn names as its cause", () => {
+    const events = log(
+      { type: "agent_spawned", agent },
+      { type: "item_started", item: task("t1") },
+      { type: "item_started", item: task("t2") },
+      ["a1", { type: "agent_spawned", agent: sub("sub1", "explorer") }],
+    );
+    // `t1` started with the event `e2`.
+    events[3] = { ...events[3], parent_id: "e2" };
+    expect(fold(events).subagentCalls).toEqual({ sub1: "t1" });
+  });
+
+  it("keeps the link when the subagent is announced again", () => {
+    const view = fold(
+      log(
+        { type: "agent_spawned", agent },
+        { type: "item_started", item: task("t1") },
+        ["a1", { type: "agent_spawned", agent: sub("sub1", "explorer") }],
+        { type: "item_started", item: task("t2") },
+        ["a1", { type: "agent_spawned", agent: { ...sub("sub1", "explorer"), status: "done" } }],
+      ),
+    );
+    expect(view.subagentCalls).toEqual({ sub1: "t1" });
+    expect(view.agents.find((one) => one.id === "sub1")?.status).toBe("done");
   });
 });

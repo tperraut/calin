@@ -17,6 +17,11 @@ export default defineConfig({
     options: { typeAware: true, typeCheck: true },
   },
   plugins: lazyPlugins(() => [solid(), tailwindcss()]),
+  // The graph stress page (stress.html) is a development page: `vp dev` serves it, and a build
+  // holds it only when asked, to measure it as built: `CALIN_STRESS=1 vp build --outDir <dir>`.
+  build: process.env.CALIN_STRESS
+    ? { rollupOptions: { input: ["index.html", "stress.html"] } }
+    : undefined,
   server: {
     proxy: {
       // `make dev-server` listens here; `ws: true` carries /api/v1/ws through.

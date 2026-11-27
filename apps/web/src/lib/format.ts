@@ -39,3 +39,26 @@ export function listInWords(items: readonly string[]): string {
 export function formatCost(usd: number): string {
   return `$${usd.toFixed(usd > 0 && usd < 1 ? 4 : 2)}`;
 }
+
+/** The time of day to the second, for moments within one session: "14:03:27". */
+export function clockTime(ts: number): string {
+  return new Date(ts).toLocaleTimeString(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
+}
+
+/** 850 → "0.9 s", 12_400 → "12 s", 95_000 → "1 min 35 s", 3_720_000 → "1 h 2 min". */
+export function formatDuration(ms: number): string {
+  const total = Math.max(0, ms);
+  if (total < 10_000) return `${trimZero((total / 1000).toFixed(1))} s`;
+  const seconds = Math.round(total / 1000);
+  if (seconds < 60) return `${seconds} s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60)
+    return seconds % 60 === 0 ? `${minutes} min` : `${minutes} min ${seconds % 60} s`;
+  const hours = Math.floor(minutes / 60);
+  return minutes % 60 === 0 ? `${hours} h` : `${hours} h ${minutes % 60} min`;
+}

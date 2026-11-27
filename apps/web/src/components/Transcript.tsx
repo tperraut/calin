@@ -3,24 +3,43 @@ import {
   createEffect,
   createMemo,
   createSignal,
+  createUniqueId,
   For,
   Match,
   onSettled,
   Show,
   Switch,
+  untrack,
   useContext,
 } from "solid-js";
+import type { Agent } from "../gen/Agent";
+import type { AgentMessage } from "../gen/AgentMessage";
 import type { Item } from "../gen/Item";
 import type { ItemContent } from "../gen/ItemContent";
 import type { ItemStatus } from "../gen/ItemStatus";
 import type { PermissionRequest } from "../gen/PermissionRequest";
 import type { PullRequest } from "../gen/PullRequest";
+import type { Question } from "../gen/Question";
 import type { SessionRepo } from "../gen/SessionRepo";
+import { isLongBody, messageHeading, type Speaker } from "../lib/messages";
 import { locateInRepos } from "../lib/paths";
-import { decisionSourceLabel, repoModeLabel, type Look, type Tone } from "../lib/status";
+import {
+  agentFinished,
+  agentLook,
+  decisionSourceLabel,
+  repoModeLabel,
+  type Look,
+  type Tone,
+} from "../lib/status";
+import { entryAgent, transcriptRows, type TranscriptRow } from "../lib/transcriptRows";
 import type { FileTarget } from "../panels/registry";
 import type { PermissionAnswers } from "../state/permissionAnswers";
-import type { PermissionOutcome, ToolPermission, TranscriptEntry } from "../state/sessionReducer";
+import type {
+  PermissionOutcome,
+  QuestionOutcome,
+  ToolPermission,
+  TranscriptEntry,
+} from "../state/sessionReducer";
 import { Badge, ItemStatusBadge } from "./Badge";
 import { Markdown } from "./Markdown";
 import { PullRequestLink } from "./PullRequests";
@@ -34,6 +53,8 @@ type Surroundings = {
   answers: () => PermissionAnswers | undefined;
   /** Absent where there is no Files panel to open a file in. */
   openFile: () => ((target: FileTarget) => void) | undefined;
+  /** Names who sent and who received a message. */
+  speaker: () => Speaker;
 };
 
 const SurroundingsContext = createContext<Surroundings>();
@@ -374,6 +395,71 @@ function PullRequestRow(props: { pullRequest: PullRequest; what: "opened" | "mer
   );
 }
 
+/**
+ * A message between two participants of the session tree: who to whom and what
+ * kind, then its text. A long one starts folded so it does not bury the turn.
+ */
+function MessageRow(props: { message: AgentMessage; direction: "sent" | "received" }) {
+  const around = useContext(SurroundingsContext);
+  const long = () => isLongBody(props.message.body);
+  const [expanded, setExpanded] = createSignal(false);
+  return (
+    <div
+      data-message={props.message.kind}
+      data-direction={props.direction}
+      class="rounded-md border border-line bg-surface px-3 py-2"
+    >
+      <p class="text-xs font-medium text-muted">
+        {messageHeading(props.message, props.direction, around.speaker())}
+      </p>
+      <div class={{ "max-h-28 overflow-hidden": long() && !expanded() }}>
+        <Markdown text={props.message.body} />
+      </div>
+      <Show when={long()}>
+        <button
+          type="button"
+          class="inline-flex min-h-11 items-center text-sm text-accent underline underline-offset-4"
+          aria-expanded={expanded() ? "true" : "false"}
+          onClick={() => setExpanded((open) => !open)}
+        >
+          {expanded() ? "Show less" : "Show the whole message"}
+        </button>
+      </Show>
+    </div>
+  );
+}
+
+function questionLook(outcome: QuestionOutcome): Look {
+  if (outcome.state === "pending") return { label: "Waiting for you", tone: "attention" };
+  if (outcome.state === "expired") return { label: "No longer needed", tone: "neutral" };
+  return { label: `Answered by ${decisionSourceLabel(outcome.by)}`, tone: "success" };
+}
+
+/** A question an agent asked the user, where it was asked, with what became of it. */
+function QuestionRow(props: { question: Question; outcome: QuestionOutcome }) {
+  const answer = () => (props.outcome.state === "answered" ? props.outcome.answer : undefined);
+  return (
+    <div
+      data-question={props.outcome.state}
+      class="rounded-md border border-line bg-surface px-3 py-2"
+    >
+      <div class="flex min-w-0 flex-wrap items-center justify-between gap-x-2 gap-y-1">
+        <span class="text-xs font-medium text-muted">Question for you</span>
+        <Badge look={questionLook(props.outcome)} pulse={props.outcome.state === "pending"} />
+      </div>
+      <Markdown text={props.question.text} />
+      <Show when={answer()}>
+        {(text) => (
+          <p class={["mt-1 border-l-2 border-line pl-3 text-sm", prose]}>
+            <span class="text-muted">Answer: </span>
+            {text()}
+          </p>
+        )}
+      </Show>
+    </div>
+  );
+}
+
 function ItemRow(props: {
   item: Item;
   interrupted: boolean;
@@ -425,8 +511,16 @@ function EntryRow(props: { entry: TranscriptEntry }) {
   const repo = () => (props.entry.kind === "repo" ? props.entry : undefined);
   const pullRequest = () => (props.entry.kind === "pull_request" ? props.entry : undefined);
   const error = () => (props.entry.kind === "error" ? props.entry : undefined);
+  const message = () => (props.entry.kind === "message" ? props.entry : undefined);
+  const question = () => (props.entry.kind === "question" ? props.entry : undefined);
   return (
     <Switch>
+      <Match when={message()}>
+        {(entry) => <MessageRow message={entry().message} direction={entry().direction} />}
+      </Match>
+      <Match when={question()}>
+        {(entry) => <QuestionRow question={entry().question} outcome={entry().outcome} />}
+      </Match>
       <Match when={user()}>{(entry) => <UserMessage text={entry().text} />}</Match>
       <Match when={item()}>
         {(entry) => (
@@ -458,6 +552,102 @@ const hasRow = (entry: TranscriptEntry): boolean =>
   entry.item.content.text.trim() !== "";
 
 const NO_REPOS: readonly SessionRepo[] = [];
+const NO_AGENTS: readonly Agent[] = [];
+const NO_CALLS: Readonly<Record<string, string>> = {};
+const plainSpeaker: Speaker = (_sessionId, agentId) => (agentId === null ? "you" : "another agent");
+
+/** The id a row carries so it can be scrolled to: its item's, for an item. */
+const itemIdOf = (entry: TranscriptEntry): string | undefined =>
+  entry.kind === "item" ? entry.item.id : undefined;
+
+function EntryItem(props: { entry: TranscriptEntry; revealed: string | undefined }) {
+  return (
+    <li
+      data-item={itemIdOf(props.entry)}
+      data-revealed={
+        props.revealed !== undefined && props.revealed === itemIdOf(props.entry)
+          ? "true"
+          : undefined
+      }
+      class="rounded-md data-revealed:outline-2 data-revealed:outline-offset-2 data-revealed:outline-accent"
+    >
+      <EntryRow entry={props.entry} />
+    </li>
+  );
+}
+
+type SubagentRow = Extract<TranscriptRow, { kind: "subagent" }>;
+
+const toolCallsLabel = (count: number): string =>
+  count === 1 ? "1 tool call" : `${count} tool calls`;
+
+/**
+ * What a subagent did, gathered under the tool call that started it. One line
+ * (role, tool calls, status) that opens onto its rows; folded once it is done.
+ */
+function SubagentGroup(props: {
+  row: SubagentRow;
+  /** What the reader chose; absent until they do. */
+  chosen: boolean | undefined;
+  revealed: string | undefined;
+  onToggle: (open: boolean) => void;
+}) {
+  const open = (): boolean => props.chosen ?? !agentFinished(props.row.agent.status);
+  const look = () => agentLook(props.row.agent.status);
+  return (
+    <div
+      role="group"
+      aria-label={`Subagent ${props.row.agent.role}`}
+      data-subagent={props.row.agentId}
+      class="ml-3 border-l-2 border-line pl-3"
+    >
+      <button
+        type="button"
+        class="flex min-h-11 w-full min-w-0 items-center gap-1.5 text-left text-sm"
+        aria-expanded={open() ? "true" : "false"}
+        onClick={() => props.onToggle(!open())}
+      >
+        <span
+          aria-hidden="true"
+          class={["text-muted transition-transform", { "rotate-90": open() }]}
+        >
+          ▸
+        </span>
+        <span class="min-w-0 truncate">
+          <span class="font-medium">{props.row.agent.role}</span>
+          <span class="text-muted"> · {toolCallsLabel(props.row.toolCalls)} · </span>
+          <span class={["font-medium", toneText[look().tone]]}>{look().label}</span>
+        </span>
+      </button>
+      <Show when={open()}>
+        <Show
+          when={props.row.entries.length > 0}
+          fallback={<p class="pb-2 text-sm text-muted">Nothing from this subagent yet.</p>}
+        >
+          <ol class="flex flex-col gap-3 pb-2">
+            <For each={props.row.entries} keyed={(entry) => entry.key}>
+              {(entry) => <EntryItem entry={entry()} revealed={props.revealed} />}
+            </For>
+          </ol>
+        </Show>
+      </Show>
+    </div>
+  );
+}
+
+/** What the filter calls each agent: its role, told apart from a namesake by its position. */
+function agentOptions(agents: readonly Agent[]): { id: string; label: string }[] {
+  const seen = new Map<string, number>();
+  return agents.map((agent) => {
+    const count = (seen.get(agent.role) ?? 0) + 1;
+    seen.set(agent.role, count);
+    const name = count === 1 ? agent.role : `${agent.role} ${count}`;
+    return { id: agent.id, label: agent.kind === "subagent" ? `${name} (subagent)` : name };
+  });
+}
+
+/** A request to bring one item into view; `seq` tells apart two requests for the same item. */
+export type RevealRequest = { itemId: string; seq: number };
 
 /**
  * The scrolling transcript. It follows new content while the reader is at the
@@ -472,14 +662,44 @@ export function Transcript(props: {
   answers?: PermissionAnswers;
   /** Opens a file of one of the session's repos in the Files panel. */
   onOpenFile?: (target: FileTarget) => void;
+  /** The session's agents: a subagent's rows are gathered under the call that started it. */
+  agents?: readonly Agent[];
+  /** Subagent id to the id of the tool call that started it (see the reducer). */
+  subagentCalls?: Readonly<Record<string, string>>;
+  /** Names who sent and who received a message. */
+  speaker?: Speaker;
+  /** The one agent whose rows show; `null` or absent for all of them. */
+  filter?: string | null;
+  onFilter?: (agentId: string | null) => void;
+  /** The item to bring into view, opening the group it is in. */
+  reveal?: RevealRequest;
 }) {
-  const rows = createMemo(() => props.entries.filter(hasRow));
+  const agents = () => props.agents ?? NO_AGENTS;
+  // A filter naming an agent that is not (or no longer) in the session shows everything.
+  const filter = (): string | null => {
+    const wanted = props.filter ?? null;
+    return wanted !== null && agents().some((agent) => agent.id === wanted) ? wanted : null;
+  };
+  const rows = createMemo(() =>
+    transcriptRows(
+      props.entries.filter(hasRow),
+      agents(),
+      props.subagentCalls ?? NO_CALLS,
+      filter(),
+    ),
+  );
+  const options = createMemo(() => agentOptions(agents()));
   const surroundings: Surroundings = {
     repos: () => props.repos ?? NO_REPOS,
     // A replay passes through every request ever made; only the caught-up ones can be answered.
     answers: () => (props.synced ? props.answers : undefined),
     openFile: () => props.onOpenFile,
+    speaker: () => props.speaker ?? plainSpeaker,
   };
+  // Which subagent groups the reader opened or closed; the others follow their agent's status.
+  const [groups, setGroups] = createSignal<ReadonlyMap<string, boolean>>(new Map());
+  const [revealed, setRevealed] = createSignal<string>();
+  const filterId = createUniqueId();
   let scroller: HTMLDivElement | undefined;
   let content: HTMLDivElement | undefined;
   const [pinned, setPinned] = createSignal(true);
@@ -508,6 +728,31 @@ export function Transcript(props: {
     },
   );
 
+  createEffect(
+    // Only a new request runs this: what the transcript holds is read without following it.
+    () => {
+      const request = props.reveal;
+      if (!request) return undefined;
+      const entry = untrack(() => props.entries.find((one) => itemIdOf(one) === request.itemId));
+      return entry ? { itemId: request.itemId, owner: entryAgent(entry) } : undefined;
+    },
+    (found) => {
+      if (!found) return;
+      const { itemId, owner } = found;
+      if (owner !== null) setGroups((all) => new Map(all).set(owner, true));
+      setRevealed(itemId);
+      pin(false);
+      // Once the group has opened and the row exists.
+      const timer = setTimeout(() => {
+        const row = [...(scroller?.querySelectorAll<HTMLElement>("[data-item]") ?? [])].find(
+          (one) => one.dataset.item === itemId,
+        );
+        row?.scrollIntoView?.({ block: "center" });
+      }, 0);
+      return () => clearTimeout(timer);
+    },
+  );
+
   onSettled(() => {
     if (!scroller || !content || typeof ResizeObserver === "undefined") return;
     const box = scroller;
@@ -529,52 +774,102 @@ export function Transcript(props: {
   });
 
   return (
-    <div class="relative min-h-0 flex-1">
-      <div
-        ref={(element) => (scroller = element)}
-        // Deltas would be read out one by one; the screen announces whole messages instead.
-        role="log"
-        aria-live="off"
-        aria-label="Transcript"
-        tabindex="0"
-        class="h-full overflow-y-auto overscroll-contain px-3 py-3"
-        onScroll={measure}
-      >
-        <div ref={(element) => (content = element)}>
-          <Show
-            when={rows().length > 0}
-            fallback={
-              <p class="py-8 text-center text-sm text-muted">
-                {props.synced ? "Nothing has happened in this session yet." : "Loading transcript…"}
-              </p>
+    <div class="relative flex min-h-0 flex-1 flex-col">
+      <Show when={props.onFilter !== undefined && (agents().length > 1 || filter() !== null)}>
+        <div class="flex shrink-0 items-center gap-2 border-b border-line bg-surface px-3 text-sm">
+          <label for={filterId} class="shrink-0 text-muted">
+            Show
+          </label>
+          <select
+            id={filterId}
+            aria-label="Agent filter"
+            class="field h-11 min-w-0 flex-1 border-transparent bg-transparent px-1 lg:max-w-xs"
+            value={filter() ?? ""}
+            onChange={(event) =>
+              props.onFilter?.(event.currentTarget.value === "" ? null : event.currentTarget.value)
             }
           >
-            <SurroundingsContext value={surroundings}>
-              <ol class="mx-auto flex max-w-3xl flex-col gap-3">
-                <For each={rows()} keyed={(entry) => entry.key}>
-                  {(entry) => (
-                    <li>
-                      <EntryRow entry={entry()} />
-                    </li>
-                  )}
-                </For>
-              </ol>
-            </SurroundingsContext>
-          </Show>
+            <option value="">All agents</option>
+            <For each={options()} keyed={(option) => option.id}>
+              {(option) => <option value={option().id}>{option().label}</option>}
+            </For>
+          </select>
         </div>
-      </div>
-      <Show when={!pinned()}>
-        <button
-          type="button"
-          class="btn absolute bottom-3 left-1/2 -translate-x-1/2 shadow-md"
-          onClick={() => {
-            pin(true);
-            toBottom();
-          }}
-        >
-          Jump to latest ↓
-        </button>
       </Show>
+      <div class="relative min-h-0 flex-1">
+        <div
+          ref={(element) => (scroller = element)}
+          // Deltas would be read out one by one; the screen announces whole messages instead.
+          role="log"
+          aria-live="off"
+          aria-label="Transcript"
+          tabindex="0"
+          class="h-full overflow-y-auto overscroll-contain px-3 py-3"
+          onScroll={measure}
+        >
+          <div ref={(element) => (content = element)}>
+            <Show
+              when={rows().length > 0}
+              fallback={
+                <p class="py-8 text-center text-sm text-muted">
+                  {!props.synced
+                    ? "Loading transcript…"
+                    : filter() !== null
+                      ? "Nothing from this agent yet."
+                      : "Nothing has happened in this session yet."}
+                </p>
+              }
+            >
+              <SurroundingsContext value={surroundings}>
+                <ol class="mx-auto flex max-w-3xl flex-col gap-3">
+                  <For each={rows()} keyed={(row) => row.key}>
+                    {(row) => (
+                      <Show
+                        when={subagentRow(row())}
+                        fallback={<EntryItem entry={entryOf(row())} revealed={revealed()} />}
+                      >
+                        {(group) => (
+                          <li>
+                            <SubagentGroup
+                              row={group()}
+                              chosen={groups().get(group().agentId)}
+                              revealed={revealed()}
+                              onToggle={(open) =>
+                                setGroups((all) => new Map(all).set(group().agentId, open))
+                              }
+                            />
+                          </li>
+                        )}
+                      </Show>
+                    )}
+                  </For>
+                </ol>
+              </SurroundingsContext>
+            </Show>
+          </div>
+        </div>
+        <Show when={!pinned()}>
+          <button
+            type="button"
+            class="btn absolute bottom-3 left-1/2 -translate-x-1/2 shadow-md"
+            onClick={() => {
+              pin(true);
+              toBottom();
+            }}
+          >
+            Jump to latest ↓
+          </button>
+        </Show>
+      </div>
     </div>
   );
+}
+
+const subagentRow = (row: TranscriptRow): SubagentRow | undefined =>
+  row.kind === "subagent" ? row : undefined;
+
+/** The entry of a plain row; a group never reaches here (see the `Show` above). */
+function entryOf(row: TranscriptRow): TranscriptEntry {
+  if (row.kind !== "entry") throw new Error("a subagent group is not an entry");
+  return row.entry;
 }

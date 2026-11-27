@@ -44,7 +44,7 @@ export function PanelTabs<T extends string>(props: {
       role="tablist"
       aria-label={props.label}
       aria-orientation={vertical() ? "vertical" : "horizontal"}
-      class={["flex min-w-0", vertical() ? "flex-col" : "flex-1"]}
+      class={["flex min-w-0", vertical() ? "flex-col" : "flex-1 overflow-x-auto"]}
       onKeyDown={onKeyDown}
     >
       <For each={props.tabs} keyed={(tab) => tab.id}>
@@ -59,8 +59,10 @@ export function PanelTabs<T extends string>(props: {
             }
             tabindex={stop() === tab().id ? 0 : -1}
             class={[
-              "flex min-h-11 min-w-11 items-center justify-center gap-1.5 px-3 text-sm font-medium -outline-offset-2",
-              vertical() ? "border-l-2" : "flex-1 border-b-2 lg:flex-none",
+              // Five tabs share a 360px phone: the padding is what gives.
+              "flex min-h-11 min-w-11 items-center justify-center gap-1 px-1.5 text-sm font-medium -outline-offset-2 sm:gap-1.5 sm:px-3",
+              // Sized by their labels, then sharing what is left: equal shares would cut the longest one.
+              vertical() ? "border-l-2" : "flex-auto shrink-0 border-b-2 lg:flex-none",
               props.active === tab().id
                 ? "border-accent text-fg"
                 : "border-transparent text-muted hover:text-fg",

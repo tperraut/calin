@@ -1,8 +1,10 @@
+import type { AnswerQuestionRequest } from "../gen/AnswerQuestionRequest";
 import type { ApiError } from "../gen/ApiError";
 import type { AttachRepoRequest } from "../gen/AttachRepoRequest";
 import type { CreateSessionRequest } from "../gen/CreateSessionRequest";
 import type { FileContent } from "../gen/FileContent";
 import type { FileDiff } from "../gen/FileDiff";
+import type { Graph } from "../gen/Graph";
 import type { Health } from "../gen/Health";
 import type { RegisterRepoRequest } from "../gen/RegisterRepoRequest";
 import type { Repo } from "../gen/Repo";
@@ -15,6 +17,7 @@ import type { SessionDetail } from "../gen/SessionDetail";
 import type { SessionRepo } from "../gen/SessionRepo";
 import type { Settings } from "../gen/Settings";
 import type { ShipRequest } from "../gen/ShipRequest";
+import type { Timeline } from "../gen/Timeline";
 import type { TreeEntry } from "../gen/TreeEntry";
 import type { WriteFileRequest } from "../gen/WriteFileRequest";
 
@@ -69,6 +72,15 @@ export interface Api {
   interruptSession(id: string): Promise<void>;
   stopSession(id: string): Promise<void>;
   resolvePermission(id: string, requestId: string, body: ResolvePermissionRequest): Promise<void>;
+  /** Answers a question an agent asked; 404 for an unknown one, 409 once it is answered. */
+  answerQuestion(id: string, questionId: string, body: AnswerQuestionRequest): Promise<void>;
+  /**
+   * Who spawned whom, who told what to whom and who changed which repo, for the
+   * session's whole tree. `at` (Unix milliseconds) asks for it as it was then.
+   */
+  getGraph(id: string, at?: number): Promise<Graph>;
+  /** Every agent's activity over time, for the session's whole tree. */
+  getTimeline(id: string): Promise<Timeline>;
   /** Attaches a repo to a session that is running, waiting or in review; 409 otherwise. */
   attachRepo(id: string, body: AttachRepoRequest): Promise<SessionRepo>;
   /**
@@ -176,6 +188,11 @@ export function createApi(
     stopSession: (id) => empty("POST", `${session(id)}/stop`),
     resolvePermission: (id, requestId, body) =>
       empty("POST", `${session(id)}/permissions/${encodeURIComponent(requestId)}`, body),
+    answerQuestion: (id, questionId, body) =>
+      empty("POST", `${session(id)}/questions/${encodeURIComponent(questionId)}`, body),
+    getGraph: (id, at) =>
+      json<Graph>("GET", `${session(id)}/graph${at === undefined ? "" : `?at=${Math.round(at)}`}`),
+    getTimeline: (id) => json<Timeline>("GET", `${session(id)}/timeline`),
     attachRepo: (id, body) => json<SessionRepo>("POST", `${session(id)}/repos`, body),
     shipSession: (id, body) => empty("POST", `${session(id)}/ship`, body),
     refreshPullRequests: (id) => empty("POST", `${session(id)}/pull-requests/refresh`),

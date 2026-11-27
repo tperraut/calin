@@ -11,6 +11,7 @@ import type { AttachRepoRequest } from "../gen/AttachRepoRequest";
 import type { EventBody } from "../gen/EventBody";
 import type { FileContent } from "../gen/FileContent";
 import type { FileDiff } from "../gen/FileDiff";
+import type { Graph } from "../gen/Graph";
 import type { Health } from "../gen/Health";
 import type { PermissionDecision } from "../gen/PermissionDecision";
 import type { PullRequest } from "../gen/PullRequest";
@@ -21,6 +22,7 @@ import type { SessionDetail } from "../gen/SessionDetail";
 import type { SessionRepo } from "../gen/SessionRepo";
 import type { SessionStatus } from "../gen/SessionStatus";
 import type { ShipRequest } from "../gen/ShipRequest";
+import type { Timeline } from "../gen/Timeline";
 import type { TreeEntry } from "../gen/TreeEntry";
 import type { WriteFileRequest } from "../gen/WriteFileRequest";
 import { mergePullRequests, shipPlan } from "../lib/delivery";
@@ -28,6 +30,7 @@ import { errorMessage } from "../lib/errors";
 import { createRefresher, type Refresher } from "../lib/refresher";
 import { coalesce, type Schedule } from "../lib/schedule";
 import { applyEvent, emptySessionView, mergeRepos, type SessionView } from "./sessionReducer";
+import { sessionTreeOf, type SessionTree } from "./sessionTree";
 
 export type SessionLoad =
   | { status: "loading" }
@@ -112,6 +115,18 @@ export type SessionStore = {
     message?: string,
   ): Promise<void>;
   /**
+   * Answers a question an agent asked. Nothing changes here: the question is
+   * over when its `question_answered` event arrives. Rejects with the server's reason.
+   */
+  answerQuestion(questionId: string, answer: string): Promise<void>;
+  /**
+   * The sessions of this session's tree (same `root_session_id`), from the
+   * sessions list, so it follows every `session_upserted`.
+   */
+  tree: Accessor<SessionTree>;
+  /** The orchestration views of the whole tree (api.rs, "Graph and timeline"). */
+  orchestration: Orchestration;
+  /**
    * Attaches a repo to the running session. Nothing is added here: the repo
    * shows once its `repo_attached` event arrives. Rejects with the server's reason.
    */
@@ -123,6 +138,12 @@ export type SessionStore = {
   start(): () => void;
   /** The session's repos on disk, for the workspace panels. Paths are relative to a repo's root. */
   workspace: SessionWorkspace;
+};
+
+export type Orchestration = {
+  /** The graph now, or as it was at `at` (Unix milliseconds). */
+  graph(at?: number): Promise<Graph>;
+  timeline(): Promise<Timeline>;
 };
 
 /** The routes under `/sessions/{id}` that read and write the repos (api.rs), and the terminal socket. */
@@ -145,6 +166,8 @@ export type SessionStoreDeps = {
   socket: SocketClient;
   /** The session as the `sessions` topic last reported it, if it did. */
   listed?: (id: string) => Session | undefined;
+  /** Every session the `sessions` topic reported; the session's tree is read from it. */
+  sessions?: () => readonly Session[];
   schedule?: Schedule;
   /** Absent where no terminal can be opened (most tests): asking for one reports an error. */
   openTerminal?: OpenTerminal;
@@ -162,6 +185,8 @@ const noTerminal: OpenTerminal = (_request, handlers) => {
   );
   return { write() {}, resize() {}, close() {} };
 };
+
+const NO_SESSIONS: readonly Session[] = [];
 
 /** Resubscriptions in a row that brought nothing new before giving up. */
 const MAX_FRUITLESS_RESYNCS = 3;
@@ -439,6 +464,13 @@ export function createSessionStore(deps: SessionStoreDeps, id: string): SessionS
       const body: ResolvePermissionRequest = { decision };
       if (message !== undefined && message.trim() !== "") body.message = message.trim();
       return api.resolvePermission(id, requestId, body);
+    },
+    answerQuestion: (questionId, answer) =>
+      api.answerQuestion(id, questionId, { answer: answer.trim() }),
+    tree: () => sessionTreeOf(deps.sessions?.() ?? NO_SESSIONS, session()),
+    orchestration: {
+      graph: (at) => api.getGraph(id, at),
+      timeline: () => api.getTimeline(id),
     },
     attachRepo: async (request) => {
       await api.attachRepo(id, request);

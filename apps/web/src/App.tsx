@@ -12,6 +12,7 @@ import {
 import { ConnectionIndicator } from "./components/ConnectionIndicator";
 import { SessionList } from "./components/SessionList";
 import { errorMessage } from "./lib/errors";
+import { sessionIdFromPath } from "./panels/registry";
 import { Router } from "./router";
 import { AppContext, type AppState } from "./state/app";
 
@@ -36,10 +37,15 @@ function Unreachable() {
 
 function SessionsPanel() {
   const app = useContext(AppContext);
+  const location = useLocation();
   return (
     <Switch>
       <Match when={app.sessions().length > 0}>
-        <SessionList sessions={app.sessions()} now={app.now()} />
+        <SessionList
+          sessions={app.sessions()}
+          now={app.now()}
+          openId={sessionIdFromPath(location.pathname)}
+        />
       </Match>
       <Match when={app.sessionsError()}>
         {(message) => (
