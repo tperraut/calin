@@ -517,6 +517,107 @@ async fn subagents_still_running_end_with_their_process() {
 }
 
 #[tokio::test]
+async fn what_an_agent_says_while_it_stops_is_kept_and_what_it_asks_then_expires() {
+    let Fixture {
+        manager,
+        mut starts,
+        dir: _dir,
+    } = fixture().await;
+    let id = manager
+        .create_session(request("work", Some("puppet")))
+        .await
+        .unwrap()
+        .session
+        .id;
+    let played = play(&mut starts).await;
+    let task = tool("task-1", ToolKind::Task, ItemStatus::Running, &[]);
+    emit(
+        &played.io,
+        RunnerOutput::Event(EventBody::ItemStarted { item: task.clone() }),
+    )
+    .await;
+    let before = until_label(&manager, &id, 0, "item_started").await;
+    let task_started = before.last().unwrap().clone();
+
+    let stopping = tokio::spawn({
+        let (manager, id) = (manager.clone(), id.clone());
+        async move { manager.stop(&id).await }
+    });
+    let mut played = played;
+    assert_eq!(
+        within(played.io.inputs.recv()).await,
+        Some(RunnerInput::Stop)
+    );
+    // The agent finishes what it was saying before it notices.
+    emit(&played.io, subagent("k1", None, "explorer", "task-1")).await;
+    let sub_item = EventBody::ItemStarted { item: item("s1") };
+    let said = RunnerOutput::SubagentEvent {
+        key: "k1".to_owned(),
+        body: sub_item,
+    };
+    emit(&played.io, said).await;
+    let ended = RunnerOutput::SubagentEnded {
+        key: "k1".to_owned(),
+        ok: true,
+    };
+    emit(&played.io, ended).await;
+    emit(&played.io, ask("p1", Some("task-1"))).await;
+    let window = calin_proto::LimitWindow {
+        name: "five_hour".to_owned(),
+        used: 0.5,
+        resets_at: None,
+        refused: false,
+    };
+    emit(&played.io, RunnerOutput::Limits(vec![window])).await;
+    let native = RunnerOutput::NativeSession {
+        id: "native-1".to_owned(),
+        model: Some("model-2".to_owned()),
+    };
+    emit(&played.io, native).await;
+    emit(&played.io, RunnerOutput::TurnEnded).await;
+    let done = tool("task-1", ToolKind::Task, ItemStatus::Completed, &[]);
+    emit(
+        &played.io,
+        RunnerOutput::Event(EventBody::ItemCompleted { item: done }),
+    )
+    .await;
+    emit(&played.io, RunnerOutput::Exited(Exit::Ok)).await;
+    within(stopping).await.unwrap().unwrap();
+
+    let events = all_events(&manager, &id).await;
+    let after = &events[before.len()..];
+    assert_eq!(
+        labels(after),
+        [
+            "agent_spawned",
+            "item_started",
+            "agent_status:done",
+            "permission_requested:Bash",
+            "permission_resolved:deny:expired",
+            "limits",
+            "agent_session",
+            "item_completed",
+            "agent_status:stopped",
+            "session_status:cancelled",
+        ]
+    );
+    let detail = manager.get(&id).await.unwrap();
+    let (lead, sub) = (&detail.agents[0], &detail.agents[1]);
+    // The subagent was started by the tool call, and its item is its own.
+    assert_eq!(after[0].parent_id.as_ref(), Some(&task_started.id));
+    assert_eq!(after[1].agent_id.as_ref(), Some(&sub.id));
+    assert_eq!(sub.status, AgentStatus::Done);
+    // Nobody will answer a request asked while stopping.
+    assert_eq!(after[3].parent_id.as_ref(), Some(&task_started.id));
+    assert_eq!(after[4].body, expired_body("p1"));
+    assert_eq!(after[4].parent_id.as_ref(), Some(&after[3].id));
+    assert_eq!(lead.native_session_id.as_deref(), Some("native-1"));
+    assert_eq!(lead.model.as_deref(), Some("model-2"));
+    assert_eq!(lead.status, AgentStatus::Stopped);
+    assert_eq!(after[7].agent_id.as_ref(), Some(&lead.id));
+}
+
+#[tokio::test]
 async fn a_child_starts_on_its_own_branch_at_the_parents_commit() {
     let mut tree = tree().await;
     let manager = tree.manager.clone();

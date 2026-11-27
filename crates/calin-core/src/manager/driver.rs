@@ -1557,17 +1557,11 @@ impl Driver {
             let interrupted = self.interrupted;
             self.capture_lead(interrupted);
         }
-        self.in_turn = false;
-        self.interrupted = false;
-        self.turn_items.clear();
-        self.held.clear();
+        self.forget_turn();
         self.expire_permissions().await?;
         // Whatever it left running inside its process went with it.
-        self.close_subagents(AgentStatus::Stopped).await?;
-        let ended = self.set_agent_status(AgentStatus::Done).await?;
-        if let Some(tracker) = tracker {
-            self.report_unreported_with(tracker, ended).await?;
-        }
+        self.close_agents(tracker, AgentStatus::Stopped, AgentStatus::Done)
+            .await?;
         // A workflow node that is not the lead's holds what waits for it.
         if self.run_holds_lead() {
             return Ok(());
@@ -1591,6 +1585,12 @@ impl Driver {
         if self.parked.is_none() && !self.waits_on_user() && self.take_slot() {
             self.resume_status().await?;
         }
+        self.ask_to_end_turn().await
+    }
+
+    /// Asks the agent to end its turn; the session rests once it has. An
+    /// agent that is gone fails the session.
+    async fn ask_to_end_turn(&mut self) -> Result<()> {
         self.interrupted = true;
         let asked = self
             .handle
@@ -1599,6 +1599,38 @@ impl Driver {
         if !asked {
             return self.fail("the agent is no longer running".to_owned()).await;
         }
+        Ok(())
+    }
+
+    /// Forgets the turn in progress: nothing of it runs any more.
+    fn forget_turn(&mut self) {
+        self.in_turn = false;
+        self.interrupted = false;
+        self.turn_items.clear();
+        self.held.clear();
+    }
+
+    /// Closes the subagents as `subagents` and the lead as `lead`, then
+    /// reports the changes of the turn `tracker` followed, caused by how
+    /// the lead ended.
+    async fn close_agents(
+        &mut self,
+        tracker: Option<tokio::sync::OwnedMutexGuard<Tracker>>,
+        subagents: AgentStatus,
+        lead: AgentStatus,
+    ) -> Result<()> {
+        self.close_subagents(subagents).await?;
+        let ended = self.set_agent_status(lead).await?;
+        if let Some(tracker) = tracker {
+            self.report_unreported_with(tracker, ended).await?;
+        }
+        Ok(())
+    }
+
+    /// Records why the agent cannot go on, said by the lead when there is one.
+    async fn record_error(&mut self, message: String) -> Result<()> {
+        let error = self.by_agent(EventBody::Error { message });
+        self.append(error.parent(self.cause.clone())).await?;
         Ok(())
     }
 
@@ -1613,103 +1645,105 @@ impl Driver {
         // The run ends with the session (workflows spec, section 6).
         self.abort_run(Abort::Stopped).await?;
         self.workflow = None;
-        // First: an agent waiting for a repo it asked for would otherwise
-        // hold up its own stop.
-        self.abort_attaching();
-        if let Some(mut preparation) = self.preparation.take() {
-            preparation.cancel.store(true, Ordering::Relaxed);
-            // The git command already running cannot be recalled. Wait for
-            // it, so its repo is on record and a later message can go on
-            // from there.
-            let grace = tokio::time::sleep(STOP_GRACE);
-            tokio::pin!(grace);
-            loop {
-                tokio::select! {
-                    prepared = preparation.results.recv() => match prepared {
-                        Some(Prepared::Repo(repo)) => self.attach(repo, None).await?,
-                        Some(Prepared::SetupStarted(item)) => self.setup_started(item).await?,
-                        Some(Prepared::SetupEnded { item, failure }) => {
-                            self.setup_ended(item, failure).await?;
-                        }
-                        Some(Prepared::Failed { .. }) | None => break,
-                    },
-                    () = &mut grace => break,
-                }
-            }
-        }
-        if let Some(mut shipping) = self.shipping.take() {
-            shipping.cancel.store(true, Ordering::Relaxed);
-            // The push or the `gh` call already running cannot be recalled.
-            // Wait for it, so a pull request it opens is on record.
-            let grace = tokio::time::sleep(STOP_GRACE);
-            tokio::pin!(grace);
-            loop {
-                tokio::select! {
-                    shipped = shipping.results.recv() => match shipped {
-                        Some(shipped) => self.record_shipped(shipped).await?,
-                        None => break,
-                    },
-                    () = &mut grace => break,
-                }
-            }
-        }
-        self.end_polling(Ok(()));
-        self.expire_permissions().await?;
-        self.expire_question().await?;
-        if let Some(mut handle) = self.handle.take()
-            && handle.stop().is_ok()
-        {
-            // Keep what the agent said before it noticed the request.
-            let grace = tokio::time::sleep(STOP_GRACE);
-            tokio::pin!(grace);
-            loop {
-                tokio::select! {
-                    output = handle.next_output() => match output {
-                        Some(RunnerOutput::Event(body)) => self.agent_event(body, None).await?,
-                        Some(RunnerOutput::SubagentEvent { key, body }) => {
-                            self.agent_event(body, Some(&key)).await?;
-                        }
-                        Some(RunnerOutput::SubagentStarted(start)) => {
-                            self.subagent_started(start).await?;
-                        }
-                        Some(RunnerOutput::SubagentEnded { key, ok }) => {
-                            self.subagent_ended(&key, ok).await?;
-                        }
-                        Some(RunnerOutput::PermissionRequest(ask)) => {
-                            // Asked while stopping: nobody will answer it.
-                            let open = self
-                                .record_request(ask.request, ask.subagent.as_deref())
-                                .await?;
-                            self.expire(open).await?;
-                        }
-                        Some(RunnerOutput::Limits(windows)) => self.limits(windows).await?,
-                        Some(RunnerOutput::NativeSession { id, model }) => {
-                            self.native_session(id, model).await?;
-                        }
-                        Some(RunnerOutput::TurnEnded) => {}
-                        Some(RunnerOutput::Exited(_)) | None => break,
-                    },
-                    // Dropping the handle ends an agent that ignores the request.
-                    () = &mut grace => break,
-                }
-            }
-        }
+        self.stop_work().await?;
         let tracker = self.turn_tracker().await;
         self.drop_agent();
-        self.in_turn = false;
-        self.interrupted = false;
+        self.forget_turn();
         self.pending.clear();
-        self.held.clear();
-        self.turn_items.clear();
-        self.close_subagents(AgentStatus::Stopped).await?;
-        let ended = self.set_agent_status(AgentStatus::Stopped).await?;
         // Before the session's last status: the changes belong to the turn.
-        if let Some(tracker) = tracker {
-            self.report_unreported_with(tracker, ended).await?;
-        }
+        self.close_agents(tracker, AgentStatus::Stopped, AgentStatus::Stopped)
+            .await?;
         self.set_status(SessionStatus::Cancelled, None).await?;
         if owes_report && !cascade {
             self.send_report(Ending::Stopped).await?;
+        }
+        Ok(())
+    }
+
+    /// Ends what the session has at work, keeping on record what each part
+    /// still reports within the grace period.
+    async fn stop_work(&mut self) -> Result<()> {
+        // First: an agent waiting for a repo it asked for would otherwise
+        // hold up its own stop.
+        self.abort_attaching();
+        self.stop_preparation().await?;
+        self.stop_shipping().await?;
+        self.end_polling(Ok(()));
+        self.expire_permissions().await?;
+        self.expire_question().await?;
+        self.stop_agent().await
+    }
+
+    /// The git command already running cannot be recalled. Waits for it, so
+    /// its repo is on record and a later message can go on from there.
+    async fn stop_preparation(&mut self) -> Result<()> {
+        let Some(mut preparation) = self.preparation.take() else {
+            return Ok(());
+        };
+        preparation.cancel.store(true, Ordering::Relaxed);
+        let grace = tokio::time::sleep(STOP_GRACE);
+        tokio::pin!(grace);
+        loop {
+            tokio::select! {
+                prepared = preparation.results.recv() => match prepared {
+                    Some(Prepared::Failed { .. }) | None => break,
+                    prepared => self.on_prepared(prepared).await?,
+                },
+                () = &mut grace => break,
+            }
+        }
+        Ok(())
+    }
+
+    /// The push or the `gh` call already running cannot be recalled. Waits
+    /// for it, so a pull request it opens is on record.
+    async fn stop_shipping(&mut self) -> Result<()> {
+        let Some(mut shipping) = self.shipping.take() else {
+            return Ok(());
+        };
+        shipping.cancel.store(true, Ordering::Relaxed);
+        let grace = tokio::time::sleep(STOP_GRACE);
+        tokio::pin!(grace);
+        loop {
+            tokio::select! {
+                shipped = shipping.results.recv() => match shipped {
+                    Some(shipped) => self.record_shipped(shipped).await?,
+                    None => break,
+                },
+                () = &mut grace => break,
+            }
+        }
+        Ok(())
+    }
+
+    /// Asks the agent to stop and keeps what it says before it notices.
+    /// Dropping the handle ends an agent that ignores the request.
+    async fn stop_agent(&mut self) -> Result<()> {
+        let Some(mut handle) = self.handle.take() else {
+            return Ok(());
+        };
+        if handle.stop().is_err() {
+            return Ok(());
+        }
+        let grace = tokio::time::sleep(STOP_GRACE);
+        tokio::pin!(grace);
+        loop {
+            tokio::select! {
+                output = handle.next_output() => match output {
+                    Some(RunnerOutput::PermissionRequest(ask)) => {
+                        // Asked while stopping: nobody will answer it.
+                        let open = self
+                            .record_request(ask.request, ask.subagent.as_deref())
+                            .await?;
+                        self.expire(open).await?;
+                    }
+                    Some(RunnerOutput::TurnEnded) => {}
+                    Some(RunnerOutput::Exited(_)) | None => break,
+                    // Recorded as it is mid-turn.
+                    output => self.on_output(output).await?,
+                },
+                () = &mut grace => break,
+            }
         }
         Ok(())
     }
@@ -1728,26 +1762,13 @@ impl Driver {
         self.abort_attaching();
         self.abort_shipping();
         self.preparation = None;
-        self.in_turn = false;
-        self.interrupted = false;
+        self.forget_turn();
         self.pending.clear();
-        self.held.clear();
-        self.turn_items.clear();
         self.expire_permissions().await?;
         self.expire_question().await?;
-        let mut error = EventDraft::new(EventBody::Error {
-            message: message.clone(),
-        })
-        .parent(self.cause.clone());
-        if let Some(lead) = &self.lead {
-            error = error.agent(lead.id.clone());
-        }
-        self.append(error).await?;
-        self.close_subagents(AgentStatus::Failed).await?;
-        let ended = self.set_agent_status(AgentStatus::Failed).await?;
-        if let Some(tracker) = tracker {
-            self.report_unreported_with(tracker, ended).await?;
-        }
+        self.record_error(message.clone()).await?;
+        self.close_agents(tracker, AgentStatus::Failed, AgentStatus::Failed)
+            .await?;
         self.set_status(SessionStatus::Failed, Some(message.clone()))
             .await?;
         if owes_report {

@@ -1012,9 +1012,13 @@ async fn a_repo_is_attached_in_review_after_the_agent_has_exited() {
 /// A manager whose home repo declares `api` with `setup`, registered by hand
 /// so that it has a clone, and with a setup limit short enough to hit.
 async fn with_setup(setup: &str) -> (Fixture, TempDir, Repo) {
+    with_setup_limit(setup, Duration::from_millis(400)).await
+}
+
+async fn with_setup_limit(setup: &str, setup_limit: Duration) -> (Fixture, TempDir, Repo) {
     let dir = TempDir::new().unwrap();
     let config = ManagerConfig {
-        setup_limit: Duration::from_millis(400),
+        setup_limit,
         ..config()
     };
     let (manager, starts) = manager_with(&dir, false, config).await;
@@ -1145,6 +1149,36 @@ async fn a_failing_setup_is_an_error_in_the_transcript_and_the_session_goes_on()
         ItemContent::Tool { output: Some(output), .. } if output == "no network\n"
     ));
     assert_eq!(events[6].agent_id, None);
+}
+
+#[tokio::test]
+async fn stopping_during_a_setup_cancels_it_and_keeps_its_end_on_record() {
+    let (fixture, _clones, api) = with_setup_limit("sleep 30", TIMEOUT).await;
+    let Fixture {
+        manager,
+        mut starts,
+        ..
+    } = fixture;
+    let mut wanted = request("stopped setup", Some("puppet"));
+    wanted.repos = vec![attach(&api, None)];
+    let id = manager.create_session(wanted).await.unwrap().session.id;
+    let before = events_until(&manager, &id, 0, |event| {
+        matches!(event.body, EventBody::ItemStarted { .. })
+    })
+    .await;
+    within(manager.stop(&id)).await.unwrap();
+    let events = events_until(&manager, &id, 0, is_status(SessionStatus::Cancelled)).await;
+    assert_eq!(
+        labels(&events[before.len()..]),
+        [
+            "item_completed",
+            "error:the setup command of api was cancelled",
+            "session_status:cancelled",
+        ]
+    );
+    assert_eq!(setup_items(&events)[1].status, ItemStatus::Failed);
+    // No agent was ever started.
+    assert!(starts.try_recv().is_err());
 }
 
 #[tokio::test]

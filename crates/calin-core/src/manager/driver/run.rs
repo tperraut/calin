@@ -552,28 +552,15 @@ impl Driver {
         let tracker = self.turn_tracker().await;
         self.drop_agent();
         self.abort_attaching();
-        self.in_turn = false;
-        self.interrupted = false;
-        self.turn_items.clear();
-        self.held.clear();
+        self.forget_turn();
         self.expire_permissions().await?;
         // Its own question goes with it; a gate is the workflow's and stays.
         if self.question.as_ref().is_some_and(|q| q.agent_id.is_some()) {
             self.expire_question().await?;
         }
-        let mut error = EventDraft::new(EventBody::Error {
-            message: message.clone(),
-        })
-        .parent(self.cause.clone());
-        if let Some(lead) = &self.lead {
-            error = error.agent(lead.id.clone());
-        }
-        self.append(error).await?;
-        self.close_subagents(AgentStatus::Failed).await?;
-        let ended = self.set_agent_status(AgentStatus::Failed).await?;
-        if let Some(tracker) = tracker {
-            self.report_unreported_with(tracker, ended).await?;
-        }
+        self.record_error(message.clone()).await?;
+        self.close_agents(tracker, AgentStatus::Failed, AgentStatus::Failed)
+            .await?;
         if let Some(run) = &mut self.run
             && let Wait::Lead { node, captured, .. } = &mut run.wait
         {
@@ -1194,15 +1181,7 @@ impl Driver {
             // The turn is asked to end; the session rests when it has.
             self.expire_permissions().await?;
             self.held.clear();
-            self.interrupted = true;
-            let asked = self
-                .handle
-                .as_ref()
-                .is_some_and(|handle| handle.interrupt().is_ok());
-            if !asked {
-                return self.fail("the agent is no longer running".to_owned()).await;
-            }
-            return Ok(());
+            return self.ask_to_end_turn().await;
         }
         self.settle_run(run.shipped).await
     }
