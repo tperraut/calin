@@ -8,6 +8,7 @@ import type { ItemDelta } from "./ItemDelta";
 import type { PermissionDecision } from "./PermissionDecision";
 import type { PermissionRequest } from "./PermissionRequest";
 import type { PlanEntry } from "./PlanEntry";
+import type { PullRequest } from "./PullRequest";
 import type { SessionRepo } from "./SessionRepo";
 import type { SessionStatus } from "./SessionStatus";
 
@@ -19,4 +20,4 @@ session_repo_id: string | null,
 /**
  * Relative to the repo root when `session_repo_id` is set, absolute otherwise.
  */
-path: string, op: FileOp, } | { "type": "error", message: string, };
+path: string, op: FileOp, } | { "type": "pull_request_opened", pull_request: PullRequest, } | { "type": "pull_request_updated", pull_request: PullRequest, } | { "type": "error", message: string, };

@@ -12,4 +12,9 @@ dry_run: boolean,
 /**
  * Runner ids this server can start, the default one first.
  */
-runners: Array<string>, };
+runners: Array<string>, 
+/**
+ * Why pull requests cannot be opened from this server (the `gh` CLI is
+ * missing or not signed in), or absent when they can.
+ */
+github_problem: string | null, };
