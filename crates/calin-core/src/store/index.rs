@@ -9,12 +9,12 @@
 use std::path::Path;
 
 use calin_proto::{
-    Agent, AgentKind, AgentMessage, AgentStatus, Event, EventBody, ItemContent, NodePhase,
+    Agent, AgentKind, AgentMessage, AgentStatus, Event, EventBody, Item, ItemContent, NodePhase,
     NodeRunState, PullRequest, Session, SessionRepo, SessionStatus, WorkflowEdge, WorkflowGraph,
     WorkflowNodeRun, WorkflowRun, WorkflowStatus,
 };
-use rusqlite::types::Type;
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use rusqlite::types::{FromSql, Type};
+use rusqlite::{Connection, OptionalExtension, Params, Row, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -332,13 +332,19 @@ pub(super) fn open(path: &Path) -> Result<Connection> {
     db.pragma_update(None, "synchronous", "NORMAL")?;
     let version: i64 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version != SCHEMA_VERSION {
-        for table in TABLES {
-            db.execute_batch(&format!("DROP TABLE IF EXISTS {table};"))?;
-        }
-        db.execute_batch(SCHEMA)?;
-        db.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        recreate(&db)?;
     }
     Ok(db)
+}
+
+/// Drops whatever tables there are and creates the current ones, empty.
+fn recreate(db: &Connection) -> Result<()> {
+    for table in TABLES {
+        db.execute_batch(&format!("DROP TABLE IF EXISTS {table};"))?;
+    }
+    db.execute_batch(SCHEMA)?;
+    db.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    Ok(())
 }
 
 /// Where the index stands for one session.
@@ -360,11 +366,7 @@ pub(super) fn indexed(db: &Connection, session_id: &str) -> Result<Option<Indexe
 }
 
 pub(super) fn session_ids(db: &Connection) -> Result<Vec<String>> {
-    let mut statement = db.prepare("SELECT id FROM sessions")?;
-    let ids = statement
-        .query_map([], |row| row.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    Ok(ids)
+    query_all(db, "SELECT id FROM sessions", [], |row| row.get(0))
 }
 
 /// Inserts the session with nothing indexed yet, replacing any earlier row.
@@ -401,29 +403,28 @@ pub(super) fn insert_session(db: &Connection, session: &Session) -> Result<()> {
 
 /// Forgets a session. The log, if any, is left alone.
 pub(super) fn delete_session(db: &Connection, session_id: &str) -> Result<()> {
-    delete_projections(db, session_id)?;
-    db.execute("DELETE FROM sessions WHERE id = ?1", [session_id])?;
-    Ok(())
+    clear_session(db, session_id, "DELETE FROM sessions WHERE id = ?1")
 }
 
-fn delete_projections(db: &Connection, session_id: &str) -> Result<()> {
+/// Returns a session to its state before any event, keeping what it was created with.
+pub(super) fn reset_session(db: &Connection, session_id: &str) -> Result<()> {
+    clear_session(
+        db,
+        session_id,
+        "UPDATE sessions SET status = 'queued', branch = NULL, head_seq = 0, log_len = 0, \
+         updated_at = created_at WHERE id = ?1",
+    )
+}
+
+/// Deletes what the session's events projected, then runs `then` on its own row.
+fn clear_session(db: &Connection, session_id: &str, then: &str) -> Result<()> {
     for table in PROJECTIONS {
         db.execute(
             &format!("DELETE FROM {table} WHERE session_id = ?1"),
             [session_id],
         )?;
     }
-    Ok(())
-}
-
-/// Returns a session to its state before any event, keeping what it was created with.
-pub(super) fn reset_session(db: &Connection, session_id: &str) -> Result<()> {
-    delete_projections(db, session_id)?;
-    db.execute(
-        "UPDATE sessions SET status = 'queued', branch = NULL, head_seq = 0, log_len = 0, \
-         updated_at = created_at WHERE id = ?1",
-        [session_id],
-    )?;
+    db.execute(then, [session_id])?;
     Ok(())
 }
 
@@ -438,63 +439,65 @@ pub(super) fn session(db: &Connection, session_id: &str) -> Result<Option<Sessio
 
 /// Every session, newest first.
 pub(super) fn sessions(db: &Connection) -> Result<Vec<Session>> {
-    let mut statement = db.prepare_cached(&format!(
-        "SELECT {SESSION_COLUMNS} FROM sessions ORDER BY created_at DESC, id DESC"
-    ))?;
-    let sessions = statement
-        .query_map([], session_from_row)?
-        .collect::<rusqlite::Result<_>>()?;
-    Ok(sessions)
+    query_all(
+        db,
+        &format!("SELECT {SESSION_COLUMNS} FROM sessions ORDER BY created_at DESC, id DESC"),
+        [],
+        session_from_row,
+    )
 }
 
 /// The agents of a session in the order they were spawned.
 pub(super) fn agents(db: &Connection, session_id: &str) -> Result<Vec<Agent>> {
-    let mut statement = db.prepare_cached(&format!(
-        "SELECT {AGENT_COLUMNS} FROM agents WHERE session_id = ?1 ORDER BY spawned_seq, id"
-    ))?;
-    let agents = statement
-        .query_map([session_id], agent_from_row)?
-        .collect::<rusqlite::Result<_>>()?;
-    Ok(agents)
+    query_all(
+        db,
+        &format!(
+            "SELECT {AGENT_COLUMNS} FROM agents WHERE session_id = ?1 ORDER BY spawned_seq, id"
+        ),
+        [session_id],
+        agent_from_row,
+    )
 }
 
 /// The repo set of a session in the order the repos were attached, which
 /// puts the primary repo first.
 pub(super) fn session_repos(db: &Connection, session_id: &str) -> Result<Vec<SessionRepo>> {
-    let mut statement = db.prepare_cached(&format!(
-        "SELECT {REPO_COLUMNS} FROM session_repos WHERE session_id = ?1 \
-         ORDER BY attached_seq, id"
-    ))?;
-    let repos = statement
-        .query_map([session_id], repo_from_row)?
-        .collect::<rusqlite::Result<_>>()?;
-    Ok(repos)
+    query_all(
+        db,
+        &format!(
+            "SELECT {REPO_COLUMNS} FROM session_repos WHERE session_id = ?1 \
+             ORDER BY attached_seq, id"
+        ),
+        [session_id],
+        repo_from_row,
+    )
 }
 
 /// The session's pull requests, in the order of its repo set.
 pub(super) fn pull_requests(db: &Connection, session_id: &str) -> Result<Vec<PullRequest>> {
-    let mut statement = db.prepare_cached(
+    query_all(
+        db,
         "SELECT p.session_repo_id, p.number, p.url, p.title, p.state, p.checks, p.review, \
          p.updated_at FROM pull_requests p \
          LEFT JOIN session_repos r ON r.id = p.session_repo_id \
          WHERE p.session_id = ?1 \
          ORDER BY r.attached_seq IS NULL, r.attached_seq, p.session_repo_id",
-    )?;
-    let pull_requests = statement
-        .query_map([session_id], |row| {
-            Ok(PullRequest {
-                session_repo_id: row.get(0)?,
-                number: row.get(1)?,
-                url: row.get(2)?,
-                title: row.get(3)?,
-                state: from_wire_name(row, 4)?,
-                checks: from_wire_name(row, 5)?,
-                review: from_wire_name(row, 6)?,
-                updated_at: row.get(7)?,
-            })
-        })?
-        .collect::<rusqlite::Result<_>>()?;
-    Ok(pull_requests)
+        [session_id],
+        pull_request_from_row,
+    )
+}
+
+fn pull_request_from_row(row: &Row<'_>) -> rusqlite::Result<PullRequest> {
+    Ok(PullRequest {
+        session_repo_id: row.get(0)?,
+        number: row.get(1)?,
+        url: row.get(2)?,
+        title: row.get(3)?,
+        state: from_wire_name(row, 4)?,
+        checks: from_wire_name(row, 5)?,
+        review: from_wire_name(row, 6)?,
+        updated_at: row.get(7)?,
+    })
 }
 
 /// The highest number among the pull requests recorded for `repo_id`, in any
@@ -531,12 +534,11 @@ pub(super) fn permission_resolved(
     session_id: &str,
     request_id: &str,
 ) -> Result<Option<bool>> {
-    Ok(db
-        .prepare_cached(
-            "SELECT resolved FROM permissions WHERE session_id = ?1 AND request_id = ?2",
-        )?
-        .query_row([session_id, request_id], |row| row.get(0))
-        .optional()?)
+    query_optional(
+        db,
+        "SELECT resolved FROM permissions WHERE session_id = ?1 AND request_id = ?2",
+        [session_id, request_id],
+    )
 }
 
 /// The requests nobody answered yet, of one session or of all of them, oldest first.
@@ -544,21 +546,20 @@ pub(super) fn open_permissions(
     db: &Connection,
     session_id: Option<&str>,
 ) -> Result<Vec<OpenPermission>> {
-    let mut statement = db.prepare_cached(
+    query_all(
+        db,
         "SELECT session_id, request_id, agent_id, event_id FROM permissions \
          WHERE resolved = 0 AND (?1 IS NULL OR session_id = ?1) ORDER BY event_id",
-    )?;
-    let open = statement
-        .query_map([session_id], |row| {
+        [session_id],
+        |row| {
             Ok(OpenPermission {
                 session_id: row.get(0)?,
                 request_id: row.get(1)?,
                 agent_id: row.get(2)?,
                 event_id: row.get(3)?,
             })
-        })?
-        .collect::<rusqlite::Result<_>>()?;
-    Ok(open)
+        },
+    )
 }
 
 /// Byte offset of an event's line in its session log.
@@ -587,391 +588,7 @@ pub(super) fn index_event(db: &Connection, event: &Event, offset: u64, end: u64)
         event.ts,
         input_label(&event.body),
     ])?;
-
-    match &event.body {
-        EventBody::SessionStatus { status, reason } => {
-            let name = wire_name(status)?;
-            db.prepare_cached("UPDATE sessions SET status = ?1 WHERE id = ?2")?
-                .execute(params![name, event.session_id])?;
-            db.prepare_cached(
-                "INSERT OR REPLACE INTO session_states (session_id, seq, ts, status) \
-                 VALUES (?1, ?2, ?3, ?4)",
-            )?
-            .execute(params![event.session_id, event.seq as i64, event.ts, name])?;
-            // Whatever the session moved to, it is no longer the waiting it was in.
-            db.prepare_cached(
-                "UPDATE spans SET end_ts = ?1 \
-                 WHERE session_id = ?2 AND kind = 'waiting' AND end_ts IS NULL",
-            )?
-            .execute(params![event.ts, event.session_id])?;
-            if *status == SessionStatus::Waiting
-                && let Some(lead) = lead_agent(db, &event.session_id)?
-            {
-                let title = match reason.as_deref() {
-                    Some("permission") => "Waiting for permission",
-                    Some("question") => "Waiting for an answer",
-                    Some("gate") => "Waiting at a gate",
-                    _ => "Waiting",
-                };
-                open_span(db, event, "wait", &lead, "waiting", title, event.ts)?;
-            }
-        }
-        EventBody::AgentSpawned { agent } => {
-            // A subagent is described by the tool call that started it.
-            let label = match (agent.kind, &event.parent_id) {
-                (AgentKind::Subagent, Some(started)) => {
-                    span_title(db, &event.session_id, &format!("tool:{started}"))?
-                }
-                _ => None,
-            };
-            db.prepare_cached(
-                "INSERT OR REPLACE INTO agents (id, session_id, parent_agent_id, kind, role, \
-                 runner, model, status, cost_usd, tokens_in, tokens_out, spawned_seq, \
-                 native_session_id, spawned_ts, label) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
-            )?
-            .execute(params![
-                agent.id,
-                event.session_id,
-                agent.parent_agent_id,
-                wire_name(&agent.kind)?,
-                agent.role,
-                agent.runner,
-                agent.model,
-                wire_name(&agent.status)?,
-                agent.cost_usd,
-                agent.tokens_in as i64,
-                agent.tokens_out as i64,
-                event.seq as i64,
-                agent.native_session_id,
-                event.ts,
-                label,
-            ])?;
-            agent_state(db, event, &agent.id, Some(agent.status), None)?;
-            if !ended(agent.status) {
-                match agent.kind {
-                    // Its one turn: from its start to its end.
-                    AgentKind::Subagent => {
-                        let title = label.unwrap_or_else(|| agent.role.clone());
-                        open_turn(db, event, &agent.id, &title, event.ts)?;
-                    }
-                    AgentKind::Process => open_caused_turn(db, event, &agent.id)?,
-                }
-            }
-        }
-        EventBody::AgentSession {
-            native_session_id,
-            model,
-        } => {
-            if let Some(agent_id) = &event.agent_id {
-                // A report without a model keeps the one already known.
-                db.prepare_cached(
-                    "UPDATE agents SET native_session_id = ?1, model = COALESCE(?2, model) \
-                     WHERE id = ?3 AND session_id = ?4",
-                )?
-                .execute(params![
-                    native_session_id,
-                    model,
-                    agent_id,
-                    event.session_id
-                ])?;
-            }
-        }
-        EventBody::RepoAttached { repo } => {
-            db.prepare_cached(
-                "INSERT OR REPLACE INTO session_repos (id, session_id, repo_id, name, mode, \
-                 path, branch, base_ref, is_primary, attached_seq, attached_ts) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            )?
-            .execute(params![
-                repo.id,
-                event.session_id,
-                repo.repo_id,
-                repo.name,
-                wire_name(&repo.mode)?,
-                repo.path,
-                repo.branch,
-                repo.base_ref,
-                repo.primary,
-                event.seq as i64,
-                event.ts,
-            ])?;
-            // The session's branch is the one of the first repo that has one.
-            db.prepare_cached("UPDATE sessions SET branch = ?1 WHERE id = ?2 AND branch IS NULL")?
-                .execute(params![repo.branch, event.session_id])?;
-        }
-        EventBody::PermissionRequested { request } => {
-            db.prepare_cached(
-                "INSERT OR REPLACE INTO permissions (session_id, request_id, agent_id, \
-                 event_id, resolved) VALUES (?1, ?2, ?3, ?4, 0)",
-            )?
-            .execute(params![
-                event.session_id,
-                request.id,
-                event.agent_id,
-                event.id
-            ])?;
-        }
-        EventBody::PermissionResolved { request_id, .. } => {
-            db.prepare_cached(
-                "UPDATE permissions SET resolved = 1 WHERE session_id = ?1 AND request_id = ?2",
-            )?
-            .execute(params![event.session_id, request_id])?;
-        }
-        EventBody::AgentStatus { status } => {
-            if let Some(agent_id) = &event.agent_id {
-                db.prepare_cached(
-                    "UPDATE agents SET status = ?1 WHERE id = ?2 AND session_id = ?3",
-                )?
-                .execute(params![
-                    wire_name(status)?,
-                    agent_id,
-                    event.session_id
-                ])?;
-                agent_state(db, event, agent_id, Some(*status), None)?;
-                // The lead's `running` opens a turn; any other status ends the
-                // one in progress (the semantics of `TimelineSpan`).
-                if *status == AgentStatus::Running {
-                    open_caused_turn(db, event, agent_id)?;
-                } else if *status != AgentStatus::Starting {
-                    close_turn(db, event, agent_id)?;
-                }
-            }
-        }
-        EventBody::Usage {
-            cost_usd,
-            tokens_in,
-            tokens_out,
-        } => {
-            if let Some(agent_id) = &event.agent_id {
-                // Before the agent's totals move on: the delta is against them.
-                index_usage(db, event, agent_id, (*cost_usd, *tokens_in, *tokens_out))?;
-                db.prepare_cached(
-                    "UPDATE agents SET cost_usd = ?1, tokens_in = ?2, tokens_out = ?3 \
-                     WHERE id = ?4 AND session_id = ?5",
-                )?
-                .execute(params![
-                    cost_usd,
-                    *tokens_in as i64,
-                    *tokens_out as i64,
-                    agent_id,
-                    event.session_id
-                ])?;
-                let totals = (*cost_usd, *tokens_in, *tokens_out);
-                agent_state(db, event, agent_id, None, Some(totals))?;
-            }
-        }
-        // Opened or updated, the event carries the whole value: the newest wins.
-        EventBody::PullRequestOpened { pull_request }
-        | EventBody::PullRequestUpdated { pull_request } => {
-            db.prepare_cached(
-                "INSERT OR REPLACE INTO pull_requests (session_repo_id, session_id, number, \
-                 url, title, state, checks, review, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            )?
-            .execute(params![
-                pull_request.session_repo_id,
-                event.session_id,
-                pull_request.number,
-                pull_request.url,
-                pull_request.title,
-                wire_name(&pull_request.state)?,
-                wire_name(&pull_request.checks)?,
-                wire_name(&pull_request.review)?,
-                pull_request.updated_at,
-            ])?;
-        }
-        // A tool call is a span in the lane of the agent that made it. The
-        // orchestrator's own (a setup command) has no lane.
-        EventBody::ItemStarted { item } => {
-            if let (
-                ItemContent::Tool {
-                    title, tool_kind, ..
-                },
-                Some(agent_id),
-            ) = (&item.content, &event.agent_id)
-            {
-                open_span(db, event, "tool", agent_id, "tool", title, event.ts)?;
-                db.prepare_cached(
-                    "UPDATE spans SET tool_kind = ?1, status = ?2, item_id = ?3 \
-                     WHERE session_id = ?4 AND id = ?5",
-                )?
-                .execute(params![
-                    wire_name(tool_kind)?,
-                    wire_name(&item.status)?,
-                    item.id,
-                    event.session_id,
-                    format!("tool:{}", event.id),
-                ])?;
-            }
-        }
-        EventBody::ItemCompleted { item } => {
-            if let ItemContent::Tool { title, .. } = &item.content {
-                db.prepare_cached(
-                    "UPDATE spans SET end_ts = ?1, status = ?2, title = ?3 \
-                     WHERE session_id = ?4 AND item_id = ?5 AND end_ts IS NULL",
-                )?
-                .execute(params![
-                    event.ts,
-                    wire_name(&item.status)?,
-                    title,
-                    event.session_id,
-                    item.id,
-                ])?;
-            }
-        }
-        EventBody::MessageSent { message } => index_message(db, event, message, true)?,
-        EventBody::MessageReceived { message } => index_message(db, event, message, false)?,
-        EventBody::QuestionAsked { question } => {
-            db.prepare_cached(
-                "INSERT OR REPLACE INTO questions (session_id, question_id, agent_id, \
-                 event_id, answered) VALUES (?1, ?2, ?3, ?4, 0)",
-            )?
-            .execute(params![
-                event.session_id,
-                question.id,
-                event.agent_id,
-                event.id
-            ])?;
-        }
-        EventBody::QuestionAnswered { question_id, .. } => {
-            db.prepare_cached(
-                "UPDATE questions SET answered = 1 WHERE session_id = ?1 AND question_id = ?2",
-            )?
-            .execute(params![event.session_id, question_id])?;
-        }
-        EventBody::FileChanged {
-            session_repo_id,
-            path,
-            ..
-        } => {
-            db.prepare_cached(
-                "INSERT OR REPLACE INTO file_changes (session_id, seq, agent_id, \
-                 session_repo_id, path, ts) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            )?
-            .execute(params![
-                event.session_id,
-                event.seq as i64,
-                event.agent_id,
-                session_repo_id,
-                path,
-                event.ts,
-            ])?;
-        }
-        EventBody::WorkflowStarted {
-            workflow_id,
-            name,
-            graph,
-            budget_usd,
-        } => {
-            // A session runs one workflow; a second start would replace it whole.
-            for table in ["workflow_nodes", "workflow_edges"] {
-                db.prepare_cached(&format!("DELETE FROM {table} WHERE session_id = ?1"))?
-                    .execute([&event.session_id])?;
-            }
-            db.prepare_cached(
-                "INSERT OR REPLACE INTO workflow_runs (session_id, workflow_id, name, graph, \
-                 budget_usd, status, reason) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
-            )?
-            .execute(params![
-                event.session_id,
-                workflow_id,
-                name,
-                serde_json::to_string(graph)?,
-                budget_usd,
-                wire_name(&WorkflowStatus::Running)?,
-            ])?;
-            let mut insert = db.prepare_cached(
-                "INSERT INTO workflow_nodes (session_id, position, node_id, is_loop, max, \
-                 state, runs) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
-            )?;
-            for (position, node) in graph.nodes.iter().enumerate() {
-                insert.execute(params![
-                    event.session_id,
-                    position as i64,
-                    node.id,
-                    node.kind == "loop",
-                    loop_max(node),
-                    wire_name(&NodeRunState::Idle)?,
-                ])?;
-            }
-        }
-        EventBody::WorkflowNode {
-            node_id,
-            phase: NodePhase::Started,
-            ..
-        } => {
-            db.prepare_cached(
-                "UPDATE workflow_nodes SET state = ?1, runs = runs + 1 \
-                 WHERE session_id = ?2 AND node_id = ?3",
-            )?
-            .execute(params![
-                wire_name(&NodeRunState::Active)?,
-                event.session_id,
-                node_id
-            ])?;
-        }
-        EventBody::WorkflowNode {
-            node_id,
-            phase: NodePhase::Finished,
-            port,
-            outcome,
-        } => {
-            // A node cut short finishes without a port and keeps its last one.
-            db.prepare_cached(
-                "UPDATE workflow_nodes SET state = ?1, last_port = COALESCE(?2, last_port), \
-                 outcome = ?3 WHERE session_id = ?4 AND node_id = ?5",
-            )?
-            .execute(params![
-                wire_name(&NodeRunState::Finished)?,
-                port,
-                outcome,
-                event.session_id,
-                node_id
-            ])?;
-            let edge = match port {
-                Some(port) => workflow_graph(db, &event.session_id)?.and_then(|graph| {
-                    let wired = |edge: &WorkflowEdge| edge.from == *node_id && edge.port == *port;
-                    graph.edges.into_iter().find(wired)
-                }),
-                None => None,
-            };
-            if let Some(edge) = edge {
-                db.prepare_cached(
-                    "INSERT OR REPLACE INTO workflow_edges (session_id, seq, from_node, port, \
-                     to_node) VALUES (?1, ?2, ?3, ?4, ?5)",
-                )?
-                .execute(params![
-                    event.session_id,
-                    event.seq as i64,
-                    edge.from,
-                    edge.port,
-                    edge.to
-                ])?;
-            }
-        }
-        EventBody::WorkflowFinished { status, reason } => {
-            db.prepare_cached(
-                "UPDATE workflow_runs SET status = ?1, reason = ?2 WHERE session_id = ?3",
-            )?
-            .execute(params![wire_name(status)?, reason, event.session_id])?;
-            // Nothing is at work in a run that is over.
-            db.prepare_cached(
-                "UPDATE workflow_nodes SET state = ?1 WHERE session_id = ?2 AND state = ?3",
-            )?
-            .execute(params![
-                wire_name(&NodeRunState::Finished)?,
-                event.session_id,
-                wire_name(&NodeRunState::Active)?
-            ])?;
-        }
-        EventBody::UserMessage { .. }
-        | EventBody::ItemDelta { .. }
-        | EventBody::PlanUpdated { .. }
-        | EventBody::Limits { .. }
-        | EventBody::Error { .. } => {}
-    }
-
+    project(db, event)?;
     db.prepare_cached(
         "UPDATE sessions SET head_seq = ?1, updated_at = ?2, log_len = ?3 WHERE id = ?4",
     )?
@@ -984,39 +601,531 @@ pub(super) fn index_event(db: &Connection, event: &Event, offset: u64, end: u64)
     Ok(())
 }
 
+/// Brings the projections this event touches up to date: one call per kind.
+fn project(db: &Connection, event: &Event) -> Result<()> {
+    match &event.body {
+        EventBody::SessionStatus { status, reason } => {
+            index_session_status(db, event, *status, reason.as_deref())
+        }
+        EventBody::AgentSpawned { agent } => index_agent_spawned(db, event, agent),
+        EventBody::AgentSession {
+            native_session_id,
+            model,
+        } => index_agent_session(db, event, native_session_id, model.as_deref()),
+        EventBody::RepoAttached { repo } => index_repo_attached(db, event, repo),
+        EventBody::PermissionRequested { request } => {
+            ask_opened(db, event, OPEN_PERMISSION, &request.id)
+        }
+        EventBody::PermissionResolved { request_id, .. } => {
+            ask_answered(db, event, RESOLVE_PERMISSION, request_id)
+        }
+        EventBody::AgentStatus { status } => index_agent_status(db, event, *status),
+        EventBody::Usage {
+            cost_usd,
+            tokens_in,
+            tokens_out,
+        } => index_usage(db, event, (*cost_usd, *tokens_in, *tokens_out)),
+        // Opened or updated, the event carries the whole value: the newest wins.
+        EventBody::PullRequestOpened { pull_request }
+        | EventBody::PullRequestUpdated { pull_request } => {
+            index_pull_request(db, event, pull_request)
+        }
+        EventBody::ItemStarted { item } => index_item_started(db, event, item),
+        EventBody::ItemCompleted { item } => index_item_completed(db, event, item),
+        EventBody::MessageSent { message } => index_message(db, event, message, true),
+        EventBody::MessageReceived { message } => index_message(db, event, message, false),
+        EventBody::QuestionAsked { question } => ask_opened(db, event, OPEN_QUESTION, &question.id),
+        EventBody::QuestionAnswered { question_id, .. } => {
+            ask_answered(db, event, ANSWER_QUESTION, question_id)
+        }
+        EventBody::FileChanged {
+            session_repo_id,
+            path,
+            ..
+        } => index_file_changed(db, event, session_repo_id.as_deref(), path),
+        EventBody::WorkflowStarted {
+            workflow_id,
+            name,
+            graph,
+            budget_usd,
+        } => index_workflow_started(db, event, (workflow_id, name), graph, *budget_usd),
+        EventBody::WorkflowNode {
+            node_id,
+            phase: NodePhase::Started,
+            ..
+        } => index_node_started(db, event, node_id),
+        EventBody::WorkflowNode {
+            node_id,
+            phase: NodePhase::Finished,
+            port,
+            outcome,
+        } => index_node_finished(db, event, node_id, port.as_deref(), outcome.as_deref()),
+        EventBody::WorkflowFinished { status, reason } => {
+            index_workflow_finished(db, event, *status, reason.as_deref())
+        }
+        EventBody::UserMessage { .. }
+        | EventBody::ItemDelta { .. }
+        | EventBody::PlanUpdated { .. }
+        | EventBody::Limits { .. }
+        | EventBody::Error { .. } => Ok(()),
+    }
+}
+
+fn index_session_status(
+    db: &Connection,
+    event: &Event,
+    status: SessionStatus,
+    reason: Option<&str>,
+) -> Result<()> {
+    record_session_status(db, event, status)?;
+    // Whatever the session moved to, it is no longer the waiting it was in.
+    db.prepare_cached(
+        "UPDATE spans SET end_ts = ?1 \
+         WHERE session_id = ?2 AND kind = 'waiting' AND end_ts IS NULL",
+    )?
+    .execute(params![event.ts, event.session_id])?;
+    if status == SessionStatus::Waiting {
+        open_wait(db, event, reason)?;
+    }
+    Ok(())
+}
+
+fn record_session_status(db: &Connection, event: &Event, status: SessionStatus) -> Result<()> {
+    let name = wire_name(&status)?;
+    db.prepare_cached("UPDATE sessions SET status = ?1 WHERE id = ?2")?
+        .execute(params![name, event.session_id])?;
+    db.prepare_cached(
+        "INSERT OR REPLACE INTO session_states (session_id, seq, ts, status) \
+         VALUES (?1, ?2, ?3, ?4)",
+    )?
+    .execute(params![event.session_id, event.seq as i64, event.ts, name])?;
+    Ok(())
+}
+
+/// The waiting span of a session, in its lead's lane; none before it has a lead.
+fn open_wait(db: &Connection, event: &Event, reason: Option<&str>) -> Result<()> {
+    let Some(lead) = lead_agent(db, &event.session_id)? else {
+        return Ok(());
+    };
+    let title = waiting_title(reason);
+    open_span(db, event, "wait", &lead, "waiting", title, event.ts)
+}
+
+fn waiting_title(reason: Option<&str>) -> &'static str {
+    match reason {
+        Some("permission") => "Waiting for permission",
+        Some("question") => "Waiting for an answer",
+        Some("gate") => "Waiting at a gate",
+        _ => "Waiting",
+    }
+}
+
+fn index_agent_spawned(db: &Connection, event: &Event, agent: &Agent) -> Result<()> {
+    let label = subagent_label(db, event, agent)?;
+    insert_agent(db, event, agent, label.as_deref())?;
+    agent_state(db, event, &agent.id, Some(agent.status), None)?;
+    open_first_turn(db, event, agent, label)
+}
+
+/// A subagent is described by the tool call that started it.
+fn subagent_label(db: &Connection, event: &Event, agent: &Agent) -> Result<Option<String>> {
+    match (agent.kind, &event.parent_id) {
+        (AgentKind::Subagent, Some(started)) => {
+            span_title(db, &event.session_id, &format!("tool:{started}"))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn insert_agent(db: &Connection, event: &Event, agent: &Agent, label: Option<&str>) -> Result<()> {
+    db.prepare_cached(
+        "INSERT OR REPLACE INTO agents (id, session_id, parent_agent_id, kind, role, \
+         runner, model, status, cost_usd, tokens_in, tokens_out, spawned_seq, \
+         native_session_id, spawned_ts, label) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+    )?
+    .execute(params![
+        agent.id,
+        event.session_id,
+        agent.parent_agent_id,
+        wire_name(&agent.kind)?,
+        agent.role,
+        agent.runner,
+        agent.model,
+        wire_name(&agent.status)?,
+        agent.cost_usd,
+        agent.tokens_in as i64,
+        agent.tokens_out as i64,
+        event.seq as i64,
+        agent.native_session_id,
+        event.ts,
+        label,
+    ])?;
+    Ok(())
+}
+
+/// The turn an agent spawned at work starts with.
+fn open_first_turn(
+    db: &Connection,
+    event: &Event,
+    agent: &Agent,
+    label: Option<String>,
+) -> Result<()> {
+    if ended(agent.status) {
+        return Ok(());
+    }
+    match agent.kind {
+        // Its one turn: from its start to its end.
+        AgentKind::Subagent => {
+            let title = label.unwrap_or_else(|| agent.role.clone());
+            open_turn(db, event, &agent.id, &title, event.ts)
+        }
+        AgentKind::Process => open_caused_turn(db, event, &agent.id),
+    }
+}
+
+fn index_agent_session(
+    db: &Connection,
+    event: &Event,
+    native_session_id: &str,
+    model: Option<&str>,
+) -> Result<()> {
+    let Some(agent_id) = &event.agent_id else {
+        return Ok(());
+    };
+    // A report without a model keeps the one already known.
+    db.prepare_cached(
+        "UPDATE agents SET native_session_id = ?1, model = COALESCE(?2, model) \
+         WHERE id = ?3 AND session_id = ?4",
+    )?
+    .execute(params![
+        native_session_id,
+        model,
+        agent_id,
+        event.session_id
+    ])?;
+    Ok(())
+}
+
+fn index_repo_attached(db: &Connection, event: &Event, repo: &SessionRepo) -> Result<()> {
+    db.prepare_cached(
+        "INSERT OR REPLACE INTO session_repos (id, session_id, repo_id, name, mode, \
+         path, branch, base_ref, is_primary, attached_seq, attached_ts) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+    )?
+    .execute(params![
+        repo.id,
+        event.session_id,
+        repo.repo_id,
+        repo.name,
+        wire_name(&repo.mode)?,
+        repo.path,
+        repo.branch,
+        repo.base_ref,
+        repo.primary,
+        event.seq as i64,
+        event.ts,
+    ])?;
+    // The session's branch is the one of the first repo that has one.
+    db.prepare_cached("UPDATE sessions SET branch = ?1 WHERE id = ?2 AND branch IS NULL")?
+        .execute(params![repo.branch, event.session_id])?;
+    Ok(())
+}
+
+const OPEN_PERMISSION: &str = "INSERT OR REPLACE INTO permissions (session_id, request_id, \
+     agent_id, event_id, resolved) VALUES (?1, ?2, ?3, ?4, 0)";
+const RESOLVE_PERMISSION: &str =
+    "UPDATE permissions SET resolved = 1 WHERE session_id = ?1 AND request_id = ?2";
+const OPEN_QUESTION: &str = "INSERT OR REPLACE INTO questions (session_id, question_id, \
+     agent_id, event_id, answered) VALUES (?1, ?2, ?3, ?4, 0)";
+const ANSWER_QUESTION: &str =
+    "UPDATE questions SET answered = 1 WHERE session_id = ?1 AND question_id = ?2";
+
+/// Records a permission request or a question, open until it is answered.
+fn ask_opened(db: &Connection, event: &Event, insert: &str, ask_id: &str) -> Result<()> {
+    db.prepare_cached(insert)?.execute(params![
+        event.session_id,
+        ask_id,
+        event.agent_id,
+        event.id
+    ])?;
+    Ok(())
+}
+
+/// Marks a permission request or a question as answered.
+fn ask_answered(db: &Connection, event: &Event, update: &str, ask_id: &str) -> Result<()> {
+    db.prepare_cached(update)?
+        .execute(params![event.session_id, ask_id])?;
+    Ok(())
+}
+
+fn index_agent_status(db: &Connection, event: &Event, status: AgentStatus) -> Result<()> {
+    let Some(agent_id) = &event.agent_id else {
+        return Ok(());
+    };
+    db.prepare_cached("UPDATE agents SET status = ?1 WHERE id = ?2 AND session_id = ?3")?
+        .execute(params![wire_name(&status)?, agent_id, event.session_id])?;
+    agent_state(db, event, agent_id, Some(status), None)?;
+    follow_turn(db, event, agent_id, status)
+}
+
+/// The lead's `running` opens a turn; any other status ends the one in
+/// progress (the semantics of `TimelineSpan`).
+fn follow_turn(db: &Connection, event: &Event, agent_id: &str, status: AgentStatus) -> Result<()> {
+    if status == AgentStatus::Running {
+        open_caused_turn(db, event, agent_id)?;
+    } else if status != AgentStatus::Starting {
+        close_turn(db, event, agent_id)?;
+    }
+    Ok(())
+}
+
+fn index_usage(db: &Connection, event: &Event, totals: (f64, u64, u64)) -> Result<()> {
+    let Some(agent_id) = &event.agent_id else {
+        return Ok(());
+    };
+    // Before the agent's totals move on: the delta is against them.
+    insert_usage_delta(db, event, agent_id, totals)?;
+    db.prepare_cached(
+        "UPDATE agents SET cost_usd = ?1, tokens_in = ?2, tokens_out = ?3 \
+         WHERE id = ?4 AND session_id = ?5",
+    )?
+    .execute(params![
+        totals.0,
+        totals.1 as i64,
+        totals.2 as i64,
+        agent_id,
+        event.session_id
+    ])?;
+    agent_state(db, event, agent_id, None, Some(totals))
+}
+
+fn index_pull_request(db: &Connection, event: &Event, pull_request: &PullRequest) -> Result<()> {
+    db.prepare_cached(
+        "INSERT OR REPLACE INTO pull_requests (session_repo_id, session_id, number, \
+         url, title, state, checks, review, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+    )?
+    .execute(params![
+        pull_request.session_repo_id,
+        event.session_id,
+        pull_request.number,
+        pull_request.url,
+        pull_request.title,
+        wire_name(&pull_request.state)?,
+        wire_name(&pull_request.checks)?,
+        wire_name(&pull_request.review)?,
+        pull_request.updated_at,
+    ])?;
+    Ok(())
+}
+
+/// A tool call is a span in the lane of the agent that made it. The
+/// orchestrator's own (a setup command) has no lane.
+fn index_item_started(db: &Connection, event: &Event, item: &Item) -> Result<()> {
+    let (
+        ItemContent::Tool {
+            title, tool_kind, ..
+        },
+        Some(agent_id),
+    ) = (&item.content, &event.agent_id)
+    else {
+        return Ok(());
+    };
+    open_span(db, event, "tool", agent_id, "tool", title, event.ts)?;
+    db.prepare_cached(
+        "UPDATE spans SET tool_kind = ?1, status = ?2, item_id = ?3 \
+         WHERE session_id = ?4 AND id = ?5",
+    )?
+    .execute(params![
+        wire_name(tool_kind)?,
+        wire_name(&item.status)?,
+        item.id,
+        event.session_id,
+        format!("tool:{}", event.id),
+    ])?;
+    Ok(())
+}
+
+fn index_item_completed(db: &Connection, event: &Event, item: &Item) -> Result<()> {
+    let ItemContent::Tool { title, .. } = &item.content else {
+        return Ok(());
+    };
+    db.prepare_cached(
+        "UPDATE spans SET end_ts = ?1, status = ?2, title = ?3 \
+         WHERE session_id = ?4 AND item_id = ?5 AND end_ts IS NULL",
+    )?
+    .execute(params![
+        event.ts,
+        wire_name(&item.status)?,
+        title,
+        event.session_id,
+        item.id,
+    ])?;
+    Ok(())
+}
+
+fn index_file_changed(
+    db: &Connection,
+    event: &Event,
+    session_repo_id: Option<&str>,
+    path: &str,
+) -> Result<()> {
+    db.prepare_cached(
+        "INSERT OR REPLACE INTO file_changes (session_id, seq, agent_id, \
+         session_repo_id, path, ts) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    )?
+    .execute(params![
+        event.session_id,
+        event.seq as i64,
+        event.agent_id,
+        session_repo_id,
+        path,
+        event.ts,
+    ])?;
+    Ok(())
+}
+
+/// `workflow`: the workflow's id and name.
+fn index_workflow_started(
+    db: &Connection,
+    event: &Event,
+    workflow: (&str, &str),
+    graph: &WorkflowGraph,
+    budget_usd: Option<f64>,
+) -> Result<()> {
+    // A session runs one workflow; a second start would replace it whole.
+    for table in ["workflow_nodes", "workflow_edges"] {
+        db.prepare_cached(&format!("DELETE FROM {table} WHERE session_id = ?1"))?
+            .execute([&event.session_id])?;
+    }
+    db.prepare_cached(
+        "INSERT OR REPLACE INTO workflow_runs (session_id, workflow_id, name, graph, \
+         budget_usd, status, reason) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+    )?
+    .execute(params![
+        event.session_id,
+        workflow.0,
+        workflow.1,
+        serde_json::to_string(graph)?,
+        budget_usd,
+        wire_name(&WorkflowStatus::Running)?,
+    ])?;
+    insert_workflow_nodes(db, event, graph)
+}
+
+fn insert_workflow_nodes(db: &Connection, event: &Event, graph: &WorkflowGraph) -> Result<()> {
+    let mut insert = db.prepare_cached(
+        "INSERT INTO workflow_nodes (session_id, position, node_id, is_loop, max, \
+         state, runs) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
+    )?;
+    for (position, node) in graph.nodes.iter().enumerate() {
+        insert.execute(params![
+            event.session_id,
+            position as i64,
+            node.id,
+            node.kind == "loop",
+            loop_max(node),
+            wire_name(&NodeRunState::Idle)?,
+        ])?;
+    }
+    Ok(())
+}
+
+fn index_node_started(db: &Connection, event: &Event, node_id: &str) -> Result<()> {
+    db.prepare_cached(
+        "UPDATE workflow_nodes SET state = ?1, runs = runs + 1 \
+         WHERE session_id = ?2 AND node_id = ?3",
+    )?
+    .execute(params![
+        wire_name(&NodeRunState::Active)?,
+        event.session_id,
+        node_id
+    ])?;
+    Ok(())
+}
+
+fn index_node_finished(
+    db: &Connection,
+    event: &Event,
+    node_id: &str,
+    port: Option<&str>,
+    outcome: Option<&str>,
+) -> Result<()> {
+    // A node cut short finishes without a port and keeps its last one.
+    db.prepare_cached(
+        "UPDATE workflow_nodes SET state = ?1, last_port = COALESCE(?2, last_port), \
+         outcome = ?3 WHERE session_id = ?4 AND node_id = ?5",
+    )?
+    .execute(params![
+        wire_name(&NodeRunState::Finished)?,
+        port,
+        outcome,
+        event.session_id,
+        node_id
+    ])?;
+    let Some(edge) = wired_edge(db, &event.session_id, node_id, port)? else {
+        return Ok(());
+    };
+    db.prepare_cached(
+        "INSERT OR REPLACE INTO workflow_edges (session_id, seq, from_node, port, \
+         to_node) VALUES (?1, ?2, ?3, ?4, ?5)",
+    )?
+    .execute(params![
+        event.session_id,
+        event.seq as i64,
+        edge.from,
+        edge.port,
+        edge.to
+    ])?;
+    Ok(())
+}
+
+/// The edge of the run's graph that leaves `node_id` through `port`, if one does.
+fn wired_edge(
+    db: &Connection,
+    session_id: &str,
+    node_id: &str,
+    port: Option<&str>,
+) -> Result<Option<WorkflowEdge>> {
+    let Some(port) = port else {
+        return Ok(None);
+    };
+    let Some(graph) = workflow_graph(db, session_id)? else {
+        return Ok(None);
+    };
+    let wired = |edge: &WorkflowEdge| edge.from == node_id && edge.port == port;
+    Ok(graph.edges.into_iter().find(wired))
+}
+
+fn index_workflow_finished(
+    db: &Connection,
+    event: &Event,
+    status: WorkflowStatus,
+    reason: Option<&str>,
+) -> Result<()> {
+    db.prepare_cached("UPDATE workflow_runs SET status = ?1, reason = ?2 WHERE session_id = ?3")?
+        .execute(params![wire_name(&status)?, reason, event.session_id])?;
+    // Nothing is at work in a run that is over.
+    db.prepare_cached("UPDATE workflow_nodes SET state = ?1 WHERE session_id = ?2 AND state = ?3")?
+        .execute(params![
+            wire_name(&NodeRunState::Finished)?,
+            event.session_id,
+            wire_name(&NodeRunState::Active)?
+        ])?;
+    Ok(())
+}
+
 /// Records what a `usage` event added to the agent's totals. Totals are
 /// cumulative per process; when any of them went down, the process started
 /// over from zero and the new totals are all new usage, never a negative.
-fn index_usage(db: &Connection, event: &Event, agent_id: &str, now: (f64, u64, u64)) -> Result<()> {
-    let known: Option<(f64, i64, i64, String, Option<String>)> = db
-        .prepare_cached(
-            "SELECT cost_usd, tokens_in, tokens_out, runner, model FROM agents \
-             WHERE id = ?1 AND session_id = ?2",
-        )?
-        .query_row([agent_id, &event.session_id], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-            ))
-        })
-        .optional()?;
-    let (before, runner, model) = match known {
-        Some((cost, tokens_in, tokens_out, runner, model)) => {
-            let before = (cost, tokens_in.max(0) as u64, tokens_out.max(0) as u64);
-            (before, runner, model)
-        }
-        // An agent the log never announced: all of it is new, on the session's runner.
-        None => {
-            let runner: Option<String> = db
-                .prepare_cached("SELECT runner FROM sessions WHERE id = ?1")?
-                .query_row([&event.session_id], |row| row.get(0))
-                .optional()?;
-            ((0.0, 0, 0), runner.unwrap_or_default(), None)
-        }
-    };
+fn insert_usage_delta(
+    db: &Connection,
+    event: &Event,
+    agent_id: &str,
+    now: (f64, u64, u64),
+) -> Result<()> {
+    let (before, runner, model) = totals_before(db, event, agent_id)?;
     let (cost, tokens_in, tokens_out) = usage_delta(before, now);
     db.prepare_cached(
         "INSERT OR REPLACE INTO usage (session_id, seq, agent_id, ts, runner, model, cost_usd, \
@@ -1034,6 +1143,40 @@ fn index_usage(db: &Connection, event: &Event, agent_id: &str, now: (f64, u64, u
         tokens_out as i64,
     ])?;
     Ok(())
+}
+
+/// An agent's totals before this event, with the runner and the model it has.
+type KnownTotals = ((f64, u64, u64), String, Option<String>);
+
+fn totals_before(db: &Connection, event: &Event, agent_id: &str) -> Result<KnownTotals> {
+    let known = db
+        .prepare_cached(
+            "SELECT cost_usd, tokens_in, tokens_out, runner, model FROM agents \
+             WHERE id = ?1 AND session_id = ?2",
+        )?
+        .query_row([agent_id, &event.session_id], known_totals_from_row)
+        .optional()?;
+    if let Some(known) = known {
+        return Ok(known);
+    }
+    // An agent the log never announced: all of it is new, on the session's runner.
+    let runner: Option<String> = query_optional(
+        db,
+        "SELECT runner FROM sessions WHERE id = ?1",
+        [&event.session_id],
+    )?;
+    Ok(((0.0, 0, 0), runner.unwrap_or_default(), None))
+}
+
+fn known_totals_from_row(row: &Row<'_>) -> rusqlite::Result<KnownTotals> {
+    let tokens_in: i64 = row.get(1)?;
+    let tokens_out: i64 = row.get(2)?;
+    let before = (
+        row.get(0)?,
+        tokens_in.max(0) as u64,
+        tokens_out.max(0) as u64,
+    );
+    Ok((before, row.get(3)?, row.get(4)?))
 }
 
 /// What `now` adds to `before`, two readings of an agent's running totals.
@@ -1079,20 +1222,20 @@ fn ended(status: AgentStatus) -> bool {
 
 /// The session's lead: its first agent with a process of its own.
 fn lead_agent(db: &Connection, session_id: &str) -> Result<Option<String>> {
-    Ok(db
-        .prepare_cached(
-            "SELECT id FROM agents WHERE session_id = ?1 AND kind = 'process' \
-             ORDER BY spawned_seq, id LIMIT 1",
-        )?
-        .query_row([session_id], |row| row.get(0))
-        .optional()?)
+    query_optional(
+        db,
+        "SELECT id FROM agents WHERE session_id = ?1 AND kind = 'process' \
+         ORDER BY spawned_seq, id LIMIT 1",
+        [session_id],
+    )
 }
 
 fn span_title(db: &Connection, session_id: &str, span_id: &str) -> Result<Option<String>> {
-    Ok(db
-        .prepare_cached("SELECT title FROM spans WHERE session_id = ?1 AND id = ?2")?
-        .query_row([session_id, span_id], |row| row.get(0))
-        .optional()?)
+    query_optional(
+        db,
+        "SELECT title FROM spans WHERE session_id = ?1 AND id = ?2",
+        [session_id, span_id],
+    )
 }
 
 /// Opens a span named after the event that opens it.
@@ -1230,12 +1373,11 @@ pub(super) fn question_answered(
     session_id: &str,
     question_id: &str,
 ) -> Result<Option<bool>> {
-    Ok(db
-        .prepare_cached(
-            "SELECT answered FROM questions WHERE session_id = ?1 AND question_id = ?2",
-        )?
-        .query_row([session_id, question_id], |row| row.get(0))
-        .optional()?)
+    query_optional(
+        db,
+        "SELECT answered FROM questions WHERE session_id = ?1 AND question_id = ?2",
+        [session_id, question_id],
+    )
 }
 
 /// The questions nobody answered yet, of one session or of all of them, oldest first.
@@ -1243,29 +1385,29 @@ pub(super) fn open_questions(
     db: &Connection,
     session_id: Option<&str>,
 ) -> Result<Vec<OpenQuestion>> {
-    let mut statement = db.prepare_cached(
+    query_all(
+        db,
         "SELECT session_id, question_id, agent_id, event_id FROM questions \
          WHERE answered = 0 AND (?1 IS NULL OR session_id = ?1) ORDER BY event_id",
-    )?;
-    let open = statement
-        .query_map([session_id], |row| {
+        [session_id],
+        |row| {
             Ok(OpenQuestion {
                 session_id: row.get(0)?,
                 question_id: row.get(1)?,
                 agent_id: row.get(2)?,
                 event_id: row.get(3)?,
             })
-        })?
-        .collect::<rusqlite::Result<_>>()?;
-    Ok(open)
+        },
+    )
 }
 
 /// The graph a session's run started with; `None` when it runs no workflow.
 fn workflow_graph(db: &Connection, session_id: &str) -> Result<Option<WorkflowGraph>> {
-    let json: Option<String> = db
-        .prepare_cached("SELECT graph FROM workflow_runs WHERE session_id = ?1")?
-        .query_row([session_id], |row| row.get(0))
-        .optional()?;
+    let json: Option<String> = query_optional(
+        db,
+        "SELECT graph FROM workflow_runs WHERE session_id = ?1",
+        [session_id],
+    )?;
     Ok(match json {
         Some(json) => Some(serde_json::from_str(&json)?),
         None => None,
@@ -1291,66 +1433,82 @@ pub(super) fn workflow_run(db: &Connection, session_id: &str) -> Result<Option<W
             "SELECT workflow_id, name, graph, budget_usd, status, reason FROM workflow_runs \
              WHERE session_id = ?1",
         )?
-        .query_row([session_id], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<f64>>(3)?,
-                from_wire_name::<WorkflowStatus>(row, 4)?,
-                row.get::<_, Option<String>>(5)?,
-            ))
-        })
+        .query_row([session_id], run_from_row)
         .optional()?;
-    let Some((workflow_id, name, graph, budget_usd, status, reason)) = run else {
+    let Some(run) = run else {
         return Ok(None);
     };
-    let mut statement = db.prepare_cached(
+    let nodes = query_all(
+        db,
         "SELECT node_id, state, runs, last_port, outcome, is_loop, max FROM workflow_nodes \
          WHERE session_id = ?1 ORDER BY position",
+        [session_id],
+        node_run_from_row,
     )?;
-    let nodes = statement
-        .query_map([session_id], |row| {
-            let runs: u32 = row.get(2)?;
-            let max: Option<u32> = row.get(6)?;
-            // A loop counts its entries up to its limit (spec section 3).
-            let iteration = row
-                .get::<_, bool>(5)?
-                .then(|| max.map_or(runs, |max| runs.min(max)));
-            Ok(WorkflowNodeRun {
-                id: row.get(0)?,
-                state: from_wire_name(row, 1)?,
-                runs,
-                last_port: row.get(3)?,
-                outcome: row.get(4)?,
-                iteration,
-                max,
-            })
-        })?
-        .collect::<rusqlite::Result<_>>()?;
-    let mut statement = db.prepare_cached(
+    let taken = query_all(
+        db,
         "SELECT from_node, port, to_node FROM workflow_edges WHERE session_id = ?1 ORDER BY seq",
+        [session_id],
+        edge_from_row,
     )?;
-    let taken = statement
-        .query_map([session_id], |row| {
-            Ok(WorkflowEdge {
-                from: row.get(0)?,
-                port: row.get(1)?,
-                to: row.get(2)?,
-            })
-        })?
-        .collect::<rusqlite::Result<_>>()?;
     Ok(Some(WorkflowRun {
-        workflow_id,
-        name,
-        graph: serde_json::from_str(&graph)?,
+        workflow_id: run.workflow_id,
+        name: run.name,
+        graph: serde_json::from_str(&run.graph)?,
         nodes,
         taken,
-        status,
-        reason,
-        budget_usd,
+        status: run.status,
+        reason: run.reason,
+        budget_usd: run.budget_usd,
         cost_usd: tree_cost(db, session_id)?,
     }))
+}
+
+/// A `workflow_runs` row; the graph is still JSON.
+struct RunRow {
+    workflow_id: String,
+    name: String,
+    graph: String,
+    budget_usd: Option<f64>,
+    status: WorkflowStatus,
+    reason: Option<String>,
+}
+
+fn run_from_row(row: &Row<'_>) -> rusqlite::Result<RunRow> {
+    Ok(RunRow {
+        workflow_id: row.get(0)?,
+        name: row.get(1)?,
+        graph: row.get(2)?,
+        budget_usd: row.get(3)?,
+        status: from_wire_name(row, 4)?,
+        reason: row.get(5)?,
+    })
+}
+
+fn node_run_from_row(row: &Row<'_>) -> rusqlite::Result<WorkflowNodeRun> {
+    let runs: u32 = row.get(2)?;
+    let max: Option<u32> = row.get(6)?;
+    // A loop counts its entries up to its limit (spec section 3).
+    let iteration = row
+        .get::<_, bool>(5)?
+        .then(|| max.map_or(runs, |max| runs.min(max)));
+    Ok(WorkflowNodeRun {
+        id: row.get(0)?,
+        state: from_wire_name(row, 1)?,
+        runs,
+        last_port: row.get(3)?,
+        outcome: row.get(4)?,
+        iteration,
+        max,
+    })
+}
+
+fn edge_from_row(row: &Row<'_>) -> rusqlite::Result<WorkflowEdge> {
+    Ok(WorkflowEdge {
+        from: row.get(0)?,
+        port: row.get(1)?,
+        to: row.get(2)?,
+    })
 }
 
 /// The event's `type` tag, as it appears on the wire.
@@ -1404,6 +1562,32 @@ pub(super) fn from_wire_name<T: DeserializeOwned>(
 pub(super) fn uint(row: &Row<'_>, index: usize) -> rusqlite::Result<u64> {
     let value: i64 = row.get(index)?;
     u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(index, value))
+}
+
+/// The first column of the row `sql` finds; `None` when it finds none.
+pub(super) fn query_optional<T: FromSql>(
+    db: &Connection,
+    sql: &str,
+    params: impl Params,
+) -> Result<Option<T>> {
+    Ok(db
+        .prepare_cached(sql)?
+        .query_row(params, |row| row.get(0))
+        .optional()?)
+}
+
+/// Every row `sql` finds, each read by `from_row`.
+pub(super) fn query_all<T>(
+    db: &Connection,
+    sql: &str,
+    params: impl Params,
+    from_row: impl FnMut(&Row<'_>) -> rusqlite::Result<T>,
+) -> Result<Vec<T>> {
+    let mut statement = db.prepare_cached(sql)?;
+    let rows = statement
+        .query_map(params, from_row)?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
 }
 
 fn session_from_row(row: &Row<'_>) -> rusqlite::Result<Session> {

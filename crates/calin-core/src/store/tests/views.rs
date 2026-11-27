@@ -836,6 +836,33 @@ async fn open_spans_have_no_end_and_a_queued_input_starts_its_turn_where_the_las
     assert!(lead[3].id.starts_with("turn:"));
 }
 
+#[tokio::test]
+async fn a_starting_agent_keeps_its_turn_and_a_wait_without_a_reason_is_plain_waiting() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir).await;
+    let id = store.create_session(new_session("w")).await.unwrap().id;
+    let s = id.as_str();
+    let first = add(&store, s, message(1)).await;
+    let lead = EventDraft::new(spawned(agent("L", s))).parent(Some(first.id.clone()));
+    add(&store, s, lead).await;
+    let starting = EventDraft::new(agent_status(AgentStatus::Starting)).agent("L");
+    add(&store, s, starting).await;
+    let waiting = EventDraft::new(EventBody::SessionStatus {
+        status: SessionStatus::Waiting,
+        reason: None,
+    });
+    add(&store, s, waiting).await;
+
+    let timeline = store.timeline(s).await.unwrap();
+    assert_eq!(
+        span_shapes(spans(&timeline, "L")),
+        [
+            (SpanKind::Turn, "message 1", None, false),
+            (SpanKind::Waiting, "Waiting", None, false),
+        ]
+    );
+}
+
 /// Tool calls per session of the large tree.
 const TOOL_CALLS: usize = 21;
 
