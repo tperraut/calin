@@ -32,7 +32,7 @@ colors:
   tone-attention-dark: "#e2b24a"
   tone-success-dark: "#6fcf8e"
   tone-danger-dark: "#ff8a80"
-  attention-soft-dark: "#33290f"
+  attention-soft-dark: "#3a2912"
   danger-soft-dark: "#3a1c1a"
 typography:
   title:
