@@ -19,6 +19,8 @@
 //! | POST | `/sessions/{id}/stop` | | `202`, empty body |
 //! | POST | `/sessions/{id}/permissions/{request_id}` | [`ResolvePermissionRequest`] | `202`, empty body |
 //! | POST | `/sessions/{id}/repos` | [`AttachRepoRequest`] | `201` [`SessionRepo`] |
+//! | POST | `/sessions/{id}/ship` | [`ShipRequest`] | `202`, empty body |
+//! | POST | `/sessions/{id}/pull-requests/refresh` | | `202`, empty body |
 //! | GET | `/sessions/{id}/changes` | | `Vec<RepoChanges>`, one per attached repo |
 //! | GET | `/sessions/{id}/repos/{session_repo_id}/diff?path=` | | [`FileDiff`] |
 //! | GET | `/sessions/{id}/repos/{session_repo_id}/tree?path=` | | `Vec<TreeEntry>`, one level |
@@ -70,6 +72,26 @@
 //!   `list_repos` (every repo, with whether it is attached and available) and
 //!   `attach_repo` (`name`, optional `mode` of `write` or `read`), which
 //!   returns the path the agent can now work in. An unknown token is a 404.
+//! - **Shipping** is accepted while the session is `review` or `shipping`
+//!   (409 otherwise, and 409 with the reason when GitHub cannot be used: see
+//!   `Health::github_problem`). It returns at once and works in the background,
+//!   repo by repo, over every `write` repo that differs from its base:
+//!   uncommitted work is committed on the session branch, the branch is pushed
+//!   (never forced, and never when it is the repo's default branch), and a
+//!   pull request against the repo's default branch is opened, or the open one
+//!   for that branch is reused. Each step that happens is an event:
+//!   `pull_request_opened` per repo, then `pull_request_updated` once every
+//!   description links its sibling pull requests. A repo that fails gets an
+//!   `error` event naming it and the others carry on. When at least one pull
+//!   request exists the session becomes `shipping`. `live` and `read` repos
+//!   are never committed to, pushed or shipped. Shipping again pushes new
+//!   commits to the existing pull requests.
+//! - **While `shipping`** the server watches each pull request and appends
+//!   `pull_request_updated` when its state, checks or review change. When all
+//!   of them are merged or closed the session becomes `done`. A message sent
+//!   while `shipping` starts a turn as it does in `review`.
+//! - **Dry run** never pushes and never calls GitHub: shipping records
+//!   pull requests with made-up URLs under `https://example.invalid/`.
 //! - **Registering a repo**: the path must be the root of a git work tree
 //!   (400 otherwise); a name already in use is a 409. A repo attached to a
 //!   session that is not `done`, `failed` or `cancelled` cannot be deleted (409).
@@ -77,7 +99,7 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-use crate::{Agent, AttachRepoRequest, PermissionMode, Session, SessionRepo};
+use crate::{Agent, AttachRepoRequest, PermissionMode, PullRequest, Session, SessionRepo};
 
 #[derive(Serialize, Deserialize, TS, Clone, Debug, PartialEq)]
 #[ts(export)]
@@ -89,6 +111,10 @@ pub struct Health {
     pub dry_run: bool,
     /// Runner ids this server can start, the default one first.
     pub runners: Vec<String>,
+    /// Why pull requests cannot be opened from this server (the `gh` CLI is
+    /// missing or not signed in), or absent when they can.
+    #[serde(default)]
+    pub github_problem: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, TS, Clone, Debug, PartialEq)]
@@ -134,6 +160,9 @@ pub struct SessionDetail {
     /// The session's repo set, the primary repo first.
     #[serde(default)]
     pub repos: Vec<SessionRepo>,
+    /// The session's pull requests, in the order of `repos`.
+    #[serde(default)]
+    pub pull_requests: Vec<PullRequest>,
 }
 
 #[derive(Serialize, Deserialize, TS, Clone, Debug, PartialEq)]

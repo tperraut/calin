@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 use crate::{
-    Agent, AgentStatus, DecisionSource, FileOp, PermissionDecision, PermissionRequest, SessionRepo,
-    SessionStatus,
+    Agent, AgentStatus, DecisionSource, FileOp, PermissionDecision, PermissionRequest, PullRequest,
+    SessionRepo, SessionStatus,
 };
 
 /// One entry in a session's append-only log.
@@ -103,6 +103,15 @@ pub enum EventBody {
         /// Relative to the repo root when `session_repo_id` is set, absolute otherwise.
         path: String,
         op: FileOp,
+    },
+    /// A pull request was opened for one of the session's repos, or an
+    /// existing one for its branch was found.
+    PullRequestOpened {
+        pull_request: PullRequest,
+    },
+    /// The pull request changed: its state, checks or review. Always the full value.
+    PullRequestUpdated {
+        pull_request: PullRequest,
     },
     /// Something went wrong that the user should see in the transcript.
     Error {

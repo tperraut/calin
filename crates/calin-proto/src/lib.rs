@@ -12,6 +12,7 @@
 //!   older event logs keep parsing.
 
 mod api;
+mod delivery;
 mod event;
 mod model;
 mod permission;
@@ -21,6 +22,7 @@ mod terminal;
 mod ws;
 
 pub use api::*;
+pub use delivery::*;
 pub use event::*;
 pub use model::*;
 pub use permission::*;
