@@ -285,7 +285,13 @@ function ToolCard(props: {
             {props.content.tool_kind}
           </span>
           <span class="min-w-0 flex-1 truncate font-mono text-sm">{props.content.title}</span>
-          <ItemStatusBadge status={props.status} interrupted={props.interrupted} />
+          {/* A call held by its permission request is not running yet: it waits for the reader. */}
+          <Show
+            when={props.permissions.some((asked) => asked.outcome.state === "pending")}
+            fallback={<ItemStatusBadge status={props.status} interrupted={props.interrupted} />}
+          >
+            <Badge look={permissionLook({ state: "pending" })} pulse />
+          </Show>
         </summary>
         <Show when={open()}>
           <div class="space-y-2 border-t border-line p-3">

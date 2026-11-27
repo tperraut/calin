@@ -251,6 +251,13 @@ describe("ports and words", () => {
     expect(stateWords(overlay.byId.get("gate") ?? overlay.nodes[0])).toBe("Not run yet");
   });
 
+  it("says an active gate waits for you rather than runs", () => {
+    const atGate = runOverlay(runThrough([...twice.slice(0, -1), ["review", "approve"], ["gate"]]));
+    const gate = atGate.byId.get("gate") ?? atGate.nodes[0];
+    expect(gate.state).toBe("active");
+    expect(stateWords(gate)).toBe("Waiting for you");
+  });
+
   it("tells the path taken, a node once per visit", () => {
     expect(takenPath(runThrough([]))).toEqual([]);
     expect(takenPath(runThrough([["start"]]))).toEqual(["start"]);

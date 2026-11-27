@@ -112,9 +112,14 @@ export function portSentence(target: PortTarget): string {
   return `${target.port} ends the run as ${target.failure ? "failed" : "succeeded"}`;
 }
 
+/** A gate or a question that is active is not working: it is waiting for the reader. */
+export const waitsForYou = (node: NodeOverlay): boolean =>
+  node.state === "active" && (node.info.kind === "gate" || node.info.kind === "ask");
+
 /** Where a node stands, in words: "Not run yet", "Running now (run 2)", "Finished through fail, 3 runs". */
 export function stateWords(node: NodeOverlay): string {
   const times = node.runs > 1 ? `, ${node.runs} runs` : "";
+  if (waitsForYou(node)) return "Waiting for you";
   if (node.state === "active")
     return node.runs > 1 ? `Running now (run ${node.runs})` : "Running now";
   if (node.state === "finished") {

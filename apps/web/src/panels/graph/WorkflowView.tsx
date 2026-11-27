@@ -23,6 +23,7 @@ import {
   runOverlay,
   stateWords,
   takenPath,
+  waitsForYou,
   type NodeOverlay,
   type RunOverlay,
 } from "./workflowModel";
@@ -39,7 +40,7 @@ function NodeCard(props: { node: NodeOverlay; layout: WorkflowLayout }) {
   /** What the node's corner says: running, its loop count, or its last port and how often it ran. */
   const corner = (): string => {
     const node = props.node;
-    if (node.state === "active") return "Running";
+    if (node.state === "active") return waitsForYou(node) ? "Waiting for you" : "Running";
     if (node.loop !== undefined) return node.loop;
     if (node.state !== "finished") return "";
     const port =
