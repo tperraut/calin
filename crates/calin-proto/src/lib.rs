@@ -12,6 +12,7 @@
 //!   older event logs keep parsing.
 
 mod api;
+mod auth;
 mod delivery;
 mod event;
 mod graph;
@@ -24,6 +25,7 @@ mod workflow;
 mod ws;
 
 pub use api::*;
+pub use auth::*;
 pub use delivery::*;
 pub use event::*;
 pub use graph::*;

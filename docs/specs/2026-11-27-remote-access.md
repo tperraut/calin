@@ -56,7 +56,8 @@ Flow:
    audience, expiry and nonce.
 3. The identity is the `email` claim when `email_verified` is true, otherwise `sub:<sub>`. It must
    match an entry of the allow-list exactly (emails compared case-insensitively). An email that is
-   not verified never matches an email entry.
+   not verified never matches an email entry. A user whose email is verified is identified by that
+   email only: a `sub:` entry does not admit them.
 4. On success Calin creates its own session and redirects to `next`. On any failure it shows a
    plain page saying sign-in failed, with no detail that helps an attacker, and logs the reason.
 
@@ -68,7 +69,9 @@ and retries; sign-in fails until it succeeds, and existing sessions keep working
 
 - A session is a random 256-bit token. The server stores only its SHA-256, with the identity,
   creation time, last use and user agent, in `<home>/auth.json` (written atomically, mode 0600).
-- Cookie `calin_session`: `HttpOnly`, `Secure`, `SameSite=Lax`, `Path=/`. `Lax` rather than
+- Cookie `__Host-calin_session`: `HttpOnly`, `Secure`, `SameSite=Lax`, `Path=/`, `Max-Age` of 30
+  days. The `__Host-` prefix stops a sibling subdomain from planting it. The pending-login cookie
+  is `__Secure-calin_login`, limited to `/auth` and 10 minutes. `Lax` rather than
   `Strict` so that following a link to Calin from elsewhere arrives signed in; state-changing
   requests are additionally protected by the Origin guard.
 - A session lasts 30 days from its last use and is extended as it is used (the cookie is re-issued
@@ -80,7 +83,9 @@ and retries; sign-in fails until it succeeds, and existing sessions keep working
   mode, except `GET /api/v1/health`, which then returns only `{ "name": "calin", "auth": "required" }`.
   The web app's static files are served without a session; the app redirects to `/auth/login` when
   `GET /api/v1/me` says 401.
-- Failed callbacks are rate-limited per client address (10 per 10 minutes). The client address is
+- Failed callbacks are rate-limited per client address (10 per 10 minutes). A failure counts only
+  when the request carried a live pending login issued by this server, so nobody can lock a user
+  out by making their browser send junk callbacks. The client address is
   the peer address, or the last `X-Forwarded-For` entry when the peer is loopback (the reverse
   proxy).
 
@@ -96,6 +101,10 @@ For the desktop app, the `calin` CLI and scripts.
   allow-list entry.
 - Routes: `GET /api/v1/tokens`, `POST /api/v1/tokens`, `DELETE /api/v1/tokens/{id}`. Sessions are
   listed and revoked the same way: `GET /api/v1/auth/sessions`, `DELETE /api/v1/auth/sessions/{id}`.
+- In local mode there is nobody to sign in: `GET /api/v1/me` says so, and the token and session
+  routes answer 409.
+- Only RS256 and ES256 ID tokens are accepted. Providers behind a private certificate authority
+  and outbound proxies are not supported.
 
 ## 5. Installing on a server
 

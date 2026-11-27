@@ -2,7 +2,13 @@
 //!
 //! | Method | Path | Request | Response |
 //! | --- | --- | --- | --- |
-//! | GET | `/health` | | [`Health`] |
+//! | GET | `/health` | | [`Health`], or [`PublicHealth`] when sign-in is required and absent |
+//! | GET | `/me` | | [`Me`]; 401 when sign-in is required and absent |
+//! | GET | `/auth/sessions` | | `Vec<AuthSessionInfo>`, the current one first |
+//! | DELETE | `/auth/sessions/{id}` | | `204` |
+//! | GET | `/tokens` | | `Vec<DeviceTokenInfo>`, newest first |
+//! | POST | `/tokens` | [`CreateDeviceTokenRequest`] | `201` [`CreatedDeviceToken`] |
+//! | DELETE | `/tokens/{id}` | | `204` |
 //! | GET | `/settings` | | [`Settings`] |
 //! | PUT | `/settings` | [`Settings`] | [`Settings`], as stored |
 //! | GET | `/repos` | | `Vec<Repo>`: the home repo first, then by name |
@@ -34,6 +40,11 @@
 //! | GET | `/sessions/{id}/terminals/ws` | WebSocket upgrade | see `terminal.rs` |
 //! | GET | `/ws` | WebSocket upgrade | frames of `ClientMsg` / `ServerMsg` |
 //! | POST | `/mcp/{token}` | JSON-RPC 2.0 | the tool endpoint agents call; see below |
+//!
+//! Three routes live outside `/api/v1`, because a browser navigates to them:
+//! `GET /auth/login?next=` (redirects to the provider), `GET /auth/callback`
+//! (finishes sign-in and redirects to `next`) and `POST /auth/logout`
+//! (`204`). In local mode they answer 404.
 //!
 //! Errors are an [`ApiError`] with status 400 (invalid input), 404 (unknown
 //! session, repo, request or path) or 409 (not possible in the current state).
@@ -147,6 +158,14 @@
 //!   `waiting`, `review`, `shipping` or settled holds no slot; one that leaves
 //!   `review` or `waiting` to run again takes a slot or waits for one as
 //!   `queued`. Stopping a queued session cancels it.
+//! - **Sign-in** follows `docs/specs/2026-11-27-remote-access.md`, sections 1
+//!   to 4, which are part of this contract. In public mode every route and
+//!   both WebSocket endpoints answer 401 without a session cookie or a device
+//!   token, except `GET /health`, the three `/auth` routes and the web app's
+//!   static files. The tool endpoint answers only to requests that came
+//!   straight from loopback with no forwarding header, in both modes. The
+//!   session and token routes act on the caller's own identity only; an id
+//!   that belongs to someone else is a 404. In local mode they are a 409.
 //! - **Registering a repo**: the path must be the root of a git work tree
 //!   (400 otherwise); a name already in use is a 409. A repo attached to a
 //!   session that is not `done`, `failed` or `cancelled` cannot be deleted (409).
