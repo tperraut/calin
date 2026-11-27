@@ -10,7 +10,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use calin_git::{CommitOutcome, GitHub, PullRequestInfo};
-use calin_proto::{CheckState, PullRequest, PullRequestState, RepoMode, ReviewState, SessionRepo};
+use calin_proto::{
+    CheckState, IssueRef, PullRequest, PullRequestState, RepoMode, ReviewState, SessionRepo,
+};
 use tokio::sync::mpsc;
 
 use crate::store::Store;
@@ -29,6 +31,9 @@ const BLOCK_BEGIN: &str = "<!-- calin:begin (Calin rewrites this block each time
      shipped; write outside it) -->";
 /// Inside the block: the user's text is above this line, the links below.
 const BLOCK_RELATED: &str = "<!-- calin:related -->";
+/// Inside the block, between the user's text and the links: the issue the
+/// session started from.
+const BLOCK_ISSUE: &str = "<!-- calin:issue -->";
 const BLOCK_END: &str = "<!-- calin:end -->";
 const COMMENT_END: &str = "-->";
 const RELATED_HEADING: &str = "### Related pull requests";
@@ -47,6 +52,8 @@ pub(super) struct ShipPlan {
     pub store: Store,
     /// The session's repo set in order, each repo with its pull request on record.
     pub repos: Vec<(SessionRepo, Option<PullRequest>)>,
+    /// The issue the session started from: its repo's pull request closes it.
+    pub issue: Option<IssueRef>,
 }
 
 /// A step of a ship, for the driver to record.
@@ -198,7 +205,8 @@ pub(super) async fn ship(plan: ShipPlan, results: mpsc::Sender<Shipped>, cancel:
             // ones a real ship gives when a sibling appears.
             None => any_new && !related.is_empty(),
             Some(current) => {
-                let wanted = describe(current, plan.body.as_deref(), &related);
+                let issue = issue_line(plan.issue.as_ref(), repo);
+                let wanted = describe(current, plan.body.as_deref(), issue.as_deref(), &related);
                 if same_text(&wanted, current) {
                     false
                 } else {
@@ -333,7 +341,8 @@ fn deliver(plan: &ShipPlan, repo: &SessionRepo) -> Result<Option<Pushed>, Failur
         Some(info) => info,
         None => {
             // The links come later, once every repo has its pull request.
-            let body = describe("", plan.body.as_deref(), &[]);
+            let issue = issue_line(plan.issue.as_ref(), repo);
+            let body = describe("", plan.body.as_deref(), issue.as_deref(), &[]);
             plan.github
                 .create_pull_request(dir, &default_branch, branch, &plan.title, &body, plan.draft)
                 .map_err(at("pull request"))?
@@ -409,6 +418,18 @@ fn related(plan: &ShipPlan, delivered: &[Delivered], index: usize) -> Vec<(Strin
     related
 }
 
+/// What the pull request of `repo` says about the session's issue: the
+/// issue's own repo closes it, the others link to it (integrations spec,
+/// section 2).
+fn issue_line(issue: Option<&IssueRef>, repo: &SessionRepo) -> Option<String> {
+    let issue = issue?;
+    Some(if issue.repo_id == repo.repo_id {
+        format!("Closes #{}", issue.number)
+    } else {
+        format!("Issue: {}", issue.url)
+    })
+}
+
 /// True when two values describe the same pull request in the same state,
 /// whenever each was observed.
 pub(super) fn same(a: &PullRequest, b: &PullRequest) -> bool {
@@ -471,18 +492,29 @@ fn find_block(text: &str) -> Option<Block<'_>> {
 
 /// The description a pull request should have, given the one it has.
 ///
-/// Calin's block holds `body`, then the links to `related` (repo name and
-/// URL). It replaces the block that is already there and leaves every
-/// character outside it alone; a description without one gets it on top.
-/// `None` for `body` keeps the text an earlier ship put in the block.
-pub(super) fn describe(current: &str, body: Option<&str>, related: &[(String, String)]) -> String {
+/// Calin's block holds `body`, then the line about the session's issue,
+/// then the links to `related` (repo name and URL). It replaces the block
+/// that is already there and leaves every character outside it alone; a
+/// description without one gets it on top. `None` for `body` keeps the text
+/// an earlier ship put in the block.
+pub(super) fn describe(
+    current: &str,
+    body: Option<&str>,
+    issue: Option<&str>,
+    related: &[(String, String)],
+) -> String {
     let found = find_block(current);
     let text = match (body, &found) {
         // The markers are Calin's: text that brings its own would cut the block short.
         (Some(body), _) => body.trim().replace("<!-- calin:", "<!-- calin "),
         (None, Some(block)) => {
-            let kept = block.inside.split(BLOCK_RELATED).next();
-            kept.unwrap_or_default().trim().to_owned()
+            // The user's text ends where Calin's own lines begin.
+            let end = [BLOCK_ISSUE, BLOCK_RELATED]
+                .iter()
+                .filter_map(|marker| block.inside.find(marker))
+                .min()
+                .unwrap_or(block.inside.len());
+            block.inside[..end].trim().to_owned()
         }
         (None, None) => String::new(),
     };
@@ -491,8 +523,14 @@ pub(super) fn describe(current: &str, body: Option<&str>, related: &[(String, St
         block.push_str(&text);
         block.push('\n');
     }
-    if !related.is_empty() {
+    if let Some(issue) = issue {
         if !text.is_empty() {
+            block.push('\n');
+        }
+        block.push_str(&format!("{BLOCK_ISSUE}\n{issue}\n"));
+    }
+    if !related.is_empty() {
+        if !text.is_empty() || issue.is_some() {
             block.push('\n');
         }
         block.push_str(&format!("{BLOCK_RELATED}\n{RELATED_HEADING}\n\n"));
@@ -532,7 +570,7 @@ mod tests {
             ("web", "https://github.com/acme/web/pull/3"),
             ("docs", "https://github.com/acme/docs/pull/9"),
         ]);
-        let text = describe("", Some("What it does.\n\nAnd why.\n"), &related);
+        let text = describe("", Some("What it does.\n\nAnd why.\n"), None, &related);
         assert_eq!(
             text,
             format!(
@@ -544,27 +582,27 @@ mod tests {
         );
         // Alone, or with nothing to say, the block has only what there is.
         assert_eq!(
-            describe("", Some("Body."), &[]),
+            describe("", Some("Body."), None, &[]),
             format!("{BLOCK_BEGIN}\nBody.\n{BLOCK_END}")
         );
         assert_eq!(
-            describe("  \n", None, &links(&[("web", "u")])),
+            describe("  \n", None, None, &links(&[("web", "u")])),
             format!(
                 "{BLOCK_BEGIN}\n{BLOCK_RELATED}\n### Related pull requests\n\n- web: u\n{BLOCK_END}"
             )
         );
         assert_eq!(
-            describe("", None, &[]),
+            describe("", None, None, &[]),
             format!("{BLOCK_BEGIN}\n{BLOCK_END}")
         );
     }
 
     #[test]
     fn the_block_is_replaced_and_what_is_outside_it_is_left_alone() {
-        let first = describe("", Some("First."), &links(&[("web", "u1")]));
+        let first = describe("", Some("First."), None, &links(&[("web", "u1")]));
         let on_github =
             format!("Reviewer notes above.\r\n\r\n{first}\n\n## Checklist\n- [x] done\n");
-        let second = describe(&on_github, Some("Second."), &links(&[("web", "u2")]));
+        let second = describe(&on_github, Some("Second."), None, &links(&[("web", "u2")]));
         assert_eq!(
             second,
             format!(
@@ -574,11 +612,11 @@ mod tests {
         );
         // Rewriting with the same input changes nothing.
         assert_eq!(
-            describe(&second, Some("Second."), &links(&[("web", "u2")])),
+            describe(&second, Some("Second."), None, &links(&[("web", "u2")])),
             second
         );
         // Without a body, the one in the block stays; the links still follow.
-        let third = describe(&second, None, &[]);
+        let third = describe(&second, None, None, &[]);
         assert!(
             third.contains(&format!("{BLOCK_BEGIN}\nSecond.\n{BLOCK_END}")),
             "{third}"
@@ -586,7 +624,7 @@ mod tests {
         assert!(third.starts_with("Reviewer notes above."));
         assert!(third.ends_with("- [x] done\n"));
         // An empty body clears it.
-        let cleared = describe(&second, Some(""), &[]);
+        let cleared = describe(&second, Some(""), None, &[]);
         assert!(
             cleared.contains(&format!("{BLOCK_BEGIN}\n{BLOCK_END}")),
             "{cleared}"
@@ -595,7 +633,7 @@ mod tests {
 
     #[test]
     fn a_description_written_by_hand_gets_the_block_on_top() {
-        let text = describe("Written on GitHub.\n", Some("From Calin."), &[]);
+        let text = describe("Written on GitHub.\n", Some("From Calin."), None, &[]);
         assert_eq!(
             text,
             format!("{BLOCK_BEGIN}\nFrom Calin.\n{BLOCK_END}\n\nWritten on GitHub.\n")
@@ -603,22 +641,81 @@ mod tests {
         // A block opened by an older wording of the marker is still found.
         let old = "<!-- calin:begin -->\nOld.\n<!-- calin:end -->\ntail";
         assert_eq!(
-            describe(old, Some("New."), &[]),
+            describe(old, Some("New."), None, &[]),
             format!("{BLOCK_BEGIN}\nNew.\n{BLOCK_END}\ntail")
         );
         // Half a block is text like any other.
         let half = "<!-- calin:begin -->\nno end";
-        assert!(describe(half, Some("x"), &[]).ends_with(half));
+        assert!(describe(half, Some("x"), None, &[]).ends_with(half));
     }
 
     #[test]
     fn a_body_cannot_close_the_block_early() {
-        let text = describe("", Some("sneaky <!-- calin:end --> tail"), &[]);
+        let text = describe("", Some("sneaky <!-- calin:end --> tail"), None, &[]);
         let block = find_block(&text).unwrap();
         assert_eq!(block.after, "");
         assert!(block.inside.contains("tail"));
-        let again = describe(&text, None, &links(&[("web", "u")]));
+        let again = describe(&text, None, None, &links(&[("web", "u")]));
         assert!(again.contains("tail\n\n<!-- calin:related -->"), "{again}");
+    }
+
+    #[test]
+    fn the_issue_line_sits_between_the_text_and_the_links_and_is_never_repeated() {
+        let related = links(&[("web", "u2")]);
+        let first = describe("", Some("Body."), Some("Closes #12"), &related);
+        assert_eq!(
+            first,
+            format!(
+                "{BLOCK_BEGIN}\nBody.\n\n{BLOCK_ISSUE}\nCloses #12\n\n{BLOCK_RELATED}\n\
+                 ### Related pull requests\n\n- web: u2\n{BLOCK_END}"
+            )
+        );
+        // A ship that keeps the text keeps one issue line, whatever it is asked again.
+        let again = describe(&first, None, Some("Closes #12"), &related);
+        assert_eq!(again, first);
+        assert_eq!(describe(&again, None, Some("Closes #12"), &related), first);
+        // Alone, and without a body.
+        assert_eq!(
+            describe("", None, Some("Issue: https://x/issues/1"), &[]),
+            format!("{BLOCK_BEGIN}\n{BLOCK_ISSUE}\nIssue: https://x/issues/1\n{BLOCK_END}")
+        );
+        // A session without an issue drops a line an older block had.
+        let dropped = describe(&first, None, None, &related);
+        assert!(!dropped.contains("Closes"), "{dropped}");
+        assert!(
+            dropped.contains("Body.\n\n<!-- calin:related -->"),
+            "{dropped}"
+        );
+    }
+
+    #[test]
+    fn the_issues_own_repo_closes_it_and_the_others_link_to_it() {
+        let repo = |repo_id: &str| SessionRepo {
+            id: format!("sr-{repo_id}"),
+            session_id: "s".into(),
+            repo_id: repo_id.into(),
+            name: repo_id.into(),
+            mode: RepoMode::Write,
+            path: "/x".into(),
+            branch: None,
+            base_ref: None,
+            primary: false,
+        };
+        let issue = IssueRef {
+            repo_id: "api".into(),
+            number: 12,
+            title: "t".into(),
+            url: "https://github.com/acme/api/issues/12".into(),
+        };
+        assert_eq!(
+            issue_line(Some(&issue), &repo("api")).as_deref(),
+            Some("Closes #12")
+        );
+        assert_eq!(
+            issue_line(Some(&issue), &repo("web")).as_deref(),
+            Some("Issue: https://github.com/acme/api/issues/12")
+        );
+        assert_eq!(issue_line(None, &repo("api")), None);
     }
 
     #[test]

@@ -4,6 +4,7 @@
 
 mod index;
 mod log;
+mod usage;
 mod views;
 mod writer;
 
@@ -15,8 +16,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use calin_proto::{
-    AttachRepoRequest, Event, EventBody, Graph, PermissionMode, Session, SessionDetail, Timeline,
-    WorkflowRun,
+    AttachRepoRequest, Event, EventBody, Graph, IssueRef, PermissionMode, Session, SessionDetail,
+    Timeline, Usage, WorkflowRun,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -24,6 +25,8 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use self::writer::{Cmd, Writer};
 use crate::error::{Error, Result};
 use crate::home::Home;
+
+pub(crate) use self::usage::{UsageQuery, resolve_range};
 
 /// Commands waiting for the writer thread. A full queue slows callers down
 /// instead of growing without bound.
@@ -44,6 +47,13 @@ pub struct NewSession {
     pub repos: Vec<AttachRepoRequest>,
     /// Set for a child session: who dispatched it, and from where.
     pub dispatch: Option<Dispatch>,
+    /// The issue the session starts from.
+    pub issue: Option<IssueRef>,
+    /// What the agent is handed after the prompt, and the transcript does
+    /// not show: the issue's text.
+    pub context: Option<String>,
+    /// The automation that starts the session.
+    pub automation_id: Option<String>,
 }
 
 /// How a child session came to be (the "Child sessions" semantics in
@@ -72,6 +82,8 @@ pub struct SessionSetup {
     pub model: Option<String>,
     pub repos: Vec<AttachRepoRequest>,
     pub dispatch: Option<Dispatch>,
+    /// What the agent is handed after the prompt ([`NewSession::context`]).
+    pub context: Option<String>,
 }
 
 /// A question to the user that nobody answered yet.
@@ -359,6 +371,12 @@ impl Store {
         let session_id = session_id.to_owned();
         self.call(|reply| Cmd::WorkflowRun { session_id, reply })
             .await
+    }
+
+    /// Totals and a breakdown of what agents spent in a range, from the
+    /// index's usage projection.
+    pub(crate) async fn usage(&self, query: UsageQuery) -> Result<Usage> {
+        self.call(|reply| Cmd::Usage { query, reply }).await
     }
 
     /// What every agent of the tree the session belongs to has cost so far,

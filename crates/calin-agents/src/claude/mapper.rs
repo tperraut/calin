@@ -9,8 +9,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
 use calin_proto::{
-    EventBody, Item, ItemContent, ItemDelta, ItemStatus, PermissionDecision, PermissionRequest,
-    ToolKind,
+    EventBody, Item, ItemContent, ItemDelta, ItemStatus, LimitWindow, PermissionDecision,
+    PermissionRequest, ToolKind,
 };
 use serde_json::{Value, json};
 
@@ -210,6 +210,7 @@ impl Mapper {
                 }
             }
             Some("result") => self.result(message, &mut out),
+            Some("rate_limit_event") => rate_limits(message, &mut out),
             _ => {}
         }
         out
@@ -920,6 +921,71 @@ impl Block {
             },
         ));
     }
+}
+
+/// A `rate_limit_event`: the plan's windows (integrations spec, section 1).
+/// `unifiedWindows` holds every window by name; without it, the event only
+/// describes the window it is about, at its top level. Nothing comes of an
+/// event that describes no window.
+fn rate_limits(message: &Value, out: &mut Vec<RunnerOutput>) {
+    let Some(info) = message
+        .get("rate_limit_info")
+        .filter(|info| info.is_object())
+    else {
+        return;
+    };
+    let mut windows: Vec<LimitWindow> = info
+        .get("unifiedWindows")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter_map(|(name, window)| limit_window(name, window))
+        .collect();
+    if windows.is_empty()
+        && let Some(name) = str_field(info, "rateLimitType")
+    {
+        windows.extend(limit_window(name, info));
+    }
+    if !windows.is_empty() {
+        out.push(RunnerOutput::Limits(windows));
+    }
+}
+
+/// One window. `utilization` is the share used, from 0 to 1; a window that
+/// says neither how much is used nor that it refuses is not worth showing.
+/// Any status but an allowed one refuses (`allowed_warning` still allows).
+fn limit_window(name: &str, window: &Value) -> Option<LimitWindow> {
+    if name.trim().is_empty() || !window.is_object() {
+        return None;
+    }
+    let refused = str_field(window, "status").is_some_and(|status| !status.starts_with("allowed"));
+    let used = match window.get("utilization").and_then(Value::as_f64) {
+        Some(used) if used.is_finite() => used.clamp(0.0, 1.0),
+        _ if refused => 1.0,
+        _ => return None,
+    };
+    Some(LimitWindow {
+        name: name.to_owned(),
+        used,
+        resets_at: window.get("resetsAt").and_then(epoch_ms),
+        refused,
+    })
+}
+
+/// The CLI gives reset times in Unix seconds. A value already in
+/// milliseconds (after the year 33658 in seconds) is taken as it is.
+fn epoch_ms(value: &Value) -> Option<i64> {
+    const MS_THRESHOLD: f64 = 1e12;
+    let number = value
+        .as_f64()
+        .filter(|number| number.is_finite() && *number > 0.0)?;
+    let ms = if number >= MS_THRESHOLD {
+        number
+    } else {
+        number * 1000.0
+    };
+    // Far beyond any reset time; refuses what would not fit.
+    (ms < 1e15).then_some(ms.round() as i64)
 }
 
 fn event(body: EventBody) -> RunnerOutput {

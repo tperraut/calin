@@ -202,7 +202,7 @@ impl Driver {
         }
         let branch = self.repos.iter().find_map(|repo| repo.branch.clone());
         let context = Context {
-            task: self.prompt.clone(),
+            task: self.task(),
             session_title: self.title.clone(),
             session_branch: branch
                 .unwrap_or_else(|| calin_git::session_branch_name(&self.title, &self.session_id)),

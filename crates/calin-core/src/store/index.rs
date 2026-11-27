@@ -25,7 +25,7 @@ use crate::workflows::loop_max;
 
 /// Bumped when the tables change. A database with another version is
 /// dropped and rebuilt from the logs, so there are no migrations to write.
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 const SCHEMA: &str = "
 CREATE TABLE sessions (
@@ -44,9 +44,13 @@ CREATE TABLE sessions (
     created_at        INTEGER NOT NULL,
     updated_at        INTEGER NOT NULL,
     -- Bytes of the log that are indexed. A longer log has events to catch up on.
-    log_len           INTEGER NOT NULL
+    log_len           INTEGER NOT NULL,
+    -- The issue the session was started from, as JSON; NULL for none.
+    issue             TEXT,
+    automation_id     TEXT
 ) WITHOUT ROWID;
 CREATE INDEX sessions_by_root ON sessions (root_session_id);
+CREATE INDEX sessions_by_automation ON sessions (automation_id) WHERE automation_id IS NOT NULL;
 
 CREATE TABLE agents (
     id              TEXT PRIMARY KEY,
@@ -252,10 +256,28 @@ CREATE TABLE workflow_edges (
     to_node    TEXT NOT NULL,
     PRIMARY KEY (session_id, seq)
 ) WITHOUT ROWID;
+
+-- What each `usage` event added to its agent's running totals, attributed
+-- to the moment it was reported (integrations spec, section 1), with the
+-- runner and model the agent had then.
+CREATE TABLE usage (
+    session_id TEXT NOT NULL,
+    seq        INTEGER NOT NULL,
+    agent_id   TEXT NOT NULL,
+    ts         INTEGER NOT NULL,
+    runner     TEXT NOT NULL,
+    model      TEXT,
+    cost_usd   REAL NOT NULL,
+    tokens_in  INTEGER NOT NULL,
+    tokens_out INTEGER NOT NULL,
+    PRIMARY KEY (session_id, seq)
+) WITHOUT ROWID;
+CREATE INDEX usage_by_ts ON usage (ts);
 ";
 
 /// Every table, for dropping a database of another schema version.
-const TABLES: [&str; 15] = [
+const TABLES: [&str; 16] = [
+    "usage",
     "workflow_edges",
     "workflow_nodes",
     "workflow_runs",
@@ -274,7 +296,8 @@ const TABLES: [&str; 15] = [
 ];
 
 /// The tables that hold what a session's events projected, keyed by `session_id`.
-const PROJECTIONS: [&str; 14] = [
+const PROJECTIONS: [&str; 15] = [
+    "usage",
     "workflow_edges",
     "workflow_nodes",
     "workflow_runs",
@@ -292,7 +315,8 @@ const PROJECTIONS: [&str; 14] = [
 ];
 
 const SESSION_COLUMNS: &str = "id, title, prompt, status, runner, branch, parent_session_id, \
-     root_session_id, head_seq, created_at, updated_at, permission_mode, workflow";
+     root_session_id, head_seq, created_at, updated_at, permission_mode, workflow, issue, \
+     automation_id";
 
 const AGENT_COLUMNS: &str = "id, session_id, parent_agent_id, kind, role, runner, model, status, \
      cost_usd, tokens_in, tokens_out, native_session_id";
@@ -348,8 +372,8 @@ pub(super) fn insert_session(db: &Connection, session: &Session) -> Result<()> {
     db.prepare_cached(
         "INSERT OR REPLACE INTO sessions (id, title, prompt, status, runner, branch, \
          parent_session_id, root_session_id, head_seq, created_at, updated_at, \
-         permission_mode, workflow, log_len) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 0)",
+         permission_mode, workflow, log_len, issue, automation_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 0, ?14, ?15)",
     )?
     .execute(params![
         session.id,
@@ -365,6 +389,12 @@ pub(super) fn insert_session(db: &Connection, session: &Session) -> Result<()> {
         session.updated_at,
         wire_name(&session.permission_mode)?,
         session.workflow,
+        session
+            .issue
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?,
+        session.automation_id,
     ])?;
     Ok(())
 }
@@ -714,6 +744,8 @@ pub(super) fn index_event(db: &Connection, event: &Event, offset: u64, end: u64)
             tokens_out,
         } => {
             if let Some(agent_id) = &event.agent_id {
+                // Before the agent's totals move on: the delta is against them.
+                index_usage(db, event, agent_id, (*cost_usd, *tokens_in, *tokens_out))?;
                 db.prepare_cached(
                     "UPDATE agents SET cost_usd = ?1, tokens_in = ?2, tokens_out = ?3 \
                      WHERE id = ?4 AND session_id = ?5",
@@ -936,6 +968,7 @@ pub(super) fn index_event(db: &Connection, event: &Event, offset: u64, end: u64)
         EventBody::UserMessage { .. }
         | EventBody::ItemDelta { .. }
         | EventBody::PlanUpdated { .. }
+        | EventBody::Limits { .. }
         | EventBody::Error { .. } => {}
     }
 
@@ -949,6 +982,74 @@ pub(super) fn index_event(db: &Connection, event: &Event, offset: u64, end: u64)
         event.session_id
     ])?;
     Ok(())
+}
+
+/// Records what a `usage` event added to the agent's totals. Totals are
+/// cumulative per process; when any of them went down, the process started
+/// over from zero and the new totals are all new usage, never a negative.
+fn index_usage(db: &Connection, event: &Event, agent_id: &str, now: (f64, u64, u64)) -> Result<()> {
+    let known: Option<(f64, i64, i64, String, Option<String>)> = db
+        .prepare_cached(
+            "SELECT cost_usd, tokens_in, tokens_out, runner, model FROM agents \
+             WHERE id = ?1 AND session_id = ?2",
+        )?
+        .query_row([agent_id, &event.session_id], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })
+        .optional()?;
+    let (before, runner, model) = match known {
+        Some((cost, tokens_in, tokens_out, runner, model)) => {
+            let before = (cost, tokens_in.max(0) as u64, tokens_out.max(0) as u64);
+            (before, runner, model)
+        }
+        // An agent the log never announced: all of it is new, on the session's runner.
+        None => {
+            let runner: Option<String> = db
+                .prepare_cached("SELECT runner FROM sessions WHERE id = ?1")?
+                .query_row([&event.session_id], |row| row.get(0))
+                .optional()?;
+            ((0.0, 0, 0), runner.unwrap_or_default(), None)
+        }
+    };
+    let (cost, tokens_in, tokens_out) = usage_delta(before, now);
+    db.prepare_cached(
+        "INSERT OR REPLACE INTO usage (session_id, seq, agent_id, ts, runner, model, cost_usd, \
+         tokens_in, tokens_out) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+    )?
+    .execute(params![
+        event.session_id,
+        event.seq as i64,
+        agent_id,
+        event.ts,
+        runner,
+        model,
+        cost,
+        tokens_in as i64,
+        tokens_out as i64,
+    ])?;
+    Ok(())
+}
+
+/// What `now` adds to `before`, two readings of an agent's running totals.
+pub(super) fn usage_delta(before: (f64, u64, u64), now: (f64, u64, u64)) -> (f64, u64, u64) {
+    // Cost is a float the CLI rounds; a hair below is not a restart.
+    const COST_EPSILON: f64 = 1e-9;
+    let restarted = now.0 < before.0 - COST_EPSILON || now.1 < before.1 || now.2 < before.2;
+    if restarted {
+        (now.0.max(0.0), now.1, now.2)
+    } else {
+        (
+            (now.0 - before.0).max(0.0),
+            now.1 - before.1,
+            now.2 - before.2,
+        )
+    }
 }
 
 /// The first line of an event that can start a turn; `None` for any other.
@@ -1278,6 +1379,7 @@ fn kind(body: &EventBody) -> &'static str {
         EventBody::WorkflowStarted { .. } => "workflow_started",
         EventBody::WorkflowNode { .. } => "workflow_node",
         EventBody::WorkflowFinished { .. } => "workflow_finished",
+        EventBody::Limits { .. } => "limits",
         EventBody::Error { .. } => "error",
     }
 }
@@ -1319,7 +1421,19 @@ fn session_from_row(row: &Row<'_>) -> rusqlite::Result<Session> {
         updated_at: row.get(10)?,
         permission_mode: from_wire_name(row, 11)?,
         workflow: row.get(12)?,
+        issue: from_json(row, 13)?,
+        automation_id: row.get(14)?,
     })
+}
+
+/// A column that holds a value as JSON, or NULL.
+fn from_json<T: DeserializeOwned>(row: &Row<'_>, index: usize) -> rusqlite::Result<Option<T>> {
+    let Some(json) = row.get::<_, Option<String>>(index)? else {
+        return Ok(None);
+    };
+    serde_json::from_str(&json)
+        .map(Some)
+        .map_err(|err| rusqlite::Error::FromSqlConversionFailure(index, Type::Text, Box::new(err)))
 }
 
 fn agent_from_row(row: &Row<'_>) -> rusqlite::Result<Agent> {

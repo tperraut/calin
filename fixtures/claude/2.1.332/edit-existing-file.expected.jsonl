@@ -1,5 +1,6 @@
 {"native_session":{"id":"uuid-0001","model":"claude-haiku-5-5"}}
 {"event":{"item":{"content":{"input":{"file_path":"/work/notes.txt"},"kind":"tool","locations":["/work/notes.txt"],"name":"Read","output":null,"title":"notes.txt","tool_kind":"read"},"id":"toolu-0001","status":"running"},"type":"item_started"}}
+{"limits":[{"name":"five_hour","refused":false,"resets_at":1800000000000,"used":0.1},{"name":"seven_day","refused":false,"resets_at":1800000000000,"used":0.1}]}
 {"event":{"item":{"content":{"input":{"file_path":"/work/notes.txt"},"kind":"tool","locations":["/work/notes.txt"],"name":"Read","output":"1\tThe quick brown fox\n2\tjumps over the lazy dgo.\n3\t","title":"notes.txt","tool_kind":"read"},"id":"toolu-0001","status":"completed"},"type":"item_completed"}}
 {"event":{"item":{"content":{"input":{"file_path":"/work/notes.txt","new_string":"lazy dog.","old_string":"lazy dgo.","replace_all":false},"kind":"tool","locations":["/work/notes.txt"],"name":"Edit","output":null,"title":"notes.txt","tool_kind":"edit"},"id":"toolu-0002","status":"running"},"type":"item_started"}}
 {"access":{"files":["/work/notes.txt"],"write":true},"permission_request":{"id":"uuid-0063","input":{"file_path":"/work/notes.txt","new_string":"lazy dog.","old_string":"lazy dgo.","replace_all":false},"item_id":"toolu-0002","title":"notes.txt","tool_kind":"edit","tool_name":"Edit"}}

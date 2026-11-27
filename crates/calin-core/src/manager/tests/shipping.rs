@@ -2,7 +2,9 @@
 //! `gh`, and how the pull requests are watched afterwards. Remotes are bare
 //! repositories on disk; nothing here reaches a network or the real `gh`.
 
-use calin_proto::{CheckState, PullRequest, PullRequestState, ReviewState, ShipRequest};
+use calin_proto::{
+    CheckState, FromIssue, IssueRef, PullRequest, PullRequestState, ReviewState, ShipRequest,
+};
 
 use super::*;
 use crate::testing::write_executable;
@@ -12,6 +14,7 @@ use crate::testing::write_executable;
 /// `origin` remote of the directory it runs in. Every invocation is logged
 /// as the repository, a tab and the arguments. Files beside it steer it:
 /// `signed-out`, `hold` (wait while it exists) and `fail-<verb>-<repo>`.
+/// Issues are JSON files, `issues/<repo>/<number>`, shown as they are.
 /// Titles and bodies may hold quotes, backslashes and newlines, no tabs.
 const FAKE_GH: &str = r#"#!/bin/sh
 root=$(dirname "$0")
@@ -89,6 +92,14 @@ case "$1 $2" in
   dir="$prs/$3"
   if [ ! -d "$dir" ]; then echo "GraphQL: Could not resolve to a PullRequest." >&2; exit 1; fi
   cat > "$dir/body"
+  ;;
+"issue view")
+  file="$root/issues/$repo/$3"
+  if [ ! -f "$file" ]; then
+    echo "GraphQL: Could not resolve to an issue or pull request with the number of $3." >&2
+    exit 1
+  fi
+  cat "$file"
   ;;
 *)
   echo "unexpected: $*" >&2
@@ -177,6 +188,23 @@ impl FakeGh {
         }
     }
 
+    /// An open issue of `repo`, as `gh issue view` shows it.
+    fn issue(&self, repo: &str, number: u32, title: &str, body: &str) {
+        let dir = self.dir.path().join("issues").join(repo);
+        std::fs::create_dir_all(&dir).unwrap();
+        let issue = serde_json::json!({
+            "number": number,
+            "title": title,
+            "state": "OPEN",
+            "labels": [{"name": "bug"}],
+            "author": {"login": "octocat"},
+            "updatedAt": "2026-11-20T08:30:00Z",
+            "url": format!("https://github.com/acme/{repo}/issues/{number}"),
+            "body": body,
+        });
+        std::fs::write(dir.join(number.to_string()), issue.to_string()).unwrap();
+    }
+
     fn switch(&self, flag: &str, on: bool) {
         let path = self.dir.path().join(flag);
         if on {
@@ -253,6 +281,18 @@ impl Delivery {
         let path = clone.to_str().unwrap().to_owned();
         let request = RegisterRepoRequest { path, name: None };
         self.manager.register_repo(request).await.unwrap()
+    }
+
+    /// [`Self::repo`], with an `origin` on GitHub as far as anyone asks:
+    /// git sends its pushes to the bare repository all the same.
+    async fn github_repo(&self, name: &str) -> Repo {
+        let repo = self.repo(name).await;
+        let github = format!("https://github.com/acme/{name}.git");
+        let clone = Path::new(&repo.path);
+        git(clone, &["remote", "set-url", "origin", &github]);
+        let rewrite = format!("url.{}.insteadOf", self.remote(name).display());
+        git(clone, &["config", &rewrite, &github]);
+        repo
     }
 
     /// The commit `branch` is at on the remote of `name`, if it is there.
@@ -1288,4 +1328,151 @@ async fn a_dry_run_makes_up_pull_requests_and_touches_neither_github_nor_a_remot
     // Without a title, the session's own.
     assert_eq!(carried(&events[0]).title, next.session.title);
     assert_eq!(d.gh.log(), [] as [&str; 0]);
+}
+
+fn from_issue(repo: &Repo, number: u32) -> FromIssue {
+    FromIssue {
+        repo_id: repo.id.clone(),
+        number,
+    }
+}
+
+#[tokio::test]
+async fn a_session_from_an_issue_hands_the_agent_its_text_and_keeps_the_users_own() {
+    let mut d = delivery().await;
+    let api = d.github_repo("api").await;
+    d.gh.issue("api", 12, "Login fails", "Steps:\n1. open the app");
+    let mut wanted = request("Fix it, tests first.", Some("puppet"));
+    wanted.issue = Some(from_issue(&api, 12));
+    let created = d.manager.create_session(wanted).await.unwrap();
+    let issue = IssueRef {
+        repo_id: api.id.clone(),
+        number: 12,
+        title: "Login fails".to_owned(),
+        url: "https://github.com/acme/api/issues/12".to_owned(),
+    };
+    assert_eq!(created.session.issue.as_ref(), Some(&issue));
+    assert_eq!(created.session.prompt, "Fix it, tests first.");
+    let (params, _io) = within(d.starts.recv()).await.unwrap();
+    assert_eq!(
+        params.prompt,
+        "Fix it, tests first.\n\n[Calin] This session works on GitHub issue #12: \
+         https://github.com/acme/api/issues/12\n\n<github-issue>\n# Login fails\n\n\
+         Steps:\n1. open the app\n</github-issue>"
+    );
+    // The repo of the issue is the primary one: the agent works there.
+    let detail = d.manager.get(&created.session.id).await.unwrap();
+    assert_eq!(detail.repos[0].repo_id, api.id);
+    assert!(detail.repos[0].primary);
+    assert_eq!(params.cwd, Path::new(&detail.repos[0].path));
+    let events = events_until(&d.manager, &created.session.id, 0, |event| {
+        matches!(event.body, EventBody::AgentSpawned { .. })
+    })
+    .await;
+    assert!(labels(&events).contains(&"user_message:Fix it, tests first.".to_owned()));
+    assert_eq!(d.gh.calls("api\tissue view 12"), 1);
+
+    // What GitHub does not have is the request's fault; what keeps GitHub
+    // from answering is the state's.
+    let mut unknown = request("Fix it", Some("puppet"));
+    unknown.issue = Some(from_issue(&api, 99));
+    let err = d.manager.create_session(unknown.clone()).await.unwrap_err();
+    assert!(
+        matches!(&err, Error::Invalid(what) if what.contains("#99")),
+        "{err:?}"
+    );
+    unknown.issue = Some(FromIssue {
+        repo_id: "nope".to_owned(),
+        number: 12,
+    });
+    let err = d.manager.create_session(unknown.clone()).await.unwrap_err();
+    assert!(
+        matches!(&err, Error::Invalid(what) if what.contains("nope")),
+        "{err:?}"
+    );
+    // The prompt is still the user's to write, as the contract says.
+    unknown.issue = Some(from_issue(&api, 12));
+    unknown.prompt = "  ".to_owned();
+    let err = d.manager.create_session(unknown).await.unwrap_err();
+    assert!(matches!(err, Error::Invalid(_)), "{err:?}");
+    // A repo that is not on GitHub has no issues.
+    let local = d.repo("local").await;
+    let mut there = request("Fix it", Some("puppet"));
+    there.issue = Some(from_issue(&local, 1));
+    let err = d.manager.create_session(there).await.unwrap_err();
+    assert!(
+        matches!(&err, Error::Conflict(why) if why.contains("not on GitHub")),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_issues_repo_closes_it_and_the_others_link_to_it_on_every_ship() {
+    let d = delivery().await;
+    let api = d.github_repo("api").await;
+    let web = d.github_repo("web").await;
+    d.gh.issue("api", 12, "Login fails", "Broken.");
+    let mut wanted = request("Fix it", None);
+    // The issue's repo is not listed: it comes first.
+    wanted.repos = vec![attach(&web, None)];
+    wanted.issue = Some(from_issue(&api, 12));
+    let id = d.manager.create_session(wanted).await.unwrap().session.id;
+    events_until(&d.manager, &id, 0, is_status(SessionStatus::Review)).await;
+    let detail = d.manager.get(&id).await.unwrap();
+    let names: Vec<&str> = detail.repos.iter().map(|repo| repo.name.as_str()).collect();
+    assert_eq!(names, ["api", "web"]);
+    write_file(Path::new(&detail.repos[1].path), "page.txt", "page\n");
+
+    let closes = "<!-- calin:issue -->\nCloses #12\n";
+    let link = "<!-- calin:issue -->\nIssue: https://github.com/acme/api/issues/12\n";
+    d.ship(&id, titled("Fix login", "What it does."), is_shipping())
+        .await;
+    for (repo, line) in [("api", closes), ("web", link)] {
+        let body = d.gh.read(repo, 1, "body");
+        assert!(
+            body.contains(&format!("What it does.\n\n{line}\n<!-- calin:related -->")),
+            "{body}"
+        );
+        assert_eq!(body.matches("<!-- calin:issue -->").count(), 1, "{body}");
+    }
+    // Once more, after another turn, keeping the text: still one line each.
+    d.turn(&id, "one more thing").await;
+    let again = ShipRequest {
+        title: None,
+        body: None,
+        draft: None,
+    };
+    d.ship(&id, again, is_shipping()).await;
+    for (repo, line) in [("api", closes), ("web", link)] {
+        let body = d.gh.read(repo, 1, "body");
+        assert!(body.contains(&format!("What it does.\n\n{line}")), "{body}");
+        assert_eq!(body.matches("<!-- calin:issue -->").count(), 1, "{body}");
+        assert_eq!(
+            body.matches("#12").count() + body.matches("issues/12").count(),
+            1,
+            "{body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn without_a_usable_gh_a_session_cannot_start_from_an_issue() {
+    let d = delivery().await;
+    let api = d.github_repo("api").await;
+    d.gh.issue("api", 12, "Login fails", "Broken.");
+    d.gh.switch("signed-out", true);
+    let mut wanted = request("Fix it", Some("puppet"));
+    wanted.issue = Some(from_issue(&api, 12));
+    let err = d.manager.create_session(wanted).await.unwrap_err();
+    assert!(
+        matches!(&err, Error::Conflict(why) if why.contains("not signed in")),
+        "{err:?}"
+    );
+    let err = d
+        .manager
+        .list_issues(&api.id, calin_proto::IssueState::Open, None)
+        .await;
+    assert!(matches!(err, Err(Error::Conflict(_))), "{err:?}");
+    assert_eq!(d.manager.list().await.unwrap(), []);
+    assert_eq!(d.gh.calls("api\tissue"), 0);
 }

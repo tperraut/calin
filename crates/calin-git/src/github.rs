@@ -18,6 +18,10 @@ use crate::cmd::{INHERITED, work_dir};
 use crate::error::{Error, Result};
 use crate::setup::{kill, kill_group};
 
+mod issues;
+
+pub use issues::{IssueQuery, PullRequestItem, on_github};
+
 const DEFAULT_PROGRAM: &str = "gh";
 /// Generous for one API round trip, short enough that a hung `gh` does not
 /// hold a delivery up for good.
@@ -445,15 +449,15 @@ if [ -f "$dir/code-$key" ]; then exit "$(cat "$dir/code-$key")"; fi
 exit 0
 "#;
 
-    struct Fake {
-        sandbox: Sandbox,
-        bin: PathBuf,
+    pub(super) struct Fake {
+        pub(super) sandbox: Sandbox,
+        pub(super) bin: PathBuf,
         /// Where `gh` is run: any directory will do for a fake.
-        work: PathBuf,
+        pub(super) work: PathBuf,
     }
 
     impl Fake {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             let sandbox = Sandbox::new();
             let bin = sandbox.dir("bin").join("gh");
             write_executable(&bin, FAKE_GH);
@@ -461,24 +465,24 @@ exit 0
             Self { sandbox, bin, work }
         }
 
-        fn github(&self) -> GitHub {
+        pub(super) fn github(&self) -> GitHub {
             GitHub::new(&self.bin).with_timeout(Duration::from_secs(30))
         }
 
-        fn set(&self, file: &str, content: impl AsRef<[u8]>) {
+        pub(super) fn set(&self, file: &str, content: impl AsRef<[u8]>) {
             std::fs::write(self.bin.with_file_name(file), content).unwrap();
         }
 
-        fn read(&self, file: &str) -> String {
+        pub(super) fn read(&self, file: &str) -> String {
             std::fs::read_to_string(self.bin.with_file_name(file)).unwrap_or_default()
         }
 
-        fn args(&self, key: &str) -> Vec<String> {
+        pub(super) fn args(&self, key: &str) -> Vec<String> {
             let args = self.read(&format!("args-{key}"));
             args.lines().map(str::to_owned).collect()
         }
 
-        fn log(&self) -> Vec<String> {
+        pub(super) fn log(&self) -> Vec<String> {
             self.read("log").lines().map(str::to_owned).collect()
         }
     }

@@ -1,11 +1,13 @@
 {"native_session":{"id":"uuid-0001","model":"claude-haiku-5-5"}}
 {"event":{"item":{"content":{"input":{"command":"python3 -c \"import time; time.sleep(60)\"","description":"Sleep for 60 seconds using python3"},"kind":"tool","locations":[],"name":"Bash","output":null,"title":"python3 -c \"import time; time.sleep(60)\"","tool_kind":"execute"},"id":"toolu-0001","status":"running"},"type":"item_started"}}
 {"access":"other","permission_request":{"id":"uuid-0016","input":{"command":"python3 -c \"import time; time.sleep(60)\"","description":"Sleep for 60 seconds using python3"},"item_id":"toolu-0001","title":"python3 -c \"import time; time.sleep(60)\"","tool_kind":"execute","tool_name":"Bash"}}
+{"limits":[{"name":"five_hour","refused":false,"resets_at":1800000000000,"used":0.1},{"name":"seven_day","refused":false,"resets_at":1800000000000,"used":0.1}]}
 {"event":{"item":{"content":{"input":{"command":"python3 -c \"import time; time.sleep(60)\"","description":"Sleep for 60 seconds using python3"},"kind":"tool","locations":[],"name":"Bash","output":"The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). STOP what you are doing and wait for the user to tell you how to proceed. Correction to the text above: this call was stopped while running, not refused before it ran. It may have run in part or in full, and its changes may have been written. No permission prompt was involved. Work it started elsewhere (a remote command, a background process) may still be running, so check before starting the same work again. The instruction to stop and wait still stands.\n\nNote: The user's next message may contain a correction or preference. Pay close attention — if they explain what went wrong or how they'd prefer you to work, consider saving that to memory for future sessions.","title":"python3 -c \"import time; time.sleep(60)\"","tool_kind":"execute"},"id":"toolu-0001","status":"failed"},"type":"item_completed"}}
 {"event":{"cost_usd":0.00226158,"tokens_in":24248,"tokens_out":98,"type":"usage"}}
 "turn_ended"
 {"event":{"item":{"content":{"kind":"text","text":""},"id":"claude-7-1","status":"running"},"type":"item_started"}}
 {"event":{"delta":{"kind":"text","text":"ok"},"item_id":"claude-7-1","type":"item_delta"}}
 {"event":{"item":{"content":{"kind":"text","text":"ok"},"id":"claude-7-1","status":"completed"},"type":"item_completed"}}
+{"limits":[{"name":"five_hour","refused":false,"resets_at":1800000000000,"used":0.1},{"name":"seven_day","refused":false,"resets_at":1800000000000,"used":0.1}]}
 {"event":{"cost_usd":0.00475224,"tokens_in":59726,"tokens_out":102,"type":"usage"}}
 "turn_ended"

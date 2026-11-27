@@ -7,8 +7,10 @@
 //! one step at a time, so the order of a session's events never depends on a
 //! race.
 
+mod automate;
 mod delivery;
 mod driver;
+mod issues;
 mod queue;
 mod unreported;
 
@@ -22,20 +24,25 @@ use calin_agents::{Runner, RunnerRegistry};
 use calin_git::GitHub;
 use calin_proto::{
     AgentMessage, AgentStatus, AttachRepoRequest, CreateSessionRequest, DecisionSource, EventBody,
-    Graph, NodePhase, NodeRunState, PermissionDecision, RegisterRepoRequest, Repo, RepoMode,
-    RepoSet, Session, SessionDetail, SessionRepo, SessionStatus, Settings, ShipRequest, Timeline,
-    WorkflowInfo, WorkflowRun, WorkflowStatus,
+    Graph, IssueRef, NodePhase, NodeRunState, PermissionDecision, RegisterRepoRequest, Repo,
+    RepoMode, RepoSet, RunnerLimits, Session, SessionDetail, SessionRepo, SessionStatus, Settings,
+    ShipRequest, Timeline, Usage, UsageBy, WorkflowInfo, WorkflowRun, WorkflowStatus,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
+use self::automate::Scheduler;
 use self::driver::Driver;
 use self::queue::Queue;
+use crate::automations::AutomationStore;
+use crate::briefing;
+use crate::clock::{SharedClock, TimeZone};
 use crate::error::{Error, Result};
+use crate::limits::LimitBoard;
 use crate::repos::{RepoRegistry, Reservation};
 use crate::settings::{DEFAULT_MAX_PARALLEL, SettingsStore};
-use crate::store::{EventDraft, NewSession, Store};
+use crate::store::{EventDraft, NewSession, Store, UsageQuery, resolve_range};
 use crate::title::default_title;
 use crate::tokens::{AgentRef, Tokens};
 use crate::workflows::WorkflowCatalog;
@@ -54,6 +61,8 @@ const GH_TIMEOUT: Duration = Duration::from_secs(60);
 const PULL_REQUEST_POLL: Duration = Duration::from_secs(60);
 /// How long an answer about `gh` (is it there, is it signed in) is trusted.
 const GITHUB_STATUS_TTL: Duration = Duration::from_secs(60);
+/// How often issue and pull request triggers ask GitHub (integrations spec, section 3).
+const TRIGGER_POLL: Duration = Duration::from_secs(5 * 60);
 
 const RESTART_REASON: &str = "server restarted";
 /// Recorded with a request that nobody answered while it could be answered.
@@ -87,6 +96,16 @@ pub struct ManagerConfig {
     pub gh_timeout: Duration,
     /// How often the pull requests of a `shipping` session are looked at.
     pub pull_request_poll: Duration,
+    /// What time it is, for usage ranges, limits and automations.
+    pub clock: SharedClock,
+    /// The server's local time zone: where usage days begin and what
+    /// automation schedules mean. The system's by default.
+    pub time_zone: TimeZone,
+    /// How often issue and pull request triggers ask GitHub.
+    pub trigger_poll: Duration,
+    /// Runs automations in the background. Tests turn it off and drive
+    /// them with [`SessionManager::automations_tick`].
+    pub automations: bool,
 }
 
 impl Default for ManagerConfig {
@@ -96,6 +115,10 @@ impl Default for ManagerConfig {
             gh_bin: PathBuf::from(GH_BIN),
             gh_timeout: GH_TIMEOUT,
             pull_request_poll: PULL_REQUEST_POLL,
+            clock: SharedClock::default(),
+            time_zone: TimeZone::system(),
+            trigger_poll: TRIGGER_POLL,
+            automations: true,
         }
     }
 }
@@ -174,6 +197,10 @@ struct Inner {
     /// drivers retire under this lock, so a command is never queued on a
     /// driver that has already decided to end.
     drivers: Mutex<Drivers>,
+    /// The newest plan limits of each runner, and which were logged.
+    limits: LimitBoard,
+    automations: AutomationStore,
+    scheduler: Scheduler,
 }
 
 impl Inner {
@@ -390,6 +417,9 @@ impl SessionManager {
         workflows.reload(in_effect.home_repo.as_deref()).await;
         let queue = Queue::new(in_effect.max_parallel.unwrap_or(DEFAULT_MAX_PARALLEL));
         let github = GitHub::new(&config.gh_bin).with_timeout(config.gh_timeout);
+        let automations = AutomationStore::load(store.home()).await;
+        // Nothing missed before the start is made up (integrations spec, section 3).
+        let scheduler = Scheduler::new(config.clock.now_ms());
         let manager = Self {
             inner: Arc::new(Inner {
                 store,
@@ -406,9 +436,15 @@ impl SessionManager {
                 tool_endpoint: Mutex::new(None),
                 trackers: Mutex::new(HashMap::new()),
                 drivers: Mutex::new(HashMap::new()),
+                limits: LimitBoard::default(),
+                automations,
+                scheduler,
             }),
         };
         manager.recover().await?;
+        if manager.inner.config.automations {
+            automate::start(&manager);
+        }
         // Dry run has made-up pull requests: there is nothing to look at.
         if !manager.inner.registry.dry_run() {
             let every = manager.inner.config.pull_request_poll;
@@ -597,7 +633,22 @@ impl SessionManager {
     /// it shows up as events. With every slot taken it stays `queued` until
     /// one is free (the "queue" semantics in `calin-proto/src/api.rs`).
     /// `Invalid` also for a workflow that is unknown or does not validate.
+    ///
+    /// With `issue`, the issue is fetched first (`Invalid` when its repo or
+    /// the issue is unknown, `Conflict` when GitHub cannot be asked), its
+    /// repo is attached as the primary repo unless `repos` lists it, and
+    /// its text follows the prompt in what the agent is handed (the
+    /// transcript keeps the prompt as written).
     pub async fn create_session(&self, request: CreateSessionRequest) -> Result<SessionDetail> {
+        self.create(request, None).await
+    }
+
+    /// [`Self::create_session`], for an automation when `automation_id` is set.
+    pub(crate) async fn create(
+        &self,
+        mut request: CreateSessionRequest,
+        automation_id: Option<String>,
+    ) -> Result<SessionDetail> {
         if request.prompt.trim().is_empty() {
             return Err(Error::Invalid("the prompt must not be blank".to_owned()));
         }
@@ -620,6 +671,38 @@ impl SessionManager {
             .model
             .map(|model| model.trim().to_owned())
             .filter(|model| !model.is_empty());
+        let (issue, context) = match request.issue.take() {
+            None => (None, None),
+            Some(from) => {
+                // The request names something that is not there: its fault, not the state's.
+                let detail =
+                    self.issue(&from.repo_id, from.number)
+                        .await
+                        .map_err(|err| match err {
+                            Error::Missing(what) => Error::Invalid(what),
+                            other => other,
+                        })?;
+                if !request
+                    .repos
+                    .iter()
+                    .any(|repo| repo.repo_id == from.repo_id)
+                {
+                    let primary = AttachRepoRequest {
+                        repo_id: from.repo_id.clone(),
+                        mode: None,
+                    };
+                    request.repos.insert(0, primary);
+                }
+                let context = briefing::issue_context(&detail);
+                let issue = IssueRef {
+                    repo_id: from.repo_id,
+                    number: detail.issue.number,
+                    title: detail.issue.title,
+                    url: detail.issue.url,
+                };
+                (Some(issue), Some(context))
+            }
+        };
         // Before anything is created: every repo must exist, once.
         let reservation = if request.repos.is_empty() {
             None
@@ -644,6 +727,9 @@ impl SessionManager {
                 model,
                 repos: request.repos,
                 dispatch: None,
+                issue,
+                context,
+                automation_id,
             })
             .await?;
         // The workflow as it is now: a later edit of its file changes
@@ -914,6 +1000,26 @@ impl SessionManager {
         .await
     }
 
+    /// What agents spent in `[from, to)` (Unix milliseconds; the last 30
+    /// days by default, at most 366), in total and broken down `by` day in
+    /// the server's time zone, root session, primary repo, runner or model
+    /// (integrations spec, section 1). `Invalid` for a range that ends
+    /// before it starts.
+    pub async fn usage(&self, from: Option<i64>, to: Option<i64>, by: UsageBy) -> Result<Usage> {
+        let now = self.inner.config.clock.now_ms();
+        let (from, to) = resolve_range(from, to, now)?;
+        let zone = self.inner.config.time_zone.clone();
+        self.inner
+            .store
+            .usage(UsageQuery { from, to, by, zone })
+            .await
+    }
+
+    /// The newest plan limits each runner reported since the server started.
+    pub fn limits(&self) -> Vec<RunnerLimits> {
+        self.inner.limits.newest()
+    }
+
     /// Why pull requests cannot be opened from this server (`gh` is missing
     /// or not signed in), or `None` when they can. Always `None` in dry run.
     /// Asks `gh` at most once a minute.
@@ -1003,6 +1109,7 @@ impl SessionManager {
         if let Some(watcher) = watcher {
             watcher.abort();
         }
+        self.inner.scheduler.stop();
         let drivers: Vec<DriverHandle> = self.inner.drivers().drain().map(|(_, d)| d).collect();
         for driver in drivers {
             // A driver ends, and drops its agent, when its command queue closes.

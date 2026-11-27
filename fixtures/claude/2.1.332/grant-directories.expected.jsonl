@@ -1,6 +1,7 @@
 {"native_session":{"id":"uuid-0001","model":"claude-haiku-5-5"}}
 {"event":{"item":{"content":{"input":{"file_path":"/work-ro/a.txt"},"kind":"tool","locations":["/work-ro/a.txt"],"name":"Read","output":null,"title":"/work-ro/a.txt","tool_kind":"read"},"id":"toolu-0001","status":"running"},"type":"item_started"}}
 {"access":{"files":["/work-ro/a.txt"],"write":false},"permission_request":{"id":"uuid-0022","input":{"file_path":"/work-ro/a.txt"},"item_id":"toolu-0001","title":"/work-ro/a.txt","tool_kind":"read","tool_name":"Read"}}
+{"limits":[{"name":"five_hour","refused":false,"resets_at":1800000000000,"used":0.1},{"name":"seven_day","refused":false,"resets_at":1800000000000,"used":0.1}]}
 {"event":{"item":{"content":{"input":{"file_path":"/work-ro/a.txt"},"kind":"tool","locations":["/work-ro/a.txt"],"name":"Read","output":"1\talpha\n2\t","title":"/work-ro/a.txt","tool_kind":"read"},"id":"toolu-0001","status":"completed"},"type":"item_completed"}}
 {"event":{"item":{"content":{"input":{"file_path":"/work-ro/b.txt"},"kind":"tool","locations":["/work-ro/b.txt"],"name":"Read","output":null,"title":"/work-ro/b.txt","tool_kind":"read"},"id":"toolu-0002","status":"running"},"type":"item_started"}}
 {"event":{"item":{"content":{"input":{"file_path":"/work-ro/b.txt"},"kind":"tool","locations":["/work-ro/b.txt"],"name":"Read","output":"1\tbeta\n2\t","title":"/work-ro/b.txt","tool_kind":"read"},"id":"toolu-0002","status":"completed"},"type":"item_completed"}}

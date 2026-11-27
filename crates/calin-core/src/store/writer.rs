@@ -10,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use calin_proto::{
     AttachRepoRequest, Event, EventBody, Graph, Session, SessionDetail, SessionStatus, Timeline,
-    WorkflowRun,
+    Usage, WorkflowRun,
 };
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -19,7 +19,8 @@ use ulid::Ulid;
 
 use super::index::{self, Indexed};
 use super::{
-    Dispatch, EventDraft, NewSession, OpenPermission, OpenQuestion, SessionSetup, log, views,
+    Dispatch, EventDraft, NewSession, OpenPermission, OpenQuestion, SessionSetup, UsageQuery, log,
+    usage, views,
 };
 use crate::error::{Error, Result};
 use crate::home::Home;
@@ -115,6 +116,10 @@ pub(super) enum Cmd {
         session_id: String,
         reply: Reply<f64>,
     },
+    Usage {
+        query: UsageQuery,
+        reply: Reply<Usage>,
+    },
     /// Sent by the store's timer when a delayed upsert is due.
     FlushUpserts,
     Close {
@@ -171,6 +176,8 @@ struct Meta {
     repos: Vec<AttachRepoRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     dispatch: Option<Dispatch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    context: Option<String>,
 }
 
 pub(super) struct Writer {
@@ -309,6 +316,9 @@ impl Writer {
                 Cmd::TreeCost { session_id, reply } => {
                     let _ = reply.send(index::tree_cost(&self.db, &session_id));
                 }
+                Cmd::Usage { query, reply } => {
+                    let _ = reply.send(usage::usage(&self.db, &query));
+                }
                 Cmd::FlushUpserts => self.flush_upserts(),
                 Cmd::Close { reply } => {
                     // Closing the connection first checkpoints the WAL before the caller moves on.
@@ -331,6 +341,8 @@ impl Writer {
             runner: new.runner,
             permission_mode: new.permission_mode,
             workflow: new.workflow,
+            issue: new.issue,
+            automation_id: new.automation_id,
             branch: None,
             parent_session_id: new
                 .dispatch
@@ -349,6 +361,7 @@ impl Writer {
             model: new.model,
             repos: new.repos,
             dispatch: new.dispatch,
+            context: new.context,
         };
         // Disk before index, like events: a reindex must be able to find the session.
         std::fs::create_dir_all(self.home.session_dir(&id))?;
@@ -540,6 +553,7 @@ impl Writer {
                 model: meta.model,
                 repos: meta.repos,
                 dispatch: meta.dispatch,
+                context: meta.context,
             },
             None => SessionSetup::default(),
         })
@@ -715,6 +729,8 @@ impl Writer {
             permission_mode: Default::default(),
             // Which file it was is not in the log; the run itself still is.
             workflow: None,
+            issue: None,
+            automation_id: None,
             branch: None,
             parent_session_id: None,
             root_session_id: session_id.to_owned(),

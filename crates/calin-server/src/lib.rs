@@ -8,6 +8,7 @@ mod assets;
 mod auth;
 mod guard;
 mod headers;
+mod integrations;
 mod mcp;
 mod notify;
 mod push;
@@ -180,6 +181,7 @@ fn api_routes() -> Vec<ApiRoute> {
     use Access::{AgentToken, Anyone, SignedIn};
     use Verb::{Delete, Get, Post, Put};
     const SESSION: &str = "/sessions/{id}";
+    const AUTOMATION: &str = "/automations/{id}";
     vec![
         route(Get, HEALTH_ROUTE, Anyone, api::health),
         route(Get, "/me", SignedIn, account::me),
@@ -223,6 +225,58 @@ fn api_routes() -> Vec<ApiRoute> {
         route(Post, "/repos/{id}/clone", SignedIn, api::clone_repo),
         route(Delete, "/repos/{id}", SignedIn, api::remove_repo),
         route(Get, "/repo-sets", SignedIn, api::list_repo_sets),
+        route(
+            Get,
+            "/repos/{id}/issues",
+            SignedIn,
+            integrations::list_issues,
+        ),
+        route(
+            Get,
+            "/repos/{id}/issues/{number}",
+            SignedIn,
+            integrations::get_issue,
+        ),
+        route(Get, "/usage", SignedIn, integrations::usage),
+        route(Get, "/usage/limits", SignedIn, integrations::limits),
+        route(
+            Get,
+            "/automations",
+            SignedIn,
+            integrations::list_automations,
+        ),
+        route(
+            Post,
+            "/automations",
+            SignedIn,
+            integrations::create_automation,
+        ),
+        route(
+            Get,
+            "/automations/cron",
+            SignedIn,
+            integrations::cron_preview,
+        ),
+        route(Get, AUTOMATION, SignedIn, integrations::get_automation),
+        route(Put, AUTOMATION, SignedIn, integrations::update_automation),
+        route(
+            Delete,
+            AUTOMATION,
+            SignedIn,
+            integrations::delete_automation,
+        ),
+        route(
+            Post,
+            "/automations/{id}/run",
+            SignedIn,
+            integrations::run_automation,
+        ),
+        route(
+            Get,
+            "/automations/{id}/runs",
+            SignedIn,
+            integrations::automation_runs,
+        ),
         route(Get, "/workflows", SignedIn, api::list_workflows),
         route(Get, "/sessions", SignedIn, api::list_sessions),
         route(Post, "/sessions", SignedIn, api::create_session),

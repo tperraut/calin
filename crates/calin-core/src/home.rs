@@ -47,6 +47,12 @@ impl Home {
         self.root.join("repos.json")
     }
 
+    /// Automations, with their runs and what their triggers have seen
+    /// (integrations spec, section 3). Machine-local: they run here.
+    pub fn automations_path(&self) -> PathBuf {
+        self.root.join("automations.json")
+    }
+
     /// Machine-local settings: the home repo, the scan roots, the clone root.
     pub fn settings_path(&self) -> PathBuf {
         self.root.join("settings.json")
@@ -147,6 +153,10 @@ mod tests {
         assert_eq!(home.work_dir("s1"), PathBuf::from("/data/sessions/s1/work"));
         assert_eq!(home.repos_path(), PathBuf::from("/data/repos.json"));
         assert_eq!(home.settings_path(), PathBuf::from("/data/settings.json"));
+        assert_eq!(
+            home.automations_path(),
+            PathBuf::from("/data/automations.json")
+        );
         assert_eq!(home.default_clone_root(), PathBuf::from("/data/repos"));
     }
 }

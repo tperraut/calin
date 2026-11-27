@@ -1,6 +1,7 @@
 {"native_session":{"id":"uuid-0001","model":"claude-haiku-5-5"}}
 {"event":{"item":{"content":{"input":{"query":"select:TaskCreate,TaskUpdate"},"kind":"tool","locations":[],"name":"ToolSearch","output":null,"title":"ToolSearch","tool_kind":"other"},"id":"toolu-0001","status":"running"},"type":"item_started"}}
 {"event":{"item":{"content":{"input":{"query":"select:TaskCreate,TaskUpdate"},"kind":"tool","locations":[],"name":"ToolSearch","output":"","title":"ToolSearch","tool_kind":"other"},"id":"toolu-0001","status":"completed"},"type":"item_completed"}}
+{"limits":[{"name":"five_hour","refused":false,"resets_at":1800000000000,"used":0.1},{"name":"seven_day","refused":false,"resets_at":1800000000000,"used":0.1}]}
 {"event":{"item":{"content":{"input":{"activeForm":"Reading notes.txt","description":"Read the contents of notes.txt in the working directory","subject":"Read notes.txt"},"kind":"tool","locations":[],"name":"TaskCreate","output":null,"title":"TaskCreate","tool_kind":"other"},"id":"toolu-0002","status":"running"},"type":"item_started"}}
 {"event":{"item":{"content":{"input":{"activeForm":"Reading notes.txt","description":"Read the contents of notes.txt in the working directory","subject":"Read notes.txt"},"kind":"tool","locations":[],"name":"TaskCreate","output":"Task #1 created successfully: Read notes.txt","title":"TaskCreate","tool_kind":"other"},"id":"toolu-0002","status":"completed"},"type":"item_completed"}}
 {"event":{"entries":[{"content":"Read notes.txt","status":"pending"}],"type":"plan_updated"}}

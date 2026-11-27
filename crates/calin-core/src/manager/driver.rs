@@ -16,9 +16,9 @@ use calin_agents::{
 };
 use calin_proto::{
     Agent, AgentKind, AgentMessage, AgentStatus, AttachRepoRequest, DecisionSource, Event,
-    EventBody, FileOp, Item, ItemContent, ItemStatus, MessageKind, PermissionDecision,
-    PermissionMode, PermissionRequest, PullRequest, PullRequestState, Question, Repo, RepoMode,
-    SessionDetail, SessionRepo, SessionStatus, ToolKind,
+    EventBody, FileOp, IssueRef, Item, ItemContent, ItemStatus, LimitWindow, MessageKind,
+    PermissionDecision, PermissionMode, PermissionRequest, PullRequest, PullRequestState, Question,
+    Repo, RepoMode, SessionDetail, SessionRepo, SessionStatus, ToolKind,
 };
 use tokio::sync::{mpsc, oneshot};
 use ulid::Ulid;
@@ -231,6 +231,8 @@ pub(super) struct Driver {
     status: SessionStatus,
     title: String,
     prompt: String,
+    /// The issue the session was started from: its pull requests close it.
+    issue: Option<IssueRef>,
     /// The root of the session's tree: the session itself unless it is a child.
     root_session_id: String,
     runner_id: String,
@@ -362,6 +364,7 @@ impl Driver {
             status: SessionStatus::Queued,
             title: String::new(),
             prompt: String::new(),
+            issue: None,
             root_session_id: String::new(),
             runner_id: String::new(),
             permission_mode: PermissionMode::default(),
@@ -527,6 +530,7 @@ impl Driver {
         self.status = detail.session.status;
         self.title = detail.session.title;
         self.prompt = detail.session.prompt;
+        self.issue = detail.session.issue;
         self.root_session_id = detail.session.root_session_id;
         self.runner_id = detail.session.runner;
         self.permission_mode = detail.session.permission_mode;
@@ -712,6 +716,7 @@ impl Driver {
             Some(RunnerOutput::SubagentEnded { key, ok }) => self.subagent_ended(&key, ok).await,
             Some(RunnerOutput::PermissionRequest(ask)) => self.permission_requested(ask).await,
             Some(RunnerOutput::NativeSession { id, model }) => self.native_session(id, model).await,
+            Some(RunnerOutput::Limits(windows)) => self.limits(windows).await,
             Some(RunnerOutput::TurnEnded) => self.turn_ended().await,
             Some(RunnerOutput::Exited(Exit::Ok)) => self.agent_exited().await,
             Some(RunnerOutput::Exited(Exit::Error(message))) => self.fail(message).await,
@@ -765,7 +770,7 @@ impl Driver {
             let parent = self.parent_title().await.unwrap_or_default();
             briefing::dispatch_text(&parent, &self.prompt)
         } else {
-            self.prompt.clone()
+            self.task()
         };
         self.launch(prompt, cause, reservation)
             .await
@@ -773,6 +778,27 @@ impl Driver {
                 tracing::error!(session = %self.session_id, %err, "could not start the session");
                 Halt
             })
+    }
+
+    /// What the session asks of its agent: the prompt the user wrote, then
+    /// what only the agent is handed (the issue it starts from).
+    fn task(&self) -> String {
+        briefing::with_context(&self.prompt, self.setup.context.as_deref())
+    }
+
+    /// Keeps the agent's report of the plan limits and logs it when the
+    /// rule of the integrations spec, section 1, says to.
+    async fn limits(&mut self, windows: Vec<LimitWindow>) -> Result<()> {
+        let Some(agent_id) = self.lead.as_ref().map(|lead| lead.id.clone()) else {
+            return Ok(());
+        };
+        let now = self.inner.config.clock.now_ms();
+        let board = &self.inner.limits;
+        if board.report(&self.runner_id, &self.session_id, &agent_id, &windows, now) {
+            let draft = self.by_agent(EventBody::Limits { windows });
+            self.append(draft.parent(self.cause.clone())).await?;
+        }
+        Ok(())
     }
 
     /// The title of the session that dispatched this one, when one did.
@@ -905,7 +931,7 @@ impl Driver {
         } else {
             // No agent ever saw the prompt (the session failed before one
             // started), so the message alone would have no context.
-            format!("{}\n\n{}", self.prompt, next.text)
+            format!("{}\n\n{}", self.task(), next.text)
         };
         self.launch(text, next.event_id, None).await
     }
@@ -1607,6 +1633,7 @@ impl Driver {
                                 .await?;
                             self.expire(open).await?;
                         }
+                        Some(RunnerOutput::Limits(windows)) => self.limits(windows).await?,
                         Some(RunnerOutput::NativeSession { id, model }) => {
                             self.native_session(id, model).await?;
                         }
@@ -2148,6 +2175,10 @@ impl Driver {
                 model: with.model.or_else(|| self.setup.model.clone()),
                 repos,
                 dispatch: Some(link.clone()),
+                // A child's work is its parent's: the parent's pull request closes the issue.
+                issue: None,
+                context: None,
+                automation_id: None,
             })
             .await?;
         let message = AgentMessage {
@@ -2695,6 +2726,7 @@ impl Driver {
                 .iter()
                 .map(|repo| (repo.clone(), known(repo)))
                 .collect(),
+            issue: self.issue.clone(),
         };
         let (results, receiver) = mpsc::channel(8);
         let cancel = Arc::new(AtomicBool::new(false));

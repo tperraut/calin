@@ -104,7 +104,7 @@ pub use delivery::{
 };
 pub use error::{Error, Result};
 pub use files::{list_dir, read_file, write_file};
-pub use github::{GitHub, PullRequestInfo};
+pub use github::{GitHub, IssueQuery, PullRequestInfo, PullRequestItem, on_github};
 pub use path::resolve_path;
 pub use repo::{CloneInfo, head_commit, inspect_clone};
 pub use setup::{CHECK_OUTPUT_CAP, CheckEnd, CheckRun, SetupEnd, SetupRun, run_check, run_setup};

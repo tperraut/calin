@@ -7,10 +7,13 @@
 //! before it is indexed or shown to anyone, and the index can always be
 //! rebuilt from the logs.
 
+mod automations;
 mod briefing;
+mod clock;
 mod error;
 mod home;
 mod json_file;
+mod limits;
 mod manager;
 mod policy;
 mod repos;
@@ -23,6 +26,7 @@ mod tokens;
 mod workflows;
 mod workspace;
 
+pub use clock::{Clock, ManualClock, SharedClock, SystemClock, TimeZone};
 pub use error::{Error, Result};
 pub use home::{ENV_HOME, Home, HomeError, resolve_home};
 pub use manager::{

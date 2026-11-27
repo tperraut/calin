@@ -19,6 +19,9 @@ use crate::home::Home;
 use crate::testing::{git, git_repo, write_file};
 
 mod attach;
+mod automations;
+mod issues;
+mod limits;
 mod orchestration;
 mod queue;
 mod shipping;
@@ -132,6 +135,7 @@ fn request_in(mode: PermissionMode, prompt: &str, runner: Option<&str>) -> Creat
         model: None,
         permission_mode: Some(mode),
         workflow: None,
+        issue: None,
         repos: Vec::new(),
     }
 }
@@ -210,6 +214,7 @@ fn label(event: &Event) -> String {
         EventBody::ItemCompleted { .. } => "item_completed".to_owned(),
         EventBody::PlanUpdated { .. } => "plan_updated".to_owned(),
         EventBody::Usage { .. } => "usage".to_owned(),
+        EventBody::Limits { .. } => "limits".to_owned(),
         EventBody::Error { message } => format!("error:{message}"),
         EventBody::AgentSession { .. } => "agent_session".to_owned(),
         EventBody::RepoAttached { repo } => format!("repo_attached:{}", repo.name),
@@ -430,7 +435,8 @@ async fn a_new_session_runs_one_turn_and_waits_for_review() {
             | EventBody::ItemDelta { .. }
             | EventBody::ItemCompleted { .. }
             | EventBody::PlanUpdated { .. }
-            | EventBody::Usage { .. } => {
+            | EventBody::Usage { .. }
+            | EventBody::Limits { .. } => {
                 // The prompt caused the turn.
                 assert_eq!(event.parent_id.as_ref(), Some(&events[1].id));
                 if event.agent_id.as_ref() == Some(&subagent.id) {

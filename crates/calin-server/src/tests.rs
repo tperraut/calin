@@ -31,6 +31,7 @@ use super::*;
 
 mod catalog;
 mod delivery;
+mod integrations;
 mod orchestration;
 mod signin;
 mod workflows;
@@ -901,6 +902,7 @@ async fn new_session(state: &AppState, prompt: &str) -> String {
         model: None,
         permission_mode: Some(PermissionMode::Autonomous),
         workflow: None,
+        issue: None,
         repos: Vec::new(),
     };
     let detail = state.manager().create_session(request).await.unwrap();

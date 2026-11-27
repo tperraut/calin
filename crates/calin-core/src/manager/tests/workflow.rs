@@ -2104,7 +2104,14 @@ async fn a_restart_ends_the_run_where_it_was_and_the_session_goes_on_plain() {
     let mut lead = Lead::default();
     lead.prompt(&mut starts).await;
     lead.say("Half way.").await;
-    events_until(&manager, &id, 0, |event| label(event) == "item_completed").await;
+    // The lead's own item: the run records an item of its own before it.
+    events_until(
+        &manager,
+        &id,
+        0,
+        |event| matches!(&event.body, EventBody::ItemCompleted { item } if item.id == "said-1"),
+    )
+    .await;
     let before = manager.get(&id).await.unwrap().session.head_seq;
     // The process dies here.
     manager.store().close().await;

@@ -1,6 +1,7 @@
 {"native_session":{"id":"uuid-0001","model":"claude-haiku-5-5"}}
 {"event":{"item":{"content":{"input":{"description":"Read first line of notes.txt","prompt":"Read the file notes.txt in the current directory and reply with its first line only.","run_in_background":false,"subagent_type":"general-purpose"},"kind":"tool","locations":[],"name":"Agent","output":null,"title":"Read first line of notes.txt","tool_kind":"task"},"id":"toolu-0001","status":"running"},"type":"item_started"}}
 {"subagent_started":{"description":"Read first line of notes.txt","item_id":"toolu-0001","key":"toolu-0001","parent":null,"role":"general-purpose"}}
+{"limits":[{"name":"five_hour","refused":false,"resets_at":1800000000000,"used":0.1},{"name":"seven_day","refused":false,"resets_at":1800000000000,"used":0.1}]}
 {"subagent_event":{"event":{"item":{"content":{"input":{"file_path":"/work/notes.txt","limit":1},"kind":"tool","locations":["/work/notes.txt"],"name":"Read","output":null,"title":"notes.txt","tool_kind":"read"},"id":"toolu-0002","status":"running"},"type":"item_started"},"key":"toolu-0001"}}
 {"subagent_event":{"event":{"item":{"content":{"input":{"file_path":"/work/notes.txt","limit":1},"kind":"tool","locations":["/work/notes.txt"],"name":"Read","output":"1\tCalin fixture note.","title":"notes.txt","tool_kind":"read"},"id":"toolu-0002","status":"completed"},"type":"item_completed"},"key":"toolu-0001"}}
 {"subagent_ended":{"key":"toolu-0001","ok":true}}

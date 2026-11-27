@@ -6,8 +6,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use calin_proto::{
-    EventBody, Item, ItemContent, ItemDelta, ItemStatus, PermissionDecision, PermissionMode,
-    PermissionRequest, PlanEntry, PlanStatus, ToolKind,
+    EventBody, Item, ItemContent, ItemDelta, ItemStatus, LimitWindow, PermissionDecision,
+    PermissionMode, PermissionRequest, PlanEntry, PlanStatus, ToolKind,
 };
 use serde_json::json;
 use tokio::sync::mpsc::error::TryRecvError;
@@ -34,6 +34,10 @@ const DEFAULT_DELAY: Duration = Duration::from_millis(40);
 
 /// How much of the user's text the scripted answer quotes back.
 const QUOTE_CHARS: usize = 120;
+
+/// The one limit window the mock reports, named like the CLI's.
+const MOCK_WINDOW: &str = "five_hour";
+const FIVE_HOURS_MS: i64 = 5 * 60 * 60 * 1000;
 
 const PLAN: [&str; 3] = [
     "Run the test suite",
@@ -293,6 +297,12 @@ impl MockAgent {
             tokens_in: 1200 * self.turns,
             tokens_out: 350 * self.turns,
         })
+        .await?;
+        // So that a dry run shows the plan limits too.
+        self.send(RunnerOutput::Limits(vec![mock_window(
+            self.turns,
+            now_ms(),
+        )]))
         .await
     }
 
@@ -662,6 +672,24 @@ async fn append_line(path: PathBuf, line: String) -> Result<(), String> {
     written.unwrap_or_else(|err| Err(format!("the edit did not run: {err}")))
 }
 
+/// A plausible window: a little more used each turn, resetting at the end
+/// of the current five-hour stretch of the clock.
+fn mock_window(turns: u64, now_ms: i64) -> LimitWindow {
+    LimitWindow {
+        name: MOCK_WINDOW.to_owned(),
+        // In whole points, as a person would read them.
+        used: (10 + 2 * turns).min(95) as f64 / 100.0,
+        resets_at: Some((now_ms.div_euclid(FIVE_HOURS_MS) + 1) * FIVE_HOURS_MS),
+        refused: false,
+    }
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as i64)
+}
+
 /// The first line of the user's text, short enough to quote.
 fn quote(text: &str) -> String {
     let line = text.trim().lines().next().unwrap_or_default().trim();
@@ -756,6 +784,8 @@ mod tests {
         requests: Vec<PermissionRequest>,
         /// What each request said it reaches for, in the order of `requests`.
         access: Vec<ToolAccess>,
+        /// What the agent reported of the plan's limits.
+        limits: Vec<Vec<LimitWindow>>,
     }
 
     async fn run_turn(
@@ -767,6 +797,7 @@ mod tests {
             outputs: Vec::new(),
             requests: Vec::new(),
             access: Vec::new(),
+            limits: Vec::new(),
         };
         loop {
             match next(handle).await {
@@ -798,6 +829,7 @@ mod tests {
                     turn.requests.push(request);
                 }
                 Some(RunnerOutput::NativeSession { .. }) => {}
+                Some(RunnerOutput::Limits(windows)) => turn.limits.push(windows),
                 Some(RunnerOutput::TurnEnded) => return turn,
                 other => panic!("unexpected output {other:?}"),
             }
@@ -925,6 +957,45 @@ mod tests {
 
     fn allow(_: &PermissionRequest) -> (PermissionDecision, Option<String>) {
         (PermissionDecision::Allow, None)
+    }
+
+    #[tokio::test]
+    async fn every_turn_reports_one_plausible_limit_window() {
+        let mut handle = start(Duration::ZERO, "first");
+        let first = run_turn(&mut handle, allow).await;
+        handle.send_message("second").unwrap();
+        let second = run_turn(&mut handle, allow).await;
+        let [first] = first.limits.as_slice() else {
+            panic!("one report per turn: {:?}", first.limits);
+        };
+        let [second] = second.limits.as_slice() else {
+            panic!("one report per turn: {:?}", second.limits);
+        };
+        for windows in [first, second] {
+            let [window] = windows.as_slice() else {
+                panic!("one window: {windows:?}");
+            };
+            assert_eq!(window.name, MOCK_WINDOW);
+            assert!(!window.refused);
+            assert!((0.0..1.0).contains(&window.used), "{window:?}");
+            let resets_at = window.resets_at.expect("a reset time");
+            let now = now_ms();
+            assert!(
+                resets_at > now && resets_at <= now + FIVE_HOURS_MS,
+                "{window:?}"
+            );
+        }
+        // Used grows with the work done.
+        assert!(second[0].used > first[0].used);
+        assert_eq!(mock_window(100, 0).used, 0.95);
+        assert_eq!(
+            mock_window(1, FIVE_HOURS_MS - 1).resets_at,
+            Some(FIVE_HOURS_MS)
+        );
+        assert_eq!(
+            mock_window(1, FIVE_HOURS_MS).resets_at,
+            Some(2 * FIVE_HOURS_MS)
+        );
     }
 
     #[tokio::test]
@@ -1633,6 +1704,8 @@ mod tests {
         loop {
             match agent.next().await {
                 Some(RunnerOutput::TurnEnded) => break,
+                // Reported for the process, not part of the turn's work.
+                Some(RunnerOutput::Limits(_)) => {}
                 Some(output) => second.push(output),
                 None => panic!("the agent ended early"),
             }

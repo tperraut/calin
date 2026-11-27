@@ -103,6 +103,10 @@ fn describe(output: &RunnerOutput) -> String {
         },
         RunnerOutput::SubagentEnded { key, ok } => format!("subagent_ended {key} ok={ok}"),
         RunnerOutput::NativeSession { id, model } => format!("native_session {id} model={model:?}"),
+        RunnerOutput::Limits(windows) => match serde_json::to_string(windows) {
+            Ok(json) => format!("limits {json}"),
+            Err(err) => format!("limits that do not serialize: {err}"),
+        },
         RunnerOutput::TurnEnded => "turn_ended".to_owned(),
         RunnerOutput::Exited(exit) => format!("exited {exit:?}"),
     };

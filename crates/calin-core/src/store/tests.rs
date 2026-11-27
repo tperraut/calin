@@ -13,6 +13,7 @@ use tokio::task::JoinSet;
 use super::writer::{LIVE_BUFFER, UPSERT_INTERVAL};
 use super::*;
 
+mod usage;
 mod views;
 
 const TIMEOUT: Duration = Duration::from_secs(20);
@@ -31,6 +32,9 @@ fn new_session(prompt: &str) -> NewSession {
         model: None,
         repos: Vec::new(),
         dispatch: None,
+        issue: None,
+        context: None,
+        automation_id: None,
     }
 }
 
@@ -682,6 +686,7 @@ async fn what_a_session_was_created_with_survives_a_reindex() {
         model: Some("opus".to_owned()),
         repos: wanted,
         dispatch: None,
+        context: None,
     };
     assert_eq!(store.setup(&configured.id).await.unwrap(), expected);
     assert_eq!(

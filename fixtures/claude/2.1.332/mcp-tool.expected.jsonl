@@ -1,6 +1,7 @@
 {"native_session":{"id":"uuid-0001","model":"claude-haiku-5-5"}}
 {"event":{"item":{"content":{"input":{},"kind":"tool","locations":[],"name":"mcp__calin__list_repos","output":null,"title":"mcp__calin__list_repos","tool_kind":"other"},"id":"toolu-0001","status":"running"},"type":"item_started"}}
 {"access":"orchestrator","permission_request":{"id":"uuid-0009","input":{},"item_id":"toolu-0001","title":"mcp__calin__list_repos","tool_kind":"other","tool_name":"mcp__calin__list_repos"}}
+{"limits":[{"name":"five_hour","refused":false,"resets_at":1800000000000,"used":0.1},{"name":"seven_day","refused":false,"resets_at":1800000000000,"used":0.1}]}
 {"event":{"item":{"content":{"input":{},"kind":"tool","locations":[],"name":"mcp__calin__list_repos","output":"api (attached, primary)\nweb (available)\ndocs (not cloned)","title":"mcp__calin__list_repos","tool_kind":"other"},"id":"toolu-0001","status":"completed"},"type":"item_completed"}}
 {"event":{"item":{"content":{"input":{"query":"select:mcp__calin__attach_repo"},"kind":"tool","locations":[],"name":"ToolSearch","output":null,"title":"ToolSearch","tool_kind":"other"},"id":"toolu-0002","status":"running"},"type":"item_started"}}
 {"event":{"item":{"content":{"input":{"query":"select:mcp__calin__attach_repo"},"kind":"tool","locations":[],"name":"ToolSearch","output":"","title":"ToolSearch","tool_kind":"other"},"id":"toolu-0002","status":"completed"},"type":"item_completed"}}

@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use calin_proto::{EventBody, PermissionDecision, PermissionMode, PermissionRequest};
+use calin_proto::{EventBody, LimitWindow, PermissionDecision, PermissionMode, PermissionRequest};
 use tokio::sync::mpsc;
 
 /// Outputs buffered between an agent and the orchestrator. Small on purpose:
@@ -152,6 +152,10 @@ pub enum RunnerOutput {
     /// when the runner knows it. Sent when first known and again whenever
     /// either changes; store the id and pass it as [`StartParams::resume`].
     NativeSession { id: String, model: Option<String> },
+    /// The plan's limit windows as the agent's CLI reports them, for the
+    /// whole process like `Usage`. Sent whenever the CLI reports them; the
+    /// orchestrator decides what is worth recording.
+    Limits(Vec<LimitWindow>),
     /// The agent answered the current user message and waits for the next one.
     TurnEnded,
     /// The agent is gone. Always the last output.

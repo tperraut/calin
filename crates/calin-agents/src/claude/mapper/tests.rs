@@ -117,6 +117,7 @@ fn to_json(output: &RunnerOutput) -> Value {
         RunnerOutput::NativeSession { id, model } => {
             json!({ "native_session": { "id": id, "model": model } })
         }
+        RunnerOutput::Limits(windows) => json!({ "limits": windows }),
         RunnerOutput::TurnEnded => json!("turn_ended"),
         RunnerOutput::Exited(exit) => json!({ "exited": format!("{exit:?}") }),
     }
@@ -326,6 +327,12 @@ fn check_invariants(name: &str, outputs: &[RunnerOutput]) -> usize {
             }
             (RunnerOutput::Exited(_), _) => panic!("{name}: a mapper never reports an exit"),
             (RunnerOutput::NativeSession { .. }, _) => {}
+            (RunnerOutput::Limits(windows), _) => {
+                assert!(!windows.is_empty(), "{name}: limits without a window");
+                for window in windows {
+                    assert!((0.0..=1.0).contains(&window.used), "{name}: {window:?}");
+                }
+            }
             (RunnerOutput::Event(_) | RunnerOutput::SubagentEvent { .. }, None) => {
                 unreachable!("an event has a body")
             }
@@ -2367,6 +2374,123 @@ fn streamed_text_and_plans_inside_a_subagent_are_its_own() {
             (Some("a1"), "plan"),
             (None, "started"),
             (None, "delta"),
+        ]
+    );
+}
+
+fn limits(outputs: &[RunnerOutput]) -> Vec<Vec<LimitWindow>> {
+    outputs
+        .iter()
+        .filter_map(|output| match output {
+            RunnerOutput::Limits(windows) => Some(windows.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_recorded_rate_limit_event_reports_every_window() {
+    // The line as CLI 2.1.332 printed it (numbers normalized by the scrubber).
+    let recorded = records(&fixture("read-and-shell"))
+        .into_iter()
+        .find(|(dir, message)| *dir == Dir::Out && message["type"] == "rate_limit_event")
+        .expect("the fixture holds a rate_limit_event")
+        .1;
+    let reported = limits(&mapper().message(&recorded));
+    let window = |name: &str| LimitWindow {
+        name: name.to_owned(),
+        used: 0.1,
+        resets_at: Some(1_800_000_000_000),
+        refused: false,
+    };
+    assert_eq!(reported, [vec![window("five_hour"), window("seven_day")]]);
+}
+
+#[test]
+fn limit_windows_keep_unknown_names_and_say_when_requests_are_refused() {
+    let event = |info: Value| json!({ "type": "rate_limit_event", "rate_limit_info": info });
+    let mut mapper = mapper();
+    let outputs = feed(
+        &mut mapper,
+        &[event(json!({
+            "status": "rejected",
+            "unifiedWindows": {
+                "five_hour": { "status": "rejected", "utilization": 1.0, "resetsAt": 1_764_000_000 },
+                // A window this mapper has never heard of, without a reset time.
+                "opus_weekly": { "status": "allowed_warning", "utilization": 0.82 },
+                // Refused without saying how much is used: full.
+                "seven_day": { "status": "rejected" },
+                // Says nothing worth showing.
+                "mystery": { "status": "allowed" },
+                "": { "status": "rejected", "utilization": 1.0 },
+                "odd": "not an object",
+            },
+        }))],
+    );
+    assert_eq!(
+        limits(&outputs),
+        [vec![
+            LimitWindow {
+                name: "five_hour".into(),
+                used: 1.0,
+                resets_at: Some(1_764_000_000_000),
+                refused: true,
+            },
+            LimitWindow {
+                name: "opus_weekly".into(),
+                used: 0.82,
+                resets_at: None,
+                refused: false,
+            },
+            LimitWindow {
+                name: "seven_day".into(),
+                used: 1.0,
+                resets_at: None,
+                refused: true,
+            },
+        ]]
+    );
+    // Nothing else comes of it: no event, no turn end.
+    assert_eq!(outputs.len(), 1);
+}
+
+#[test]
+fn a_rate_limit_event_without_unified_windows_describes_its_own() {
+    let mut mapper = mapper();
+    let outputs = feed(
+        &mut mapper,
+        &[
+            json!({ "type": "rate_limit_event", "rate_limit_info": {
+                "rateLimitType": "seven_day", "status": "allowed", "utilization": 0.4,
+                "resetsAt": 1_764_000_000_123_i64,
+            }}),
+            // Out of range values are held to the range; strings are not numbers.
+            json!({ "type": "rate_limit_event", "rate_limit_info": {
+                "rateLimitType": "five_hour", "status": "allowed", "utilization": 7.5,
+                "resetsAt": "soon",
+            }}),
+            json!({ "type": "rate_limit_event", "rate_limit_info": {
+                "unifiedWindows": {}, "rateLimitType": "five_hour", "utilization": -1,
+            }}),
+            // Nothing to describe.
+            json!({ "type": "rate_limit_event", "rate_limit_info": { "status": "allowed" } }),
+            json!({ "type": "rate_limit_event", "rate_limit_info": "full" }),
+            json!({ "type": "rate_limit_event" }),
+        ],
+    );
+    let window = |name: &str, used: f64, resets_at: Option<i64>| LimitWindow {
+        name: name.into(),
+        used,
+        resets_at,
+        refused: false,
+    };
+    assert_eq!(
+        limits(&outputs),
+        [
+            // Already in milliseconds: taken as it is.
+            vec![window("seven_day", 0.4, Some(1_764_000_000_123))],
+            vec![window("five_hour", 1.0, None)],
+            vec![window("five_hour", 0.0, None)],
         ]
     );
 }

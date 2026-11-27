@@ -2003,6 +2003,7 @@ async fn in_public_mode_agents_are_still_given_the_loopback_address() {
         model: None,
         permission_mode: None,
         workflow: None,
+        issue: None,
         repos: Vec::new(),
     };
     state.manager().create_session(request).await.unwrap();
