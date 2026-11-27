@@ -436,6 +436,29 @@ async fn usage_of_an_agent_the_log_never_announced_is_all_new_on_the_sessions_ru
 }
 
 #[tokio::test]
+async fn an_agent_the_log_never_announced_is_counted_by_what_its_totals_grew() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir).await;
+    let id = store.create_session(new_session("ghost")).await.unwrap().id;
+    store.close().await;
+    let home = Home::new(dir.path());
+    let at = local("2026-11-11T10:00:00");
+    write_log(
+        &home,
+        &id,
+        vec![
+            (at, Some("ghost"), totals(0.5, 50, 5)),
+            (at + 1_000, Some("ghost"), totals(0.75, 80, 8)),
+        ],
+    );
+
+    let store = Store::open(home).await.unwrap();
+    let usage = store.usage(query(FROM, TO, UsageBy::Runner)).await.unwrap();
+    // Totals are cumulative per agent: the second report adds what grew.
+    assert_eq!(usage.rows, [row("mock", "mock", 0.75, (80, 8), 1)]);
+}
+
+#[tokio::test]
 async fn the_default_range_includes_what_was_spent_just_now() {
     let spent = spent().await;
     // The moment `d` reported its usage.

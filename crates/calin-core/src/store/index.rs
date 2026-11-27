@@ -1159,24 +1159,41 @@ fn totals_before(db: &Connection, event: &Event, agent_id: &str) -> Result<Known
     if let Some(known) = known {
         return Ok(known);
     }
-    // An agent the log never announced: all of it is new, on the session's runner.
+    // An agent the log never announced, on the session's runner: it has
+    // what it last reported, or nothing before its first report.
+    let before = db
+        .prepare_cached(
+            "SELECT cost_usd, tokens_in, tokens_out FROM agent_states \
+             WHERE session_id = ?1 AND agent_id = ?2 AND cost_usd IS NOT NULL \
+             ORDER BY seq DESC LIMIT 1",
+        )?
+        .query_row([&event.session_id, agent_id], totals_from_row)
+        .optional()?;
     let runner: Option<String> = query_optional(
         db,
         "SELECT runner FROM sessions WHERE id = ?1",
         [&event.session_id],
     )?;
-    Ok(((0.0, 0, 0), runner.unwrap_or_default(), None))
+    Ok((
+        before.unwrap_or((0.0, 0, 0)),
+        runner.unwrap_or_default(),
+        None,
+    ))
 }
 
 fn known_totals_from_row(row: &Row<'_>) -> rusqlite::Result<KnownTotals> {
+    Ok((totals_from_row(row)?, row.get(3)?, row.get(4)?))
+}
+
+/// Cost and tokens in the first three columns.
+fn totals_from_row(row: &Row<'_>) -> rusqlite::Result<(f64, u64, u64)> {
     let tokens_in: i64 = row.get(1)?;
     let tokens_out: i64 = row.get(2)?;
-    let before = (
+    Ok((
         row.get(0)?,
         tokens_in.max(0) as u64,
         tokens_out.max(0) as u64,
-    );
-    Ok((before, row.get(3)?, row.get(4)?))
+    ))
 }
 
 /// What `now` adds to `before`, two readings of an agent's running totals.
