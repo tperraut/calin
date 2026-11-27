@@ -16,6 +16,7 @@ import type { RepoSet } from "../gen/RepoSet";
 import type { Settings } from "../gen/Settings";
 import { errorMessage } from "../lib/errors";
 import { createRequest } from "../lib/request";
+import { themeChoices, themeState } from "../lib/theme";
 import { blameSettingsField, settingsFromForm, type SettingsBlame } from "../lib/settings";
 import { problemLines, stepCount } from "../lib/workflow";
 import { AppContext, type RepoRegistry, type WorkflowCatalog } from "../state/app";
@@ -498,6 +499,35 @@ function HomeRepoExplained() {
 }
 
 /** `/settings`: where this machine keeps its repos, and what the home repo declares. */
+/** Light, dark or the system's setting; kept in this browser, applied at once. */
+function AppearanceSettings() {
+  const theme = themeState();
+  const group = createUniqueId();
+  return (
+    <fieldset class="flex flex-col gap-2">
+      <legend class="mb-1.5 text-sm font-medium">Theme</legend>
+      <div class="flex flex-wrap gap-2">
+        <For each={themeChoices}>
+          {(one) => (
+            <label class="choice items-center gap-2">
+              <input
+                type="radio"
+                name={group}
+                value={one.choice}
+                class="size-5 accent-accent"
+                checked={theme.choice() === one.choice}
+                onChange={() => theme.setChoice(one.choice)}
+              />
+              {one.label}
+            </label>
+          )}
+        </For>
+      </div>
+      <p class={hint}>System follows this device's light or dark setting.</p>
+    </fieldset>
+  );
+}
+
 export default function SettingsPage() {
   const app = useContext(AppContext);
   const summaryId = createUniqueId();
@@ -527,6 +557,7 @@ export default function SettingsPage() {
           </a>
           <h1 class="text-lg font-semibold">Settings</h1>
         </header>
+        <AppearanceSettings />
         <Switch>
           <Match when={failed()}>
             {(failure) => (

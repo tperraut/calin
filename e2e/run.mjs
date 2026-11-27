@@ -281,6 +281,34 @@ try {
   );
   await m2.shot("settings");
 
+  // ---- The theme: chosen in Settings, applied at once, kept across a reload.
+  const shown = () =>
+    page.evaluate(() => [document.documentElement.dataset.theme, getComputedStyle(document.documentElement).backgroundColor]);
+  await page.emulateMedia({ colorScheme: "light" });
+  const [, lightBackground] = await shown();
+  await page.getByRole("radio", { name: "Dark" }).check();
+  const chosen = await shown();
+  check("choosing Dark darkens the page at once", chosen[0] === "dark" && chosen[1] !== lightBackground, JSON.stringify(chosen));
+  await page.reload();
+  await page.waitForSelector('[aria-label="Settings"]');
+  const afterReload = await shown();
+  check(
+    "the theme choice survives a reload",
+    afterReload[0] === "dark" && afterReload[1] === chosen[1] && (await page.getByRole("radio", { name: "Dark" }).isChecked()),
+    JSON.stringify(afterReload),
+  );
+  await page.getByRole("radio", { name: "System" }).check();
+  // The system's change reaches the page as an event: wait for it rather than read at once.
+  const themeBecomes = (theme) =>
+    page
+      .waitForFunction((t) => document.documentElement.dataset.theme === t, theme, { timeout: 5000 })
+      .then(() => true, () => false);
+  await page.emulateMedia({ colorScheme: "dark" });
+  const followsDark = await themeBecomes("dark");
+  await page.emulateMedia({ colorScheme: "light" });
+  const followsLight = await themeBecomes("light");
+  check("System follows the device's setting", followsDark && followsLight, `${followsDark} ${followsLight}`);
+
   await page.goto(`${base}/`);
   await page.waitForSelector(PROMPT);
   await page.fill(PROMPT, "Tidy the notes");

@@ -36,13 +36,14 @@ import {
   lineNumbers,
 } from "@codemirror/view";
 import { tags } from "@lezer/highlight";
+import { pageTheme, watchTheme } from "../../lib/theme";
 import "./editor.css";
 import { languageFor } from "./languages";
 import { minimalChange } from "./textChange";
 import type { DiffHandle, DiffOptions, EditorHandle, EditorModule, EditorOptions } from "./types";
 
 // Colors are the app's own custom properties (index.css, editor.css), so both
-// themes come from the stylesheet and follow the system setting on their own.
+// themes come from the stylesheet and follow the page's theme on their own.
 const theme = EditorView.theme({
   "&": { height: "100%", color: "var(--fg)", backgroundColor: "var(--surface)", fontSize: "13px" },
   "&.cm-focused": { outline: "2px solid var(--accent)", outlineOffset: "-2px" },
@@ -121,21 +122,18 @@ const highlight = HighlightStyle.define([
 
 const external = Annotation.define<boolean>();
 
-/** CodeMirror picks some of its own defaults by this flag; it follows the system like the rest. */
+/** CodeMirror picks some of its own defaults by this flag; it follows the page's theme. */
 function followScheme(views: () => readonly EditorView[], compartment: Compartment): () => void {
-  if (typeof matchMedia !== "function") return () => {};
-  const query = matchMedia("(prefers-color-scheme: dark)");
-  const apply = (): void => {
+  return watchTheme((theme) => {
     for (const view of views()) {
-      view.dispatch({ effects: compartment.reconfigure(EditorView.darkTheme.of(query.matches)) });
+      view.dispatch({
+        effects: compartment.reconfigure(EditorView.darkTheme.of(theme === "dark")),
+      });
     }
-  };
-  query.addEventListener("change", apply);
-  return () => query.removeEventListener("change", apply);
+  });
 }
 
-const isDark = (): boolean =>
-  typeof matchMedia === "function" && matchMedia("(prefers-color-scheme: dark)").matches;
+const isDark = (): boolean => pageTheme() === "dark";
 
 /** Fetches the grammar for `path`, if there is one, and hands it over. */
 function loadLanguage(path: string, apply: (language: Extension) => void): void {

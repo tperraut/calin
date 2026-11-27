@@ -18,24 +18,22 @@
   --syntax-property: #7a4a12;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --editor-selection: #2c3d66;
-    --editor-active-line: #222320;
-    --editor-match: #34362f;
-    --diff-added: #17301e;
-    --diff-added-strong: #23592f;
-    --diff-removed: #3a1c1a;
-    --diff-removed-strong: #6e2b26;
+:root[data-theme="dark"] {
+  --editor-selection: #2c3d66;
+  --editor-active-line: #222320;
+  --editor-match: #34362f;
+  --diff-added: #17301e;
+  --diff-added-strong: #23592f;
+  --diff-removed: #3a1c1a;
+  --diff-removed-strong: #6e2b26;
 
-    --syntax-keyword: #d7a0f0;
-    --syntax-string: #8fd6a2;
-    --syntax-number: #f0b072;
-    --syntax-comment: #9b9b93;
-    --syntax-type: #7fd0e0;
-    --syntax-function: #9dbcff;
-    --syntax-property: #e0c08a;
-  }
+  --syntax-keyword: #d7a0f0;
+  --syntax-string: #8fd6a2;
+  --syntax-number: #f0b072;
+  --syntax-comment: #9b9b93;
+  --syntax-type: #7fd0e0;
+  --syntax-function: #9dbcff;
+  --syntax-property: #e0c08a;
 }
 
 /* The search panel: the app's controls, at the app's touch size. */

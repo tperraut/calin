@@ -7,10 +7,14 @@ import { createSocket } from "./api/socket";
 import { createTerminalOpener } from "./api/terminal";
 import { browserDevice } from "./lib/device";
 import { registerWorker } from "./lib/serviceWorker";
+import { themeState } from "./lib/theme";
 import { createAppState } from "./state/app";
 
 const root = document.getElementById("root");
 if (!root) throw new Error("index.html has no #root element");
+
+// public/theme.js set the theme already; this keeps it current and colors the browser's chrome.
+themeState();
 
 // The development server serves modules, not a build: no worker there (remote-access spec, section 6).
 const workerEnabled = import.meta.env.PROD && "serviceWorker" in navigator;

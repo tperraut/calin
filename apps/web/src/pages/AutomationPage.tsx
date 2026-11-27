@@ -337,7 +337,7 @@ function AutomationEditor(props: {
         <div class="flex flex-wrap gap-2">
           <For each={triggerKinds}>
             {(one) => (
-              <label class="flex min-h-11 cursor-pointer items-center gap-2 rounded-md border border-line px-3 has-checked:border-accent has-checked:bg-accent-soft">
+              <label class="choice items-center gap-2">
                 <input
                   type="radio"
                   name={kindGroup}

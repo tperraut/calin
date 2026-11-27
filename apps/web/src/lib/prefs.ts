@@ -1,6 +1,7 @@
 import type { PermissionMode } from "../gen/PermissionMode";
 import type { RepoMode } from "../gen/RepoMode";
 import { permissionModes, repoModes } from "./status";
+import type { ThemeChoice } from "./theme";
 
 export type RepoChoice = { repoId: string; mode: RepoMode };
 
@@ -26,6 +27,7 @@ const COMPOSER_KEY_V1 = "calin.composer.v1";
 const SIDE_PANE_KEY = "calin.sidePane.v1";
 const DIFF_LAYOUT_KEY = "calin.diffLayout.v1";
 const EDITOR_WRAP_KEY = "calin.editorWrap.v1";
+export const THEME_KEY = "calin.theme.v1";
 
 // Storage can be missing, full or forbidden (private windows, blocked site
 // data). Every access is guarded: the app works the same, it just forgets.
@@ -114,4 +116,14 @@ export function loadEditorWrap(): boolean | undefined {
 
 export function saveEditorWrap(wrap: boolean): void {
   write(EDITOR_WRAP_KEY, wrap);
+}
+
+/** Light, dark, or the system's setting (the default). `public/theme.js` reads it too. */
+export function loadThemeChoice(): ThemeChoice {
+  const stored = read(THEME_KEY);
+  return stored === "light" || stored === "dark" ? stored : "system";
+}
+
+export function saveThemeChoice(choice: ThemeChoice): void {
+  write(THEME_KEY, choice);
 }

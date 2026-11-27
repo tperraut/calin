@@ -45,6 +45,7 @@ const publicFiles = [
   "icons/icon-maskable-512.png",
   "icons/badge-96.png",
   "robots.txt",
+  "theme.js",
 ];
 
 describe("the pre-cache list", () => {
@@ -63,6 +64,7 @@ describe("the pre-cache list", () => {
       "/icons/icon-maskable-512.png",
       "/index.html",
       "/manifest.webmanifest",
+      "/theme.js",
     ]);
   });
 

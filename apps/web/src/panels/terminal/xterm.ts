@@ -3,6 +3,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { Terminal, type ITheme } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
+import { watchTheme } from "../../lib/theme";
 import "./terminal.css";
 import {
   TERMINAL_FONT,
@@ -13,7 +14,7 @@ import {
 } from "./types";
 
 // xterm paints with concrete colors, so the tokens are read from the stylesheet
-// (index.css, terminal.css) and read again when the system theme changes.
+// (index.css, terminal.css) and read again when the theme changes.
 function theme(): ITheme {
   const style = getComputedStyle(document.documentElement);
   const token = (name: string): string => style.getPropertyValue(name).trim();
@@ -61,11 +62,9 @@ function createTerminalView(parent: HTMLElement, options: TerminalViewOptions): 
     terminal.onBinary((data) => options.onBytes(Uint8Array.from(data, (c) => c.charCodeAt(0)))),
   ];
 
-  const scheme = matchMedia("(prefers-color-scheme: dark)");
-  const retheme = (): void => {
+  const unwatch = watchTheme(() => {
     terminal.options.theme = theme();
-  };
-  scheme.addEventListener("change", retheme);
+  });
 
   return {
     write(data) {
@@ -87,7 +86,7 @@ function createTerminalView(parent: HTMLElement, options: TerminalViewOptions): 
     },
     applicationCursorKeys: () => terminal.modes.applicationCursorKeysMode,
     dispose() {
-      scheme.removeEventListener("change", retheme);
+      unwatch();
       for (const subscription of subscriptions) subscription.dispose();
       terminal.dispose();
     },

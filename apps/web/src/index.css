@@ -1,11 +1,12 @@
 @import "tailwindcss";
 
 /*
- * Every color is a custom property, so the theme follows the system setting
- * with no class toggling. Text tokens keep at least 4.5:1 against --bg and --surface.
+ * Every color is a custom property, defined once per theme. `data-theme` on the root
+ * says which one shows (lib/theme.ts: the reader's choice, or the system's).
+ * Text tokens keep at least 4.5:1 against --bg and --surface.
  */
 :root {
-  color-scheme: light dark;
+  color-scheme: light;
 
   --bg: #f7f7f5;
   --surface: #ffffff;
@@ -26,26 +27,27 @@
   --attention-soft: #fbf3df;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #141513;
-    --surface: #1c1d1b;
-    --sunken: #101110;
-    --line: #33352f;
-    --fg: #e8e8e4;
-    --muted: #a5a59e;
-    --accent: #8fb0ff;
-    --accent-fg: #0e1626;
-    --accent-soft: #1d2740;
+/* Native controls and scrollbars follow `color-scheme`. */
+:root[data-theme="dark"] {
+  color-scheme: dark;
 
-    --tone-neutral: #a5a59e;
-    --tone-active: #8fb0ff;
-    --tone-attention: #e2b24a;
-    --tone-success: #6fcf8e;
-    --tone-danger: #ff8a80;
-    --danger-soft: #3a1c1a;
-    --attention-soft: #33290f;
-  }
+  --bg: #141513;
+  --surface: #1c1d1b;
+  --sunken: #101110;
+  --line: #33352f;
+  --fg: #e8e8e4;
+  --muted: #a5a59e;
+  --accent: #8fb0ff;
+  --accent-fg: #0e1626;
+  --accent-soft: #1d2740;
+
+  --tone-neutral: #a5a59e;
+  --tone-active: #8fb0ff;
+  --tone-attention: #e2b24a;
+  --tone-success: #6fcf8e;
+  --tone-danger: #ff8a80;
+  --danger-soft: #3a1c1a;
+  --attention-soft: #33290f;
 }
 
 /*
@@ -166,6 +168,21 @@
   .btn-primary:hover:not(:disabled) {
     border-color: var(--accent);
     filter: brightness(1.08);
+  }
+
+  /* One option of a radio group shown as a row of boxes: the checked one carries the accent. */
+  .choice {
+    display: flex;
+    min-height: 44px;
+    cursor: pointer;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding-inline: 0.75rem;
+  }
+
+  .choice:has(:checked) {
+    border-color: var(--accent);
+    background: var(--accent-soft);
   }
 
   .field {

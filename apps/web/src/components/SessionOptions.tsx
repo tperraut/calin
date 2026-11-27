@@ -100,7 +100,7 @@ export function PermissionField(props: {
       </Show>
       <For each={props.modes}>
         {(mode, index) => (
-          <label class="flex min-h-11 cursor-pointer items-start gap-3 rounded-md border border-line px-3 py-2 has-checked:border-accent has-checked:bg-accent-soft">
+          <label class="choice items-start gap-3 py-2">
             <input
               type="radio"
               name={modeGroup}

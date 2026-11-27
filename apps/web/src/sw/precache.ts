@@ -20,9 +20,12 @@ export const SHELL_PAGE = "index.html";
 /** The worker's own file, which must never be in its cache. */
 export const WORKER_FILE = "sw.js";
 
-/** Files copied as they are from `public/` that the installed app shows before any API call. */
+/**
+ * Files copied as they are from `public/` that the installed app needs before any API call:
+ * the icons, and the script that sets the theme before the first paint.
+ */
 const PUBLIC_SHELL =
-  /^(favicon\.svg|manifest\.webmanifest|apple-touch-icon\.png|icons\/[^/]+\.png)$/;
+  /^(favicon\.svg|manifest\.webmanifest|apple-touch-icon\.png|theme\.js|icons\/[^/]+\.png)$/;
 
 /**
  * Root-relative URLs of what first paint needs: the page, the entry chunk and

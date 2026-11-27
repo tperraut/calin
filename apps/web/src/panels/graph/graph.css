@@ -1,6 +1,6 @@
 /*
  * The session graph and the timeline. Colors are the app's own tokens, so both
- * follow the system theme; the series colors of the timeline are stepped per
+ * follow the theme; the series colors of the timeline are stepped per
  * theme (validated for color-vision deficiencies on each surface).
  */
 .orch {
@@ -12,14 +12,12 @@
   --series-other: var(--muted);
 }
 
-@media (prefers-color-scheme: dark) {
-  .orch {
-    --series-read: #3987e5;
-    --series-write: #d95926;
-    --series-run: #199e70;
-    --series-task: #c98500;
-    --series-think: #d55181;
-  }
+[data-theme="dark"] .orch {
+  --series-read: #3987e5;
+  --series-write: #d95926;
+  --series-run: #199e70;
+  --series-task: #c98500;
+  --series-think: #d55181;
 }
 
 .graph-canvas {
