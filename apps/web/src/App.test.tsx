@@ -36,6 +36,7 @@ import {
   find,
   findByText,
   mount,
+  offersButton,
   PHONE,
   setViewportWidth,
   type,
@@ -347,7 +348,7 @@ describe("App", () => {
     emit(7, { type: "session_status", status: "cancelled", reason: "stopped by the user" });
     flush();
     expect(find(main, "header").textContent).toContain("Cancelled");
-    expect(stop.disabled).toBe(true);
+    expect(stop.isConnected).toBe(false);
     // A stopped session can be picked up again: the next message restarts the agent.
     expect(box.disabled).toBe(false);
     expect(send.textContent).toBe("Continue");
@@ -394,8 +395,6 @@ describe("App", () => {
       getSession: () => Promise.resolve(makeDetail(makeSession("s1"))),
     });
     const main = find(host, "main");
-    const interrupt = findByText<HTMLButtonElement>(main, "button", "Interrupt");
-    const stop = findByText<HTMLButtonElement>(main, "button", "Stop");
     const box = find<HTMLTextAreaElement>(main, "textarea");
     const send = find<HTMLButtonElement>(main, 'button[type="submit"]');
     socket.emit("session:s1", { op: "subscribed", topic: "session:s1", head_seq: 0 });
@@ -428,8 +427,9 @@ describe("App", () => {
       flush();
       expect({
         status,
-        interrupt: !interrupt.disabled,
-        stop: !stop.disabled,
+        // A control that cannot act is not shown at all.
+        interrupt: offersButton(main, "Interrupt"),
+        stop: offersButton(main, "Stop"),
         message: !box.disabled && !send.disabled,
         label: send.textContent,
       }).toEqual({ status, ...can });
@@ -610,7 +610,7 @@ describe("App", () => {
     // The status moves when the event says so, and the open tool call stops spinning.
     emit({ type: "session_status", status: "review", reason: "interrupted" }, null);
     expect(find(main, "header").textContent).toContain("Review");
-    expect(interrupt.disabled).toBe(true);
+    expect(interrupt.isConnected).toBe(false);
     expect(find(main, '[role="log"] summary').textContent).toContain("Interrupted");
   });
 

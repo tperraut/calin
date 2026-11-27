@@ -65,24 +65,29 @@ export function SessionHeader(props: {
             <span aria-hidden="true">←</span>
           </a>
           <h1 class="min-w-0 flex-1 truncate font-semibold">{title()}</h1>
-          <button
-            type="button"
-            class="btn px-2.5"
-            title="End the current turn; the session stays open for review"
-            disabled={!canInterrupt(props.store.status()) || interrupt.busy()}
-            onClick={() => void interrupt.run()}
-          >
-            {interrupt.busy() ? "Interrupting…" : "Interrupt"}
-          </button>
-          <button
-            type="button"
-            class="btn px-2.5"
-            title="End the agent and cancel the session"
-            disabled={!canStop(props.store.status()) || stop.busy()}
-            onClick={() => void stop.run()}
-          >
-            {stop.busy() ? "Stopping…" : "Stop"}
-          </button>
+          {/* Shown only while they can act: a dead button costs a phone's title its room. */}
+          <Show when={canInterrupt(props.store.status()) || interrupt.busy()}>
+            <button
+              type="button"
+              class="btn px-2.5"
+              title="End the current turn; the session stays open for review"
+              disabled={interrupt.busy()}
+              onClick={() => void interrupt.run()}
+            >
+              {interrupt.busy() ? "Interrupting…" : "Interrupt"}
+            </button>
+          </Show>
+          <Show when={canStop(props.store.status()) || stop.busy()}>
+            <button
+              type="button"
+              class="btn px-2.5 text-tone-danger hover:not-disabled:border-tone-danger"
+              title="End the agent and cancel the session"
+              disabled={stop.busy()}
+              onClick={() => void stop.run()}
+            >
+              {stop.busy() ? "Stopping…" : "Stop"}
+            </button>
+          </Show>
         </div>
         <div class="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-muted">
           <Show when={props.store.status()}>

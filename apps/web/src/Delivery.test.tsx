@@ -28,6 +28,7 @@ import {
   find,
   findByText,
   mount,
+  offersButton,
   PHONE,
   setViewportWidth,
   type,
@@ -581,7 +582,7 @@ describe("the statuses after review", () => {
     await click(find<HTMLButtonElement>(main, 'button[type="submit"]'));
     expect(sendMessage).toHaveBeenCalledWith("s1", { text: "Rebase on main, please" });
 
-    expect(findByText<HTMLButtonElement>(header, "button", "Interrupt").disabled).toBe(true);
+    expect(offersButton(header, "Interrupt")).toBe(false);
     const stop = findByText<HTMLButtonElement>(header, "button", "Stop");
     expect(stop.disabled).toBe(false);
     await click(stop);
@@ -622,12 +623,9 @@ describe("the statuses after review", () => {
       "This session is done: it can be read, not continued",
     ]);
     expect(find<HTMLButtonElement>(main, 'button[type="submit"]').disabled).toBe(true);
-    for (const name of ["Interrupt", "Stop", "Attach repo"]) {
-      expect([name, findByText<HTMLButtonElement>(header, "button", name).disabled]).toEqual([
-        name,
-        true,
-      ]);
-    }
+    expect(offersButton(header, "Interrupt")).toBe(false);
+    expect(offersButton(header, "Stop")).toBe(false);
+    expect(findByText<HTMLButtonElement>(header, "button", "Attach repo").disabled).toBe(true);
     // Nothing more to ship; the pull requests stay on show.
     expect(delivery(header)).toBeNull();
     expect(chips(header)).toEqual(["api #12 Merged"]);

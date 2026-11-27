@@ -55,6 +55,13 @@ export function findByText<T extends HTMLElement = HTMLElement>(
   throw new Error(`no <${tag}> contains "${text}"`);
 }
 
+/** Whether a button whose text contains `text` is on screen and can be pressed. */
+export function offersButton(root: ParentNode, text: string): boolean {
+  return [...root.querySelectorAll<HTMLButtonElement>("button")].some(
+    (button) => button.textContent.includes(text) && !button.disabled,
+  );
+}
+
 export function type(field: HTMLTextAreaElement | HTMLInputElement, value: string): void {
   field.value = value;
   field.dispatchEvent(new InputEvent("input", { bubbles: true }));
