@@ -10,7 +10,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow, bail};
 use calin_agents::{RegistryConfig, RunnerRegistry};
 use calin_auth::{AuthMode, ConfigError, LoopbackHttp, SystemClock};
-use calin_core::{ManagerConfig, SessionManager, Store, resolve_home};
+use calin_core::{Home, ManagerConfig, SessionManager, Store, resolve_home};
 use calin_push::EndpointPolicy;
 use calin_server::{AUTH_FILE, AppState, Assets, Push, PushSetup, Server, SignIn, vapid_subject};
 use clap::{Args, Parser, Subcommand};
@@ -91,88 +91,157 @@ async fn main() -> Result<()> {
 }
 
 async fn serve(args: ServeArgs) -> Result<()> {
-    let addr = parse_bind(&args.bind)?;
-    // Before anything is opened or listens: a server that was meant to ask
-    // for sign-in must not come up without it.
-    let mode = read_auth_mode(std::env::var_os(ENV_UNSAFE_HTTP), |loopback_http| {
-        AuthMode::from_process_environment(loopback_http)
-    })?;
-    let home = resolve_home(args.home)?;
-    // Finds `claude` (or `CALIN_CLAUDE_BIN`) and makes it the default runner
-    // outside dry run; the mock runner is always there.
-    let registry = RunnerRegistry::new(RegistryConfig::from_env());
-    let dry_run = registry.dry_run();
+    let setup = Setup::from_environment(args)?;
+    let running = setup.start().await?;
+    running.serve_until(shutdown_signal()).await
+}
+
+/// What `serve` runs with, read and checked before anything is opened.
+struct Setup {
+    addr: SocketAddr,
+    mode: AuthMode,
+    home: Home,
+    registry: RunnerRegistry,
+}
+
+impl Setup {
+    fn from_environment(args: ServeArgs) -> Result<Self> {
+        let addr = parse_bind(&args.bind)?;
+        // Before anything is opened or listens: a server that was meant to ask
+        // for sign-in must not come up without it.
+        let mode = read_auth_mode(
+            std::env::var_os(ENV_UNSAFE_HTTP),
+            AuthMode::from_process_environment,
+        )?;
+        let home = resolve_home(args.home)?;
+        // Finds `claude` (or `CALIN_CLAUDE_BIN`) and makes it the default runner
+        // outside dry run; the mock runner is always there.
+        let registry = RunnerRegistry::new(RegistryConfig::from_env());
+        log_runners(&registry);
+        Ok(Self {
+            addr,
+            mode,
+            home,
+            registry,
+        })
+    }
+
+    /// Opens the data, recovers the sessions and listens.
+    async fn start(self) -> Result<Running> {
+        let Self {
+            addr,
+            mode,
+            home,
+            registry,
+        } = self;
+        let dry_run = registry.dry_run();
+        let store = Store::open(home.clone())
+            .await
+            .with_context(|| format!("cannot open the data directory {}", home.root().display()))?;
+        let public = Public::open(mode, &home).await?;
+        let manager = SessionManager::start_with(store.clone(), registry, manager_config())
+            .await
+            .context("cannot recover the sessions of the previous run")?;
+        let server = Server::bind(addr, app_state(&manager, public.as_ref()))
+            .await
+            .with_context(|| format!("cannot listen on {addr}"))?;
+        let addr = server.local_addr()?;
+        if Assets::embedded().is_empty() {
+            tracing::warn!("this binary has no web app in it; `make build` produces one that does");
+        }
+        if let Some(Public { sign_in, .. }) = public {
+            // Not awaited: a provider that is slow or down must not delay serving.
+            tokio::spawn(async move { sign_in.warm_up().await });
+        }
+
+        println!("Calin is serving on http://{addr}");
+        tracing::info!(%addr, home = %home.root().display(), dry_run, "server started");
+        Ok(Running {
+            server,
+            manager,
+            store,
+        })
+    }
+}
+
+fn log_runners(registry: &RunnerRegistry) {
     let runners = registry.ids();
     match runners.split_first() {
-        Some((default, _)) if !dry_run => {
+        Some((default, _)) if !registry.dry_run() => {
             tracing::info!(runners = %runners.join(", "), %default, "runners available");
         }
         _ => tracing::info!("dry run: every agent runs on the mock runner"),
     }
+}
 
-    let store = Store::open(home.clone())
-        .await
-        .with_context(|| format!("cannot open the data directory {}", home.root().display()))?;
-    let (sign_in, push) = match mode {
-        AuthMode::Local => (None, None),
-        AuthMode::Public(config) => {
-            let public_url = config.public_origin().to_owned();
-            let setup = push_setup(
-                &public_url,
-                config.loopback_http(),
-                std::env::var_os(ENV_PUSH_CONTACT),
-            )?;
-            if config.loopback_http() == LoopbackHttp::AllowForDevelopment {
-                tracing::warn!(
-                    "{ENV_UNSAFE_HTTP} is set: plain http is accepted for loopback URLs. \
-                     This is for development only."
-                );
-            }
-            let auth_file = home.root().join(AUTH_FILE);
-            let sign_in = SignIn::open(config, auth_file, Arc::new(SystemClock))
-                .await
-                .context("cannot set up sign-in")?;
-            // Next to `auth.json`. A corrupt key file stops the server here,
-            // naming the file: replacing it would orphan every subscription.
-            let push = Push::open(home.root(), setup, Arc::new(calin_push::SystemClock))
-                .await
-                .context("cannot set up push notifications")?;
-            tracing::info!(%public_url, "public mode: sign-in is required");
-            (Some(Arc::new(sign_in)), Some(Arc::new(push)))
+/// Public mode's sign-in and push notifications.
+struct Public {
+    sign_in: Arc<SignIn>,
+    push: Arc<Push>,
+}
+
+impl Public {
+    /// Opens both from the data directory; `None` in local mode.
+    async fn open(mode: AuthMode, home: &Home) -> Result<Option<Self>> {
+        let AuthMode::Public(config) = mode else {
+            return Ok(None);
+        };
+        let public_url = config.public_origin().to_owned();
+        let setup = push_setup(
+            &public_url,
+            config.loopback_http(),
+            std::env::var_os(ENV_PUSH_CONTACT),
+        )?;
+        if config.loopback_http() == LoopbackHttp::AllowForDevelopment {
+            tracing::warn!(
+                "{ENV_UNSAFE_HTTP} is set: plain http is accepted for loopback URLs. \
+                 This is for development only."
+            );
         }
-    };
-    let manager = SessionManager::start_with(store.clone(), registry, manager_config())
-        .await
-        .context("cannot recover the sessions of the previous run")?;
-    let mut state = AppState::new(manager.clone());
-    if let Some(sign_in) = &sign_in {
-        state = state.with_sign_in(sign_in.clone());
+        let auth_file = home.root().join(AUTH_FILE);
+        let sign_in = SignIn::open(config, auth_file, Arc::new(SystemClock))
+            .await
+            .context("cannot set up sign-in")?;
+        // Next to `auth.json`. A corrupt key file stops the server here,
+        // naming the file: replacing it would orphan every subscription.
+        let push = Push::open(home.root(), setup, Arc::new(calin_push::SystemClock))
+            .await
+            .context("cannot set up push notifications")?;
+        tracing::info!(%public_url, "public mode: sign-in is required");
+        Ok(Some(Self {
+            sign_in: Arc::new(sign_in),
+            push: Arc::new(push),
+        }))
     }
-    if let Some(push) = push {
-        state = state.with_push(push);
-    }
-    let server = Server::bind(addr, state)
-        .await
-        .with_context(|| format!("cannot listen on {addr}"))?;
-    let addr = server.local_addr()?;
-    if Assets::embedded().is_empty() {
-        tracing::warn!("this binary has no web app in it; `make build` produces one that does");
-    }
-    if let Some(sign_in) = sign_in {
-        // Not awaited: a provider that is slow or down must not delay serving.
-        tokio::spawn(async move { sign_in.warm_up().await });
-    }
+}
 
-    println!("Calin is serving on http://{addr}");
-    tracing::info!(%addr, home = %home.root().display(), dry_run, "server started");
-    // Returns once the sign-in store is flushed.
-    server.run(shutdown_signal()).await?;
+fn app_state(manager: &SessionManager, public: Option<&Public>) -> AppState {
+    let state = AppState::new(manager.clone());
+    match public {
+        Some(public) => state
+            .with_sign_in(public.sign_in.clone())
+            .with_push(public.push.clone()),
+        None => state,
+    }
+}
 
-    // Sessions still running are failed as "server restarted" on the next start.
-    manager.shutdown().await;
-    store.close().await;
-    tracing::info!("server stopped");
-    Ok(())
+/// A server that listens, and what it closes once it stops.
+struct Running {
+    server: Server,
+    manager: SessionManager,
+    store: Store,
+}
+
+impl Running {
+    async fn serve_until(self, shutdown: impl Future<Output = ()> + Send + 'static) -> Result<()> {
+        // Returns once the sign-in store is flushed.
+        self.server.run(shutdown).await?;
+        // Sessions still running are failed as "server restarted" on the next start.
+        self.manager.shutdown().await;
+        self.store.close().await;
+        tracing::info!("server stopped");
+        Ok(())
+    }
 }
 
 /// Reads the mode through `read`, which is `calin-auth`'s reader of the
