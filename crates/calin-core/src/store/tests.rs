@@ -991,6 +991,41 @@ async fn events_logged_but_not_indexed_are_caught_up_on_startup() {
 }
 
 #[tokio::test]
+async fn a_corrupt_line_stops_the_catch_up_and_what_precedes_it_stays_indexed() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir).await;
+    let id = store.create_session(new_session("rot")).await.unwrap().id;
+    let last = store.append(&id, message(1)).await.unwrap();
+    store.close().await;
+
+    let next = Event {
+        id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+        seq: last.seq + 1,
+        body: EventBody::SessionStatus {
+            status: SessionStatus::Running,
+            reason: None,
+        },
+        ..(*last).clone()
+    };
+    let mut log = std::fs::OpenOptions::new()
+        .append(true)
+        .open(store.home().log_path(&id))
+        .unwrap();
+    writeln!(log, "{}", serde_json::to_string(&next).unwrap()).unwrap();
+    writeln!(log, "not an event").unwrap();
+    drop(log);
+
+    let reopened = open(&dir).await;
+    let session = reopened.session(&id).await.unwrap().session;
+    assert_eq!(session.head_seq, 2);
+    assert_eq!(session.status, SessionStatus::Running);
+    assert!(matches!(
+        reopened.append(&id, message(2)).await,
+        Err(Error::Corrupt { .. })
+    ));
+}
+
+#[tokio::test]
 async fn a_log_shorter_than_its_index_is_indexed_again_from_the_log() {
     let dir = TempDir::new().unwrap();
     let store = open(&dir).await;
