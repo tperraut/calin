@@ -91,7 +91,6 @@ Known gaps carried forward from M2:
 - Nothing marks the start or end of a ship, so the web app waits for pull request or error
   events and gives up after 30 seconds of silence.
 - `error` events name a repo only in prose.
-- `git push` and commit hooks run without a timeout.
 - The push remote is always `origin`; forks are not handled.
 - `PUT /settings` errors name no field; `clone_root` cannot tell a stored value from the default.
 - The agent prefers its shell over file tools in a freshly attached repo unless told otherwise;
@@ -119,9 +118,7 @@ Known gaps carried forward from M3:
   busy session about ten lines still meet at the lead's side with overlapping arrowheads, the
   column layout's corridor between the lead and its children is crowded, and count labels can
   sit far from both cards.
-- A child that is stopped, or failed by a server restart, sends no report: its parent is not told.
 - Nothing has run on a real phone; the graph's frame rates were measured in a headless browser.
-- A stopped or failed turn is not scanned for shell-made changes.
 - Timeline marks and arrow hit areas are smaller than 44 px.
 
 ## M4: Workflows (done 2026-11-27, except a second agent runner)
@@ -146,7 +143,6 @@ Known gaps carried forward from M4:
 - A run interrupted by a server restart is closed as failed, not resumed.
 - The loop limit travels to the web app inside the node's label ("Up to N times").
 - `question_answered` carries no comment; a gate's comment is visible only in its node outcome.
-- A file named `quick.yaml` is listed as invalid beside the built-in, so that id appears twice.
 - The sessions list cannot show why a session is queued; the session page can.
 
 ## M5: Remote access (done 2026-11-28, except the desktop app and the real-world checks)
@@ -202,7 +198,7 @@ Known gaps carried forward from M6:
 - The usage range starts at the browser's local midnight while days are the server's, so the
   first day can be partial when the two time zones differ.
 - A 400 from saving an automation names no field; the web app guesses which one from the wording.
-- Cron: five fields only, no `@daily`, seconds or `L W # ?`.
+- Cron: five fields plus `@hourly`, `@daily`, `@weekly` and `@monthly`; no seconds or `L W # ?`.
 - A repo set always adds its repos as worktrees.
 - Cost is what the agent CLI reports; on a subscription it is an estimate, and the page says so.
 
@@ -216,6 +212,8 @@ Known gaps carried forward from M6:
 - [x] A repo attached read-only stays read-only; usage days follow the server's
 - [x] `calin home init` scaffolds a home repo (repo list from a scan, two example workflows, a
       starter link script), and `docs/guide.md` is the user guide
+- [x] A parent is told when a child is stopped or fails without reporting; commit and push have
+      time limits; shell-made changes are recorded when a turn is stopped or fails
 - [x] A real Claude session on Calin's own code, under a workflow that runs its tests: it added
       the cron aliases, the check passed, and the session ended in review
 

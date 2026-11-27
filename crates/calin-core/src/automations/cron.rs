@@ -12,8 +12,9 @@
 //! Daylight saving time: a local time that does not exist on a day (in the
 //! gap of a spring change) is skipped that day; a local time that exists
 //! twice (in the fold of an autumn change) fires once, at its first
-//! occurrence. Macros such as `@daily`, seconds, and `L`, `W`, `#` and `?`
-//! are not supported.
+//! occurrence. The aliases `@hourly`, `@daily`, `@weekly` and `@monthly` stand
+//! for their five-field expressions; other macros, seconds, and `L`, `W`, `#`
+//! and `?` are not supported.
 
 use jiff::civil::{Date, DateTime};
 use jiff::tz::{AmbiguousOffset, TimeZone};
@@ -141,10 +142,32 @@ const SPECS: [Spec; 5] = [
     },
 ];
 
+/// The `@` aliases and the expressions they stand for.
+const ALIASES: [(&str, &str); 4] = [
+    ("@hourly", "0 * * * *"),
+    ("@daily", "0 0 * * *"),
+    ("@weekly", "0 0 * * 0"),
+    ("@monthly", "0 0 1 * *"),
+];
+
 impl Cron {
     /// Parses an expression. The error says what is wrong, in words.
     pub(crate) fn parse(expr: &str) -> Result<Self, String> {
-        let fields: Vec<&str> = expr.split_whitespace().collect();
+        let mut fields: Vec<&str> = expr.split_whitespace().collect();
+        if let [first] = fields[..]
+            && first.starts_with('@')
+        {
+            let Some((_, expansion)) = ALIASES
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(first))
+            else {
+                return Err(format!(
+                    "unknown alias `{first}`; the supported aliases are @hourly, @daily, @weekly and @monthly"
+                ));
+            };
+            // Expanding here makes an alias identical to its expression everywhere.
+            fields = expansion.split(' ').collect();
+        }
         if fields.is_empty() {
             return Err("the expression is empty".to_owned());
         }

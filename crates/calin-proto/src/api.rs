@@ -138,10 +138,13 @@
 //!   parent's `write` repos, all of them by default) a new branch starting at
 //!   the parent's current commit in that repo. The brief is the child's
 //!   prompt, recorded as a `dispatch` message: `message_sent` in the parent,
-//!   `message_received` in the child. When the child reaches `review` or
-//!   `failed`, its report (what it passed to the `report` tool, else its last
-//!   text) goes back the same way as a `report` message and is delivered to
-//!   the dispatching agent as its next input, with the child's branch names.
+//!   `message_received` in the child. When the child comes to rest in
+//!   `review`, `failed` or `cancelled`, its report (what it passed to the
+//!   `report` tool, else its last text, with a line saying so when it was
+//!   stopped or failed without reporting) goes back the same way as a
+//!   `report` message and is delivered to the dispatching agent as its next
+//!   input, with the child's branch names. A child stopped because its parent
+//!   was stopped sends nothing.
 //!   At most four children of one session run at a time and a child cannot
 //!   dispatch (both are tool errors). Stopping a session stops its running
 //!   descendants. Children appear in `GET /sessions` like any session.

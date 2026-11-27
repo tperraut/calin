@@ -39,7 +39,12 @@ fn invalid_expressions_say_what_is_wrong() {
         ("   ", "the expression is empty"),
         ("* * * *", "expected five fields"),
         ("* * * * * *", "found 6"),
-        ("@daily", "found 1"),
+        (
+            "@yearly",
+            "the supported aliases are @hourly, @daily, @weekly and @monthly",
+        ),
+        ("@", "unknown alias `@`"),
+        ("@daily *", "found 2"),
         ("60 * * * *", "the minute field: 60 is out of range 0-59"),
         ("* 24 * * *", "the hour field: 24 is out of range 0-23"),
         (
@@ -286,4 +291,30 @@ fn an_expression_that_only_fires_years_apart_is_found() {
         .next_after(at(&TimeZone::UTC, "2028-03-01T00:00:00"), &TimeZone::UTC)
         .unwrap();
     assert_eq!(show(&TimeZone::UTC, fired), "2032-02-29T00:00:00 +00");
+}
+
+#[test]
+fn aliases_behave_like_their_expressions() {
+    let zone = paris();
+    for (alias, expr, words) in [
+        ("@hourly", "0 * * * *", "Every hour"),
+        ("@daily", "0 0 * * *", "Every day at 00:00"),
+        ("@weekly", "0 0 * * 0", "At 00:00 on Sundays"),
+        (
+            "@monthly",
+            "0 0 1 * *",
+            "On the 1st of every month at 00:00",
+        ),
+    ] {
+        let a = Cron::parse(alias).unwrap();
+        let e = Cron::parse(expr).unwrap();
+        assert_eq!(a.describe(), e.describe(), "{alias}");
+        assert_eq!(
+            next(alias, &zone, "2026-03-01T12:30:00", 40),
+            next(expr, &zone, "2026-03-01T12:30:00", 40),
+            "{alias}"
+        );
+        assert_eq!(a.describe(), words, "{alias}");
+    }
+    assert!(Cron::parse("  @Daily ").is_ok());
 }
