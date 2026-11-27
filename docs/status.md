@@ -64,9 +64,19 @@ Known gaps carried forward from M1:
 - A 409 from saving a file does not say which of its three causes it was, except in its message.
 - Real-agent runs are checked by hand; `make e2e` covers the mock runner only.
 
+## M2: Home repo and delivery (in progress, branch `m2`)
+
+- [x] Contract: settings, repo catalog from the home repo, clone, repo sets, attach mid-session,
+      the tool endpoint for agents
+- [ ] Core and server: settings, `.calin/repos.yaml`, scan and clone, attach mid-session, path
+      policy for attached repos, setup command, the tool endpoint, session system prompt
+- [ ] Web: settings, catalog with clone and sets, attach from the session page, M1 polish
+- [ ] Delivery: commit, push and one linked draft pull request per changed repo; PR and CI status
+- [ ] End to end: mock in `make e2e`, then a real agent attaching a repo through the tool endpoint
+
 ## Later
 
-M2 multi-repo · M3 graph · M4 workflows · M5 sign-in, server install, PWA, desktop · M6 integrations
+M3 graph · M4 workflows · M5 sign-in, server install, PWA, desktop · M6 integrations
 
 ## Decisions since the spec
 

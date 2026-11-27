@@ -414,7 +414,7 @@ Section 12 lists the technical unknowns and the milestone that settles each.
 | --- | --- |
 | Vite+ with the Solid plugin and Bun | Settled in M0: the scaffold builds, type-checks and lints with Vite+ 1.8, Solid 2.0 and Bun 1.4. |
 | The Claude stream-json protocol is not a versioned public contract | Golden fixtures per CLI version. The mapper ignores what it does not know, and a CLI version other than the recorded one logs a warning; surfacing that warning in the UI is still to do. |
-| Granting a new directory to a running Claude session | M2 spike. Fallback: resume the same conversation with the extra `--add-dir`; resuming in a new process is verified to keep the conversation and its cost totals. |
+| Granting a new directory to a running Claude session | Settled on CLI 2.1.332: the CLI asks permission for a path outside its directories, and once Calin allows it the read, edit or write goes through. The request also carries an `addDirectories` suggestion for the rest of the session. No restart is needed. |
 | A custom graph renderer is real work | Spike at the start of M3: 200 nodes laid out and animated on a phone. Fallback: adopt the xyflow port if it is stable by then. |
 | Disk use: a worktree and dependencies per repo per session | `setup` commands, idle reclamation, and a disk view from M2 |
 | A public server that hands out shells | The server refuses any non-loopback bind until sign-in ships in M5 |

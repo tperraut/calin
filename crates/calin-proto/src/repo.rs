@@ -12,6 +12,36 @@ pub struct Repo {
     pub path: String,
     pub default_branch: Option<String>,
     pub remote_url: Option<String>,
+    /// False when the home repo declares this repo but no clone of it was found
+    /// on this machine. `path` is empty then, and the repo cannot be attached
+    /// until it is cloned.
+    #[serde(default = "yes")]
+    pub available: bool,
+    /// True when the home repo's `.calin/repos.yaml` lists this repo.
+    #[serde(default)]
+    pub declared: bool,
+    /// True for the home repo itself.
+    #[serde(default)]
+    pub home: bool,
+    /// The git URL the home repo declares for it.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Shell command run in a new worktree of this repo before the agent starts.
+    #[serde(default)]
+    pub setup: Option<String>,
+    /// Shell commands that validate a change in this repo.
+    #[serde(default)]
+    pub checks: Vec<String>,
+    /// True while a clone started with `POST /repos/{id}/clone` is running.
+    #[serde(default)]
+    pub cloning: bool,
+    /// Why the last clone or resolution attempt failed, when it did.
+    #[serde(default)]
+    pub problem: Option<String>,
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// How a repo takes part in a session.

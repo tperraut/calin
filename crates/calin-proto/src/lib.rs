@@ -16,6 +16,7 @@ mod event;
 mod model;
 mod permission;
 mod repo;
+mod settings;
 mod terminal;
 mod ws;
 
@@ -24,6 +25,7 @@ pub use event::*;
 pub use model::*;
 pub use permission::*;
 pub use repo::*;
+pub use settings::*;
 pub use terminal::*;
 pub use ws::*;
 

@@ -11,4 +11,38 @@ name: string,
 /**
  * Absolute path of the clone on this machine.
  */
-path: string, default_branch: string | null, remote_url: string | null, };
+path: string, default_branch: string | null, remote_url: string | null, 
+/**
+ * False when the home repo declares this repo but no clone of it was found
+ * on this machine. `path` is empty then, and the repo cannot be attached
+ * until it is cloned.
+ */
+available: boolean, 
+/**
+ * True when the home repo's `.calin/repos.yaml` lists this repo.
+ */
+declared: boolean, 
+/**
+ * True for the home repo itself.
+ */
+home: boolean, 
+/**
+ * The git URL the home repo declares for it.
+ */
+url: string | null, 
+/**
+ * Shell command run in a new worktree of this repo before the agent starts.
+ */
+setup: string | null, 
+/**
+ * Shell commands that validate a change in this repo.
+ */
+checks: Array<string>, 
+/**
+ * True while a clone started with `POST /repos/{id}/clone` is running.
+ */
+cloning: boolean, 
+/**
+ * Why the last clone or resolution attempt failed, when it did.
+ */
+problem: string | null, };
