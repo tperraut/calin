@@ -239,6 +239,8 @@ describe("a session that ends", () => {
         runner: "mock",
         permission_mode: "ask",
         workflow: null,
+        issue: null,
+        automation_id: null,
         branch: null,
         parent_session_id: null,
         root_session_id: "s1",

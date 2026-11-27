@@ -15,6 +15,7 @@ import { AppContext } from "../state/app";
 import type { SessionStore } from "../state/sessionStore";
 import { AttachRepo } from "./AttachRepo";
 import { SessionStatusBadge } from "./Badge";
+import { SessionOrigin } from "./SessionChips";
 import { PullRequestChips } from "./PullRequests";
 import { currentShipPlan, ShipAction, shipOffered } from "./ShipAction";
 import { ShipForm } from "./ShipForm";
@@ -86,6 +87,9 @@ export function SessionHeader(props: {
         <div class="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-muted">
           <Show when={props.store.status()}>
             {(status) => <SessionStatusBadge status={status()} />}
+          </Show>
+          <Show when={props.store.session()}>
+            {(session) => <SessionOrigin session={session()} class="-my-2.5" />}
           </Show>
           <Show when={pendingCount() > 0}>
             <span class="font-medium text-tone-attention">

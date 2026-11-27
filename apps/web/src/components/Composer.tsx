@@ -1,16 +1,46 @@
-import { createMemo, createSignal, createUniqueId, For, Show } from "solid-js";
+import { createMemo, createSignal, createUniqueId, lazy, Loading, Show } from "solid-js";
+import type { IssueQuery } from "../api/http";
 import type { CreateSessionRequest } from "../gen/CreateSessionRequest";
+import type { Issue } from "../gen/Issue";
+import type { IssueDetail } from "../gen/IssueDetail";
 import type { PermissionMode } from "../gen/PermissionMode";
 import type { RegisterRepoRequest } from "../gen/RegisterRepoRequest";
 import type { Repo } from "../gen/Repo";
 import type { RepoSet } from "../gen/RepoSet";
+import type { RunnerLimits } from "../gen/RunnerLimits";
 import type { WorkflowInfo } from "../gen/WorkflowInfo";
 import { errorMessage } from "../lib/errors";
 import { loadComposerPrefs, saveComposerPrefs, type RepoChoice } from "../lib/prefs";
-import { defaultRepoMode, permissionModeLook, permissionModes } from "../lib/status";
-import { dollars, isUsable, QUICK_WORKFLOW, shapeSummary } from "../lib/workflow";
+import { defaultRepoMode, permissionModes } from "../lib/status";
+import { refusalText } from "../lib/usage";
+import { isUsable, QUICK_WORKFLOW } from "../lib/workflow";
 import type { RepoRegistry, WorkflowCatalog } from "../state/app";
+import { refusingWindow } from "../state/limits";
+import { Markdown } from "./Markdown";
 import { RepoPicker } from "./RepoPicker";
+import { PermissionField, RunnerOptions, WorkflowField } from "./SessionOptions";
+
+// Only someone who opens the Issues disclosure needs the list, so it is fetched then.
+const IssueList = lazy(() => import("./IssueList"));
+
+/** Where the composer reads a repo's GitHub issues; absent when GitHub cannot be used. */
+export type IssueSource = {
+  list: (repoId: string, query: IssueQuery) => Promise<Issue[]>;
+  get: (repoId: string, number: number) => Promise<IssueDetail>;
+};
+
+/** The issue a session is to start from, with its body once read. */
+type PickedIssue = {
+  repoId: string;
+  issue: Issue;
+  body:
+    | { status: "loading" }
+    | { status: "ready"; text: string }
+    | { status: "error"; message: string };
+};
+
+export const DEFAULT_PLACEHOLDER = "Describe what the agent should do";
+export const ISSUE_PLACEHOLDER = "Extra instructions (optional)";
 
 /** True for the chord that submits a multi-line field: Ctrl+Enter, or Cmd+Enter on a Mac. */
 export const isSubmitChord = (event: KeyboardEvent): boolean =>
@@ -65,6 +95,12 @@ export function Composer(props: {
   onRemoveRepo: (id: string) => Promise<void>;
   onCloneRepo: (id: string) => Promise<void>;
   onRetryRepos: () => void;
+  /** Where issues are read; absent when GitHub cannot be used, and no Issues disclosure shows. */
+  issues?: IssueSource;
+  /** The newest limits per runner: a window refusing requests is said above Start. */
+  limits?: readonly RunnerLimits[];
+  /** The app's clock, for relative and reset times. */
+  now?: number;
 }) {
   const initial = loadComposerPrefs();
   const [prompt, setPrompt] = createSignal("");
@@ -76,19 +112,15 @@ export function Composer(props: {
   const [workflow, setWorkflow] = createSignal<string | undefined>(initial.workflow);
   const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal<string>();
+  const [picked, setPicked] = createSignal<PickedIssue>();
+  const [issuesOpen, setIssuesOpen] = createSignal(false);
   const formId = createUniqueId();
   const promptId = createUniqueId();
-  const runnerId = createUniqueId();
-  const modelId = createUniqueId();
   const errorId = createUniqueId();
-  const modeGroup = createUniqueId();
-  const workflowId = createUniqueId();
-  const workflowNoteId = createUniqueId();
+  const noticeId = createUniqueId();
 
   const workflowList = (): readonly WorkflowInfo[] =>
     props.workflows?.status === "ready" ? props.workflows.workflows : [];
-  // Only worth a control when there is something besides the built-in one.
-  const offersWorkflows = (): boolean => workflowList().some((one) => one.id !== QUICK_WORKFLOW);
   const pickedWorkflow = createMemo(() => chosenWorkflow(workflow(), workflowList()));
   /** The id a session is started with; `quick` is said by saying nothing. */
   const workflowToSend = (): string | undefined => {
@@ -105,9 +137,46 @@ export function Composer(props: {
   );
   const blocked = (): boolean => props.disabled === true || busy();
 
+  /** The primary repo, whose issues the disclosure lists. */
+  const primary = createMemo(() => {
+    const first = chosen().at(0);
+    if (!first || props.registry.status !== "ready") return undefined;
+    return props.registry.repos.find((repo) => repo.id === first.repoId);
+  });
+  const refusing = () => refusingWindow(props.limits ?? [], selectedRunner());
+
+  const bodyText = (): string | undefined => {
+    const body = picked()?.body;
+    return body?.status === "ready" ? body.text : undefined;
+  };
+  const bodyError = (): string | undefined => {
+    const body = picked()?.body;
+    return body?.status === "error" ? body.message : undefined;
+  };
+
+  function pickIssue(repoId: string, issue: Issue): void {
+    setPicked({ repoId, issue, body: { status: "loading" } });
+    setIssuesOpen(false);
+    const source = props.issues;
+    if (!source) return;
+    const settle = (body: PickedIssue["body"]): void => {
+      setPicked((current) =>
+        current?.repoId === repoId && current.issue.number === issue.number
+          ? { ...current, body }
+          : current,
+      );
+    };
+    source.get(repoId, issue.number).then(
+      (detail) => settle({ status: "ready", text: detail.body }),
+      (reason: unknown) => settle({ status: "error", message: errorMessage(reason) }),
+    );
+  }
+
   async function submit(): Promise<void> {
     const text = prompt().trim();
-    if (text === "" || blocked()) return;
+    const issue = picked();
+    // With an issue the issue is the task, and what is typed only adds to it.
+    if ((text === "" && !issue) || blocked()) return;
     const repos = chosen();
     const mode = permissionMode();
     const request: CreateSessionRequest = {
@@ -115,6 +184,7 @@ export function Composer(props: {
       permission_mode: mode,
       repos: repos.map((choice) => ({ repo_id: choice.repoId, mode: choice.mode })),
     };
+    if (issue) request.issue = { repo_id: issue.repoId, number: issue.issue.number };
     const usedRunner = selectedRunner();
     if (usedRunner !== undefined) request.runner = usedRunner;
     if (model().trim() !== "") request.model = model().trim();
@@ -135,6 +205,7 @@ export function Composer(props: {
         workflow: known ? usedWorkflow : workflow(),
       });
       setPrompt("");
+      setPicked(undefined);
     } catch (reason) {
       setError(errorMessage(reason));
     } finally {
@@ -155,11 +226,67 @@ export function Composer(props: {
         <label for={promptId} class="text-sm font-medium">
           New session
         </label>
+        <Show when={picked()}>
+          {(chosenIssue) => (
+            <div class="flex flex-col gap-1">
+              <div class="flex min-w-0 items-center gap-1">
+                <a
+                  href={chosenIssue().issue.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  data-part="issue-chip"
+                  class="flex min-h-11 min-w-0 items-center gap-1.5 rounded-full border border-accent bg-accent-soft px-3 text-sm"
+                >
+                  <span class="shrink-0 font-mono">#{chosenIssue().issue.number}</span>
+                  <span class="truncate">{chosenIssue().issue.title}</span>
+                </a>
+                <button
+                  type="button"
+                  class="btn shrink-0 border-transparent px-2"
+                  aria-label={`Remove issue #${chosenIssue().issue.number}`}
+                  onClick={() => setPicked(undefined)}
+                >
+                  <span aria-hidden="true">✕</span>
+                </button>
+              </div>
+              <details class="group rounded-md border border-line">
+                <summary class="flex min-h-11 items-center gap-1.5 px-3 text-sm">
+                  <span
+                    aria-hidden="true"
+                    class="text-muted transition-transform group-open:rotate-90"
+                  >
+                    ▸
+                  </span>
+                  Show issue
+                </summary>
+                <div class="max-h-[40dvh] overflow-y-auto border-t border-line px-3 py-2 text-sm">
+                  <Show
+                    when={bodyText() !== undefined}
+                    fallback={
+                      <p class="text-muted">
+                        {bodyError() === undefined
+                          ? "Loading the issue…"
+                          : `The issue could not be loaded: ${bodyError()}`}
+                      </p>
+                    }
+                  >
+                    <Show
+                      when={(bodyText() ?? "").trim() !== ""}
+                      fallback={<p class="text-muted">The issue has no description.</p>}
+                    >
+                      <Markdown text={bodyText() ?? ""} />
+                    </Show>
+                  </Show>
+                </div>
+              </details>
+            </div>
+          )}
+        </Show>
         <textarea
           id={promptId}
           class="field min-h-22 resize-y px-3 py-2"
           rows="3"
-          placeholder="Describe what the agent should do"
+          placeholder={picked() ? ISSUE_PLACEHOLDER : DEFAULT_PLACEHOLDER}
           value={prompt()}
           aria-describedby={error() === undefined ? undefined : errorId}
           onInput={(event) => setPrompt(event.currentTarget.value)}
@@ -190,126 +317,82 @@ export function Composer(props: {
         onRetry={props.onRetryRepos}
       />
 
-      <Show when={offersWorkflows()}>
-        <div class="flex flex-col gap-1.5">
-          <label for={workflowId} class="text-sm font-medium">
-            Workflow
-          </label>
-          <select
-            id={workflowId}
-            class="field h-11 px-2"
-            aria-describedby={workflowNoteId}
-            disabled={props.disabled === true}
-            onChange={(event) => setWorkflow(event.currentTarget.value)}
+      <Show when={props.issues && primary()}>
+        {(repo) => (
+          <details
+            class="group"
+            open={issuesOpen()}
+            onToggle={(event) => setIssuesOpen(event.currentTarget.open)}
           >
-            <For each={workflowList()} keyed={(one) => one.id}>
-              {(one) => (
-                <option
-                  value={one().id}
-                  disabled={!isUsable(one())}
-                  selected={one().id === pickedWorkflow()?.id}
-                >
-                  {one().id === QUICK_WORKFLOW
-                    ? "Quick (no workflow)"
-                    : isUsable(one())
-                      ? one().name
-                      : `${one().name} (has errors)`}
-                </option>
-              )}
-            </For>
-          </select>
-          <div id={workflowNoteId} class="flex flex-col gap-0.5 text-xs text-muted">
-            <Show when={pickedWorkflow()}>
-              {(picked) => (
-                <>
-                  <Show when={picked().description}>
-                    {(description) => <p class="wrap-break-word">{description()}</p>}
-                  </Show>
-                  <Show when={picked().id !== QUICK_WORKFLOW && picked().graph}>
-                    {(graph) => <p data-part="workflow-shape">{shapeSummary(graph())}</p>}
-                  </Show>
-                  <Show when={picked().budget_usd}>
-                    {(budget) => <p>Budget: {dollars(budget())}</p>}
-                  </Show>
-                </>
+            <summary class="flex min-h-11 items-center gap-1.5 text-sm">
+              <span aria-hidden="true" class="text-muted transition-transform group-open:rotate-90">
+                ▸
+              </span>
+              <span class="font-medium">Issues</span>
+              <span class="truncate text-xs text-muted">{repo().name}</span>
+            </summary>
+            <Show when={issuesOpen() && props.issues}>
+              {(source) => (
+                <Loading fallback={<p class="text-sm text-muted">Loading…</p>}>
+                  <IssueList
+                    repoId={repo().id}
+                    repoName={repo().name}
+                    now={props.now ?? Date.now()}
+                    list={source().list}
+                    onPick={(issue) => pickIssue(repo().id, issue)}
+                  />
+                </Loading>
               )}
             </Show>
-          </div>
-        </div>
+          </details>
+        )}
       </Show>
 
-      <fieldset class="flex flex-col gap-1.5">
-        <legend class="mb-1.5 text-sm font-medium">Permissions</legend>
-        <For each={permissionModes}>
-          {(mode) => (
-            <label class="flex min-h-11 cursor-pointer items-start gap-3 rounded-md border border-line px-3 py-2 has-checked:border-accent has-checked:bg-accent-soft">
-              <input
-                type="radio"
-                name={modeGroup}
-                value={mode}
-                class="mt-0.5 size-5 shrink-0 accent-accent"
-                checked={permissionMode() === mode}
-                onChange={() => setPermissionMode(mode)}
-              />
-              <span class="min-w-0">
-                <span class="block font-medium">{permissionModeLook(mode).label}</span>
-                <span class="block text-xs text-muted">{permissionModeLook(mode).hint}</span>
-              </span>
-            </label>
-          )}
-        </For>
-      </fieldset>
+      <WorkflowField
+        workflows={workflowList()}
+        picked={pickedWorkflow()}
+        disabled={props.disabled}
+        onChange={setWorkflow}
+      />
 
-      <details class="group">
-        <summary class="flex min-h-11 items-center gap-1.5 text-sm">
-          <span aria-hidden="true" class="text-muted transition-transform group-open:rotate-90">
-            ▸
-          </span>
-          <span class="font-medium">Options</span>
-          <span class="truncate font-mono text-xs text-muted group-open:hidden">
-            {selectedRunner()}
-            {model().trim() === "" ? "" : ` · ${model().trim()}`}
-          </span>
-        </summary>
-        <div class="grid grid-cols-[auto_minmax(0,1fr)] items-center gap-2 pb-1 lg:max-w-md">
-          <label for={runnerId} class="text-sm text-muted">
-            Runner
-          </label>
-          <select
-            id={runnerId}
-            class="field h-11 px-2 font-mono"
-            disabled={props.disabled === true || props.runners.length === 0}
-            onChange={(event) => setRunner(event.currentTarget.value)}
+      <PermissionField
+        modes={permissionModes}
+        value={permissionMode()}
+        onChange={setPermissionMode}
+      />
+
+      <RunnerOptions
+        runners={props.runners}
+        runner={selectedRunner()}
+        model={model()}
+        disabled={props.disabled}
+        onRunner={setRunner}
+        onModel={setModel}
+      />
+
+      <Show when={refusing()}>
+        {(window) => (
+          <p
+            id={noticeId}
+            role="status"
+            class="rounded-md border border-line bg-attention-soft px-3 py-2 text-sm"
           >
-            <For each={props.runners}>
-              {(name) => (
-                <option value={name} selected={name === selectedRunner()}>
-                  {name}
-                </option>
-              )}
-            </For>
-          </select>
-          <label for={modelId} class="text-sm text-muted">
-            Model
-          </label>
-          <input
-            id={modelId}
-            type="text"
-            class="field h-11 px-3 font-mono"
-            placeholder="runner default"
-            autocomplete="off"
-            autocapitalize="off"
-            spellcheck={false}
-            value={model()}
-            onInput={(event) => setModel(event.currentTarget.value)}
-          />
-        </div>
-      </details>
+            {refusalText(window(), props.now ?? Date.now())} A session started now will fail or
+            wait.
+          </p>
+        )}
+      </Show>
 
       {/* Stays in view while the choices above scroll, so a session is always one tap away. */}
       <div class="sticky bottom-0 flex items-center justify-between gap-3 border-t border-line bg-surface py-3">
         <p class="text-xs text-muted">Ctrl+Enter (⌘+Enter on a Mac) starts the session.</p>
-        <button type="submit" form={formId} class="btn btn-primary" disabled={blocked()}>
+        <button
+          type="submit"
+          form={formId}
+          class="btn btn-primary"
+          disabled={blocked()}
+          aria-describedby={refusing() ? noticeId : undefined}
+        >
           {busy() ? "Starting…" : "Start"}
         </button>
       </div>

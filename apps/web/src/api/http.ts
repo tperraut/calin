@@ -2,14 +2,21 @@ import type { AnswerQuestionRequest } from "../gen/AnswerQuestionRequest";
 import type { ApiError } from "../gen/ApiError";
 import type { AttachRepoRequest } from "../gen/AttachRepoRequest";
 import type { AuthSessionInfo } from "../gen/AuthSessionInfo";
+import type { Automation } from "../gen/Automation";
+import type { AutomationRequest } from "../gen/AutomationRequest";
+import type { AutomationRun } from "../gen/AutomationRun";
 import type { CreateDeviceTokenRequest } from "../gen/CreateDeviceTokenRequest";
 import type { CreatedDeviceToken } from "../gen/CreatedDeviceToken";
 import type { CreateSessionRequest } from "../gen/CreateSessionRequest";
+import type { CronPreview } from "../gen/CronPreview";
 import type { DeviceTokenInfo } from "../gen/DeviceTokenInfo";
 import type { FileContent } from "../gen/FileContent";
 import type { FileDiff } from "../gen/FileDiff";
 import type { Graph } from "../gen/Graph";
 import type { Health } from "../gen/Health";
+import type { Issue } from "../gen/Issue";
+import type { IssueDetail } from "../gen/IssueDetail";
+import type { IssueState } from "../gen/IssueState";
 import type { Me } from "../gen/Me";
 import type { PublicHealth } from "../gen/PublicHealth";
 import type { PushKey } from "../gen/PushKey";
@@ -21,6 +28,8 @@ import type { Repo } from "../gen/Repo";
 import type { RepoChanges } from "../gen/RepoChanges";
 import type { RepoSet } from "../gen/RepoSet";
 import type { ResolvePermissionRequest } from "../gen/ResolvePermissionRequest";
+import type { RunAutomationRequest } from "../gen/RunAutomationRequest";
+import type { RunnerLimits } from "../gen/RunnerLimits";
 import type { SendMessageRequest } from "../gen/SendMessageRequest";
 import type { Session } from "../gen/Session";
 import type { SessionDetail } from "../gen/SessionDetail";
@@ -29,6 +38,8 @@ import type { Settings } from "../gen/Settings";
 import type { ShipRequest } from "../gen/ShipRequest";
 import type { Timeline } from "../gen/Timeline";
 import type { TreeEntry } from "../gen/TreeEntry";
+import type { Usage } from "../gen/Usage";
+import type { UsageBy } from "../gen/UsageBy";
 import type { WorkflowInfo } from "../gen/WorkflowInfo";
 import type { WorkflowRun } from "../gen/WorkflowRun";
 import type { WriteFileRequest } from "../gen/WriteFileRequest";
@@ -62,6 +73,12 @@ export class HttpError extends Error {
 }
 
 export const UNREACHABLE_MESSAGE = "Cannot reach the server";
+
+/** What `GET /repos/{id}/issues` is asked for; the server's defaults apply to what is absent. */
+export type IssueQuery = { state?: IssueState; q?: string };
+
+/** What `GET /usage` is asked for, in Unix milliseconds; the server's defaults apply to what is absent. */
+export type UsageQuery = { from?: number; to?: number; by?: UsageBy };
 
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
@@ -117,6 +134,32 @@ export interface Api {
   removeRepo(id: string): Promise<void>;
   /** The home repo's named groups of repos, in its order. */
   listRepoSets(): Promise<RepoSet[]>;
+  /**
+   * A repo's GitHub issues, newest first, at most 50. 409 with the reason when
+   * the repo has no GitHub remote or `gh` cannot be used.
+   */
+  listIssues(repoId: string, query?: IssueQuery): Promise<Issue[]>;
+  /** One issue with its Markdown body; 404 for an unknown one. */
+  getIssue(repoId: string, number: number): Promise<IssueDetail>;
+  /** Totals and one breakdown over a range (integrations spec, section 1). 400 for an invalid query. */
+  getUsage(query?: UsageQuery): Promise<Usage>;
+  /** The newest limit windows each runner reported; none after a restart until an agent runs. */
+  getUsageLimits(): Promise<RunnerLimits[]>;
+  /** By name. */
+  listAutomations(): Promise<Automation[]>;
+  /** 400 with the reason when it does not validate. */
+  createAutomation(body: AutomationRequest): Promise<Automation>;
+  /** What a cron expression means, or why it is not valid. */
+  previewCron(expr: string): Promise<CronPreview>;
+  getAutomation(id: string): Promise<Automation>;
+  /** Replaces the automation; 400 with the reason when it does not validate. */
+  putAutomation(id: string, body: AutomationRequest): Promise<Automation>;
+  /** The sessions it started are kept. */
+  deleteAutomation(id: string): Promise<void>;
+  /** Fires it now; 409 while its previous session is still active. */
+  runAutomation(id: string, body: RunAutomationRequest): Promise<AutomationRun>;
+  /** Newest first, at most 50. */
+  listAutomationRuns(id: string): Promise<AutomationRun[]>;
   /** The built-in `quick` first, then the home repo's workflows by id; an invalid one carries its problems. */
   listWorkflows(): Promise<WorkflowInfo[]>;
   listSessions(): Promise<Session[]>;
@@ -249,6 +292,16 @@ export function createApi(
     `${session(id)}/repos/${encodeURIComponent(sessionRepoId)}/${route}` +
     (path === "" ? "" : `?path=${encodeURIComponent(path)}`);
 
+  /** `?a=1&b=2` from the entries that are set, each value percent-encoded; empty when none is. */
+  const query = (params: Record<string, string | number | undefined>): string => {
+    const parts = Object.entries(params).flatMap(([key, value]) =>
+      value === undefined ? [] : [`${key}=${encodeURIComponent(String(value))}`],
+    );
+    return parts.length === 0 ? "" : `?${parts.join("&")}`;
+  };
+  const repo = (id: string) => `/repos/${encodeURIComponent(id)}`;
+  const automation = (id: string) => `/automations/${encodeURIComponent(id)}`;
+
   const tokens = (id: string) => `/tokens/${encodeURIComponent(id)}`;
 
   return {
@@ -288,6 +341,31 @@ export function createApi(
     cloneRepo: (id) => empty("POST", `/repos/${encodeURIComponent(id)}/clone`),
     removeRepo: (id) => empty("DELETE", `/repos/${encodeURIComponent(id)}`),
     listRepoSets: () => json<RepoSet[]>("GET", "/repo-sets"),
+    listIssues: (repoId, wanted = {}) =>
+      json<Issue[]>(
+        "GET",
+        `${repo(repoId)}/issues${query({ state: wanted.state, q: wanted.q === "" ? undefined : wanted.q })}`,
+      ),
+    getIssue: (repoId, number) =>
+      json<IssueDetail>("GET", `${repo(repoId)}/issues/${encodeURIComponent(String(number))}`),
+    getUsage: (wanted = {}) =>
+      json<Usage>(
+        "GET",
+        `/usage${query({
+          from: wanted.from === undefined ? undefined : Math.round(wanted.from),
+          to: wanted.to === undefined ? undefined : Math.round(wanted.to),
+          by: wanted.by,
+        })}`,
+      ),
+    getUsageLimits: () => json<RunnerLimits[]>("GET", "/usage/limits"),
+    listAutomations: () => json<Automation[]>("GET", "/automations"),
+    createAutomation: (body) => json<Automation>("POST", "/automations", body),
+    previewCron: (expr) => json<CronPreview>("GET", `/automations/cron${query({ expr })}`),
+    getAutomation: (id) => json<Automation>("GET", automation(id)),
+    putAutomation: (id, body) => json<Automation>("PUT", automation(id), body),
+    deleteAutomation: (id) => empty("DELETE", automation(id)),
+    runAutomation: (id, body) => json<AutomationRun>("POST", `${automation(id)}/run`, body),
+    listAutomationRuns: (id) => json<AutomationRun[]>("GET", `${automation(id)}/runs`),
     listWorkflows: () => json<WorkflowInfo[]>("GET", "/workflows"),
     listSessions: () => json<Session[]>("GET", "/sessions"),
     createSession: (body) => json<SessionDetail>("POST", "/sessions", body),

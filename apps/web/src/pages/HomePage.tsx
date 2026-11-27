@@ -14,6 +14,10 @@ export default function HomePage() {
     return health.status === "ready" ? health.health.runners : [];
   };
 
+  // api.rs: issues need a usable `gh`; when the server says it is not, there is nothing to list.
+  const githubUsable = (): boolean =>
+    app.health().status === "ready" && app.githubProblem() === undefined;
+
   onSettled(() => {
     app.loadRepos();
     app.loadWorkflows();
@@ -30,6 +34,16 @@ export default function HomePage() {
         onRemoveRepo={(id) => app.removeRepo(id)}
         onCloneRepo={(id) => app.cloneRepo(id)}
         onRetryRepos={() => app.loadRepos()}
+        issues={
+          githubUsable()
+            ? {
+                list: (repoId, query) => app.listIssues(repoId, query),
+                get: (repoId, number) => app.getIssue(repoId, number),
+              }
+            : undefined
+        }
+        limits={app.limits()}
+        now={app.now()}
         onCreate={async (request) => {
           const session = await app.createSession(request);
           navigate(sessionPath(session.id));

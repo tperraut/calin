@@ -11,6 +11,7 @@ import {
   type ParentProps,
 } from "solid-js";
 import { ConnectionIndicator } from "./components/ConnectionIndicator";
+import { HomeSummary } from "./components/HomeSummary";
 import { AccountControls, SessionEndedBar, SignInScreen } from "./components/SignIn";
 import { SessionList } from "./components/SessionList";
 import { errorMessage } from "./lib/errors";
@@ -194,6 +195,24 @@ function Shell(props: ParentProps) {
                   </a>
                 </span>
               </header>
+              {/* More of the app's pages; not a landmark, so the sessions stay the one navigation here. */}
+              <div class="flex items-center gap-4 border-b border-line px-3">
+                <a
+                  href="/automations"
+                  class="flex min-h-11 items-center text-sm text-accent"
+                  aria-current={location.pathname.startsWith("/automations") ? "page" : undefined}
+                >
+                  Automations
+                </a>
+                <a
+                  href="/usage"
+                  class="flex min-h-11 items-center text-sm text-accent"
+                  aria-current={location.pathname === "/usage" ? "page" : undefined}
+                >
+                  Usage
+                </a>
+              </div>
+              <HomeSummary sessions={app.sessions()} limits={app.limits()} />
               <nav aria-label="Sessions" class="min-h-0 flex-1 overflow-y-auto overscroll-contain">
                 <SessionsPanel />
               </nav>

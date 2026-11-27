@@ -12,6 +12,16 @@ export function relativeTime(ts: number, now: number): string {
   return new Date(ts).toLocaleDateString(undefined, { dateStyle: "medium" });
 }
 
+/** "in less than a minute", "in 12 min", "in 3 h", "in 2 d", then a date. For times ahead of `now`. */
+export function relativeFuture(ts: number, now: number): string {
+  const ahead = Math.max(0, ts - now);
+  if (ahead < MINUTE) return "in less than a minute";
+  if (ahead < HOUR) return `in ${Math.floor(ahead / MINUTE)} min`;
+  if (ahead < DAY) return `in ${Math.floor(ahead / HOUR)} h`;
+  if (ahead < 7 * DAY) return `in ${Math.floor(ahead / DAY)} d`;
+  return `on ${new Date(ts).toLocaleDateString(undefined, { dateStyle: "medium" })}`;
+}
+
 export function absoluteTime(ts: number): string {
   return new Date(ts).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
 }

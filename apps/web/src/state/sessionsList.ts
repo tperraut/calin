@@ -1,4 +1,5 @@
 import type { Session } from "../gen/Session";
+import type { SessionStatus } from "../gen/SessionStatus";
 import { isSettled } from "./sessionTree";
 
 /** Newest first by `created_at`; the id breaks ties so the order is stable. */
@@ -58,4 +59,43 @@ function descendants(node: SessionNode): Session[] {
 export function childrenShownByDefault(node: SessionNode, openId: string | undefined): boolean {
   const all = descendants(node);
   return all.some((child) => child.id === openId || !isSettled(child.status));
+}
+
+/** model.rs: `waiting` asks the user something, `review` waits for them to look (integrations spec, section 4). */
+export const needsYou = (status: SessionStatus): boolean =>
+  status === "waiting" || status === "review";
+
+const treeNeedsYou = (node: SessionNode): boolean =>
+  needsYou(node.session.status) || node.children.some(treeNeedsYou);
+
+/**
+ * The top-level rows with every tree that holds a session needing the user
+ * first, each group in its existing order. Children stay under their parent. Pure.
+ */
+export function needsYouFirst(nodes: readonly SessionNode[]): SessionNode[] {
+  return [...nodes.filter(treeNeedsYou), ...nodes.filter((node) => !treeNeedsYou(node))];
+}
+
+/** The first session needing the user, reading the rows top to bottom, children under their parent. */
+export function firstNeedingYou(nodes: readonly SessionNode[]): Session | undefined {
+  for (const node of nodes) {
+    if (needsYou(node.session.status)) return node.session;
+    const below = firstNeedingYou(node.children);
+    if (below) return below;
+  }
+  return undefined;
+}
+
+/** What the home summary counts (integrations spec, section 4). */
+export type SessionCounts = { needYou: number; running: number; queued: number };
+
+export function countSessions(sessions: readonly Session[]): SessionCounts {
+  const counts: SessionCounts = { needYou: 0, running: 0, queued: 0 };
+  for (const { status } of sessions) {
+    if (needsYou(status)) counts.needYou += 1;
+    // `preparing` is a session that took its slot and is setting up its worktrees.
+    else if (status === "running" || status === "preparing") counts.running += 1;
+    else if (status === "queued") counts.queued += 1;
+  }
+  return counts;
 }

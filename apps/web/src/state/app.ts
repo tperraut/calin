@@ -1,21 +1,29 @@
 import { createContext, createSignal, type Accessor } from "solid-js";
-import { HttpError, type Api } from "../api/http";
+import { HttpError, type Api, type IssueQuery, type UsageQuery } from "../api/http";
 import { TOPIC_SESSIONS, type ConnectionState, type SocketClient } from "../api/socket";
 import type { OpenTerminal } from "../api/terminal";
 import type { WorkerMessage } from "../sw/protocol";
 import type { AuthSessionInfo } from "../gen/AuthSessionInfo";
+import type { Automation } from "../gen/Automation";
+import type { AutomationRequest } from "../gen/AutomationRequest";
+import type { AutomationRun } from "../gen/AutomationRun";
 import type { CreatedDeviceToken } from "../gen/CreatedDeviceToken";
 import type { CreateSessionRequest } from "../gen/CreateSessionRequest";
+import type { CronPreview } from "../gen/CronPreview";
 import type { DeviceTokenInfo } from "../gen/DeviceTokenInfo";
 import type { Health } from "../gen/Health";
+import type { Issue } from "../gen/Issue";
+import type { IssueDetail } from "../gen/IssueDetail";
 import type { PushPreferences } from "../gen/PushPreferences";
 import type { PushSubscriptionInfo } from "../gen/PushSubscriptionInfo";
 import type { PushSubscriptionRequest } from "../gen/PushSubscriptionRequest";
 import type { RegisterRepoRequest } from "../gen/RegisterRepoRequest";
 import type { Repo } from "../gen/Repo";
 import type { RepoSet } from "../gen/RepoSet";
+import type { RunnerLimits } from "../gen/RunnerLimits";
 import type { Session } from "../gen/Session";
 import type { Settings } from "../gen/Settings";
+import type { Usage } from "../gen/Usage";
 import type { WorkflowInfo } from "../gen/WorkflowInfo";
 import { signInUrl } from "../lib/auth";
 import { NO_DEVICE, type Device } from "../lib/device";
@@ -23,6 +31,7 @@ import type { WorkerBridge } from "../lib/serviceWorker";
 import { errorMessage } from "../lib/errors";
 import { coalesce, type Schedule } from "../lib/schedule";
 import { createCatalog, type RepoRegistry } from "./catalog";
+import { mergeAllLimits, mergeLimits } from "./limits";
 import { createSessionStore, type SessionStore } from "./sessionStore";
 import { upsertSession } from "./sessionsList";
 
@@ -124,8 +133,29 @@ export type AppState = {
   loadSettings(): void;
   /** Replaces the settings. Rejects with the server's reason; the repos follow a change. */
   saveSettings(settings: Settings): Promise<Settings>;
-  /** A clock that ticks slowly, for relative times. */
+  /** A clock that ticks once a minute, for relative times. */
   now: Accessor<number>;
+  /**
+   * The newest limit windows per runner, by runner: what `GET /usage/limits`
+   * said, then each `limits` event of a session open here (integrations spec, section 1).
+   */
+  limits: Accessor<readonly RunnerLimits[]>;
+  /** Reads `GET /usage/limits` again; what the events said since stays when it is newer. */
+  loadLimits(): void;
+  /** A repo's GitHub issues; rejects with the server's reason (a 409 when GitHub cannot be used). */
+  listIssues(repoId: string, query: IssueQuery): Promise<Issue[]>;
+  getIssue(repoId: string, number: number): Promise<IssueDetail>;
+  /** Totals and one breakdown over a range; rejects with the server's reason. */
+  usage(query: UsageQuery): Promise<Usage>;
+  listAutomations(): Promise<Automation[]>;
+  getAutomation(id: string): Promise<Automation>;
+  /** Creates the automation when `id` is absent, replaces it otherwise. Rejects with the server's reason. */
+  saveAutomation(id: string | undefined, request: AutomationRequest): Promise<Automation>;
+  deleteAutomation(id: string): Promise<void>;
+  previewCron(expr: string): Promise<CronPreview>;
+  /** `number` names the issue or pull request for a trigger; absent for a schedule. */
+  runAutomation(id: string, number?: number): Promise<AutomationRun>;
+  automationRuns(id: string): Promise<AutomationRun[]>;
   createSession(request: CreateSessionRequest): Promise<Session>;
   openSession(id: string): SessionStore;
   /** Asks again for the server, without waiting for the backoff. */
@@ -156,7 +186,8 @@ export type AppState = {
 
 export const AppContext = createContext<AppState>();
 
-const CLOCK_TICK_MS = 30_000;
+// Relative times ("3 min ago") change at most once a minute.
+const CLOCK_TICK_MS = 60_000;
 const ME_RETRY_BASE_MS = 1000;
 const ME_RETRY_MAX_MS = 15_000;
 
@@ -196,6 +227,29 @@ export function createAppState(services: AppServices): AppState {
   }
 
   const catalog = createCatalog(api);
+
+  const [limits, setLimits] = createSignal<readonly RunnerLimits[]>([]);
+  let limitsNow: readonly RunnerLimits[] = [];
+  function takeLimits(next: readonly RunnerLimits[]): void {
+    if (next === limitsNow) return;
+    limitsNow = next;
+    setLimits(next);
+  }
+  let limitsInFlight = false;
+  function loadLimits(): void {
+    if (limitsInFlight) return;
+    limitsInFlight = true;
+    api.getUsageLimits().then(
+      (loaded) => {
+        limitsInFlight = false;
+        takeLimits(mergeAllLimits(limitsNow, loaded));
+      },
+      () => {
+        // Limits are a hint wherever they show: without them the screens simply say nothing.
+        limitsInFlight = false;
+      },
+    );
+  }
 
   let settingsKnown = false;
   let settingsWanted = false;
@@ -273,6 +327,7 @@ export function createAppState(services: AppServices): AppState {
       // After a reconnect the server may be another build with other runners.
       if (opens > 1 || !healthKnown) loadHealth();
       catalog.reload({ missingOnly: opens === 1 });
+      loadLimits();
       if (settingsWanted && !settingsKnown) loadSettings();
       // After a reconnect the home repo's files may have changed.
       if (workflowsWanted && (opens > 1 || !workflowsKnown)) loadWorkflows();
@@ -416,6 +471,7 @@ export function createAppState(services: AppServices): AppState {
     setWorkflows({ status: "loading" });
     healthKnown = false;
     setHealth({ status: "loading" });
+    takeLimits([]);
   }
 
   const identity = (): string | undefined => {
@@ -489,6 +545,19 @@ export function createAppState(services: AppServices): AppState {
       return stored;
     },
     now,
+    limits,
+    loadLimits,
+    listIssues: (repoId, query) => api.listIssues(repoId, query),
+    getIssue: (repoId, number) => api.getIssue(repoId, number),
+    usage: (query) => api.getUsage(query),
+    listAutomations: () => api.listAutomations(),
+    getAutomation: (id) => api.getAutomation(id),
+    saveAutomation: (id, request) =>
+      id === undefined ? api.createAutomation(request) : api.putAutomation(id, request),
+    deleteAutomation: (id) => api.deleteAutomation(id),
+    previewCron: (expr) => api.previewCron(expr),
+    runAutomation: (id, number) => api.runAutomation(id, number === undefined ? {} : { number }),
+    automationRuns: (id) => api.listAutomationRuns(id),
     async createSession(request) {
       const { session } = await api.createSession(request);
       upsert(session);
@@ -506,6 +575,7 @@ export function createAppState(services: AppServices): AppState {
           health: knownHealth,
           checkHealth: loadHealth,
           now,
+          onLimits: (report) => takeLimits(mergeLimits(limitsNow, report)),
         },
         id,
       ),

@@ -48,6 +48,20 @@
   }
 }
 
+/*
+ * Narrowest slot of a day in the usage chart: a fingertip's width on a touch
+ * screen; with a mouse on a wide screen 90 days fit without scrolling.
+ */
+:root {
+  --chart-slot: 24px;
+}
+
+@media (min-width: 64rem) and (not (pointer: coarse)) {
+  :root {
+    --chart-slot: 8px;
+  }
+}
+
 @theme inline {
   --color-bg: var(--bg);
   --color-surface: var(--surface);

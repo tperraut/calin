@@ -14,10 +14,12 @@ import type { FileContent } from "../gen/FileContent";
 import type { FileDiff } from "../gen/FileDiff";
 import type { Graph } from "../gen/Graph";
 import type { Health } from "../gen/Health";
+import type { LimitWindow } from "../gen/LimitWindow";
 import type { PermissionDecision } from "../gen/PermissionDecision";
 import type { PullRequest } from "../gen/PullRequest";
 import type { RepoChanges } from "../gen/RepoChanges";
 import type { ResolvePermissionRequest } from "../gen/ResolvePermissionRequest";
+import type { RunnerLimits } from "../gen/RunnerLimits";
 import type { Session } from "../gen/Session";
 import type { SessionDetail } from "../gen/SessionDetail";
 import type { SessionRepo } from "../gen/SessionRepo";
@@ -201,6 +203,8 @@ export type SessionStoreDeps = {
   checkHealth?: () => void;
   /** The app's clock; a still one where none is given. */
   now?: Accessor<number>;
+  /** A `limits` event arrived: the runner of the agent that reported it, as of the event. */
+  onLimits?: (report: RunnerLimits) => void;
 };
 
 const noTerminal: OpenTerminal = (_request, handlers) => {
@@ -422,6 +426,16 @@ export function createSessionStore(deps: SessionStoreDeps, id: string): SessionS
     socket.resync(topic, current.seq);
   }
 
+  function reportLimits(
+    event: { agent_id: string | null; ts: number },
+    windows: LimitWindow[],
+  ): void {
+    const agent = current.agents.find((one) => one.id === event.agent_id);
+    const runner = agent?.runner ?? session()?.runner;
+    if (runner === undefined) return;
+    deps.onLimits?.({ runner, windows, reported_at: event.ts });
+  }
+
   const onFrame: TopicHandler = (msg) => {
     if (msg.op === "event") {
       const result = applyEvent(current, msg.event);
@@ -435,6 +449,8 @@ export function createSessionStore(deps: SessionStoreDeps, id: string): SessionS
         }
         // Live only as well: a replayed pull request is not this ship's.
         if (caughtUp && shipWatch) watchShip(shipWatch, msg.event.body);
+        // Replayed ones too: the app keeps whichever report is newest.
+        if (msg.event.body.type === "limits") reportLimits(msg.event, msg.event.body.windows);
         if (current.workflow && caughtUp) {
           seedWorkflow();
           const type = msg.event.body.type;

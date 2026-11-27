@@ -786,6 +786,9 @@ function applyBody(view: SessionView, event: Event): SessionView {
     case "workflow_node":
     case "workflow_finished":
       return applyWorkflow(view, event, body);
+    case "limits":
+      // Not a transcript row: the store hands it to the app (integrations spec, section 1).
+      return view;
     case "error": {
       const entry: TranscriptEntry = {
         kind: "error",

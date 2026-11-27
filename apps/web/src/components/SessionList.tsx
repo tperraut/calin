@@ -2,8 +2,14 @@ import { createMemo, createSignal, For, Show } from "solid-js";
 import type { Session } from "../gen/Session";
 import { absoluteTime, relativeTime } from "../lib/format";
 import { sessionPath } from "../panels/registry";
-import { childrenShownByDefault, nestSessions, type SessionNode } from "../state/sessionsList";
+import {
+  childrenShownByDefault,
+  needsYouFirst,
+  nestSessions,
+  type SessionNode,
+} from "../state/sessionsList";
 import { SessionStatusBadge } from "./Badge";
+import { SessionOrigin } from "./SessionChips";
 
 function SessionLink(props: { session: Session; now: number; child: boolean }) {
   return (
@@ -65,6 +71,8 @@ function SessionRows(props: {
         <li>
           <div class="flex items-stretch">
             <SessionLink session={node().session} now={props.now} child={props.child} />
+            {/* Links of their own, beside the row's: links do not nest. */}
+            <SessionOrigin session={node().session} />
             <Show when={node().children.length > 0}>
               <button
                 type="button"
@@ -106,13 +114,14 @@ function SessionRows(props: {
 }
 
 /**
- * The sessions as links, in the order given, with the sessions an agent
+ * The sessions as links, those needing the reader first, then in the order
+ * given, with the sessions an agent
  * dispatched nested under the one that dispatched them. A parent's children
  * are folded away once all of them are settled; the reader can always toggle.
  * `now` drives the relative times; `openId` is the session on screen, if any.
  */
 export function SessionList(props: { sessions: readonly Session[]; now: number; openId?: string }) {
-  const nodes = createMemo(() => nestSessions(props.sessions));
+  const nodes = createMemo(() => needsYouFirst(nestSessions(props.sessions)));
   const [chosen, setChosen] = createSignal<ReadonlyMap<string, boolean>>(new Map());
   return (
     <ul class="divide-y divide-line">
