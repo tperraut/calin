@@ -14,6 +14,7 @@ import type { Tone } from "../../lib/status";
 import { layoutGraph, NODE_SIZE, sizeOf, type Layout, type LayoutMode } from "./layout";
 import {
   clip,
+  clipMiddle,
   describeGraph,
   edgeEmphasis,
   edgeKindWords,
@@ -145,7 +146,7 @@ function NodeShape(props: { node: NodeView }) {
       <rect class="gown" x="-3" y="-3" width={AGENT.w + 6} height={AGENT.h + 6} rx="10" />
       <rect class="gshape" width={AGENT.w} height={AGENT.h} rx="8" />
       <text class="gtitle" x="10" y="20">
-        {clip(props.node.title, props.node.cost === undefined ? 22 : 14)}
+        {clipMiddle(props.node.title, props.node.cost === undefined ? 22 : 14)}
       </text>
       <Show when={props.node.status}>
         {(status) => <StatusMark tone={status().tone} x={10} y={30} />}

@@ -7,6 +7,7 @@ import type { TimelineSpan } from "../../gen/TimelineSpan";
 import type { ToolKind } from "../../gen/ToolKind";
 import { clockTime, formatDuration } from "../../lib/format";
 import { itemLook } from "../../lib/status";
+import { clipMiddle } from "./model";
 
 /** Height of one lane, and of the axis above the first one. */
 export const LANE_HEIGHT = 44;
@@ -55,7 +56,8 @@ export function laneViews(
       id: lane.agent.id,
       lane,
       depth: depthOf(lane, new Set()),
-      label: title === undefined ? lane.agent.role : `${lane.agent.role} · ${title}`,
+      label:
+        title === undefined ? lane.agent.role : `${lane.agent.role} · ${clipMiddle(title, 24)}`,
       own: lane.session_id === openSessionId,
     };
   });

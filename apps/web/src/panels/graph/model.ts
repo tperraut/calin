@@ -260,3 +260,14 @@ export const edgesOf = (nodeId: string, model: GraphModel): EdgeView[] =>
 export function clip(text: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, Math.max(1, max - 1)).trimEnd()}…`;
 }
+
+/**
+ * Cut in the middle: sibling sessions share their start ("Ship the health check:
+ * part A", "… part B"), so the end is what tells them apart.
+ */
+export function clipMiddle(text: string, max: number): string {
+  if (text.length <= max) return text;
+  const tail = Math.floor((max - 1) / 2);
+  const head = max - 1 - tail;
+  return `${text.slice(0, head).trimEnd()}…${text.slice(text.length - tail).trimStart()}`;
+}

@@ -146,6 +146,9 @@ describe("lanes and arrows", () => {
     ]);
     // A lead whose session's title is not known is just its role.
     expect(laneViews(makeTimeline(), "s1", () => undefined)[2].label).toBe("lead");
+    // Sibling sessions share their start: the label keeps the end that tells them apart.
+    const long = laneViews(makeTimeline(), "s1", () => "Ship the health check: part B")[2];
+    expect(long.label).toBe("lead · Ship the hea…eck: part B");
   });
 
   it("draws an arrow at its moment from the sender's lane to the recipient's", () => {
