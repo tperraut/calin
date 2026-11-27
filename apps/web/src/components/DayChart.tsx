@@ -92,7 +92,9 @@ export function DayChart(props: { days: readonly UsageRow[]; today: string | und
     <div class="flex flex-col gap-1">
       <p class="min-h-10 text-sm" aria-hidden="true" data-part="day-detail">
         {detail() ?? (
-          <span class="text-muted">Point at a bar, or focus one and use the arrow keys.</span>
+          <span class="text-muted pointer-coarse:hidden">
+            Point at a bar, or focus one and use the arrow keys.
+          </span>
         )}
       </p>
       <div class="flex">

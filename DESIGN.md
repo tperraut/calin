@@ -152,7 +152,7 @@ enough to sit in dense lists without shouting.
 ### Status
 
 - **Attention** (`tone-attention`, on `attention-soft`): waiting for you, review, permission and
-  question cards, the dry-run banner.
+  question cards. Only what needs the user: the dry-run banner and neutral notices use the Well.
 - **Success** (`tone-success`): done, passed, added lines.
 - **Danger** (`tone-danger`, on `danger-soft`): failed, denied, deleted lines, destructive actions.
 - **Active** is the accent; **Neutral** is Pencil.
@@ -250,8 +250,9 @@ outline with a 2 px offset is the one focus style.
   and no fill until pointed at, then the Well.
 - **Pressed toggle:** `aria-pressed="true"` fills it with `accent-soft` under a Cobalt border, so
   the state does not rest on hue alone.
-- **Disabled:** half opacity, not-allowed cursor. A disabled primary drops its fill: Well
-  background, hairline border, Pencil text, so it never reads as live.
+- **Disabled:** half opacity, not-allowed cursor. A disabled primary drops its fill: no
+  background, hairline border, Pencil text, so it never reads as live (a Well fill read as a
+  pressed button in dark).
 
 ### Choices
 

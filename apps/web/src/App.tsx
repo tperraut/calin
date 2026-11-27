@@ -153,7 +153,7 @@ function Shell(props: ParentProps) {
         <UpdateNotice />
       </Show>
       <Show when={authorized() && dryRun()}>
-        <p class="border-b border-line bg-attention-soft px-3 py-1 text-center text-xs">
+        <p class="border-b border-line bg-sunken px-3 py-1 text-center text-xs text-muted">
           Dry run: agents are simulated
         </p>
       </Show>

@@ -63,10 +63,7 @@ export function LimitMeters(props: { limits: readonly RunnerLimits[]; now: numbe
                               {state().label}
                             </span>
                           </p>
-                          <div
-                            aria-hidden="true"
-                            class="h-2 overflow-hidden rounded-full bg-sunken"
-                          >
+                          <div aria-hidden="true" class="h-2 overflow-hidden rounded-full bg-line">
                             <div
                               class={["h-full rounded-full", toneFill[state().tone]]}
                               style={{ width: percentUsed(window().used) }}

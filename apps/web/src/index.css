@@ -193,10 +193,13 @@
     filter: brightness(1.08);
   }
 
-  /* Plainly off in both themes, rather than a faded accent that still reads as live. */
+  /*
+   * Plainly off in both themes, rather than a faded accent that still reads as live. No
+   * fill: a sunken one reads as a pressed button in the dark theme.
+   */
   .btn-primary:disabled {
     border-color: var(--line);
-    background: var(--sunken);
+    background: transparent;
     color: var(--muted);
     opacity: 1;
   }

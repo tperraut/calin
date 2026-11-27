@@ -82,7 +82,7 @@ function ShareTable(props: {
                     <span class="block truncate">
                       {row().key === "" ? props.emptyLabel : row().label || row().key}
                     </span>
-                    <span aria-hidden="true" class="mt-1 block h-1 rounded-full bg-sunken">
+                    <span aria-hidden="true" class="mt-1 block h-1 rounded-full bg-line">
                       <span
                         class="block h-full rounded-full bg-accent"
                         style={{
