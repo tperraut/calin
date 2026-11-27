@@ -204,10 +204,14 @@ impl Driver {
                 request_id,
                 decision,
                 message,
+                grants,
             } => {
-                let response = self
-                    .mapper
-                    .permission_response(&request_id, decision, message);
+                let response = self.mapper.permission_response_granting(
+                    &request_id,
+                    decision,
+                    message,
+                    &grants,
+                );
                 match response {
                     Some(response) => self.write(&response).await,
                     None => {

@@ -5,6 +5,7 @@
 mod api;
 mod assets;
 mod guard;
+mod mcp;
 mod term;
 mod ws;
 
@@ -23,6 +24,12 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
 pub use assets::Assets;
+
+/// Where agents reach Calin's tools, under [`API_ROOT`]: the token of one
+/// agent follows.
+const MCP_PATH: &str = "/mcp";
+const MCP_ROUTE: &str = "/mcp/{token}";
+const API_ROOT: &str = "/api/v1";
 
 /// What the handlers share.
 #[derive(Clone)]
@@ -78,8 +85,15 @@ impl AppState {
 pub fn router(state: AppState) -> Router {
     let api = Router::new()
         .route("/health", get(api::health))
+        .route(
+            "/settings",
+            get(api::get_settings).put(api::update_settings),
+        )
         .route("/repos", get(api::list_repos).post(api::register_repo))
+        .route("/repos/refresh", post(api::refresh_repos))
+        .route("/repos/{id}/clone", post(api::clone_repo))
         .route("/repos/{id}", delete(api::remove_repo))
+        .route("/repo-sets", get(api::list_repo_sets))
         .route(
             "/sessions",
             get(api::list_sessions).post(api::create_session),
@@ -92,6 +106,7 @@ pub fn router(state: AppState) -> Router {
             "/sessions/{id}/permissions/{request_id}",
             post(api::resolve_permission),
         )
+        .route("/sessions/{id}/repos", post(api::attach_repo))
         .route("/sessions/{id}/changes", get(api::session_changes))
         .route(
             "/sessions/{id}/repos/{session_repo_id}/diff",
@@ -106,9 +121,10 @@ pub fn router(state: AppState) -> Router {
             get(api::read_file).put(api::write_file),
         )
         .route("/sessions/{id}/terminals/ws", get(term::upgrade))
-        .route("/ws", get(ws::upgrade));
+        .route("/ws", get(ws::upgrade))
+        .route(MCP_ROUTE, post(mcp::call));
     Router::new()
-        .nest("/api/v1", api)
+        .nest(API_ROOT, api)
         // Everything else: a JSON 404 under `/api`, the web app otherwise.
         .fallback(assets::serve)
         .method_not_allowed_fallback(api::method_not_allowed)
@@ -126,6 +142,12 @@ pub struct Server {
 impl Server {
     pub async fn bind(addr: SocketAddr, state: AppState) -> std::io::Result<Self> {
         let listener = TcpListener::bind(addr).await?;
+        // Only now is the port known, and with it the address agents are
+        // given for Calin's tools. They run on this machine: loopback it is.
+        let bound = listener.local_addr()?;
+        state
+            .manager
+            .set_tool_endpoint(format!("http://{bound}{API_ROOT}{MCP_PATH}"));
         Ok(Self { listener, state })
     }
 

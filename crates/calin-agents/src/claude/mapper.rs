@@ -15,7 +15,7 @@ use calin_proto::{
 use serde_json::{Value, json};
 
 use super::tools;
-use crate::runner::RunnerOutput;
+use crate::runner::{DirGrant, PermissionAsk, RunnerOutput};
 
 /// Told to the agent with a denial that carries no message of its own.
 const DEFAULT_DENIAL: &str = "The user denied this request.";
@@ -49,6 +49,8 @@ pub(crate) struct Mapper {
     totals: Totals,
     /// The error already shown in this turn, so the result does not repeat it.
     turn_error: Option<String>,
+    /// The agent's task list, which the CLI reports one change at a time.
+    tasks: tools::TaskList,
 }
 
 #[derive(Debug, Default)]
@@ -149,6 +151,7 @@ impl Mapper {
             denied: HashSet::new(),
             totals: Totals::default(),
             turn_error: None,
+            tasks: tools::TaskList::default(),
         }
     }
 
@@ -207,16 +210,34 @@ impl Mapper {
 
     /// The stdin line that answers a permission request, or `None` when no
     /// request with this id is waiting.
+    #[cfg(test)]
     pub(crate) fn permission_response(
         &mut self,
         request_id: &str,
         decision: PermissionDecision,
         message: Option<String>,
     ) -> Option<Value> {
+        self.permission_response_granting(request_id, decision, message, &[])
+    }
+
+    /// Like [`Self::permission_response`]; an allow also opens `grants` to
+    /// the CLI for the rest of its run, so it stops asking about them
+    /// (recorded in `grant-directories`).
+    pub(crate) fn permission_response_granting(
+        &mut self,
+        request_id: &str,
+        decision: PermissionDecision,
+        message: Option<String>,
+        grants: &[DirGrant],
+    ) -> Option<Value> {
         let pending = self.pending.remove(request_id)?;
         let response = match decision {
             PermissionDecision::Allow => {
-                json!({ "behavior": "allow", "updatedInput": pending.input })
+                let mut response = json!({ "behavior": "allow", "updatedInput": pending.input });
+                if !grants.is_empty() {
+                    response["updatedPermissions"] = grants.iter().map(permission_update).collect();
+                }
+                response
             }
             PermissionDecision::Deny => {
                 self.denied.extend(pending.tool_use_id);
@@ -245,6 +266,16 @@ impl Mapper {
     }
 
     fn system(&mut self, message: &Value, out: &mut Vec<RunnerOutput>) {
+        // Statuses the CLI set without a task tool call. The shape is the one
+        // in the CLI's own schema; no recording holds one.
+        if str_field(message, "subtype") == Some("task_list_statuses") {
+            let statuses = message.get("statuses").and_then(Value::as_array);
+            let statuses = statuses.map(Vec::as_slice).unwrap_or_default();
+            if let Some(entries) = self.tasks.set_statuses(statuses) {
+                out.push(event(EventBody::PlanUpdated { entries }));
+            }
+            return;
+        }
         // `init` opens every turn; only a change is news.
         if str_field(message, "subtype") != Some("init") {
             return;
@@ -484,9 +515,19 @@ impl Mapper {
                 ItemStatus::Completed
             };
             let output = tools::result_text(block.get("content").unwrap_or(&Value::Null));
+            let plan = (status == ItemStatus::Completed)
+                .then(|| {
+                    let result = message.get("tool_use_result").unwrap_or(&Value::Null);
+                    self.tasks.apply(&call.name, &call.input, result, &output)
+                })
+                .flatten();
             out.push(event(EventBody::ItemCompleted {
                 item: call.item(status, Some(tools::capped(output))),
             }));
+            // After the call: the plan changed when the tool said so.
+            if let Some(entries) = plan {
+                out.push(event(EventBody::PlanUpdated { entries }));
+            }
         }
     }
 
@@ -521,13 +562,16 @@ impl Mapper {
                 input: input.clone(),
             },
         );
-        out.push(RunnerOutput::PermissionRequest(PermissionRequest {
-            id: request_id.to_owned(),
-            tool_name: name.to_owned(),
-            tool_kind: view.kind,
-            title: view.title,
-            input,
-            item_id: tool_use_id,
+        out.push(RunnerOutput::PermissionRequest(PermissionAsk {
+            request: PermissionRequest {
+                id: request_id.to_owned(),
+                tool_name: name.to_owned(),
+                tool_kind: view.kind,
+                title: view.title,
+                input,
+                item_id: tool_use_id,
+            },
+            access: view.access,
         }));
     }
 
@@ -678,6 +722,23 @@ impl Block {
 
 fn event(body: EventBody) -> RunnerOutput {
     RunnerOutput::Event(body)
+}
+
+/// One entry of `updatedPermissions`, in the shape of the CLI's own
+/// suggestions: a directory to work in, or a rule that allows reading below
+/// one. A rule's path starts with `//` when it is absolute.
+fn permission_update(grant: &DirGrant) -> Value {
+    let dir = grant.dir.to_string_lossy();
+    if grant.write {
+        json!({ "type": "addDirectories", "directories": [dir], "destination": "session" })
+    } else {
+        json!({
+            "type": "addRules",
+            "rules": [{ "toolName": "Read", "ruleContent": format!("/{dir}/**") }],
+            "behavior": "allow",
+            "destination": "session",
+        })
+    }
 }
 
 fn str_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {

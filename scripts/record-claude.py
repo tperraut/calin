@@ -16,13 +16,21 @@ A scenario is a JSON object. Only `turns` is required.
 
     {
       "files": {"notes.txt": "one\n"},     files created in the working directory first
+      "dirs": {"other": {"a.txt": "a\n"}},  directories created NEXT TO the working directory, as
+                                            <workdir>-<label>, with their files; `{other}` in a
+                                            turn is replaced by that directory's path (the
+                                            scrubber then turns it into /work-other)
       "turns": ["first prompt", "..."],     one user message each; the next is sent after `result`
       "model": "haiku",                     default "haiku"
       "permission_mode": "default",         default "default"
       "args": ["--tools", "Read,Write"],    extra CLI arguments
+      "env": {"NAME": "value"},             extra environment variables for the CLI
       "permissions": ["deny", "allow"],     answers to permission requests, in order; the last
                                             one repeats; default ["allow"]
       "deny_message": "Not allowed.",       sent with a deny
+      "grant": true,                        an allow also carries `updatedPermissions`: the
+                                            request's `addDirectories` and `addRules` suggestions,
+                                            so the CLI stops asking about that directory
       "interrupt": {                        send an interrupt request ...
         "turn": 1,                          ... during this turn (1-based) ...
         "after_tool_use": "Bash",           ... once the CLI reported a call of this tool ...
@@ -94,6 +102,16 @@ def main() -> int:
         with open(path, "w", encoding="utf-8") as f:
             f.write(content)
 
+    for label, files in scenario.get("dirs", {}).items():
+        side = f"{workdir}-{label}"
+        os.makedirs(side, exist_ok=True)
+        for name, content in files.items():
+            path = os.path.join(side, name)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+        turns = [turn.replace("{" + label + "}", side) for turn in turns]
+
     cmd = [
         args.claude, "-p",
         "--input-format", "stream-json",
@@ -122,7 +140,7 @@ def main() -> int:
     record({"dir": "meta", "workdir": workdir, "cmd": cmd[1:], "scenario": scenario})
     proc = subprocess.Popen(
         cmd, cwd=workdir, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, bufsize=1, start_new_session=True,
+        text=True, bufsize=1, start_new_session=True, env={**os.environ, **scenario.get("env", {})},
     )  # fmt: skip
 
     def send(obj: dict) -> None:
@@ -168,6 +186,13 @@ def main() -> int:
             asked += 1
             if answer == "allow":
                 response = {"behavior": "allow", "updatedInput": request.get("input", {})}
+                grants = [
+                    suggestion
+                    for suggestion in request.get("permission_suggestions") or []
+                    if suggestion.get("type") in ("addDirectories", "addRules")
+                ]
+                if scenario.get("grant") and grants:
+                    response["updatedPermissions"] = grants
             else:
                 response = {"behavior": "deny", "message": scenario.get("deny_message", "Denied by the user.")}
             send({

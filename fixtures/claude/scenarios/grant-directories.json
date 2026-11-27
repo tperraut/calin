@@ -1,0 +1,12 @@
+{
+  "dirs": {
+    "ro": { "a.txt": "alpha\n", "b.txt": "beta\n" },
+    "rw": { "seed.txt": "seed\n" }
+  },
+  "turns": [
+    "Do these four steps in order, one tool call at a time, using the absolute paths exactly as written. 1. Read {ro}/a.txt with the Read tool. 2. Read {ro}/b.txt with the Read tool. 3. Create {rw}/one.txt containing the word one with the Write tool. 4. Create {rw}/two.txt containing the word two with the Write tool. Then answer with the single word done."
+  ],
+  "permission_mode": "acceptEdits",
+  "permissions": ["allow"],
+  "grant": true
+}

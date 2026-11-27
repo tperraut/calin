@@ -1,0 +1,8 @@
+{
+  "files": { "notes.txt": "one\n" },
+  "turns": [
+    "Before doing anything else, write a task list with exactly three tasks using your task list tools (load them with ToolSearch if they are not loaded yet): read notes.txt, count its lines, report the count. Then carry the tasks out one by one, updating the status of each task as you start and finish it. End with one short sentence."
+  ],
+  "permissions": ["allow"],
+  "env": { "CLAUDE_CODE_ENABLE_TODO_TOOLS": "1" }
+}

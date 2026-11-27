@@ -1,6 +1,6 @@
 {"native_session":{"id":"uuid-0001","model":"claude-haiku-5-5"}}
 {"event":{"item":{"content":{"input":{"content":"alpha\n","file_path":"/work/made.txt"},"kind":"tool","locations":["/work/made.txt"],"name":"Write","output":null,"title":"made.txt","tool_kind":"edit"},"id":"toolu-0001","status":"running"},"type":"item_started"}}
-{"permission_request":{"id":"uuid-0006","input":{"content":"alpha\n","file_path":"/work/made.txt"},"item_id":"toolu-0001","title":"made.txt","tool_kind":"edit","tool_name":"Write"}}
+{"access":{"files":["/work/made.txt"],"write":true},"permission_request":{"id":"uuid-0006","input":{"content":"alpha\n","file_path":"/work/made.txt"},"item_id":"toolu-0001","title":"made.txt","tool_kind":"edit","tool_name":"Write"}}
 {"event":{"item":{"content":{"input":{"content":"alpha\n","file_path":"/work/made.txt"},"kind":"tool","locations":["/work/made.txt"],"name":"Write","output":"File created successfully at: /work/made.txt (file state is current in your context — no need to Read it back)","title":"made.txt","tool_kind":"edit"},"id":"toolu-0001","status":"completed"},"type":"item_completed"}}
 {"event":{"item":{"content":{"kind":"text","text":""},"id":"claude-7-1","status":"running"},"type":"item_started"}}
 {"event":{"item":{"content":{"kind":"text","text":"done"},"id":"claude-7-1","status":"completed"},"type":"item_completed"}}

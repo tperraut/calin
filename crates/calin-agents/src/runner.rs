@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 const OUTPUT_BUFFER: usize = 64;
 
 /// What a runner needs to start an agent.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct StartParams {
     pub session_id: String,
     /// Assigned by the orchestrator; stable across restarts of the same agent.
@@ -32,6 +32,76 @@ pub struct StartParams {
     /// start within a session, so a runner that mints its own item ids can
     /// use it as a namespace.
     pub start_seq: u64,
+    /// Where this agent reaches the orchestrator's own tools: the URL of a
+    /// Model Context Protocol endpoint over HTTP that is this agent's alone.
+    /// `None` when there is none; a runner without such a channel ignores it.
+    pub tool_endpoint: Option<String>,
+    /// Text to add to the agent's system prompt: where it runs and what the
+    /// orchestrator's tools are for.
+    pub system_prompt: Option<String>,
+}
+
+/// The endpoint holds the agent's token, which must never reach a log.
+impl std::fmt::Debug for StartParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StartParams")
+            .field("session_id", &self.session_id)
+            .field("agent_id", &self.agent_id)
+            .field("prompt", &self.prompt)
+            .field("cwd", &self.cwd)
+            .field("add_dirs", &self.add_dirs)
+            .field("permission_mode", &self.permission_mode)
+            .field("model", &self.model)
+            .field("resume", &self.resume)
+            .field("start_seq", &self.start_seq)
+            .field(
+                "tool_endpoint",
+                &self.tool_endpoint.as_ref().map(|_| "<redacted>"),
+            )
+            .field("system_prompt", &self.system_prompt)
+            .finish()
+    }
+}
+
+/// A permission request with what the orchestrator needs to decide it by
+/// policy, in terms that do not depend on the runner's tool names.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PermissionAsk {
+    pub request: PermissionRequest,
+    pub access: ToolAccess,
+}
+
+/// What the tool call behind a permission request reaches for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ToolAccess {
+    /// A file tool. `paths` are absolute and name every file or directory
+    /// the call touches; `write` is true when it creates or changes them.
+    Files { paths: Vec<PathBuf>, write: bool },
+    /// One of the orchestrator's own tools, served at
+    /// [`StartParams::tool_endpoint`].
+    Orchestrator,
+    /// Anything else: a command, a fetch, a tool the runner knows nothing about.
+    Other,
+}
+
+impl From<PermissionRequest> for PermissionAsk {
+    /// A request about which nothing more is known.
+    fn from(request: PermissionRequest) -> Self {
+        Self {
+            request,
+            access: ToolAccess::Other,
+        }
+    }
+}
+
+/// A directory to open to the agent for the rest of its run, sent along with
+/// an allowed request so that later calls there do not ask again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirGrant {
+    /// Absolute.
+    pub dir: PathBuf,
+    /// False grants reading only.
+    pub write: bool,
 }
 
 /// What an agent tells the orchestrator.
@@ -42,7 +112,7 @@ pub enum RunnerOutput {
     /// The agent wants to use a tool and waits for
     /// [`RunnerInput::PermissionDecision`] with the request's id. The runner
     /// forwards every request it receives and applies no policy of its own.
-    PermissionRequest(PermissionRequest),
+    PermissionRequest(PermissionAsk),
     /// The runner's own conversation id for this agent, and the model in use
     /// when the runner knows it. Sent when first known and again whenever
     /// either changes; store the id and pass it as [`StartParams::resume`].
@@ -73,11 +143,31 @@ pub enum RunnerInput {
         decision: PermissionDecision,
         /// Shown to the agent with a denial, so it can adapt.
         message: Option<String>,
+        /// With an allow: directories to open for the rest of the run. A
+        /// runner that has no notion of directories ignores them.
+        grants: Vec<DirGrant>,
     },
     /// End the current turn but stay alive. Ignored between turns.
     Interrupt,
     /// End the current turn and exit.
     Stop,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_tool_endpoint_never_shows_in_debug_output() {
+        let params = StartParams {
+            tool_endpoint: Some("http://127.0.0.1:4680/api/v1/mcp/secret-token".into()),
+            ..StartParams::default()
+        };
+        let shown = format!("{params:?}");
+        assert!(!shown.contains("secret-token"), "{shown}");
+        assert!(shown.contains("<redacted>"));
+        assert!(format!("{:?}", StartParams::default()).contains("tool_endpoint: None"));
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -194,6 +284,22 @@ impl AgentHandle {
             request_id: request_id.into(),
             decision,
             message,
+            grants: Vec::new(),
+        })
+    }
+
+    /// Allows a permission request and opens `grants` to the agent, so that
+    /// it stops asking about those directories.
+    pub fn allow_granting(
+        &self,
+        request_id: impl Into<String>,
+        grants: Vec<DirGrant>,
+    ) -> Result<(), RunnerError> {
+        self.send(RunnerInput::PermissionDecision {
+            request_id: request_id.into(),
+            decision: PermissionDecision::Allow,
+            message: None,
+            grants,
         })
     }
 

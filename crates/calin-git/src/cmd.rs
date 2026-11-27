@@ -11,7 +11,7 @@ use crate::error::{Error, Result};
 
 /// Set by git for hooks and `rebase -x`. Inherited, they would point every
 /// command at the repository the server was started from.
-const INHERITED: [&str; 7] = [
+pub(crate) const INHERITED: [&str; 7] = [
     "GIT_DIR",
     "GIT_WORK_TREE",
     "GIT_INDEX_FILE",
@@ -95,6 +95,11 @@ impl Git {
     /// some commands (`check-ignore`) refuse to run with it.
     pub(crate) fn literal_pathspecs(mut self) -> Self {
         self.cmd.env("GIT_LITERAL_PATHSPECS", "1");
+        self
+    }
+
+    pub(crate) fn env(mut self, name: &str, value: &str) -> Self {
+        self.cmd.env(name, value);
         self
     }
 

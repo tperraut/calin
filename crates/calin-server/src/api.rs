@@ -8,9 +8,9 @@ use axum::http::StatusCode;
 use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
 use calin_proto::{
-    ApiError, CreateSessionRequest, FileContent, FileDiff, Health, RegisterRepoRequest, Repo,
-    RepoChanges, ResolvePermissionRequest, SendMessageRequest, Session, SessionDetail, TreeEntry,
-    WriteFileRequest,
+    ApiError, AttachRepoRequest, CreateSessionRequest, FileContent, FileDiff, Health,
+    RegisterRepoRequest, Repo, RepoChanges, RepoSet, ResolvePermissionRequest, SendMessageRequest,
+    Session, SessionDetail, SessionRepo, Settings, TreeEntry, WriteFileRequest,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -132,8 +132,45 @@ pub(crate) async fn health(State(state): State<AppState>) -> Json<Health> {
     })
 }
 
+pub(crate) async fn get_settings(State(state): State<AppState>) -> Json<Settings> {
+    Json(state.manager.settings().await)
+}
+
+pub(crate) async fn update_settings(
+    State(state): State<AppState>,
+    ApiJson(body): ApiJson<serde_json::Value>,
+) -> ApiResult<Json<Settings>> {
+    // Every field has a default, so a list would read as settings with
+    // nothing set and quietly replace the stored ones.
+    if !body.is_object() {
+        return Err(ApiFailure::new(
+            StatusCode::BAD_REQUEST,
+            "the settings must be a JSON object",
+        ));
+    }
+    let settings: Settings = serde_json::from_value(body)
+        .map_err(|err| ApiFailure::new(StatusCode::BAD_REQUEST, err.to_string()))?;
+    Ok(Json(state.manager.update_settings(settings).await?))
+}
+
 pub(crate) async fn list_repos(State(state): State<AppState>) -> Json<Vec<Repo>> {
     Json(state.manager.list_repos().await)
+}
+
+pub(crate) async fn refresh_repos(State(state): State<AppState>) -> ApiResult<Json<Vec<Repo>>> {
+    Ok(Json(state.manager.refresh_repos().await?))
+}
+
+pub(crate) async fn clone_repo(
+    State(state): State<AppState>,
+    Path(repo_id): Path<String>,
+) -> ApiResult<StatusCode> {
+    state.manager.clone_repo(&repo_id).await?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+pub(crate) async fn list_repo_sets(State(state): State<AppState>) -> Json<Vec<RepoSet>> {
+    Json(state.manager.repo_sets().await)
 }
 
 pub(crate) async fn register_repo(
@@ -201,6 +238,15 @@ pub(crate) async fn resolve_permission(
         .resolve_permission(&session_id, &request_id, request.decision, request.message)
         .await?;
     Ok(StatusCode::ACCEPTED)
+}
+
+pub(crate) async fn attach_repo(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    ApiJson(request): ApiJson<AttachRepoRequest>,
+) -> ApiResult<(StatusCode, Json<SessionRepo>)> {
+    let repo = state.manager.attach_repo(&session_id, request).await?;
+    Ok((StatusCode::CREATED, Json(repo)))
 }
 
 pub(crate) async fn session_changes(

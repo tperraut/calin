@@ -28,6 +28,8 @@ use tower::ServiceExt;
 
 use super::*;
 
+mod catalog;
+
 const TIMEOUT: Duration = Duration::from_secs(20);
 const LOCAL: &str = "127.0.0.1:4680";
 const UNKNOWN_SESSION: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";

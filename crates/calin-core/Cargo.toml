@@ -9,9 +9,11 @@ rust-version.workspace = true
 calin-agents = { version = "0.0.1", path = "../calin-agents" }
 calin-git = { version = "0.0.1", path = "../calin-git" }
 calin-proto = { version = "0.0.1", path = "../calin-proto" }
+getrandom = "0.4.3"
 rusqlite = { version = "0.43.0", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+serde_yaml_ng = "0.10.0"
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["sync", "time", "rt", "macros"] }
 tracing = "0.1.44"

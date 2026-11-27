@@ -196,11 +196,11 @@ pub(crate) async fn working_directory(work_dir: &Path, repos: &[SessionRepo]) ->
     .await
 }
 
+/// The repo the agent's working directory is in. A session started without
+/// repos has none, whatever is attached to it later: its agent keeps working
+/// in the session's own folder, which is also where its conversation lives.
 pub(crate) fn primary(repos: &[SessionRepo]) -> Option<&SessionRepo> {
-    repos
-        .iter()
-        .find(|repo| repo.primary)
-        .or_else(|| repos.first())
+    repos.iter().find(|repo| repo.primary)
 }
 
 /// Places a path an agent reported in the session's repo set: the id of the
@@ -282,9 +282,10 @@ mod tests {
     }
 
     #[test]
-    fn the_primary_repo_is_the_flagged_one_else_the_first() {
+    fn the_primary_repo_is_the_flagged_one_and_only_that() {
         let mut repos = vec![repo("a", "/a"), repo("b", "/b")];
-        assert_eq!(primary(&repos).unwrap().id, "a");
+        // Repos attached to a session that started without any.
+        assert!(primary(&repos).is_none());
         repos[1].primary = true;
         assert_eq!(primary(&repos).unwrap().id, "b");
         assert!(primary(&[]).is_none());

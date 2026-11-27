@@ -47,6 +47,16 @@ impl Home {
         self.root.join("repos.json")
     }
 
+    /// Machine-local settings: the home repo, the scan roots, the clone root.
+    pub fn settings_path(&self) -> PathBuf {
+        self.root.join("settings.json")
+    }
+
+    /// Where declared repos are cloned to when the settings name no place.
+    pub fn default_clone_root(&self) -> PathBuf {
+        self.root.join("repos")
+    }
+
     pub fn sessions_dir(&self) -> PathBuf {
         self.root.join("sessions")
     }
@@ -136,5 +146,7 @@ mod tests {
         );
         assert_eq!(home.work_dir("s1"), PathBuf::from("/data/sessions/s1/work"));
         assert_eq!(home.repos_path(), PathBuf::from("/data/repos.json"));
+        assert_eq!(home.settings_path(), PathBuf::from("/data/settings.json"));
+        assert_eq!(home.default_clone_root(), PathBuf::from("/data/repos"));
     }
 }

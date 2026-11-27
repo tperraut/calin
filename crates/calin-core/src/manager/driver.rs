@@ -2,13 +2,15 @@
 //! manager's commands, the agent's output and the results of preparing the
 //! repos, one at a time, and appends what follows from each.
 
-use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use calin_agents::{AgentHandle, Exit, Runner, RunnerOutput, StartParams};
+use calin_agents::{
+    AgentHandle, DirGrant, Exit, PermissionAsk, Runner, RunnerOutput, StartParams, ToolAccess,
+};
 use calin_proto::{
     Agent, AgentKind, AgentStatus, AttachRepoRequest, DecisionSource, Event, EventBody, FileOp,
     Item, ItemContent, ItemStatus, PermissionDecision, PermissionMode, PermissionRequest, Repo,
@@ -18,12 +20,15 @@ use tokio::sync::mpsc;
 use ulid::Ulid;
 
 use super::{
-    Command, Inner, Reply, agent_ended, closed, expired, has_turn, is_closed, no_longer_active,
-    no_turn, takes_messages,
+    Command, Inner, Reply, agent_ended, closed, expired, has_turn, is_closed, no_attaching,
+    no_longer_active, no_turn, takes_messages, takes_repos,
 };
+use crate::briefing;
 use crate::error::{Error, Result};
+use crate::policy::{self, Target, Verdict};
 use crate::repos::{Reservation, blocking};
 use crate::store::{EventDraft, SessionSetup};
+use crate::tokens::{AgentRef, Token};
 use crate::workspace::{locate, primary, working_directory};
 
 /// How long a stopped agent, or a git command of a stopped preparation, may
@@ -53,6 +58,9 @@ struct OpenRequest {
     request_id: String,
     /// The `permission_requested` event: the cause of the answer.
     event_id: String,
+    /// The repos of the session the request reaches into, as indexes into
+    /// the driver's list: what an allow may have to open to the agent.
+    repos: Vec<usize>,
 }
 
 /// One repo to make ready for a session.
@@ -64,11 +72,46 @@ struct AttachPlan {
     worktree: PathBuf,
     branch: String,
     primary: bool,
+    /// How long the repo's setup command may run.
+    setup_limit: Duration,
 }
 
+/// A step of making repos ready, reported to the driver, which is the one
+/// that writes to the log.
 enum Prepared {
     Repo(SessionRepo),
-    Failed(String),
+    /// The setup command of a new worktree: the tool item as it starts, then
+    /// as it ended, with what to tell the user when it failed.
+    SetupStarted(Item),
+    SetupEnded {
+        item: Item,
+        failure: Option<String>,
+    },
+    Failed {
+        repo: String,
+        error: Error,
+    },
+}
+
+/// A repo being attached to a session that is already at work.
+struct Attaching {
+    results: mpsc::Receiver<Prepared>,
+    /// Set to end the setup command early.
+    cancel: Arc<AtomicBool>,
+    /// The agent that asked through Calin's tools; `None` for the user.
+    agent_id: Option<String>,
+    reply: Reply<SessionRepo>,
+    /// Set once the repo is on record; its setup may still be running.
+    attached: Option<SessionRepo>,
+    /// Keeps the repo registered until it is attached.
+    _reservation: Reservation,
+}
+
+/// An attach request waiting for the one in progress.
+struct QueuedAttach {
+    request: AttachRepoRequest,
+    agent_id: Option<String>,
+    reply: Reply<SessionRepo>,
 }
 
 /// Repos being made ready in the background, and the turn that waits for them.
@@ -90,6 +133,7 @@ enum Step {
     Command(Command),
     Output(Option<RunnerOutput>),
     Prepared(Option<Prepared>),
+    Attached(Option<Prepared>),
 }
 
 pub(super) struct Driver {
@@ -123,6 +167,18 @@ pub(super) struct Driver {
     open: Vec<OpenRequest>,
     /// Item id to its `item_started` event, for the items of the current turn.
     turn_items: HashMap<String, String>,
+    /// The repo being attached mid-session, and the requests behind it: one
+    /// at a time, so two never fight over a worktree or a name.
+    attaching: Option<Attaching>,
+    attach_queue: VecDeque<QueuedAttach>,
+    /// What to tell the agent with the next user message it is handed. The
+    /// transcript keeps the user's own text: notes only exist on that path.
+    notes: Vec<String>,
+    /// Ids of the session repos the running agent can work in without
+    /// asking: the ones it was started with and the ones opened to it since.
+    granted: HashSet<String>,
+    /// The running agent's key to Calin's tools. Revoked when dropped.
+    token: Option<Token>,
 }
 
 async fn next_output(handle: &mut Option<AgentHandle>) -> Option<RunnerOutput> {
@@ -135,6 +191,13 @@ async fn next_output(handle: &mut Option<AgentHandle>) -> Option<RunnerOutput> {
 async fn next_prepared(preparation: &mut Option<Preparation>) -> Option<Prepared> {
     match preparation {
         Some(preparation) => preparation.results.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn next_attached(attaching: &mut Option<Attaching>) -> Option<Prepared> {
+    match attaching {
+        Some(attaching) => attaching.results.recv().await,
         None => std::future::pending().await,
     }
 }
@@ -168,6 +231,11 @@ impl Driver {
             pending: VecDeque::new(),
             open: Vec::new(),
             turn_items: HashMap::new(),
+            attaching: None,
+            attach_queue: VecDeque::new(),
+            notes: Vec::new(),
+            granted: HashSet::new(),
+            token: None,
         }
     }
 
@@ -176,6 +244,7 @@ impl Driver {
         if !retired {
             self.inner.drivers().remove(&self.session_id);
         }
+        self.abort_attaching();
         // Off the map, so nothing new arrives; what is queued came too late.
         self.commands.close();
         while let Ok(command) = self.commands.try_recv() {
@@ -191,7 +260,9 @@ impl Driver {
             return false;
         }
         loop {
-            let step = if self.handle.is_none() && self.preparation.is_none() {
+            let idle =
+                self.handle.is_none() && self.preparation.is_none() && self.attaching.is_none();
+            let step = if idle {
                 match self.commands.try_recv() {
                     Ok(command) => Step::Command(command),
                     Err(_) => {
@@ -211,6 +282,7 @@ impl Driver {
                     },
                     output = next_output(&mut self.handle) => Step::Output(output),
                     prepared = next_prepared(&mut self.preparation) => Step::Prepared(prepared),
+                    attached = next_attached(&mut self.attaching) => Step::Attached(attached),
                 }
             };
             let result = match step {
@@ -221,6 +293,10 @@ impl Driver {
                 }),
                 Step::Prepared(prepared) => self.on_prepared(prepared).await.map_err(|err| {
                     tracing::error!(session = %self.session_id, %err, "could not record the session's repos");
+                    Halt
+                }),
+                Step::Attached(attached) => self.on_attached(attached).await.map_err(|err| {
+                    tracing::error!(session = %self.session_id, %err, "could not record an attached repo");
                     Halt
                 }),
             };
@@ -285,6 +361,22 @@ impl Driver {
                 let result = self.answer_permission(request_id, decision, message).await;
                 self.answer(reply, result)
             }
+            Command::Attach {
+                request,
+                agent_id,
+                reply,
+            } => {
+                let queued = QueuedAttach {
+                    request,
+                    agent_id,
+                    reply,
+                };
+                if self.attaching.is_some() {
+                    self.attach_queue.push_back(queued);
+                    return Ok(());
+                }
+                self.begin_attach(queued).await
+            }
         }
     }
 
@@ -305,9 +397,7 @@ impl Driver {
     async fn on_output(&mut self, output: Option<RunnerOutput>) -> Result<()> {
         match output {
             Some(RunnerOutput::Event(body)) => self.agent_event(body).await,
-            Some(RunnerOutput::PermissionRequest(request)) => {
-                self.permission_requested(request).await
-            }
+            Some(RunnerOutput::PermissionRequest(ask)) => self.permission_requested(ask).await,
             Some(RunnerOutput::NativeSession { id, model }) => self.native_session(id, model).await,
             Some(RunnerOutput::TurnEnded) => self.turn_ended().await,
             Some(RunnerOutput::Exited(Exit::Ok)) => self.agent_exited().await,
@@ -396,28 +486,32 @@ impl Driver {
         reservation: Option<Reservation>,
     ) -> Result<()> {
         self.cause = Some(cause.clone());
-        if self.setup.repos.len() <= self.repos.len() {
+        // By repo, not by count: repos attached later are in the list too.
+        let attached = |wanted: &AttachRepoRequest| {
+            let same = |repo: &SessionRepo| repo.repo_id == wanted.repo_id;
+            self.repos.iter().any(same)
+        };
+        let wanted: Vec<AttachRepoRequest> = self
+            .setup
+            .repos
+            .iter()
+            .filter(|wanted| !attached(wanted))
+            .cloned()
+            .collect();
+        if wanted.is_empty() {
             return self.begin_turn(text, cause).await;
         }
         self.set_status(SessionStatus::Preparing, None).await?;
-        let wanted: Vec<AttachRepoRequest> = self.setup.repos[self.repos.len()..].to_vec();
-        let branch = calin_git::session_branch_name(&self.title, &self.session_id);
-        let work_dir = self.inner.store.home().work_dir(&self.session_id);
+        // The first repo the session was created with is where its agent works.
+        let first = self.setup.repos.first().map(|repo| repo.repo_id.clone());
         let mut plans = Vec::with_capacity(wanted.len());
         for wanted in wanted {
             let Some(repo) = self.inner.repos.get(&wanted.repo_id).await else {
                 let message = format!("repo {} is no longer registered", wanted.repo_id);
                 return self.fail(message).await;
             };
-            plans.push(AttachPlan {
-                session_id: self.session_id.clone(),
-                worktree: work_dir.join(&repo.name),
-                repo,
-                mode: wanted.mode.unwrap_or_default(),
-                branch: branch.clone(),
-                // Repos attach in order, so the first one ever is the primary.
-                primary: self.repos.is_empty() && plans.is_empty(),
-            });
+            let primary = first.as_ref() == Some(&repo.id);
+            plans.push(self.plan(repo, wanted.mode.unwrap_or_default(), primary));
         }
         let (results, receiver) = mpsc::channel(plans.len().max(1));
         let cancel = Arc::new(AtomicBool::new(false));
@@ -432,12 +526,29 @@ impl Driver {
         Ok(())
     }
 
+    /// How to make `repo` ready for this session.
+    fn plan(&self, repo: Repo, mode: RepoMode, primary: bool) -> AttachPlan {
+        let work_dir = self.inner.store.home().work_dir(&self.session_id);
+        AttachPlan {
+            session_id: self.session_id.clone(),
+            worktree: work_dir.join(&repo.name),
+            repo,
+            mode,
+            branch: calin_git::session_branch_name(&self.title, &self.session_id),
+            primary,
+            setup_limit: self.inner.config.setup_limit,
+        }
+    }
+
     async fn on_prepared(&mut self, prepared: Option<Prepared>) -> Result<()> {
         match prepared {
-            Some(Prepared::Repo(repo)) => self.attach(repo).await,
-            Some(Prepared::Failed(message)) => {
+            Some(Prepared::Repo(repo)) => self.attach(repo, None).await,
+            Some(Prepared::SetupStarted(item)) => self.setup_started(item).await,
+            Some(Prepared::SetupEnded { item, failure }) => self.setup_ended(item, failure).await,
+            Some(Prepared::Failed { repo, error }) => {
                 self.preparation = None;
-                self.fail(message).await
+                self.fail(format!("could not prepare repo {repo}: {error}"))
+                    .await
             }
             None => match self.preparation.take() {
                 Some(preparation) => self.begin_turn(preparation.text, preparation.cause).await,
@@ -446,11 +557,165 @@ impl Driver {
         }
     }
 
-    async fn attach(&mut self, repo: SessionRepo) -> Result<()> {
-        let attached = EventBody::RepoAttached { repo };
-        self.append(EventDraft::new(attached).parent(self.cause.clone()))
+    /// Records a repo that is ready. `agent_id` is the agent that asked for
+    /// it through Calin's tools, if one did.
+    async fn attach(&mut self, repo: SessionRepo, agent_id: Option<&str>) -> Result<()> {
+        let mut attached =
+            EventDraft::new(EventBody::RepoAttached { repo }).parent(self.cause.clone());
+        if let Some(agent_id) = agent_id {
+            attached = attached.agent(agent_id);
+        }
+        self.append(attached).await?;
+        Ok(())
+    }
+
+    /// The setup command shows in the transcript as a tool call nobody but
+    /// the orchestrator made.
+    async fn setup_started(&mut self, item: Item) -> Result<()> {
+        let started = EventBody::ItemStarted { item };
+        self.append(EventDraft::new(started).parent(self.cause.clone()))
             .await?;
         Ok(())
+    }
+
+    /// A setup that failed is said, and the session goes on: the agent can
+    /// often work without it, or run it again itself.
+    async fn setup_ended(&mut self, item: Item, failure: Option<String>) -> Result<()> {
+        let completed = EventBody::ItemCompleted { item };
+        self.append(EventDraft::new(completed).parent(self.cause.clone()))
+            .await?;
+        if let Some(message) = failure {
+            let error = EventBody::Error { message };
+            self.append(EventDraft::new(error).parent(self.cause.clone()))
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Starts making a repo ready for a session that is already at work.
+    /// The caller is answered when the repo is ready, or at once when the
+    /// request cannot be met.
+    async fn begin_attach(&mut self, queued: QueuedAttach) -> std::result::Result<(), Halt> {
+        let QueuedAttach {
+            request,
+            agent_id,
+            reply,
+        } = queued;
+        match self.plan_attach(&request).await {
+            Ok((plan, reservation)) => {
+                let (results, receiver) = mpsc::channel(4);
+                let cancel = Arc::new(AtomicBool::new(false));
+                tokio::spawn(prepare(vec![plan], results, Arc::clone(&cancel)));
+                self.attaching = Some(Attaching {
+                    results: receiver,
+                    cancel,
+                    agent_id,
+                    reply,
+                    attached: None,
+                    _reservation: reservation,
+                });
+                Ok(())
+            }
+            Err(err) => {
+                let halt = if err.is_refusal() { Ok(()) } else { Err(Halt) };
+                if halt.is_err() {
+                    tracing::error!(session = %self.session_id, %err, "could not attach a repo");
+                }
+                let _ = reply.send(Err(err));
+                halt
+            }
+        }
+    }
+
+    async fn plan_attach(&self, request: &AttachRepoRequest) -> Result<(AttachPlan, Reservation)> {
+        if !takes_repos(self.status) {
+            return Err(no_attaching(self.status));
+        }
+        let Some(repo) = self.inner.repos.get(&request.repo_id).await else {
+            return Err(Error::Missing(format!("unknown repo {}", request.repo_id)));
+        };
+        if let Some(attached) = self.repos.iter().find(|r| r.repo_id == repo.id) {
+            return Err(Error::Conflict(format!(
+                "{} is already attached to this session, at {}",
+                attached.name, attached.path
+            )));
+        }
+        // The name is the repo's folder in the session.
+        if self.repos.iter().any(|attached| attached.name == repo.name) {
+            return Err(Error::Conflict(format!(
+                "another repo named {} is attached to this session",
+                repo.name
+            )));
+        }
+        // Refuses a repo without a clone, and holds the others in place.
+        let reservation = self.inner.repos.reserve(&[&repo.id]).await?;
+        // Never the primary: the agent already works somewhere.
+        let plan = self.plan(repo, request.mode.unwrap_or_default(), false);
+        Ok((plan, reservation))
+    }
+
+    async fn on_attached(&mut self, prepared: Option<Prepared>) -> Result<()> {
+        match prepared {
+            Some(Prepared::Repo(repo)) => {
+                let agent_id = self.attaching.as_ref().and_then(|a| a.agent_id.clone());
+                self.attach(repo.clone(), agent_id.as_deref()).await?;
+                if let Some(attaching) = &mut self.attaching {
+                    attaching.attached = Some(repo);
+                }
+                Ok(())
+            }
+            Some(Prepared::SetupStarted(item)) => self.setup_started(item).await,
+            Some(Prepared::SetupEnded { item, failure }) => self.setup_ended(item, failure).await,
+            Some(Prepared::Failed { repo, error }) => {
+                tracing::warn!(session = %self.session_id, %repo, %error, "could not attach a repo");
+                if let Some(attaching) = self.attaching.take() {
+                    let _ = attaching.reply.send(Err(error));
+                }
+                self.next_attach().await
+            }
+            None => {
+                if let Some(attaching) = self.attaching.take() {
+                    let result = attaching.attached.ok_or_else(no_longer_active);
+                    // An agent that asked is told by its tool's result. One
+                    // that did not is told with the next message, unless it
+                    // is not running: its next start names every repo.
+                    if let (Ok(repo), None, true) =
+                        (&result, &attaching.agent_id, self.handle.is_some())
+                    {
+                        self.notes.push(briefing::attach_note(repo));
+                    }
+                    let _ = attaching.reply.send(result);
+                }
+                self.next_attach().await
+            }
+        }
+    }
+
+    /// Takes up the next attach request that waited for the one that ended.
+    async fn next_attach(&mut self) -> Result<()> {
+        while self.attaching.is_none() {
+            let Some(queued) = self.attach_queue.pop_front() else {
+                break;
+            };
+            if self.begin_attach(queued).await.is_err() {
+                return Err(Error::Closed);
+            }
+        }
+        Ok(())
+    }
+
+    /// Ends the attach in progress, as far as it can be ended, and answers
+    /// everyone who waits for one.
+    fn abort_attaching(&mut self) {
+        if let Some(attaching) = self.attaching.take() {
+            attaching.cancel.store(true, Ordering::Relaxed);
+            let _ = attaching
+                .reply
+                .send(attaching.attached.ok_or_else(no_longer_active));
+        }
+        for queued in self.attach_queue.drain(..) {
+            let _ = queued.reply.send(Err(no_longer_active()));
+        }
     }
 
     /// Starts a turn on `text`, starting the agent first if it is not running.
@@ -460,6 +725,8 @@ impl Driver {
         if self.status != SessionStatus::Running {
             self.set_status(SessionStatus::Running, None).await?;
         }
+        // What the agent is handed, which may say more than the user wrote.
+        let text = briefing::with_notes(std::mem::take(&mut self.notes), text);
         if let Some(handle) = &self.handle {
             let sent = handle.send_message(text);
             if sent.is_err() {
@@ -484,32 +751,64 @@ impl Driver {
                 }
             };
             let main = primary(&self.repos).map(|repo| repo.id.clone());
-            let add_dirs = self
+            // A repo attached `read` is not a directory to work in: the
+            // agent asks before it touches one, and the policy answers.
+            let open: Vec<&SessionRepo> = self
                 .repos
+                .iter()
+                .filter(|repo| Some(&repo.id) == main.as_ref() || repo.mode != RepoMode::Read)
+                .collect();
+            let add_dirs = open
                 .iter()
                 .filter(|repo| Some(&repo.id) != main.as_ref())
                 .map(|repo| PathBuf::from(&repo.path))
                 .collect();
+            let granted = open.iter().map(|repo| repo.id.clone()).collect();
+            // An agent that accepts edits does not ask about the directory
+            // it works in. When that is a repo attached `read`, it has to ask
+            // about every edit, so that the policy can refuse those.
+            let read_only_home = primary(&self.repos).is_some_and(|r| r.mode == RepoMode::Read);
+            let asks = match self.permission_mode {
+                PermissionMode::AcceptEdits if read_only_home => PermissionMode::Ask,
+                mode => mode,
+            };
             let agent_id = match &self.lead {
                 Some(lead) => lead.id.clone(),
                 None => Ulid::generate().to_string(),
             };
+            // A token of its own for every start; the previous one is revoked here.
+            self.token = self.inner.tool_endpoint().and_then(|_| {
+                self.inner.tokens.issue(AgentRef {
+                    session_id: self.session_id.clone(),
+                    agent_id: agent_id.clone(),
+                })
+            });
+            let tool_endpoint = match (self.inner.tool_endpoint(), &self.token) {
+                (Some(base), Some(token)) => Some(format!("{base}/{}", token.value())),
+                _ => None,
+            };
+            let system_prompt = briefing::system_prompt(&self.repos, &cwd, tool_endpoint.is_some());
             let started = runner.start(StartParams {
                 session_id: self.session_id.clone(),
                 agent_id: agent_id.clone(),
                 prompt: text,
                 cwd,
                 add_dirs,
-                permission_mode: self.permission_mode,
+                permission_mode: asks,
                 model: self.setup.model.clone(),
                 resume: self
                     .lead
                     .as_ref()
                     .and_then(|lead| lead.native_session_id.clone()),
                 start_seq: self.head_seq,
+                tool_endpoint,
+                system_prompt: Some(system_prompt),
             });
             match started {
-                Ok(handle) => self.handle = Some(handle),
+                Ok(handle) => {
+                    self.handle = Some(handle);
+                    self.granted = granted;
+                }
                 Err(err) => return self.fail(err.to_string()).await,
             }
             if self.lead.is_some() {
@@ -558,10 +857,11 @@ impl Driver {
             if self.status != SessionStatus::Running {
                 self.set_status(SessionStatus::Running, None).await?;
             }
+            let text = briefing::with_notes(std::mem::take(&mut self.notes), next.text);
             let sent = self
                 .handle
                 .as_ref()
-                .is_some_and(|handle| handle.send_message(next.text).is_ok());
+                .is_some_and(|handle| handle.send_message(text).is_ok());
             if !sent {
                 return self.fail("the agent is no longer running".to_owned()).await;
             }
@@ -572,8 +872,18 @@ impl Driver {
         self.set_status(SessionStatus::Review, None).await
     }
 
-    async fn agent_exited(&mut self) -> Result<()> {
+    /// Forgets the agent that is gone: its handle, its token, and what was
+    /// only ever true of that process.
+    fn drop_agent(&mut self) {
         self.handle = None;
+        self.token = None;
+        self.granted.clear();
+        // Its next start is told about every repo in its system prompt.
+        self.notes.clear();
+    }
+
+    async fn agent_exited(&mut self) -> Result<()> {
+        self.drop_agent();
         self.in_turn = false;
         self.interrupted = false;
         self.turn_items.clear();
@@ -613,6 +923,9 @@ impl Driver {
         if is_closed(self.status) {
             return Err(closed(self.status));
         }
+        // First: an agent waiting for a repo it asked for would otherwise
+        // hold up its own stop.
+        self.abort_attaching();
         if let Some(mut preparation) = self.preparation.take() {
             preparation.cancel.store(true, Ordering::Relaxed);
             // The git command already running cannot be recalled. Wait for
@@ -623,8 +936,12 @@ impl Driver {
             loop {
                 tokio::select! {
                     prepared = preparation.results.recv() => match prepared {
-                        Some(Prepared::Repo(repo)) => self.attach(repo).await?,
-                        Some(Prepared::Failed(_)) | None => break,
+                        Some(Prepared::Repo(repo)) => self.attach(repo, None).await?,
+                        Some(Prepared::SetupStarted(item)) => self.setup_started(item).await?,
+                        Some(Prepared::SetupEnded { item, failure }) => {
+                            self.setup_ended(item, failure).await?;
+                        }
+                        Some(Prepared::Failed { .. }) | None => break,
                     },
                     () = &mut grace => break,
                 }
@@ -641,9 +958,9 @@ impl Driver {
                 tokio::select! {
                     output = handle.next_output() => match output {
                         Some(RunnerOutput::Event(body)) => self.agent_event(body).await?,
-                        Some(RunnerOutput::PermissionRequest(request)) => {
+                        Some(RunnerOutput::PermissionRequest(ask)) => {
                             // Asked while stopping: nobody will answer it.
-                            let open = self.record_request(request).await?;
+                            let open = self.record_request(ask.request).await?;
                             self.expire(open).await?;
                         }
                         Some(RunnerOutput::NativeSession { id, model }) => {
@@ -657,6 +974,7 @@ impl Driver {
                 }
             }
         }
+        self.drop_agent();
         self.in_turn = false;
         self.interrupted = false;
         self.pending.clear();
@@ -667,7 +985,8 @@ impl Driver {
 
     /// Records that the session cannot go on and fails it.
     async fn fail(&mut self, message: String) -> Result<()> {
-        self.handle = None;
+        self.drop_agent();
+        self.abort_attaching();
         self.preparation = None;
         self.in_turn = false;
         self.interrupted = false;
@@ -686,29 +1005,38 @@ impl Driver {
         self.set_status(SessionStatus::Failed, Some(message)).await
     }
 
-    async fn permission_requested(&mut self, request: PermissionRequest) -> Result<()> {
-        let open = self.record_request(request).await?;
+    async fn permission_requested(&mut self, ask: PermissionAsk) -> Result<()> {
+        let PermissionAsk { request, access } = ask;
+        let mut open = self.record_request(request).await?;
         if !self.in_turn {
             // A request lives no longer than its turn, and there is none.
             return self.expire(open).await;
         }
-        if self.permission_mode == PermissionMode::Autonomous {
-            let allowed = EventBody::PermissionResolved {
-                request_id: open.request_id.clone(),
-                decision: PermissionDecision::Allow,
-                by: DecisionSource::Policy,
-                message: None,
-            };
-            self.append(self.by_agent(allowed).parent(Some(open.event_id)))
-                .await?;
-            self.forward_decision(open.request_id, PermissionDecision::Allow, None);
-            return Ok(());
+        let target = self.place(access).await?;
+        if let Target::Files { repos, .. } = &target {
+            open.repos = repos.iter().flatten().copied().collect();
         }
-        self.open.push(open);
-        if self.status != SessionStatus::Waiting {
-            let reason = Some(WAITING_FOR_PERMISSION.to_owned());
-            self.set_status(SessionStatus::Waiting, reason).await?;
-        }
+        let (decision, message) = match policy::decide(self.permission_mode, &target, &self.repos) {
+            Verdict::Allow => (PermissionDecision::Allow, None),
+            Verdict::Deny(message) => (PermissionDecision::Deny, Some(message)),
+            Verdict::Ask => {
+                self.open.push(open);
+                if self.status != SessionStatus::Waiting {
+                    let reason = Some(WAITING_FOR_PERMISSION.to_owned());
+                    self.set_status(SessionStatus::Waiting, reason).await?;
+                }
+                return Ok(());
+            }
+        };
+        let resolved = EventBody::PermissionResolved {
+            request_id: open.request_id.clone(),
+            decision,
+            by: DecisionSource::Policy,
+            message: message.clone(),
+        };
+        self.append(self.by_agent(resolved).parent(Some(open.event_id.clone())))
+            .await?;
+        self.forward_decision(open, decision, message);
         Ok(())
     }
 
@@ -727,7 +1055,17 @@ impl Driver {
         Ok(OpenRequest {
             request_id,
             event_id: event.id.clone(),
+            repos: Vec::new(),
         })
+    }
+
+    /// Finds the repos a request reaches into. Resolving links reads the disk.
+    async fn place(&self, access: ToolAccess) -> Result<Target> {
+        if !matches!(access, ToolAccess::Files { .. }) || self.repos.is_empty() {
+            return Ok(policy::place(&access, &[]));
+        }
+        let repos = self.repos.clone();
+        blocking(move || Ok(policy::place(&access, &repos))).await
     }
 
     async fn answer_permission(
@@ -738,12 +1076,13 @@ impl Driver {
     ) -> Result<()> {
         let store = &self.inner.store;
         // The `permission_requested` event: the cause of the answer.
-        let asked = match self
+        let waiting = self
             .open
             .iter()
             .position(|open| open.request_id == request_id)
-        {
-            Some(index) => Some(self.open.remove(index).event_id),
+            .map(|index| self.open.remove(index));
+        let asked = match &waiting {
+            Some(open) => Some(open.event_id.clone()),
             None => match store
                 .permission_resolved(&self.session_id, &request_id)
                 .await?
@@ -775,23 +1114,44 @@ impl Driver {
             message: message.clone(),
         };
         self.append(self.by_agent(resolved).parent(asked)).await?;
-        self.forward_decision(request_id, decision, message);
+        if let Some(open) = waiting {
+            self.forward_decision(open, decision, message);
+        }
         if self.open.is_empty() && self.status == SessionStatus::Waiting {
             self.set_status(SessionStatus::Running, None).await?;
         }
         Ok(())
     }
 
+    /// Hands a decision to the agent. An allow also opens the repos the
+    /// request reached into, when the agent was not started with them: it
+    /// then stops asking about every file there.
     fn forward_decision(
-        &self,
-        request_id: String,
+        &mut self,
+        open: OpenRequest,
         decision: PermissionDecision,
         message: Option<String>,
     ) {
-        if let Some(handle) = &self.handle {
-            // An agent that is gone says so on its output, which is handled there.
-            let _ = handle.resolve_permission(request_id, decision, message);
+        let Some(handle) = &self.handle else {
+            return;
+        };
+        let mut grants = Vec::new();
+        if decision == PermissionDecision::Allow {
+            for repo in open.repos.iter().filter_map(|index| self.repos.get(*index)) {
+                if self.granted.insert(repo.id.clone()) {
+                    grants.push(DirGrant {
+                        dir: PathBuf::from(&repo.path),
+                        write: repo.mode != RepoMode::Read,
+                    });
+                }
+            }
         }
+        // An agent that is gone says so on its output, which is handled there.
+        let _ = if grants.is_empty() {
+            handle.resolve_permission(open.request_id, decision, message)
+        } else {
+            handle.allow_granting(open.request_id, grants)
+        };
     }
 
     /// Closes every request still waiting for the user.
@@ -944,39 +1304,101 @@ impl Driver {
     }
 }
 
-/// Makes the repos ready one after the other and reports each. Ends at the
-/// first failure, or early when cancelled.
+/// Makes the repos ready one after the other and reports each step. Ends at
+/// the first failure, or early when cancelled.
 async fn prepare(plans: Vec<AttachPlan>, results: mpsc::Sender<Prepared>, cancel: Arc<AtomicBool>) {
     for plan in plans {
         if cancel.load(Ordering::Relaxed) {
             return;
         }
         let name = plan.repo.name.clone();
-        let prepared = match blocking(move || attach(plan)).await {
-            Ok(repo) => Prepared::Repo(repo),
-            Err(err) => Prepared::Failed(format!("could not prepare repo {name}: {err}")),
+        let setup = plan.repo.setup.clone();
+        let limit = plan.setup_limit;
+        let (repo, fresh) = match blocking(move || attach(plan)).await {
+            Ok(attached) => attached,
+            Err(error) => {
+                let _ = results.send(Prepared::Failed { repo: name, error }).await;
+                return;
+            }
         };
-        let failed = matches!(prepared, Prepared::Failed(_));
-        if results.send(prepared).await.is_err() || failed {
+        let dir = PathBuf::from(&repo.path);
+        if results.send(Prepared::Repo(repo)).await.is_err() {
+            return;
+        }
+        // Setup is for a worktree that was just made (design spec, section
+        // 3): one that was already there has had it.
+        let Some(command) = setup.filter(|_| fresh) else {
+            continue;
+        };
+        let mut item = setup_item(&name, &command);
+        if results
+            .send(Prepared::SetupStarted(item.clone()))
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let stop = Arc::clone(&cancel);
+        let ran = blocking(move || Ok(calin_git::run_setup(&dir, &command, limit, &stop)?)).await;
+        let (output, failure) = match ran {
+            Ok(run) => {
+                let failure = match run.end {
+                    calin_git::SetupEnd::Succeeded => None,
+                    calin_git::SetupEnd::Failed(how) => Some(format!("failed ({how})")),
+                    calin_git::SetupEnd::TimedOut => {
+                        Some(format!("was stopped: it ran longer than {limit:?}"))
+                    }
+                    calin_git::SetupEnd::Cancelled => Some("was cancelled".to_owned()),
+                };
+                (run.output, failure)
+            }
+            Err(err) => (String::new(), Some(format!("could not be run: {err}"))),
+        };
+        item.status = match failure {
+            None => ItemStatus::Completed,
+            Some(_) => ItemStatus::Failed,
+        };
+        if let ItemContent::Tool { output: slot, .. } = &mut item.content {
+            *slot = Some(output);
+        }
+        let failure = failure.map(|how| format!("the setup command of {name} {how}"));
+        if results
+            .send(Prepared::SetupEnded { item, failure })
+            .await
+            .is_err()
+        {
             return;
         }
     }
 }
 
+/// The tool item a setup command shows as. Its id is new for every run.
+fn setup_item(repo: &str, command: &str) -> Item {
+    Item {
+        id: format!("setup-{}", Ulid::generate()),
+        status: ItemStatus::Running,
+        content: ItemContent::Tool {
+            name: "setup".to_owned(),
+            tool_kind: ToolKind::Execute,
+            title: command.to_owned(),
+            input: serde_json::json!({ "command": command, "repo": repo }),
+            output: None,
+            locations: Vec::new(),
+        },
+    }
+}
+
 /// Blocking: a worktree on the session's branch for a `write` repo, the
-/// clone as it is for the others (design spec, section 3, "Repo set").
-fn attach(plan: AttachPlan) -> Result<SessionRepo> {
+/// clone as it is for the others (design spec, section 3, "Repo set"). Also
+/// says whether a worktree was made that was not there before.
+fn attach(plan: AttachPlan) -> Result<(SessionRepo, bool)> {
     let clone = PathBuf::from(&plan.repo.path);
-    let (path, branch, base_ref) = match plan.mode {
+    let (path, branch, base_ref, fresh) = match plan.mode {
         RepoMode::Write => {
             let worktree = calin_git::create_worktree(&clone, &plan.worktree, &plan.branch, None)?;
-            let path = worktree.path.to_str().map(str::to_owned).ok_or_else(|| {
-                Error::Invalid(format!(
-                    "{} is not valid UTF-8",
-                    worktree.path.to_string_lossy()
-                ))
-            })?;
-            (path, Some(worktree.branch), Some(worktree.base_ref))
+            let path = utf8(&worktree.path)?;
+            let fresh = worktree.outcome != calin_git::WorktreeOutcome::AlreadyPresent;
+            (path, Some(worktree.branch), Some(worktree.base_ref), fresh)
         }
         RepoMode::Read | RepoMode::Live => {
             // A clone without commits has nothing to measure changes against.
@@ -985,10 +1407,10 @@ fn attach(plan: AttachPlan) -> Result<SessionRepo> {
                 Err(calin_git::Error::Conflict(_)) => None,
                 Err(err) => return Err(err.into()),
             };
-            (plan.repo.path.clone(), None, base)
+            (plan.repo.path.clone(), None, base, false)
         }
     };
-    Ok(SessionRepo {
+    let repo = SessionRepo {
         id: Ulid::generate().to_string(),
         session_id: plan.session_id,
         repo_id: plan.repo.id,
@@ -998,5 +1420,12 @@ fn attach(plan: AttachPlan) -> Result<SessionRepo> {
         branch,
         base_ref,
         primary: plan.primary,
-    })
+    };
+    Ok((repo, fresh))
+}
+
+fn utf8(path: &Path) -> Result<String> {
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| Error::Invalid(format!("{} is not valid UTF-8", path.to_string_lossy())))
 }

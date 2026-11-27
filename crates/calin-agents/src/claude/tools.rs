@@ -6,9 +6,23 @@ use std::path::{Component, Path, PathBuf};
 use calin_proto::{PlanEntry, PlanStatus, ToolKind};
 use serde_json::Value;
 
-/// The tool that carries the agent's plan as its input. CLI 2.1.332 does not
-/// ship it, so its shape here is the documented one, not a recorded one.
+use crate::runner::ToolAccess;
+
+/// The tool that carries the agent's whole plan as its input. CLI 2.1.332
+/// only offers it when its task tools are switched off, so its shape here is
+/// the documented one, not a recorded one.
 pub(crate) const PLAN_TOOL: &str = "TodoWrite";
+
+/// The task tools of CLI 2.1.332, which change the plan one task at a time
+/// (recorded in `task-list`). The CLI only offers them to models it lists,
+/// or to every model with `CLAUDE_CODE_ENABLE_TODO_TOOLS=1`.
+pub(crate) const TASK_CREATE_TOOL: &str = "TaskCreate";
+pub(crate) const TASK_UPDATE_TOOL: &str = "TaskUpdate";
+
+/// The name Calin's tool endpoint is given in `--mcp-config`. The CLI names
+/// the tools of a server `mcp__<server>__<tool>`.
+pub(crate) const TOOL_SERVER: &str = "calin";
+const TOOL_SERVER_PREFIX: &str = "mcp__calin__";
 
 /// Tool output kept on an item. More than a transcript can usefully show.
 pub(crate) const OUTPUT_CAP: usize = 64 * 1024;
@@ -22,6 +36,8 @@ pub(crate) struct ToolView {
     pub title: String,
     /// Absolute paths of the files the call reads or writes.
     pub locations: Vec<String>,
+    /// What a permission request for the call is about.
+    pub access: ToolAccess,
 }
 
 /// Describes a call of `name` with `input`, made by an agent working in `cwd`.
@@ -52,6 +68,21 @@ pub(crate) fn describe(name: &str, input: &Value, cwd: &Path) -> ToolView {
         _ => (ToolKind::Other, None, None),
     };
     let file = file.map(|path| absolute(path, cwd));
+    let access = match (name, &file) {
+        (_, Some(path)) => ToolAccess::Files {
+            paths: vec![path.clone()],
+            write: kind == ToolKind::Edit,
+        },
+        // A search reads below `path`, or below the working directory. No
+        // recording holds a permission request for one; the CLI's rules for
+        // reading cover them.
+        ("Grep" | "Glob", None) => ToolAccess::Files {
+            paths: vec![absolute(text("path").unwrap_or("."), cwd)],
+            write: false,
+        },
+        _ if name.starts_with(TOOL_SERVER_PREFIX) => ToolAccess::Orchestrator,
+        _ => ToolAccess::Other,
+    };
     let title = match (&file, title) {
         (Some(path), _) => relative(path, cwd),
         (None, Some(title)) => one_line(title),
@@ -64,6 +95,7 @@ pub(crate) fn describe(name: &str, input: &Value, cwd: &Path) -> ToolView {
             .iter()
             .map(|path| path.to_string_lossy().into_owned())
             .collect(),
+        access,
     }
 }
 
@@ -75,15 +107,112 @@ pub(crate) fn plan_entries(input: &Value) -> Option<Vec<PlanEntry>> {
             .iter()
             .filter_map(|todo| {
                 let content = todo.get("content")?.as_str()?.to_owned();
-                let status = match todo.get("status").and_then(Value::as_str) {
-                    Some("in_progress") => PlanStatus::InProgress,
-                    Some("completed") => PlanStatus::Completed,
-                    _ => PlanStatus::Pending,
-                };
+                let status = plan_status(todo.get("status").and_then(Value::as_str));
                 Some(PlanEntry { content, status })
             })
             .collect(),
     )
+}
+
+fn plan_status(status: Option<&str>) -> PlanStatus {
+    match status {
+        Some("in_progress") => PlanStatus::InProgress,
+        Some("completed") => PlanStatus::Completed,
+        _ => PlanStatus::Pending,
+    }
+}
+
+/// The agent's task list, kept from its task tool calls: the CLI reports one
+/// change at a time, and a plan event carries the whole list.
+#[derive(Debug, Default)]
+pub(crate) struct TaskList {
+    /// In the order the tasks were created.
+    tasks: Vec<(String, PlanEntry)>,
+}
+
+impl TaskList {
+    /// Applies a completed call of a task tool. `result` is the structured
+    /// result the CLI attaches to the call's `user` message, `output` the
+    /// text the model was given. Returns the whole plan when it changed.
+    pub(crate) fn apply(
+        &mut self,
+        name: &str,
+        input: &Value,
+        result: &Value,
+        output: &str,
+    ) -> Option<Vec<PlanEntry>> {
+        let text = |value: &Value, key: &str| {
+            value
+                .get(key)
+                .and_then(Value::as_str)
+                .filter(|text| !text.trim().is_empty())
+                .map(str::to_owned)
+        };
+        match name {
+            TASK_CREATE_TOOL => {
+                let task = result.get("task").unwrap_or(&Value::Null);
+                let id = text(task, "id").or_else(|| created_id(output))?;
+                let content = text(input, "subject").or_else(|| text(task, "subject"))?;
+                if self.tasks.iter().any(|(known, _)| *known == id) {
+                    return None;
+                }
+                let status = PlanStatus::Pending;
+                self.tasks.push((id, PlanEntry { content, status }));
+            }
+            TASK_UPDATE_TOOL => {
+                if result.get("success").and_then(Value::as_bool) == Some(false) {
+                    return None;
+                }
+                let id = text(input, "taskId")?;
+                // A task of an earlier process of this conversation is not
+                // known here: its subject was never seen.
+                let index = self.tasks.iter().position(|(known, _)| *known == id)?;
+                let status = input.get("status").and_then(Value::as_str);
+                if status == Some("deleted") {
+                    self.tasks.remove(index);
+                } else {
+                    let entry = &mut self.tasks[index].1;
+                    if status.is_some() {
+                        entry.status = plan_status(status);
+                    }
+                    if let Some(subject) = text(input, "subject") {
+                        entry.content = subject;
+                    }
+                }
+            }
+            _ => return None,
+        }
+        Some(self.entries())
+    }
+
+    /// Applies statuses the CLI set by itself, with no task tool call to show
+    /// for it. Returns the whole plan when a known task changed.
+    pub(crate) fn set_statuses(&mut self, statuses: &[Value]) -> Option<Vec<PlanEntry>> {
+        let mut changed = false;
+        for change in statuses {
+            let id = change.get("id").and_then(Value::as_str);
+            let status = plan_status(change.get("status").and_then(Value::as_str));
+            let known = self
+                .tasks
+                .iter_mut()
+                .find(|(known, _)| Some(known.as_str()) == id);
+            if let Some((_, entry)) = known.filter(|(_, entry)| entry.status != status) {
+                entry.status = status;
+                changed = true;
+            }
+        }
+        changed.then(|| self.entries())
+    }
+
+    fn entries(&self) -> Vec<PlanEntry> {
+        self.tasks.iter().map(|(_, entry)| entry.clone()).collect()
+    }
+}
+
+/// `7` out of `Task #7 created successfully: ...`.
+fn created_id(output: &str) -> Option<String> {
+    let id = output.strip_prefix("Task #")?.split_whitespace().next()?;
+    Some(id.to_owned())
 }
 
 /// The text of a `tool_result`, whose content is a string or a list of blocks.

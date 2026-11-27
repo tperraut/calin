@@ -11,11 +11,13 @@ mod driver;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use calin_agents::{Runner, RunnerRegistry};
 use calin_proto::{
-    AgentStatus, CreateSessionRequest, DecisionSource, EventBody, PermissionDecision,
-    RegisterRepoRequest, Repo, Session, SessionDetail, SessionStatus,
+    AgentStatus, AttachRepoRequest, CreateSessionRequest, DecisionSource, EventBody,
+    PermissionDecision, RegisterRepoRequest, Repo, RepoMode, RepoSet, Session, SessionDetail,
+    SessionRepo, SessionStatus, Settings,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -23,8 +25,14 @@ use tokio::task::JoinHandle;
 use self::driver::Driver;
 use crate::error::{Error, Result};
 use crate::repos::{RepoRegistry, Reservation};
+use crate::settings::SettingsStore;
 use crate::store::{EventDraft, NewSession, Store};
 use crate::title::default_title;
+use crate::tokens::{AgentRef, Tokens};
+
+/// How long the setup command of a new worktree may run (the task of a
+/// dependency install, not of a build farm).
+const SETUP_LIMIT: Duration = Duration::from_secs(10 * 60);
 
 const RESTART_REASON: &str = "server restarted";
 /// Recorded with a request that nobody answered while it could be answered.
@@ -44,10 +52,41 @@ pub struct SessionManager {
     inner: Arc<Inner>,
 }
 
+/// What a manager can be told to do differently. Every value has a working
+/// default; tests shorten the waits.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManagerConfig {
+    /// How long the setup command of a new worktree may run before it is
+    /// stopped and counted as failed.
+    pub setup_limit: Duration,
+}
+
+impl Default for ManagerConfig {
+    fn default() -> Self {
+        Self {
+            setup_limit: SETUP_LIMIT,
+        }
+    }
+}
+
+/// A repo as an agent sees it through Calin's tools.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentRepo {
+    pub repo: Repo,
+    /// How the repo takes part in the agent's session, when it does.
+    pub attached: Option<SessionRepo>,
+}
+
 struct Inner {
     store: Store,
     registry: RunnerRegistry,
-    repos: RepoRegistry,
+    repos: Arc<RepoRegistry>,
+    settings: SettingsStore,
+    config: ManagerConfig,
+    tokens: Arc<Tokens>,
+    /// Where agents reach Calin's tools, without the token: known once the
+    /// server has bound its port. Until then agents start without tools.
+    tool_endpoint: Mutex<Option<String>>,
     /// The command queue of every running driver. Commands are sent and
     /// drivers retire under this lock, so a command is never queued on a
     /// driver that has already decided to end.
@@ -59,6 +98,12 @@ impl Inner {
         // The map stays consistent even if a holder panicked: every critical
         // section is a single insert, remove or send.
         self.drivers.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn tool_endpoint(&self) -> Option<String> {
+        // One read or one write of the value per critical section.
+        let endpoint = self.tool_endpoint.lock();
+        endpoint.unwrap_or_else(PoisonError::into_inner).clone()
     }
 }
 
@@ -87,6 +132,13 @@ enum Command {
         message: Option<String>,
         reply: Reply,
     },
+    /// Make a repo ready and add it to the session's repo set. `agent_id` is
+    /// the agent that asked through Calin's tools; `None` when the user did.
+    Attach {
+        request: AttachRepoRequest,
+        agent_id: Option<String>,
+        reply: Reply<SessionRepo>,
+    },
 }
 
 impl Command {
@@ -94,6 +146,9 @@ impl Command {
         // The caller may have stopped waiting.
         match self {
             Self::Start { reply, .. } => {
+                let _ = reply.send(Err(err));
+            }
+            Self::Attach { reply, .. } => {
                 let _ = reply.send(Err(err));
             }
             Self::Message { reply, .. }
@@ -107,15 +162,33 @@ impl Command {
 }
 
 impl SessionManager {
-    /// Wraps the store, loads the repo registry and settles the sessions
-    /// that a previous process left in the middle of their work.
+    /// Wraps the store, loads the settings and the repo registry, scans for
+    /// the repos the home repo declares, and settles the sessions that a
+    /// previous process left in the middle of their work.
     pub async fn start(store: Store, registry: RunnerRegistry) -> Result<Self> {
-        let repos = RepoRegistry::load(store.home().repos_path()).await;
+        Self::start_with(store, registry, ManagerConfig::default()).await
+    }
+
+    pub async fn start_with(
+        store: Store,
+        registry: RunnerRegistry,
+        config: ManagerConfig,
+    ) -> Result<Self> {
+        let settings = SettingsStore::load(store.home()).await;
+        let repos = Arc::new(RepoRegistry::load(store.home().repos_path()).await);
+        // The repo list must be whole before the first request reads it.
+        if let Err(err) = repos.refresh(&settings.get().await).await {
+            tracing::warn!(%err, "could not scan for repos; listing the registered ones only");
+        }
         let manager = Self {
             inner: Arc::new(Inner {
                 store,
                 registry,
                 repos,
+                settings,
+                config,
+                tokens: Arc::default(),
+                tool_endpoint: Mutex::new(None),
                 drivers: Mutex::new(HashMap::new()),
             }),
         };
@@ -131,9 +204,45 @@ impl SessionManager {
         &self.inner.registry
     }
 
-    /// Every registered repo, by name.
+    /// The settings in effect, with the default clone root filled in.
+    pub async fn settings(&self) -> Settings {
+        self.inner.settings.get().await
+    }
+
+    /// Replaces the settings, then reads the home repo again and rescans.
+    /// `Invalid` when the home repo is not the root of a git work tree or a
+    /// scan root is not an existing directory; nothing is changed then.
+    pub async fn update_settings(&self, settings: Settings) -> Result<Settings> {
+        let stored = self.inner.settings.replace(settings).await?;
+        self.inner.repos.refresh(&stored).await?;
+        Ok(stored)
+    }
+
+    /// Every repo this machine knows: the home repo first, then by name.
     pub async fn list_repos(&self) -> Vec<Repo> {
         self.inner.repos.list().await
+    }
+
+    /// Reads the home repo's `.calin/repos.yaml` again, rescans for clones
+    /// and returns the list that results.
+    pub async fn refresh_repos(&self) -> Result<Vec<Repo>> {
+        let settings = self.inner.settings.get().await;
+        self.inner.repos.refresh(&settings).await?;
+        Ok(self.inner.repos.list().await)
+    }
+
+    /// The home repo's named sets, in its order.
+    pub async fn repo_sets(&self) -> Vec<RepoSet> {
+        self.inner.repos.sets().await
+    }
+
+    /// Starts cloning a declared repo into the clone root and returns at
+    /// once; the repo list shows how it goes. `Missing` for an unknown id,
+    /// `Conflict` unless the repo is declared with a URL, has no clone and is
+    /// not being cloned already.
+    pub async fn clone_repo(&self, repo_id: &str) -> Result<()> {
+        let settings = self.inner.settings.get().await;
+        self.inner.repos.start_clone(repo_id, settings).await
     }
 
     /// Registers a local clone. `Invalid` when the path is not the root of a
@@ -147,9 +256,92 @@ impl SessionManager {
     }
 
     /// Forgets a repo; nothing on disk is touched. `Conflict` while it is
-    /// attached to a session that is not `done`, `failed` or `cancelled`.
+    /// attached to a session that is not `done`, `failed` or `cancelled`,
+    /// and for a repo the home repo declares.
     pub async fn remove_repo(&self, repo_id: &str) -> Result<()> {
         self.inner.repos.remove(repo_id, &self.inner.store).await
+    }
+
+    /// Tells the manager where agents reach Calin's tool endpoint: `base`
+    /// followed by `/` and the agent's token is the URL an agent is given.
+    /// Called by the server once it knows the port it listens on.
+    pub fn set_tool_endpoint(&self, base: impl Into<String>) {
+        let endpoint = self.inner.tool_endpoint.lock();
+        *endpoint.unwrap_or_else(PoisonError::into_inner) = Some(base.into());
+    }
+
+    /// The agent a tool endpoint token was issued to, while that agent runs.
+    pub fn agent_for_token(&self, token: &str) -> Option<AgentRef> {
+        self.inner.tokens.agent(token)
+    }
+
+    /// Every repo, with how it takes part in the agent's session.
+    pub async fn agent_repos(&self, agent: &AgentRef) -> Result<Vec<AgentRepo>> {
+        let attached = self.get(&agent.session_id).await?.repos;
+        let repos = self.inner.repos.list().await;
+        Ok(repos
+            .into_iter()
+            .map(|repo| AgentRepo {
+                attached: attached.iter().find(|a| a.repo_id == repo.id).cloned(),
+                repo,
+            })
+            .collect())
+    }
+
+    /// Attaches the repo called `name` to the agent's session, for the
+    /// agent. `Missing` when no repo has that name; otherwise as
+    /// [`Self::attach_repo`]. An agent cannot ask for `live`: editing the
+    /// user's own checkout is for the user to decide.
+    pub async fn agent_attach_repo(
+        &self,
+        agent: &AgentRef,
+        name: &str,
+        mode: Option<RepoMode>,
+    ) -> Result<SessionRepo> {
+        if mode == Some(RepoMode::Live) {
+            return Err(Error::Invalid("the mode must be write or read".to_owned()));
+        }
+        let repos = self.inner.repos.list().await;
+        let Some(repo) = repos.into_iter().find(|repo| repo.name == name) else {
+            return Err(Error::Missing(format!("no repository is named {name}")));
+        };
+        let request = AttachRepoRequest {
+            repo_id: repo.id,
+            mode,
+        };
+        self.attach(&agent.session_id, request, Some(agent.agent_id.clone()))
+            .await
+    }
+
+    /// Adds a repo to a session that is `running`, `waiting` or `review`:
+    /// a worktree on the session's branch for `write`, the clone itself for
+    /// `live` and `read`. Returns once the repo is ready, its setup command
+    /// included. `Missing` for an unknown repo; `Conflict` in any other
+    /// status, when the repo is already attached and when it has no clone.
+    pub async fn attach_repo(
+        &self,
+        session_id: &str,
+        request: AttachRepoRequest,
+    ) -> Result<SessionRepo> {
+        self.attach(session_id, request, None).await
+    }
+
+    async fn attach(
+        &self,
+        session_id: &str,
+        request: AttachRepoRequest,
+        agent_id: Option<String>,
+    ) -> Result<SessionRepo> {
+        let status = self.get(session_id).await?.session.status;
+        if !takes_repos(status) {
+            return Err(no_attaching(status));
+        }
+        self.command(session_id, |reply| Command::Attach {
+            request,
+            agent_id,
+            reply,
+        })
+        .await
     }
 
     /// Creates a session and returns it as soon as its prompt is recorded,
@@ -394,6 +586,22 @@ fn is_closed(status: SessionStatus) -> bool {
 /// is continued by one (the semantics in `calin-proto/src/api.rs`).
 fn takes_messages(status: SessionStatus) -> bool {
     status != SessionStatus::Done
+}
+
+/// True while a repo can join the session: its agent is at work or waits for
+/// the next message (the semantics in `calin-proto/src/api.rs`).
+fn takes_repos(status: SessionStatus) -> bool {
+    matches!(
+        status,
+        SessionStatus::Running | SessionStatus::Waiting | SessionStatus::Review
+    )
+}
+
+fn no_attaching(status: SessionStatus) -> Error {
+    Error::Conflict(format!(
+        "a repo can only be attached while the session is running, waiting or in review; it is {}",
+        status_name(status)
+    ))
 }
 
 /// True while an agent's turn is in progress.

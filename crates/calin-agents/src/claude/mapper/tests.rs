@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use calin_proto::PlanStatus;
 
 use super::*;
+use crate::runner::ToolAccess;
 
 /// Set to `1` to rewrite the expected files from what the mapper produces now.
 const ENV_BLESS: &str = "CALIN_BLESS";
@@ -36,7 +37,7 @@ fn fixtures() -> Vec<PathBuf> {
         }
     }
     found.sort();
-    assert!(found.len() >= 9, "fixtures are missing: {found:?}");
+    assert!(found.len() >= 12, "fixtures are missing: {found:?}");
     found
 }
 
@@ -87,7 +88,14 @@ fn replay(path: &Path) -> Vec<RunnerOutput> {
 fn to_json(output: &RunnerOutput) -> Value {
     match output {
         RunnerOutput::Event(body) => json!({ "event": body }),
-        RunnerOutput::PermissionRequest(request) => json!({ "permission_request": request }),
+        RunnerOutput::PermissionRequest(ask) => {
+            let access = match &ask.access {
+                ToolAccess::Files { paths, write } => json!({ "files": paths, "write": write }),
+                ToolAccess::Orchestrator => json!("orchestrator"),
+                ToolAccess::Other => json!("other"),
+            };
+            json!({ "permission_request": ask.request, "access": access })
+        }
         RunnerOutput::NativeSession { id, model } => {
             json!({ "native_session": { "id": id, "model": model } })
         }
@@ -201,7 +209,7 @@ fn check_invariants(name: &str, outputs: &[RunnerOutput]) -> usize {
                     ItemContent::Tool { .. } => assert!(streamed.is_empty()),
                 }
             }
-            RunnerOutput::PermissionRequest(request) => {
+            RunnerOutput::PermissionRequest(PermissionAsk { request, .. }) => {
                 assert!(
                     requests.insert(request.id.clone()),
                     "{name}: request reused"
@@ -278,7 +286,9 @@ fn the_mapper_writes_what_the_recordings_wrote() {
                         other => panic!("{name}: unknown behavior {other:?}"),
                     };
                     let request_id = message["response"]["request_id"].as_str().unwrap();
-                    let written = mapper.permission_response(request_id, decision, said);
+                    let grants = recorded_grants(&answer["updatedPermissions"]);
+                    let written =
+                        mapper.permission_response_granting(request_id, decision, said, &grants);
                     assert_eq!(written, Some(message.clone()), "{name}");
                     // Answered once; a second decision has nothing to answer.
                     assert_eq!(mapper.permission_response(request_id, decision, None), None);
@@ -296,6 +306,29 @@ fn the_mapper_writes_what_the_recordings_wrote() {
         // Knowing the decisions changes nothing: the CLI's output says it all.
         assert_eq!(outputs, replay(&path), "{name}");
     }
+}
+
+/// The grants a recorded allow carried, read back from the CLI's own shapes.
+fn recorded_grants(updates: &Value) -> Vec<DirGrant> {
+    let updates = updates.as_array().map(Vec::as_slice).unwrap_or_default();
+    updates
+        .iter()
+        .map(|update| match update["type"].as_str() {
+            Some("addDirectories") => DirGrant {
+                dir: update["directories"][0].as_str().unwrap().into(),
+                write: true,
+            },
+            Some("addRules") => {
+                let rule = update["rules"][0]["ruleContent"].as_str().unwrap();
+                let dir = rule.strip_prefix('/').and_then(|r| r.strip_suffix("/**"));
+                DirGrant {
+                    dir: dir.unwrap().into(),
+                    write: false,
+                }
+            }
+            other => panic!("unknown permission update {other:?}"),
+        })
+        .collect()
 }
 
 fn events(outputs: &[RunnerOutput]) -> Vec<&EventBody> {
@@ -393,7 +426,7 @@ fn a_denied_call_is_declined_and_an_allowed_one_completes() {
     let requests: Vec<&PermissionRequest> = allowed
         .iter()
         .filter_map(|output| match output {
-            RunnerOutput::PermissionRequest(request) => Some(request),
+            RunnerOutput::PermissionRequest(ask) => Some(&ask.request),
             _ => None,
         })
         .collect();
@@ -747,20 +780,8 @@ fn a_todo_list_is_also_the_plan() {
             ),
         ],
     );
-    let plans: Vec<Vec<(&str, PlanStatus)>> = events(&outputs)
-        .into_iter()
-        .filter_map(|body| match body {
-            EventBody::PlanUpdated { entries } => Some(
-                entries
-                    .iter()
-                    .map(|entry| (entry.content.as_str(), entry.status))
-                    .collect(),
-            ),
-            _ => None,
-        })
-        .collect();
     assert_eq!(
-        plans,
+        plans(&outputs),
         [[
             ("Read the notes", PlanStatus::Completed),
             ("Fix the typo", PlanStatus::InProgress),
@@ -1013,14 +1034,384 @@ fn a_request_that_comes_before_its_call_starts_the_item() {
     ));
     assert_eq!(
         outputs[1],
-        RunnerOutput::PermissionRequest(PermissionRequest {
-            id: "r1".into(),
-            tool_name: "Bash".into(),
-            tool_kind: ToolKind::Execute,
-            title: "rm -rf build".into(),
-            input,
-            item_id: Some("t1".into()),
+        RunnerOutput::PermissionRequest(PermissionAsk {
+            request: PermissionRequest {
+                id: "r1".into(),
+                tool_name: "Bash".into(),
+                tool_kind: ToolKind::Execute,
+                title: "rm -rf build".into(),
+                input,
+                item_id: Some("t1".into()),
+            },
+            access: ToolAccess::Other,
         })
+    );
+}
+
+fn can_use(request_id: &str, tool_use_id: &str, name: &str, input: Value) -> Value {
+    json!({
+        "type": "control_request", "request_id": request_id,
+        "request": { "subtype": "can_use_tool", "tool_name": name, "input": input,
+                     "tool_use_id": tool_use_id },
+    })
+}
+
+fn asks(outputs: &[RunnerOutput]) -> Vec<&PermissionAsk> {
+    outputs
+        .iter()
+        .filter_map(|output| match output {
+            RunnerOutput::PermissionRequest(ask) => Some(ask),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_request_says_which_paths_it_reads_or_writes() {
+    let mut mapper = mapper();
+    let files = |paths: &[&str], write| ToolAccess::Files {
+        paths: paths.iter().map(PathBuf::from).collect(),
+        write,
+    };
+    let cases = [
+        (
+            "Read",
+            json!({ "file_path": "/other/a.txt" }),
+            files(&["/other/a.txt"], false),
+        ),
+        (
+            "Edit",
+            json!({ "file_path": "/other/a.txt", "old_string": "a" }),
+            files(&["/other/a.txt"], true),
+        ),
+        (
+            "Write",
+            json!({ "file_path": "made.txt", "content": "x" }),
+            files(&["/work/made.txt"], true),
+        ),
+        (
+            "MultiEdit",
+            json!({ "file_path": "../x/y.rs" }),
+            files(&["/x/y.rs"], true),
+        ),
+        (
+            "NotebookEdit",
+            json!({ "notebook_path": "/other/n.ipynb" }),
+            files(&["/other/n.ipynb"], true),
+        ),
+        // A search reads the tree below its path, or the working directory.
+        (
+            "Grep",
+            json!({ "pattern": "fn", "path": "/other/src" }),
+            files(&["/other/src"], false),
+        ),
+        (
+            "Glob",
+            json!({ "pattern": "**/*.rs" }),
+            files(&["/work"], false),
+        ),
+        // Calin's own tools, under the server name the runner gave the CLI.
+        (
+            "mcp__calin__attach_repo",
+            json!({ "name": "web" }),
+            ToolAccess::Orchestrator,
+        ),
+        (
+            "mcp__calin__list_repos",
+            json!({}),
+            ToolAccess::Orchestrator,
+        ),
+        // Everything else says nothing: a command can touch any path.
+        (
+            "Bash",
+            json!({ "command": "cat /other/a.txt" }),
+            ToolAccess::Other,
+        ),
+        (
+            "mcp__other__attach_repo",
+            json!({ "name": "web" }),
+            ToolAccess::Other,
+        ),
+        (
+            "WebFetch",
+            json!({ "url": "https://example.com" }),
+            ToolAccess::Other,
+        ),
+        // A file tool that names no file cannot be placed anywhere.
+        ("Read", json!({}), ToolAccess::Other),
+        ("Edit", json!({ "file_path": 7 }), ToolAccess::Other),
+    ];
+    for (index, (name, input, expected)) in cases.into_iter().enumerate() {
+        let request = can_use(
+            &format!("r{index}"),
+            &format!("t{index}"),
+            name,
+            input.clone(),
+        );
+        let outputs = feed(&mut mapper, &[request]);
+        let [ask] = asks(&outputs)[..] else {
+            panic!("{name}: expected one request, got {outputs:?}");
+        };
+        assert_eq!(ask.access, expected, "{name} {input}");
+        assert_eq!(ask.request.tool_name, name);
+    }
+}
+
+#[test]
+fn the_recorded_requests_carry_their_access() {
+    let access = |name: &str| -> Vec<(String, ToolAccess)> {
+        asks(&replay(&fixture(name)))
+            .into_iter()
+            .map(|ask| (ask.request.tool_name.clone(), ask.access.clone()))
+            .collect()
+    };
+    let files = |path: &str, write| ToolAccess::Files {
+        paths: vec![path.into()],
+        write,
+    };
+    // Outside the working directory the CLI asks before a read and before
+    // the first write; the grants then keep it from asking again.
+    assert_eq!(
+        access("grant-directories"),
+        [
+            ("Read".to_owned(), files("/work-ro/a.txt", false)),
+            ("Write".to_owned(), files("/work-rw/one.txt", true)),
+        ]
+    );
+    assert_eq!(
+        access("mcp-tool"),
+        [
+            (
+                "mcp__calin__list_repos".to_owned(),
+                ToolAccess::Orchestrator
+            ),
+            (
+                "mcp__calin__attach_repo".to_owned(),
+                ToolAccess::Orchestrator
+            ),
+            (
+                "mcp__calin__attach_repo".to_owned(),
+                ToolAccess::Orchestrator
+            ),
+        ]
+    );
+    assert_eq!(
+        access("deny-permission")[0],
+        ("Write".to_owned(), files("/work/made.txt", true))
+    );
+}
+
+#[test]
+fn an_allow_can_open_directories_in_the_shapes_the_cli_suggests() {
+    let mut mapper = mapper();
+    let input = json!({ "file_path": "/other/a.txt", "content": "x" });
+    feed(
+        &mut mapper,
+        &[
+            can_use("r1", "t1", "Write", input.clone()),
+            can_use("r2", "t2", "Write", input.clone()),
+            can_use("r3", "t3", "Write", input.clone()),
+        ],
+    );
+    let grants = [
+        DirGrant {
+            dir: "/repos/web".into(),
+            write: true,
+        },
+        DirGrant {
+            dir: "/repos/docs".into(),
+            write: false,
+        },
+    ];
+    let allowed = mapper
+        .permission_response_granting("r1", PermissionDecision::Allow, None, &grants)
+        .unwrap();
+    assert_eq!(
+        allowed["response"]["response"],
+        json!({
+            "behavior": "allow",
+            "updatedInput": input,
+            "updatedPermissions": [
+                { "type": "addDirectories", "directories": ["/repos/web"], "destination": "session" },
+                { "type": "addRules", "behavior": "allow", "destination": "session",
+                  "rules": [{ "toolName": "Read", "ruleContent": "//repos/docs/**" }] },
+            ],
+        })
+    );
+    // Nothing to grant, nothing said about permissions.
+    let plain = mapper
+        .permission_response_granting("r2", PermissionDecision::Allow, None, &[])
+        .unwrap();
+    assert!(
+        plain["response"]["response"]
+            .get("updatedPermissions")
+            .is_none()
+    );
+    // A denial grants nothing, whatever it was handed.
+    let denied = mapper
+        .permission_response_granting("r3", PermissionDecision::Deny, None, &grants)
+        .unwrap();
+    assert_eq!(
+        denied["response"]["response"],
+        json!({ "behavior": "deny", "message": DEFAULT_DENIAL })
+    );
+}
+
+fn plans(outputs: &[RunnerOutput]) -> Vec<Vec<(&str, PlanStatus)>> {
+    events(outputs)
+        .into_iter()
+        .filter_map(|body| match body {
+            EventBody::PlanUpdated { entries } => Some(
+                entries
+                    .iter()
+                    .map(|entry| (entry.content.as_str(), entry.status))
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn the_recorded_task_tools_become_the_whole_plan_each_time() {
+    use PlanStatus::{Completed, InProgress, Pending};
+    let outputs = replay(&fixture("task-list"));
+    let (read, count, report) = (
+        "Read notes.txt",
+        "Count lines in notes.txt",
+        "Report the line count",
+    );
+    assert_eq!(
+        plans(&outputs),
+        [
+            vec![(read, Pending)],
+            vec![(read, Pending), (count, Pending)],
+            vec![(read, Pending), (count, Pending), (report, Pending)],
+            vec![(read, InProgress), (count, Pending), (report, Pending)],
+            vec![(read, Completed), (count, Pending), (report, Pending)],
+            vec![(read, Completed), (count, InProgress), (report, Pending)],
+            vec![(read, Completed), (count, Completed), (report, Pending)],
+            vec![(read, Completed), (count, Completed), (report, InProgress)],
+            vec![(read, Completed), (count, Completed), (report, Completed)],
+        ]
+    );
+    // Each plan follows the completion of the call that changed it.
+    for (index, output) in outputs.iter().enumerate() {
+        if matches!(output, RunnerOutput::Event(EventBody::PlanUpdated { .. })) {
+            let RunnerOutput::Event(EventBody::ItemCompleted { item }) = &outputs[index - 1] else {
+                panic!("a plan without its call: {:?}", outputs[index - 1]);
+            };
+            let ItemContent::Tool { name, .. } = &item.content else {
+                panic!("not a tool call: {item:?}");
+            };
+            assert!(name == "TaskCreate" || name == "TaskUpdate", "{name}");
+        }
+    }
+}
+
+fn task_result(id: &str, content: &str, result: Value) -> Value {
+    json!({
+        "type": "user",
+        "message": { "role": "user", "content": [
+            { "type": "tool_result", "tool_use_id": id, "content": content },
+        ] },
+        "tool_use_result": result,
+    })
+}
+
+#[test]
+fn task_calls_edit_rename_and_delete_plan_entries() {
+    use PlanStatus::{Completed, InProgress, Pending};
+    let mut mapper = mapper();
+    let created = |call: &str, id: &str, subject: &str| {
+        [
+            tool_use(
+                call,
+                "TaskCreate",
+                json!({ "subject": subject, "description": "d" }),
+            ),
+            task_result(
+                call,
+                &format!("Task #{id} created successfully: {subject}"),
+                json!({ "task": { "id": id, "subject": subject } }),
+            ),
+        ]
+    };
+    let updated = |call: &str, input: Value| {
+        [
+            tool_use(call, "TaskUpdate", input),
+            task_result(call, "Updated task", json!({ "success": true })),
+        ]
+    };
+    let mut messages = Vec::new();
+    messages.extend(created("c1", "1", "First"));
+    messages.extend(created("c2", "2", "Second"));
+    messages.extend(updated(
+        "u1",
+        json!({ "taskId": "1", "status": "in_progress" }),
+    ));
+    messages.extend(updated(
+        "u2",
+        json!({ "taskId": "2", "subject": "Second, renamed" }),
+    ));
+    messages.extend(updated("u3", json!({ "taskId": "1", "status": "deleted" })));
+    messages.extend(updated(
+        "u4",
+        json!({ "taskId": "2", "status": "completed" }),
+    ));
+    // A task this process never saw created, and a failed update: no plan.
+    messages.extend(updated(
+        "u5",
+        json!({ "taskId": "9", "status": "completed" }),
+    ));
+    messages.push(tool_use(
+        "u6",
+        "TaskUpdate",
+        json!({ "taskId": "2", "status": "pending" }),
+    ));
+    messages.push(task_result(
+        "u6",
+        "Task not found",
+        json!({ "success": false }),
+    ));
+    messages.push(tool_use(
+        "u7",
+        "TaskUpdate",
+        json!({ "taskId": "2", "status": "pending" }),
+    ));
+    messages.push(tool_result(
+        "u7",
+        json!({ "content": "refused", "is_error": true }),
+    ));
+    // The id is read from the text when the structured result is missing.
+    messages.push(tool_use("c3", "TaskCreate", json!({ "subject": "Third" })));
+    messages.push(tool_result(
+        "c3",
+        json!({ "content": "Task #3 created successfully: Third" }),
+    ));
+    let outputs = feed(&mut mapper, &messages);
+    assert_eq!(
+        plans(&outputs),
+        [
+            vec![("First", Pending)],
+            vec![("First", Pending), ("Second", Pending)],
+            vec![("First", InProgress), ("Second", Pending)],
+            vec![("First", InProgress), ("Second, renamed", Pending)],
+            vec![("Second, renamed", Pending)],
+            vec![("Second, renamed", Completed)],
+            vec![("Second, renamed", Completed), ("Third", Pending)],
+        ]
+    );
+
+    // Statuses the CLI sets by itself arrive as a system message.
+    let statuses = json!({
+        "type": "system", "subtype": "task_list_statuses",
+        "statuses": [{ "id": "3", "status": "in_progress" }, { "id": "8", "status": "completed" }],
+    });
+    let outputs = feed(&mut mapper, &[statuses.clone(), statuses]);
+    assert_eq!(
+        plans(&outputs),
+        [vec![("Second, renamed", Completed), ("Third", InProgress)]]
     );
 }
 

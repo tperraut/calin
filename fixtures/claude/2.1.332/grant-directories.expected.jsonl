@@ -1,0 +1,16 @@
+{"native_session":{"id":"uuid-0001","model":"claude-haiku-5-5"}}
+{"event":{"item":{"content":{"input":{"file_path":"/work-ro/a.txt"},"kind":"tool","locations":["/work-ro/a.txt"],"name":"Read","output":null,"title":"/work-ro/a.txt","tool_kind":"read"},"id":"toolu-0001","status":"running"},"type":"item_started"}}
+{"access":{"files":["/work-ro/a.txt"],"write":false},"permission_request":{"id":"uuid-0022","input":{"file_path":"/work-ro/a.txt"},"item_id":"toolu-0001","title":"/work-ro/a.txt","tool_kind":"read","tool_name":"Read"}}
+{"event":{"item":{"content":{"input":{"file_path":"/work-ro/a.txt"},"kind":"tool","locations":["/work-ro/a.txt"],"name":"Read","output":"1\talpha\n2\t","title":"/work-ro/a.txt","tool_kind":"read"},"id":"toolu-0001","status":"completed"},"type":"item_completed"}}
+{"event":{"item":{"content":{"input":{"file_path":"/work-ro/b.txt"},"kind":"tool","locations":["/work-ro/b.txt"],"name":"Read","output":null,"title":"/work-ro/b.txt","tool_kind":"read"},"id":"toolu-0002","status":"running"},"type":"item_started"}}
+{"event":{"item":{"content":{"input":{"file_path":"/work-ro/b.txt"},"kind":"tool","locations":["/work-ro/b.txt"],"name":"Read","output":"1\tbeta\n2\t","title":"/work-ro/b.txt","tool_kind":"read"},"id":"toolu-0002","status":"completed"},"type":"item_completed"}}
+{"event":{"item":{"content":{"input":{"content":"one","file_path":"/work-rw/one.txt"},"kind":"tool","locations":["/work-rw/one.txt"],"name":"Write","output":null,"title":"/work-rw/one.txt","tool_kind":"edit"},"id":"toolu-0003","status":"running"},"type":"item_started"}}
+{"access":{"files":["/work-rw/one.txt"],"write":true},"permission_request":{"id":"uuid-0079","input":{"content":"one","file_path":"/work-rw/one.txt"},"item_id":"toolu-0003","title":"/work-rw/one.txt","tool_kind":"edit","tool_name":"Write"}}
+{"event":{"item":{"content":{"input":{"content":"one","file_path":"/work-rw/one.txt"},"kind":"tool","locations":["/work-rw/one.txt"],"name":"Write","output":"File created successfully at: /work-rw/one.txt (file state is current in your context — no need to Read it back)","title":"/work-rw/one.txt","tool_kind":"edit"},"id":"toolu-0003","status":"completed"},"type":"item_completed"}}
+{"event":{"item":{"content":{"input":{"content":"two","file_path":"/work-rw/two.txt"},"kind":"tool","locations":["/work-rw/two.txt"],"name":"Write","output":null,"title":"/work-rw/two.txt","tool_kind":"edit"},"id":"toolu-0004","status":"running"},"type":"item_started"}}
+{"event":{"item":{"content":{"input":{"content":"two","file_path":"/work-rw/two.txt"},"kind":"tool","locations":["/work-rw/two.txt"],"name":"Write","output":"File created successfully at: /work-rw/two.txt (file state is current in your context — no need to Read it back)","title":"/work-rw/two.txt","tool_kind":"edit"},"id":"toolu-0004","status":"completed"},"type":"item_completed"}}
+{"event":{"item":{"content":{"kind":"text","text":""},"id":"claude-7-1","status":"running"},"type":"item_started"}}
+{"event":{"delta":{"kind":"text","text":"done"},"item_id":"claude-7-1","type":"item_delta"}}
+{"event":{"item":{"content":{"kind":"text","text":"done"},"id":"claude-7-1","status":"completed"},"type":"item_completed"}}
+{"event":{"cost_usd":0.0066733899999999995,"tokens_in":165532,"tokens_out":537,"type":"usage"}}
+"turn_ended"

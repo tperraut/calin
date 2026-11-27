@@ -54,6 +54,10 @@ BUILTIN_TOOLS = [
     "WebFetch",
     "WebSearch",
     "TodoWrite",
+    "TaskCreate",
+    "TaskUpdate",
+    "TaskGet",
+    "TaskList",
 ]
 
 # Dropped wherever they appear: opaque, large, or about the account.

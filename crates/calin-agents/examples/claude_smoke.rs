@@ -15,7 +15,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use calin_agents::{ClaudeConfig, ClaudeRunner, Exit, Runner, RunnerOutput, StartParams};
+use calin_agents::{
+    ClaudeConfig, ClaudeRunner, Exit, PermissionAsk, Runner, RunnerOutput, StartParams,
+};
 use calin_proto::{PermissionDecision, PermissionMode};
 
 /// Longest line printed per output; a transcript is for reading, not for replay.
@@ -85,7 +87,7 @@ fn describe(output: &RunnerOutput) -> String {
             Ok(json) => format!("event {json}"),
             Err(err) => format!("event that does not serialize: {err}"),
         },
-        RunnerOutput::PermissionRequest(request) => format!(
+        RunnerOutput::PermissionRequest(PermissionAsk { request, .. }) => format!(
             "permission_request {} {} {:?} item={:?}",
             request.id, request.tool_name, request.title, request.item_id
         ),
@@ -160,7 +162,7 @@ async fn main() -> ExitCode {
         };
         println!("{}", describe(&output));
         match output {
-            RunnerOutput::PermissionRequest(request) => {
+            RunnerOutput::PermissionRequest(PermissionAsk { request, .. }) => {
                 println!("# {:?} {}", options.decision, request.id);
                 let _ = handle.resolve_permission(request.id, options.decision, None);
             }

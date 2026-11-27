@@ -1,0 +1,12 @@
+{
+  "turns": [
+    "Call the list_repos tool of the calin server, then call its attach_repo tool with the name web, then call attach_repo again with the name nope. Finish with one short sentence saying which path you were given."
+  ],
+  "permissions": ["allow"],
+  "args": [
+    "--mcp-config",
+    "{\"mcpServers\":{\"calin\":{\"type\":\"http\",\"url\":\"http://127.0.0.1:47811/api/v1/mcp/0123456789abcdef0123456789abcdef\"}}}",
+    "--append-system-prompt",
+    "You run inside Calin. To work in another repository, call the attach_repo tool."
+  ]
+}

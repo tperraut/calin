@@ -13,7 +13,8 @@ use serde_json::json;
 use tokio::sync::mpsc::error::TryRecvError;
 
 use crate::runner::{
-    AgentHandle, AgentIo, Exit, Runner, RunnerError, RunnerInput, RunnerOutput, StartParams,
+    AgentHandle, AgentIo, Exit, PermissionAsk, Runner, RunnerError, RunnerInput, RunnerOutput,
+    StartParams, ToolAccess,
 };
 
 pub const MOCK_RUNNER_ID: &str = "mock";
@@ -301,13 +302,23 @@ impl MockAgent {
         })
         .await?;
         if self.asks_before(tool_kind) {
-            let request = PermissionRequest {
-                id: format!("{id}-permission"),
-                tool_name: name.to_owned(),
-                tool_kind,
-                title: title.to_owned(),
-                input,
-                item_id: Some(id),
+            let access = match (tool_kind, &self.edited) {
+                (ToolKind::Edit, Some(path)) => ToolAccess::Files {
+                    paths: vec![path.clone()],
+                    write: true,
+                },
+                _ => ToolAccess::Other,
+            };
+            let request = PermissionAsk {
+                request: PermissionRequest {
+                    id: format!("{id}-permission"),
+                    tool_name: name.to_owned(),
+                    tool_kind,
+                    title: title.to_owned(),
+                    input,
+                    item_id: Some(id),
+                },
+                access,
             };
             if let (PermissionDecision::Deny, message) = self.ask(request).await? {
                 if let Some(Item {
@@ -360,9 +371,9 @@ impl MockAgent {
     /// Sends a permission request and waits for its decision, however long it takes.
     async fn ask(
         &mut self,
-        request: PermissionRequest,
+        request: PermissionAsk,
     ) -> Result<(PermissionDecision, Option<String>), Cut> {
-        let id = request.id.clone();
+        let id = request.request.id.clone();
         self.io
             .outputs
             .send(RunnerOutput::PermissionRequest(request))
@@ -370,10 +381,12 @@ impl MockAgent {
             .map_err(|_| Cut::Detached)?;
         loop {
             match self.io.inputs.recv().await.ok_or(Cut::Detached)? {
+                // The mock has no notion of directories: grants are ignored.
                 RunnerInput::PermissionDecision {
                     request_id,
                     decision,
                     message,
+                    ..
                 } if request_id == id => return Ok((decision, message)),
                 other => self.cut_by(other)?,
             }
@@ -623,6 +636,8 @@ mod tests {
     struct Turn {
         events: Vec<EventBody>,
         requests: Vec<PermissionRequest>,
+        /// What each request said it reaches for, in the order of `requests`.
+        access: Vec<ToolAccess>,
     }
 
     async fn run_turn(
@@ -632,11 +647,13 @@ mod tests {
         let mut turn = Turn {
             events: Vec::new(),
             requests: Vec::new(),
+            access: Vec::new(),
         };
         loop {
             match next(handle).await {
                 Some(RunnerOutput::Event(body)) => turn.events.push(body),
-                Some(RunnerOutput::PermissionRequest(request)) => {
+                Some(RunnerOutput::PermissionRequest(PermissionAsk { request, access })) => {
+                    turn.access.push(access);
                     let (decision, message) = answer(&request);
                     handle
                         .resolve_permission(request.id.clone(), decision, message)
@@ -983,6 +1000,17 @@ mod tests {
             turn.requests[0].input,
             json!({ "command": "cargo test -q" })
         );
+        // The edit says which file it writes; a command says nothing.
+        assert_eq!(
+            turn.access,
+            [
+                ToolAccess::Other,
+                ToolAccess::Files {
+                    paths: vec![handle.notes_path()],
+                    write: true,
+                },
+            ]
+        );
 
         // Allowed, the script is the one of an agent that never asks.
         let mut unattended = start_at(
@@ -1053,7 +1081,7 @@ mod tests {
         let mut handle = start_in(PermissionMode::AcceptEdits, Duration::ZERO, "ids");
         let request = loop {
             match next(&mut handle).await {
-                Some(RunnerOutput::PermissionRequest(request)) => break request,
+                Some(RunnerOutput::PermissionRequest(ask)) => break ask.request,
                 Some(_) => {}
                 None => panic!("the agent ended before asking"),
             }
@@ -1079,7 +1107,7 @@ mod tests {
         let request = loop {
             match next(&mut handle).await {
                 Some(RunnerOutput::Event(body)) => events.push(body),
-                Some(RunnerOutput::PermissionRequest(request)) => break request,
+                Some(RunnerOutput::PermissionRequest(ask)) => break ask.request,
                 Some(RunnerOutput::NativeSession { .. }) => {}
                 other => panic!("unexpected output {other:?}"),
             }

@@ -1,24 +1,32 @@
-//! Sessions, the store (SQLite index + NDJSON logs), the event bus, the repo
-//! registry and the session manager. No HTTP and no process spawning here.
+//! Sessions, the store (SQLite index + NDJSON logs), the event bus, the
+//! settings, the repo catalog and the session manager. No HTTP and no process
+//! spawning here: git and setup commands run in `calin-git`, agents in
+//! `calin-agents`.
 //!
 //! The log is the source of truth: an event is written to its session's log
 //! before it is indexed or shown to anyone, and the index can always be
 //! rebuilt from the logs.
 
+mod briefing;
 mod error;
 mod home;
+mod json_file;
 mod manager;
+mod policy;
 mod repos;
+mod settings;
 mod store;
 #[cfg(test)]
 mod testing;
 mod title;
+mod tokens;
 mod workspace;
 
 pub use error::{Error, Result};
 pub use home::{ENV_HOME, Home, HomeError, resolve_home};
-pub use manager::SessionManager;
+pub use manager::{AgentRepo, ManagerConfig, SessionManager};
 pub use store::{
     EventDraft, Live, LiveEnd, NewSession, OpenPermission, SessionSetup, Store, Subscription,
 };
+pub use tokens::AgentRef;
 pub use workspace::MAX_FILE_BYTES;

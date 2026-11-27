@@ -18,6 +18,8 @@ use super::*;
 use crate::home::Home;
 use crate::testing::{git, git_repo, write_file};
 
+mod attach;
+
 const TIMEOUT: Duration = Duration::from_secs(20);
 
 /// A runner the test plays by hand: every start hands over the agent's end.
@@ -76,9 +78,19 @@ fn registry(dry_run: bool) -> (RunnerRegistry, Starts) {
 }
 
 async fn manager_in(dir: &TempDir, dry_run: bool) -> (SessionManager, Starts) {
+    manager_with(dir, dry_run, ManagerConfig::default()).await
+}
+
+async fn manager_with(
+    dir: &TempDir,
+    dry_run: bool,
+    config: ManagerConfig,
+) -> (SessionManager, Starts) {
     let store = Store::open(Home::new(dir.path())).await.unwrap();
     let (registry, starts) = registry(dry_run);
-    let manager = SessionManager::start(store, registry).await.unwrap();
+    let manager = SessionManager::start_with(store, registry, config)
+        .await
+        .unwrap();
     (manager, starts)
 }
 
@@ -230,14 +242,15 @@ fn tool(id: &str, tool_kind: ToolKind, status: ItemStatus, locations: &[&str]) -
 }
 
 fn ask(id: &str, item_id: Option<&str>) -> RunnerOutput {
-    RunnerOutput::PermissionRequest(PermissionRequest {
+    let request = PermissionRequest {
         id: id.to_owned(),
         tool_name: "Bash".to_owned(),
         tool_kind: ToolKind::Execute,
         title: "cargo test".to_owned(),
         input: serde_json::json!({ "command": "cargo test" }),
         item_id: item_id.map(str::to_owned),
-    })
+    };
+    RunnerOutput::PermissionRequest(request.into())
 }
 
 async fn emit(io: &AgentIo, output: RunnerOutput) {
@@ -1620,6 +1633,7 @@ async fn in_autonomous_mode_the_policy_allows_at_once_and_records_it() {
             request_id: "p1".to_owned(),
             decision: PermissionDecision::Allow,
             message: None,
+            grants: Vec::new(),
         })
     );
     // A request that names no item is caused by the turn's message.

@@ -87,8 +87,8 @@ async fn turn(
     let mut outputs = Vec::new();
     loop {
         let output = next(handle).await.expect("the agent ended mid-turn");
-        if let RunnerOutput::PermissionRequest(request) = &output {
-            on_request(handle, request);
+        if let RunnerOutput::PermissionRequest(ask) = &output {
+            on_request(handle, &ask.request);
         }
         let ended = output == RunnerOutput::TurnEnded;
         assert!(

@@ -4,10 +4,11 @@
 //!
 //! - A **clone** is a repository the user registered: the root of an ordinary
 //!   (non-bare) work tree. [`inspect_clone`] validates and describes it.
+//!   [`clone_repo`] makes one from a URL.
 //! - A **worktree** is a `git worktree` of a clone, on the session's branch
 //!   ([`session_branch_name`]). [`create_worktree`] and [`remove_worktree`]
 //!   manage it; the branch outlives the worktree, which is how a session
-//!   resumes.
+//!   resumes. [`run_setup`] runs a repo's setup command in a new one.
 //! - A **work directory** is where a session's files are: a worktree, or the
 //!   clone itself for a repo attached `read` or `live`. The functions that
 //!   take a `dir` want the root of one. They do not search parent
@@ -73,20 +74,24 @@
 
 mod branch;
 mod changes;
+mod clone;
 mod cmd;
 mod content;
 mod error;
 mod files;
 mod path;
 mod repo;
+mod setup;
 #[cfg(test)]
 mod testing;
 mod worktree;
 
 pub use branch::session_branch_name;
 pub use changes::{changes, file_diff};
+pub use clone::clone_repo;
 pub use error::{Error, Result};
 pub use files::{list_dir, read_file, write_file};
 pub use path::resolve_path;
 pub use repo::{CloneInfo, head_commit, inspect_clone};
+pub use setup::{SetupEnd, SetupRun, run_setup};
 pub use worktree::{Worktree, WorktreeOutcome, create_worktree, remove_worktree};

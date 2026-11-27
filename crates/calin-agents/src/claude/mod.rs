@@ -168,6 +168,20 @@ fn command_args(config: &ClaudeConfig, params: &StartParams) -> Vec<OsString> {
     for dir in &params.add_dirs {
         args.extend(["--add-dir".into(), dir.into()]);
     }
+    if let Some(url) = &params.tool_endpoint {
+        // Verified on CLI 2.1.332: the tools appear as `mcp__calin__<tool>`.
+        let config = serde_json::json!({
+            "mcpServers": { tools::TOOL_SERVER: { "type": "http", "url": url } },
+        });
+        args.extend(["--mcp-config".into(), config.to_string().into()]);
+    }
+    if let Some(text) = params
+        .system_prompt
+        .as_ref()
+        .filter(|text| !text.is_empty())
+    {
+        args.extend(["--append-system-prompt".into(), text.into()]);
+    }
     args
 }
 
@@ -234,6 +248,41 @@ mod tests {
         // The start's model wins over the runner's.
         params.model = Some("haiku".into());
         assert!(tail(args(&config, &params)).contains("--model haiku --resume"));
+    }
+
+    #[test]
+    fn the_tool_endpoint_and_the_system_prompt_are_passed_as_single_arguments() {
+        let prompt = "You run inside Calin.\nRepos: \"api\" at /repos/api --not-a-flag";
+        let params = StartParams {
+            tool_endpoint: Some("http://127.0.0.1:4680/api/v1/mcp/abc123".into()),
+            system_prompt: Some(prompt.into()),
+            add_dirs: vec!["/repos/a".into()],
+            ..StartParams::default()
+        };
+        let args = args(&ClaudeConfig::default(), &params);
+        assert_eq!(
+            args[11..],
+            [
+                "--add-dir",
+                "/repos/a",
+                "--mcp-config",
+                r#"{"mcpServers":{"calin":{"type":"http","url":"http://127.0.0.1:4680/api/v1/mcp/abc123"}}}"#,
+                "--append-system-prompt",
+                prompt,
+            ]
+        );
+        // The server name is what makes its tools `mcp__calin__<tool>`.
+        let config: serde_json::Value = serde_json::from_str(&args[14]).unwrap();
+        assert_eq!(config["mcpServers"][tools::TOOL_SERVER]["type"], "http");
+
+        // Without either, nothing is added; an empty prompt is no prompt.
+        let bare = StartParams {
+            system_prompt: Some(String::new()),
+            ..StartParams::default()
+        };
+        let args = self::args(&ClaudeConfig::default(), &bare);
+        assert!(!args.iter().any(|arg| arg == "--mcp-config"));
+        assert!(!args.iter().any(|arg| arg == "--append-system-prompt"));
     }
 
     #[test]

@@ -1,9 +1,9 @@
 {"native_session":{"id":"uuid-0001","model":"claude-haiku-5-5"}}
 {"event":{"item":{"content":{"input":{"content":"alpha\n","file_path":"/work/made.txt"},"kind":"tool","locations":["/work/made.txt"],"name":"Write","output":null,"title":"made.txt","tool_kind":"edit"},"id":"toolu-0001","status":"running"},"type":"item_started"}}
-{"permission_request":{"id":"uuid-0030","input":{"content":"alpha\n","file_path":"/work/made.txt"},"item_id":"toolu-0001","title":"made.txt","tool_kind":"edit","tool_name":"Write"}}
+{"access":{"files":["/work/made.txt"],"write":true},"permission_request":{"id":"uuid-0030","input":{"content":"alpha\n","file_path":"/work/made.txt"},"item_id":"toolu-0001","title":"made.txt","tool_kind":"edit","tool_name":"Write"}}
 {"event":{"item":{"content":{"input":{"content":"alpha\n","file_path":"/work/made.txt"},"kind":"tool","locations":["/work/made.txt"],"name":"Write","output":"Not in this directory.","title":"made.txt","tool_kind":"edit"},"id":"toolu-0001","status":"declined"},"type":"item_completed"}}
 {"event":{"item":{"content":{"input":{"content":"alpha\n","file_path":"made.txt"},"kind":"tool","locations":["/work/made.txt"],"name":"Write","output":null,"title":"made.txt","tool_kind":"edit"},"id":"toolu-0002","status":"running"},"type":"item_started"}}
-{"permission_request":{"id":"uuid-0049","input":{"content":"alpha\n","file_path":"/work/made.txt"},"item_id":"toolu-0002","title":"made.txt","tool_kind":"edit","tool_name":"Write"}}
+{"access":{"files":["/work/made.txt"],"write":true},"permission_request":{"id":"uuid-0049","input":{"content":"alpha\n","file_path":"/work/made.txt"},"item_id":"toolu-0002","title":"made.txt","tool_kind":"edit","tool_name":"Write"}}
 {"event":{"item":{"content":{"input":{"content":"alpha\n","file_path":"made.txt"},"kind":"tool","locations":["/work/made.txt"],"name":"Write","output":"Not in this directory.","title":"made.txt","tool_kind":"edit"},"id":"toolu-0002","status":"declined"},"type":"item_completed"}}
 {"event":{"item":{"content":{"kind":"text","text":""},"id":"claude-7-3","status":"running"},"type":"item_started"}}
 {"event":{"delta":{"kind":"text","text":"I couldn't cre"},"item_id":"claude-7-3","type":"item_delta"}}
