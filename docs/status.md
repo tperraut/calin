@@ -33,15 +33,29 @@ shows changes grouped by repo. What stays in M2 is the home repo's repo list, at
 mid-session, and pull requests.
 
 - [x] Contract: repos, repo set, permissions, interrupt, changes, diffs, files, terminal socket
-- [ ] `calin-git`: worktrees, changes against a base, file diff, tree, safe file read and write
-- [ ] `calin-term`: pseudo-terminal library
-- [ ] `calin-agents`: Claude Code runner over stream-json, tested against the recorded fixtures;
+- [x] `calin-git`: worktrees, changes against a base, file diff, tree, safe file read and write
+- [x] `calin-term`: pseudo-terminal library
+- [x] `calin-agents`: Claude Code runner over stream-json, tested against the recorded fixtures;
       mock runner asks for permission
-- [ ] Core and server: repo registry, repo set and worktrees, permission flow, interrupt, continue
+- [x] Core and server: repo registry, repo set and worktrees, permission flow, interrupt, continue
       after stop or failure, file-change events, all new routes, terminal socket
-- [ ] Web: repo picker, permission mode, permission cards, interrupt
+- [x] Web: repo picker, permission mode, permission cards, interrupt
 - [ ] Web: Changes with diff view, Files with editor, Terminal
-- [ ] End to end with the mock runner, then a real Claude Code session in a real repo
+- [x] A real Claude Code session through the server's API: worktree on its own branch, a
+      permission request allowed over the API, the edit in changes and diff, a second turn
+- [ ] `make e2e` covering repos, permissions, changes, files and the terminal with the mock runner
+- [ ] The same real session driven from the web app
+
+Known gaps carried forward from M1 so far:
+
+- Claude Code 2.1.332 has no `TodoWrite` tool, so no plan is shown for real sessions yet. Find
+  what the CLI uses for task lists now and map it.
+- A tool call cut short by an interrupt is recorded as `failed`; there is no `interrupted` status.
+- A CLI version other than the recorded one only logs a warning.
+- `file_changed` for a rename carries no old path.
+- Output produced inside a subagent is attributed to the lead agent until M3.
+- Idle worktrees are never reclaimed yet.
+- Branch names are slugs of the whole first prompt line and can be long.
 
 ## Later
 

@@ -73,7 +73,7 @@ One Rust process contains everything. It runs on the VPS, or inside the desktop 
 
 | Part | Responsibility |
 | --- | --- |
-| API gateway | REST under `/api/v1` and one WebSocket per client for subscriptions, event replay and terminal bytes |
+| API gateway | REST under `/api/v1`, one WebSocket per client for subscriptions and event replay, and one socket per open terminal |
 | Orchestrator | Sessions and their repo sets, the queue, the lifecycle, the workflow engine |
 | Agent runners | Start and steer agent CLIs; turn each CLI's output into Calin events |
 | Calin MCP tools | The channel agents use to talk back: dispatch, message, attach a repo, ask the user |
@@ -106,11 +106,12 @@ One Rust process contains everything. It runs on the VPS, or inside the desktop 
 
 ```
 ~/.calin/                      machine-local, safe to delete
-  config.toml                  scan roots, parallel limit, bind address
+  repos.json                   the repo registry of this machine
   calin.db                     SQLite index, rebuilt from the logs if missing
   sessions/<id>/
     events.ndjson              the session's event log
-    api/  web/  ...            one worktree per attached repo
+    session.json               what the session was created with
+    work/api/  work/web/  ...  one worktree per attached repo
 
 <home repo>/.calin/            versioned with your other configuration
   repos.yaml                   logical repo names, git URLs, checks, named sets
@@ -398,8 +399,8 @@ Each milestone ends with something usable. No dates are attached.
 | | Milestone | Done when |
 | --- | --- | --- |
 | M0 | Skeleton | The validation command passes; the server serves the web app; a mock session streams events to the browser and survives a reload |
-| M1 | One session, one repo | A real Claude Code session runs in a worktree with a live transcript, permissions, diff, editor and terminal; it can be stopped and continued |
-| M2 | Multi-repo | A session started from the home repo attaches repos at start and on demand, shows unified changes and opens linked draft PRs |
+| M1 | One session, real agent, real repos | A real Claude Code session runs in a worktree per attached repo with a live transcript, permissions, changes grouped by repo, diff, editor and terminal; it can be interrupted, stopped and continued |
+| M2 | Home repo and delivery | The repo list comes from the home repo, a repo can be attached mid-session by you or by the agent, and a session opens linked draft PRs |
 | M3 | Graph | Agents dispatch children and message each other through MCP; the session graph and timeline are live and replayable |
 | M4 | Workflows | YAML graphs run with per-repo checks, gates, queue and budgets; the ACP runner works with one more agent |
 | M5 | Everywhere | OpenID Connect sign-in, `calin server install`, the PWA with push, and the desktop app in local and remote mode |
@@ -412,8 +413,8 @@ Section 12 lists the technical unknowns and the milestone that settles each.
 | Risk | How it is settled |
 | --- | --- |
 | Vite+ with the Solid plugin and Bun | Settled in M0: the scaffold builds, type-checks and lints with Vite+ 1.8, Solid 2.0 and Bun 1.4. |
-| The Claude stream-json protocol is not a versioned public contract | Golden fixtures per CLI version; the runner refuses unknown CLI versions loudly instead of guessing |
-| Granting a new directory to a running Claude session | M2 spike. Fallback: resume the same conversation with the extra `--add-dir`. |
+| The Claude stream-json protocol is not a versioned public contract | Golden fixtures per CLI version. The mapper ignores what it does not know, and a CLI version other than the recorded one logs a warning; surfacing that warning in the UI is still to do. |
+| Granting a new directory to a running Claude session | M2 spike. Fallback: resume the same conversation with the extra `--add-dir`; resuming in a new process is verified to keep the conversation and its cost totals. |
 | A custom graph renderer is real work | Spike at the start of M3: 200 nodes laid out and animated on a phone. Fallback: adopt the xyflow port if it is stable by then. |
 | Disk use: a worktree and dependencies per repo per session | `setup` commands, idle reclamation, and a disk view from M2 |
 | A public server that hands out shells | The server refuses any non-loopback bind until sign-in ships in M5 |
