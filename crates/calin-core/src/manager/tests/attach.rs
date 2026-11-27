@@ -707,6 +707,12 @@ async fn in_accept_edits_the_policy_answers_for_the_sessions_repos_and_opens_eac
     let (_, _, request) = waiting_request(&session.manager, &session.id, before).await;
     assert_eq!(request.id, "o1");
     emit(&session.io, ask("b1", None)).await;
+    // On record before o1 is answered: the driver takes output and commands
+    // in either order, and b1 is what keeps the session waiting.
+    events_until(&session.manager, &session.id, before, |event| {
+        matches!(&event.body, EventBody::PermissionRequested { request } if request.id == "b1")
+    })
+    .await;
     session
         .manager
         .resolve_permission(&session.id, "o1", PermissionDecision::Deny, None)
