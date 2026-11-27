@@ -1,0 +1,758 @@
+[
+ {
+  "n": 50,
+  "e": 80,
+  "rate": 1,
+  "config": "layered-default",
+  "where": "worker",
+  "firstMs": 198.1,
+  "fullMs": 27.1,
+  "fullElkMs": 0,
+  "addNodeMs": {
+   "n": 6,
+   "median": 33.3,
+   "p95": 43.7,
+   "max": 43.7,
+   "mean": 31.2
+  },
+  "workerThrottle": ""
+ },
+ {
+  "n": 50,
+  "e": 80,
+  "rate": 1,
+  "config": "layered-default",
+  "where": "main",
+  "firstMs": 106.9,
+  "fullMs": 32.1,
+  "fullElkMs": 0,
+  "addNodeMs": {
+   "n": 6,
+   "median": 38,
+   "p95": 44.1,
+   "max": 44.1,
+   "mean": 37
+  },
+  "workerThrottle": ""
+ },
+ {
+  "n": 50,
+  "e": 80,
+  "rate": 1,
+  "config": "tree-order-noforce",
+  "where": "worker",
+  "firstMs": 39.9,
+  "fullMs": 15.8,
+  "fullElkMs": 0,
+  "addNodeMs": {
+   "n": 6,
+   "median": 11.3,
+   "p95": 13.6,
+   "max": 13.6,
+   "mean": 11.6
+  },
+  "workerThrottle": ""
+ },
+ {
+  "n": 50,
+  "e": 80,
+  "rate": 1,
+  "config": "tree-order-noforce",
+  "where": "main",
+  "firstMs": 20,
+  "fullMs": 15.5,
+  "fullElkMs": 0,
+  "addNodeMs": {
+   "n": 6,
+   "median": 25.9,
+   "p95": 32.4,
+   "max": 32.4,
+   "mean": 26.5
+  },
+  "workerThrottle": ""
+ },
+ {
+  "n": 50,
+  "e": 80,
+  "rate": 1,
+  "config": "mrtree-tree",
+  "where": "worker",
+  "firstMs": 28.3,
+  "fullMs": 14.3,
+  "fullElkMs": null,
+  "addNodeMs": {
+   "n": 6,
+   "median": 6.9,
+   "p95": 7.4,
+   "max": 7.4,
+   "mean": 7
+  },
+  "workerThrottle": ""
+ },
+ {
+  "n": 50,
+  "e": 80,
+  "rate": 1,
+  "config": "mrtree-tree",
+  "where": "main",
+  "firstMs": 28.3,
+  "fullMs": 24.9,
+  "fullElkMs": null,
+  "addNodeMs": {
+   "n": 6,
+   "median": 16.6,
+   "p95": 16.8,
+   "max": 16.8,
+   "mean": 16.5
+  },
+  "workerThrottle": ""
+ },
+ {
+  "n": 50,
+  "e": 80,
+  "rate": 1,
+  "config": "custom-tree-top",
+  "where": "main",
+  "firstMs": 0.1,
+  "fullMs": 0,
+  "fullElkMs": null,
+  "addNodeMs": {
+   "n": 6,
+   "median": 0,
+   "p95": 0.1,
+   "max": 0.1,
+   "mean": 0
+  },
+  "workerThrottle": ""
+ },
+ {
+  "n": 50,
+  "e": 80,
+  "rate": 4,
+  "config": "layered-default",
+  "where": "worker",
+  "firstMs": 202.3,
+  "fullMs": 31.3,
+  "fullElkMs": 0,
+  "addNodeMs": {
+   "n": 6,
+   "median": 27.2,
+   "p95": 34.7,
+   "max": 34.7,
+   "mean": 26.6
+  },
+  "workerThrottle": "error: Operation is only supported for pages, not workers"
+ },
+ {
+  "n": 50,
+  "e": 80,
+  "rate": 4,
+  "config": "layered-default",
+  "where": "main",
+  "firstMs": 429.3,
+  "fullMs": 130.5,
+  "fullElkMs": 0.1,
+  "addNodeMs": {
+   "n": 6,
+   "median": 118.4,
+   "p95": 131.2,
+   "max": 131.2,
+   "mean": 115.7
+  },
+  "workerThrottle": "error: Operation is only supported for pages, not workers"
+ },
+ {
+  "n": 50,
+  "e": 80,
+  "rate": 4,
+  "config": "tree-order-noforce",
+  "where": "worker",
+  "firstMs": 29.2,
+  "fullMs": 15.7,
+  "fullElkMs": 0,
+  "addNodeMs": {
+   "n": 6,
+   "median": 17,
+   "p95": 21.3,
+   "max": 21.3,
+   "mean": 16.6
+  },
+  "workerThrottle": "error: Operation is only supported for pages, not workers"
+ },
+ {
+  "n": 50,
+  "e": 80,
+  "rate": 4,
+  "config": "tree-order-noforce",
+  "where": "main",
+  "firstMs": 85.4,
+  "fullMs": 66.6,
+  "fullElkMs": 0,
+  "addNodeMs": {
+   "n": 6,
+   "median": 60.9,
+   "p95": 70.3,
+   "max": 70.3,
+   "mean": 62.2
+  },
+  "workerThrottle": "error: Operation is only supported for pages, not workers"
+ },
+ {
+  "n": 50,
+  "e": 80,
+  "rate": 4,
+  "config": "mrtree-tree",
+  "where": "worker",
+  "firstMs": 32.6,
+  "fullMs": 19.2,
+  "fullElkMs": null,
+  "addNodeMs": {
+   "n": 6,
+   "median": 10.2,
+   "p95": 12.7,
+   "max": 12.7,
+   "mean": 10
+  },
+  "workerThrottle": "error: Operation is only supported for pages, not workers"
+ },
+ {
+  "n": 50,
+  "e": 80,
+  "rate": 4,
+  "config": "mrtree-tree",
+  "where": "main",
+  "firstMs": 134.2,
+  "fullMs": 85.8,
+  "fullElkMs": null,
+  "addNodeMs": {
+   "n": 6,
+   "median": 43.2,
+   "p95": 44.5,
+   "max": 44.5,
+   "mean": 41.6
+  },
+  "workerThrottle": "error: Operation is only supported for pages, not workers"
+ },
+ {
+  "n": 50,
+  "e": 80,
+  "rate": 4,
+  "config": "custom-tree-top",
+  "where": "main",
+  "firstMs": 0.7,
+  "fullMs": 0,
+  "fullElkMs": null,
+  "addNodeMs": {
+   "n": 6,
+   "median": 0,
+   "p95": 0.5,
+   "max": 0.5,
+   "mean": 0.1
+  },
+  "workerThrottle": "error: Operation is only supported for pages, not workers"
+ },
+ {
+  "n": 200,
+  "e": 300,
+  "rate": 1,
+  "config": "layered-default",
+  "where": "worker",
+  "firstMs": 326.9,
+  "fullMs": 119.4,
+  "fullElkMs": 0.1,
+  "addNodeMs": {
+   "n": 6,
+   "median": 76.7,
+   "p95": 77.9,
+   "max": 77.9,
+   "mean": 76.2
+  },
+  "workerThrottle": ""
+ },
+ {
+  "n": 200,
+  "e": 300,
+  "rate": 1,
+  "config": "layered-default",
+  "where": "main",
+  "firstMs": 228.8,
+  "fullMs": 124.8,
+  "fullElkMs": 0.1,
+  "addNodeMs": {
+   "n": 6,
+   "median": 99.5,
+   "p95": 105.6,
+   "max": 105.6,
+   "mean": 97.8
+  },
+  "workerThrottle": ""
+ },
+ {
+  "n": 200,
+  "e": 300,
+  "rate": 1,
+  "config": "tree-order-noforce",
+  "where": "worker",
+  "firstMs": 185.5,
+  "fullMs": 161.3,
+  "fullElkMs": 0.2,
+  "addNodeMs": {
+   "n": 6,
+   "median": 158.9,
+   "p95": 182.3,
+   "max": 182.3,
+   "mean": 161
+  },
+  "workerThrottle": ""
+ },
+ {
+  "n": 200,
+  "e": 300,
+  "rate": 1,
+  "config": "tree-order-noforce",
+  "where": "main",
+  "firstMs": 191.5,
+  "fullMs": 176,
+  "fullElkMs": 0.2,
+  "addNodeMs": {
+   "n": 6,
+   "median": 178.7,
+   "p95": 196.8,
+   "max": 196.8,
+   "mean": 180
+  },
+  "workerThrottle": ""
+ },
+ {
+  "n": 200,
+  "e": 300,
+  "rate": 1,
+  "config": "mrtree-tree",
+  "where": "worker",
+  "firstMs": 86.2,
+  "fullMs": 43.6,
+  "fullElkMs": null,
+  "addNodeMs": {
+   "n": 6,
+   "median": 23.5,
+   "p95": 24,
+   "max": 24,
+   "mean": 23.4
+  },
+  "workerThrottle": ""
+ },
+ {
+  "n": 200,
+  "e": 300,
+  "rate": 1,
+  "config": "mrtree-tree",
+  "where": "main",
+  "firstMs": 77.6,
+  "fullMs": 69.8,
+  "fullElkMs": null,
+  "addNodeMs": {
+   "n": 6,
+   "median": 34.7,
+   "p95": 36.4,
+   "max": 36.4,
+   "mean": 34.9
+  },
+  "workerThrottle": ""
+ },
+ {
+  "n": 200,
+  "e": 300,
+  "rate": 1,
+  "config": "custom-tree-top",
+  "where": "main",
+  "firstMs": 0.2,
+  "fullMs": 0.1,
+  "fullElkMs": null,
+  "addNodeMs": {
+   "n": 6,
+   "median": 0.1,
+   "p95": 0.1,
+   "max": 0.1,
+   "mean": 0.1
+  },
+  "workerThrottle": ""
+ },
+ {
+  "n": 200,
+  "e": 300,
+  "rate": 4,
+  "config": "layered-default",
+  "where": "worker",
+  "firstMs": 339.7,
+  "fullMs": 107.1,
+  "fullElkMs": 0.1,
+  "addNodeMs": {
+   "n": 6,
+   "median": 97.9,
+   "p95": 104.3,
+   "max": 104.3,
+   "mean": 92.9
+  },
+  "workerThrottle": "error: Operation is only supported for pages, not workers"
+ },
+ {
+  "n": 200,
+  "e": 300,
+  "rate": 4,
+  "config": "layered-default",
+  "where": "main",
+  "firstMs": 925,
+  "fullMs": 410.3,
+  "fullElkMs": 0.3,
+  "addNodeMs": {
+   "n": 6,
+   "median": 387.2,
+   "p95": 409,
+   "max": 409,
+   "mean": 378
+  },
+  "workerThrottle": "error: Operation is only supported for pages, not workers"
+ },
+ {
+  "n": 200,
+  "e": 300,
+  "rate": 4,
+  "config": "tree-order-noforce",
+  "where": "worker",
+  "firstMs": 211.3,
+  "fullMs": 169.9,
+  "fullElkMs": 0.2,
+  "addNodeMs": {
+   "n": 6,
+   "median": 177.6,
+   "p95": 193.6,
+   "max": 193.6,
+   "mean": 176.3
+  },
+  "workerThrottle": "error: Operation is only supported for pages, not workers"
+ },
+ {
+  "n": 200,
+  "e": 300,
+  "rate": 4,
+  "config": "tree-order-noforce",
+  "where": "main",
+  "firstMs": 808.9,
+  "fullMs": 726.9,
+  "fullElkMs": 0.7,
+  "addNodeMs": {
+   "n": 6,
+   "median": 702,
+   "p95": 713.1,
+   "max": 713.1,
+   "mean": 700.3
+  },
+  "workerThrottle": "error: Operation is only supported for pages, not workers"
+ },
+ {
+  "n": 200,
+  "e": 300,
+  "rate": 4,
+  "config": "mrtree-tree",
+  "where": "worker",
+  "firstMs": 82.9,
+  "fullMs": 61.2,
+  "fullElkMs": null,
+  "addNodeMs": {
+   "n": 6,
+   "median": 25.5,
+   "p95": 28.5,
+   "max": 28.5,
+   "mean": 26.2
+  },
+  "workerThrottle": "error: Operation is only supported for pages, not workers"
+ },
+ {
+  "n": 200,
+  "e": 300,
+  "rate": 4,
+  "config": "mrtree-tree",
+  "where": "main",
+  "firstMs": 321.1,
+  "fullMs": 227.1,
+  "fullElkMs": null,
+  "addNodeMs": {
+   "n": 6,
+   "median": 117.9,
+   "p95": 119.3,
+   "max": 119.3,
+   "mean": 116.4
+  },
+  "workerThrottle": "error: Operation is only supported for pages, not workers"
+ },
+ {
+  "n": 200,
+  "e": 300,
+  "rate": 4,
+  "config": "custom-tree-top",
+  "where": "main",
+  "firstMs": 0.7,
+  "fullMs": 0.1,
+  "fullElkMs": null,
+  "addNodeMs": {
+   "n": 6,
+   "median": 0.1,
+   "p95": 0.1,
+   "max": 0.1,
+   "mean": 0.1
+  },
+  "workerThrottle": "error: Operation is only supported for pages, not workers"
+ },
+ {
+  "n": 500,
+  "e": 800,
+  "rate": 1,
+  "config": "layered-default",
+  "where": "worker",
+  "firstMs": 539,
+  "fullMs": 222.6,
+  "fullElkMs": 0.2,
+  "addNodeMs": {
+   "n": 6,
+   "median": 244.5,
+   "p95": 281.1,
+   "max": 281.1,
+   "mean": 236.8
+  },
+  "workerThrottle": ""
+ },
+ {
+  "n": 500,
+  "e": 800,
+  "rate": 1,
+  "config": "layered-default",
+  "where": "main",
+  "firstMs": 489.3,
+  "fullMs": 257.4,
+  "fullElkMs": 0.2,
+  "addNodeMs": {
+   "n": 6,
+   "median": 253.4,
+   "p95": 274.1,
+   "max": 274.1,
+   "mean": 250.1
+  },
+  "workerThrottle": ""
+ },
+ {
+  "n": 500,
+  "e": 800,
+  "rate": 1,
+  "config": "tree-order-noforce",
+  "where": "worker",
+  "firstMs": 2783.9,
+  "fullMs": 2745,
+  "fullElkMs": 2.7,
+  "addNodeMs": {
+   "n": 6,
+   "median": 2666.3,
+   "p95": 2720,
+   "max": 2720,
+   "mean": 2657
+  },
+  "workerThrottle": ""
+ },
+ {
+  "n": 500,
+  "e": 800,
+  "rate": 1,
+  "config": "tree-order-noforce",
+  "where": "main",
+  "firstMs": 2867.3,
+  "fullMs": 2819.6,
+  "fullElkMs": 2.8,
+  "addNodeMs": {
+   "n": 6,
+   "median": 2781.9,
+   "p95": 2886.5,
+   "max": 2886.5,
+   "mean": 2774.8
+  },
+  "workerThrottle": ""
+ },
+ {
+  "n": 500,
+  "e": 800,
+  "rate": 1,
+  "config": "mrtree-tree",
+  "where": "worker",
+  "firstMs": 258.1,
+  "fullMs": 150.1,
+  "fullElkMs": null,
+  "addNodeMs": {
+   "n": 6,
+   "median": 75.9,
+   "p95": 99.1,
+   "max": 99.1,
+   "mean": 78.4
+  },
+  "workerThrottle": ""
+ },
+ {
+  "n": 500,
+  "e": 800,
+  "rate": 1,
+  "config": "mrtree-tree",
+  "where": "main",
+  "firstMs": 191.7,
+  "fullMs": 159.8,
+  "fullElkMs": null,
+  "addNodeMs": {
+   "n": 6,
+   "median": 82.3,
+   "p95": 92.5,
+   "max": 92.5,
+   "mean": 83.7
+  },
+  "workerThrottle": ""
+ },
+ {
+  "n": 500,
+  "e": 800,
+  "rate": 1,
+  "config": "custom-tree-top",
+  "where": "main",
+  "firstMs": 0.3,
+  "fullMs": 0.1,
+  "fullElkMs": null,
+  "addNodeMs": {
+   "n": 6,
+   "median": 0.2,
+   "p95": 0.2,
+   "max": 0.2,
+   "mean": 0.2
+  },
+  "workerThrottle": ""
+ },
+ {
+  "n": 500,
+  "e": 800,
+  "rate": 4,
+  "config": "layered-default",
+  "where": "worker",
+  "firstMs": 579.4,
+  "fullMs": 238.2,
+  "fullElkMs": 0.2,
+  "addNodeMs": {
+   "n": 6,
+   "median": 232.1,
+   "p95": 239.8,
+   "max": 239.8,
+   "mean": 226.5
+  },
+  "workerThrottle": "error: Operation is only supported for pages, not workers"
+ },
+ {
+  "n": 500,
+  "e": 800,
+  "rate": 4,
+  "config": "layered-default",
+  "where": "main",
+  "firstMs": 1799.2,
+  "fullMs": 1071.6,
+  "fullElkMs": 1,
+  "addNodeMs": {
+   "n": 6,
+   "median": 983.8,
+   "p95": 1023.2,
+   "max": 1023.2,
+   "mean": 974.4
+  },
+  "workerThrottle": "error: Operation is only supported for pages, not workers"
+ },
+ {
+  "n": 500,
+  "e": 800,
+  "rate": 4,
+  "config": "tree-order-noforce",
+  "where": "worker",
+  "firstMs": 2958.1,
+  "fullMs": 3096.5,
+  "fullElkMs": 3.1,
+  "addNodeMs": {
+   "n": 6,
+   "median": 2831.3,
+   "p95": 2909.3,
+   "max": 2909.3,
+   "mean": 2834.5
+  },
+  "workerThrottle": "error: Operation is only supported for pages, not workers"
+ },
+ {
+  "n": 500,
+  "e": 800,
+  "rate": 4,
+  "config": "tree-order-noforce",
+  "where": "main",
+  "firstMs": 11894.6,
+  "fullMs": 11578.9,
+  "fullElkMs": 11.5,
+  "addNodeMs": {
+   "n": 6,
+   "median": 11234.2,
+   "p95": 11597.6,
+   "max": 11597.6,
+   "mean": 11288.9
+  },
+  "workerThrottle": "error: Operation is only supported for pages, not workers"
+ },
+ {
+  "n": 500,
+  "e": 800,
+  "rate": 4,
+  "config": "mrtree-tree",
+  "where": "worker",
+  "firstMs": 281.5,
+  "fullMs": 135.5,
+  "fullElkMs": null,
+  "addNodeMs": {
+   "n": 6,
+   "median": 77,
+   "p95": 90.2,
+   "max": 90.2,
+   "mean": 77.9
+  },
+  "workerThrottle": "error: Operation is only supported for pages, not workers"
+ },
+ {
+  "n": 500,
+  "e": 800,
+  "rate": 4,
+  "config": "mrtree-tree",
+  "where": "main",
+  "firstMs": 722.7,
+  "fullMs": 609.8,
+  "fullElkMs": null,
+  "addNodeMs": {
+   "n": 6,
+   "median": 318.6,
+   "p95": 337.5,
+   "max": 337.5,
+   "mean": 320
+  },
+  "workerThrottle": "error: Operation is only supported for pages, not workers"
+ },
+ {
+  "n": 500,
+  "e": 800,
+  "rate": 4,
+  "config": "custom-tree-top",
+  "where": "main",
+  "firstMs": 1.9,
+  "fullMs": 0.8,
+  "fullElkMs": null,
+  "addNodeMs": {
+   "n": 6,
+   "median": 0.5,
+   "p95": 0.8,
+   "max": 0.8,
+   "mean": 0.4
+  },
+  "workerThrottle": "error: Operation is only supported for pages, not workers"
+ }
+]

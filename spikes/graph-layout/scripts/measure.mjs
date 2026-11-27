@@ -145,7 +145,8 @@ async function workerControl(debugPort, targetId, rate) {
 }
 
 async function main() {
-  const [mode = "smoke", nArg = "200", eArg = "300", rateArg = "1", only] = process.argv.slice(2);
+  // `extra` is appended to every page's query, e.g. cfg=custom-tree-top to take ELK out of a run.
+  const [mode = "smoke", nArg = "200", eArg = "300", rateArg = "1", only, extra = ""] = process.argv.slice(2);
   const n = Number(nArg), e = Number(eArg), rate = Number(rateArg);
   mkdirSync(RESULTS, { recursive: true });
   mkdirSync(SHOTS, { recursive: true });
@@ -195,7 +196,7 @@ async function main() {
       const workers = await workerControl(debugPort, targetInfo.targetId, rate);
       await cdp.send("Performance.enable");
       if (rate > 1) await cdp.send("Emulation.setCPUThrottlingRate", { rate });
-      await page.goto(`${site.base}${path}?n=${n}&e=${e}&${query}`);
+      await page.goto(`${site.base}${path}?n=${n}&e=${e}&${query}&${extra}`);
       await page.waitForFunction((name) => window[name]?.ready, ready, { timeout: 180000 });
       const metrics = async () => {
         const { metrics } = await cdp.send("Performance.getMetrics");
@@ -259,7 +260,7 @@ async function main() {
           const after = await run.metrics();
           const per = (key) => r1(((after[key] - before[key]) * 1000) / Math.max(1, result.frames));
           const row = {
-            n, e, variant, rate, raster: gpuFlags.length ? "software" : "gpu", coldMs, ...result,
+            n, e, variant, rate, raster: gpuFlags.length ? "software" : "gpu", layout: extra.replace("cfg=", "") || "tree-order-noforce", coldMs, ...result,
             // Main-thread time per frame over the whole scenario, in (throttled) milliseconds.
             scriptMsPerFrame: per("ScriptDuration"),
             styleMsPerFrame: per("RecalcStyleDuration"),

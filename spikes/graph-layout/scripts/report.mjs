@@ -19,13 +19,14 @@ for (const file of readdirSync(dir).filter((f) => f.startsWith("render-")).sort(
   };
   const label = (key) => {
     const [variant, rate, raster] = key.split("|");
-    return [variant, `${rate}x`, raster];
+    // chrome://gpu reports software raster either way in this headless browser; the column says which flags ran.
+    return [variant, `${rate}x`, raster === "software" ? "--disable-gpu" : "default"];
   };
   console.log(`\n### ${rows[0].n} nodes / ${rows[0].e} edges: frame time (median / p95 ms, % of frames over 33 ms)\n`);
-  console.log(table(["renderer", "CPU", "raster", ...SCENARIOS],
+  console.log(table(["renderer", "CPU", "browser flags", ...SCENARIOS],
     keys.map((k) => [...label(k), ...SCENARIOS.map((s) => cell(k, s, (r) => `${r.frame.median} / ${r.frame.p95}, ${r.over33Pct}%`))])));
   console.log(`\n### ${rows[0].n} nodes / ${rows[0].e} edges: main-thread time per frame (ms: total task, of which script / style / layout)\n`);
-  console.log(table(["renderer", "CPU", "raster", ...SCENARIOS, "DOM elements", "JS heap MB"],
+  console.log(table(["renderer", "CPU", "browser flags", ...SCENARIOS, "DOM elements", "JS heap MB"],
     keys.map((k) => [...label(k),
       ...SCENARIOS.map((s) => cell(k, s, (r) => `${r.taskMsPerFrame} (${r.scriptMsPerFrame} / ${r.styleMsPerFrame} / ${r.layoutMsPerFrame})`)),
       cell(k, "pan-far", (r) => r.domElements), cell(k, "grow", (r) => r.heapMb)])));
@@ -36,7 +37,7 @@ for (const file of readdirSync(dir).filter((f) => f.startsWith("render-")).sort(
   }
   const cold = rows.filter((r) => r.scenario === "idle" && r.coldMs);
   console.log(`\nCold start to first layout applied (worker spawn + ELK compile + layout), ms: ` +
-    cold.map((r) => `${r.variant} ${r.rate}x ${r.raster}: ${r.coldMs}`).join("; "));
+    cold.filter((r) => r.raster !== "software").map((r) => `${r.variant} ${r.rate}x: ${r.coldMs}`).join("; ") + ` (layout: ${cold[0].layout ?? "tree-order-noforce"})`);
 }
 
 const layout = load("layout.json");
@@ -60,3 +61,10 @@ for (const f of stab) {
   }
 }
 console.log(table(["nodes / edges", "configuration", "mean", "mean, pan-compensated", "max per step: mean", "max per step: p95", "max per step: worst", "nodes moved > 2 px", "steps with no movement", "layout ms (Node, mean)", "final size", "overlapping pairs"], srows));
+
+const trace = load("trace.json");
+if (trace.length) {
+  console.log(`\n### Trace breakdown, ${trace[0].n} nodes, main thread throttled ${trace[0].rate}x (ms per frame)\n`);
+  console.log(table(["renderer", "scenario", "frame median / p95", "script", "style", "layout", "pre-paint", "paint", "layerize", "commit", "raster threads (not throttled)", "raster tasks"],
+    trace.map((r) => [r.variant, r.scenario, `${r.frameMedian} / ${r.frameP95}`, r.scriptMs, r.styleMs, r.layoutMs, r.prepaintMs, r.paintMs, r.layerizeMs, r.commitMs, r.rasterMs, r.rasterTasks])));
+}

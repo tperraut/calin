@@ -92,7 +92,7 @@ One Rust process contains everything. It runs on the VPS, or inside the desktop 
 | Styling | Tailwind v4 and Kobalte | Accessible unstyled components that exist for Solid |
 | Editor and diff | CodeMirror 6 | Works with touch input and loads on demand; Monaco is not usable on a phone |
 | Terminal | xterm.js over a server PTY | Standard, and already proven in cezar |
-| Graph | ELK layout in a web worker, custom Solid renderer | See [Graph views](#5-graph-views) |
+| Graph | Custom Solid renderer on SVG with an incremental tree layout | See [Graph views](#5-graph-views) |
 | Desktop | Tauri 2 | Small shell; links the Rust core directly for local mode |
 | Phone | PWA with web push | Installable, and no app store or relay |
 
@@ -267,13 +267,27 @@ Common behavior:
 
 - Selecting a node filters the transcript to that agent. Selecting an edge lists its messages.
 - A scrubber replays the session from its log, so a finished run can be watched again.
-- Layout runs in a web worker with ELK. Positions of existing nodes are kept when new ones arrive,
-  so the picture does not jump while agents work.
+- The picture must not jump while agents work: adding a node moves existing nodes as little as
+  possible, and what does move is animated.
 
-The renderer is written for Calin in Solid on SVG, with a canvas fallback for large graphs. The
-Solid port of xyflow was pre-release when this was written, so it is not a dependency. Check its
-status at M3, and again for the workflow *editor* in M4, where drag-and-connect matters more than
-animation.
+A spike measured this at 200 nodes and 300 edges on a phone-sized viewport with the CPU throttled
+four times (`spikes/graph-layout/README.md`). Its results set the approach:
+
+- **Rendering: Solid on SVG.** Solid creates the elements; one frame loop writes `transform` and
+  path data directly. Panning, 20 animated message pulses and growth at two nodes per second all
+  held 60 frames per second with under 1% slow frames. A canvas fallback is not needed at this size.
+- **Layout: a small incremental tree layout, not ELK.** The spawn tree is laid out by a hand-written
+  algorithm on the main thread (0.1 ms). Message and changed-file edges are drawn as curves over it
+  and do not influence positions. ELK's layered layout moved 91% of existing nodes per added node
+  (766 px on average); its most stable configuration matched the tree layout's 11.5 px average but
+  took 160 ms per added node and adds 474 kB compressed.
+- **ELK stays an option for the workflow view**, where the graph is a general DAG and is edited
+  rather than growing live.
+- **`@dschz/solid-flow` 1.0** now targets Solid 2 and worked on first try. It is the candidate for
+  the workflow editor in M4 (it adds 71 kB compressed). It is three days into 1.0 with one
+  maintainer, so re-check it then.
+- Not measured: a real phone. All rasterization in the spike was in software; check on a device
+  early in M3.
 
 ## 6. Built-in workbench
 
@@ -415,7 +429,7 @@ Section 12 lists the technical unknowns and the milestone that settles each.
 | Vite+ with the Solid plugin and Bun | Settled in M0: the scaffold builds, type-checks and lints with Vite+ 1.8, Solid 2.0 and Bun 1.4. |
 | The Claude stream-json protocol is not a versioned public contract | Golden fixtures per CLI version. The mapper ignores what it does not know, and a CLI version other than the recorded one logs a warning; surfacing that warning in the UI is still to do. |
 | Granting a new directory to a running Claude session | Settled on CLI 2.1.332: the CLI asks permission for a path outside its directories, and once Calin allows it the read, edit or write goes through. The request also carries an `addDirectories` suggestion for the rest of the session. No restart is needed. |
-| A custom graph renderer is real work | Spike at the start of M3: 200 nodes laid out and animated on a phone. Fallback: adopt the xyflow port if it is stable by then. |
+| A custom graph renderer is real work | Spike done: SVG with a hand-written tree layout holds 60 frames per second at 200 nodes under a 4x CPU throttle. A real device is still to be checked in M3. |
 | Disk use: a worktree and dependencies per repo per session | `setup` commands, idle reclamation, and a disk view from M2 |
 | A public server that hands out shells | The server refuses any non-loopback bind until sign-in ships in M5 |
 | Scope: cezar is a large product | The feature map is the cut. Every milestone is usable on its own. |

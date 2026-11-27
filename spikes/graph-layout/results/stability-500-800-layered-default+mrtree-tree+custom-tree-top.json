@@ -1,0 +1,53 @@
+[
+ {
+  "config": "layered-default",
+  "failed": "",
+  "rawMeanPx": 1800.9,
+  "rawMaxMeanPx": 5514.3,
+  "compMeanPx": 1751.9,
+  "compMaxMeanPx": 5728.8,
+  "compMaxP95Px": 11800.9,
+  "compMaxWorstPx": 13371.7,
+  "movedPct": 96.6,
+  "stepsQuietPct": 1.2,
+  "layoutMsMean": 118.3,
+  "layoutMsLast": 243.5,
+  "bbox": "2728x11791",
+  "overlaps": 0,
+  "routedEdgeLenK": 1330.4
+ },
+ {
+  "config": "mrtree-tree",
+  "failed": "",
+  "rawMeanPx": 14,
+  "rawMaxMeanPx": 61.1,
+  "compMeanPx": 8.5,
+  "compMaxMeanPx": 61.3,
+  "compMaxP95Px": 74,
+  "compMaxWorstPx": 2316.4,
+  "movedPct": 21.4,
+  "stepsQuietPct": 7.8,
+  "layoutMsMean": 38.4,
+  "layoutMsLast": 77.4,
+  "bbox": "1696x15472",
+  "overlaps": 0,
+  "routedEdgeLenK": 144.9
+ },
+ {
+  "config": "custom-tree-top",
+  "failed": "",
+  "rawMeanPx": 12.9,
+  "rawMaxMeanPx": 31,
+  "compMeanPx": 7.4,
+  "compMaxMeanPx": 31,
+  "compMaxP95Px": 52,
+  "compMaxWorstPx": 188,
+  "movedPct": 17,
+  "stepsQuietPct": 27.9,
+  "layoutMsMean": 0.1,
+  "layoutMsLast": 0.1,
+  "bbox": "972x16854",
+  "overlaps": 0,
+  "routedEdgeLenK": 0
+ }
+]

@@ -24,7 +24,8 @@ Known gaps carried forward:
 - Stopping a session leaves its running items open; the web app should show them as interrupted.
 - Log lines are flushed but not fsynced: they survive a crash of the process, not a power cut.
 - Replay loads a session's whole backlog into memory.
-- The graph layout spike moved to the start of M3, where its result is used.
+- The graph spike is done (`spikes/graph-layout/README.md`): SVG with a small tree layout, no ELK
+  for the session graph. It was measured in a headless browser only, not on a phone.
 
 ## M1: One session, real agent, real repos (done 2026-11-27)
 
