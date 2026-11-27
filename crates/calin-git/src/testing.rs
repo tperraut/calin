@@ -1,10 +1,27 @@
 //! Test support: throwaway repositories and a git that ignores this machine.
 
+use std::cell::Cell;
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use tempfile::TempDir;
+
+thread_local! {
+    /// Set while a test wants the library's git to find no identity at all.
+    static NO_IDENTITY: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Runs `work` with a git that has no name and no email to commit with, as
+/// on a machine where nobody configured one. The library's calls are
+/// blocking, so they happen on this thread.
+pub(crate) fn without_identity<T>(work: impl FnOnce() -> T) -> T {
+    NO_IDENTITY.set(true);
+    let result = work();
+    NO_IDENTITY.set(false);
+    result
+}
 
 /// Cuts a git command off from the user's and the system's configuration and
 /// fixes the identity and the clock. Applied to the commands the tests run
@@ -12,8 +29,20 @@ use tempfile::TempDir;
 pub(crate) fn isolate(cmd: &mut Command) {
     cmd.env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_AUTHOR_NAME", "Calin Test")
+        .env("GIT_CONFIG_NOSYSTEM", "1");
+    if NO_IDENTITY.get() {
+        for name in [
+            "GIT_AUTHOR_NAME",
+            "GIT_AUTHOR_EMAIL",
+            "GIT_COMMITTER_NAME",
+            "GIT_COMMITTER_EMAIL",
+            "EMAIL",
+        ] {
+            cmd.env_remove(name);
+        }
+        return;
+    }
+    cmd.env("GIT_AUTHOR_NAME", "Calin Test")
         .env("GIT_AUTHOR_EMAIL", "test@calin.invalid")
         .env("GIT_AUTHOR_DATE", "2026-01-01T00:00:00Z")
         .env("GIT_COMMITTER_NAME", "Calin Test")
@@ -64,6 +93,22 @@ pub(crate) fn commit_all(dir: &Path, message: &str) -> String {
     git(dir, &["add", "-A"]);
     git(dir, &["commit", "-q", "-m", message]);
     git(dir, &["rev-parse", "HEAD"])
+}
+
+/// Writes an executable without this process ever holding it open for
+/// writing. Otherwise a test that forks at the wrong moment passes the open
+/// file on to its child, and running the script fails with "text file busy".
+pub(crate) fn write_executable(path: &Path, content: &str) {
+    let mut writer = Command::new("/bin/sh")
+        .args(["-c", r#"cat > "$0" && chmod 755 "$0""#])
+        .arg(path)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = writer.stdin.take().unwrap();
+    stdin.write_all(content.as_bytes()).unwrap();
+    drop(stdin);
+    assert!(writer.wait().unwrap().success());
 }
 
 /// A temporary directory that holds the repositories of one test.

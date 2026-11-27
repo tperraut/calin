@@ -219,6 +219,15 @@ fn is_occupied(path: &Path) -> Result<bool> {
     }
 }
 
+/// The branch checked out in the clone that `dir` is a work tree of: the
+/// clone's own, whichever of its work trees `dir` is. `None` when detached.
+pub(crate) fn main_branch(dir: &Path) -> Result<Option<String>> {
+    let main = list(dir)?.into_iter().find(|worktree| worktree.main);
+    Ok(main
+        .and_then(|worktree| worktree.branch)
+        .and_then(|full| full.strip_prefix("refs/heads/").map(str::to_owned)))
+}
+
 /// One entry of `git worktree list`.
 struct Registered {
     /// Canonical when the directory exists.

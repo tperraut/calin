@@ -1,0 +1,463 @@
+//! Delivering a session's work: committing what is uncommitted and pushing
+//! the session's branch. Nothing here amends, forces or touches another branch.
+
+use std::path::Path;
+
+use crate::cmd::{Git, no_ssh_prompt, require_commit, resolve_commit, work_dir};
+use crate::error::{Error, Result};
+use crate::worktree::main_branch;
+
+/// Makes git refuse to invent an identity from the user and host names: a
+/// commit signed `calin@vps.(none)` is worse than an error that says why.
+const CONFIGURED_IDENTITY_ONLY: [&str; 2] = ["-c", "user.useConfigOnly=true"];
+
+/// How [`commit_all`] ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CommitOutcome {
+    /// The new commit.
+    Committed(String),
+    /// Nothing differed from `HEAD` once everything was staged.
+    NothingToCommit,
+}
+
+/// Stages everything in `worktree` that is not ignored and commits it on the
+/// branch that is checked out, with `message` as it is.
+///
+/// The commit is made with the machine's git identity and runs the repo's
+/// hooks, like a commit made by hand. It is never an amend.
+///
+/// [`Error::Conflict`] when git has no name or email to commit with; the
+/// changes are staged then, and nothing else happened. [`Error::Git`] with
+/// git's own words when the commit fails, for example in a hook.
+pub fn commit_all(worktree: &Path, message: &str) -> Result<CommitOutcome> {
+    let dir = work_dir(worktree)?;
+    if message.trim().is_empty() {
+        return Err(Error::Conflict("a commit needs a message".to_owned()));
+    }
+    Git::write(&dir).args(["add", "--all"]).run()?;
+    // Status 1 says the index differs from `HEAD`.
+    let staged = Git::read(&dir)
+        .args(["diff", "--cached", "--quiet"])
+        .exec()?;
+    match staged.status.code() {
+        Some(0) => return Ok(CommitOutcome::NothingToCommit),
+        Some(1) => {}
+        _ => return Err(staged.into_error()),
+    }
+    for who in ["GIT_AUTHOR_IDENT", "GIT_COMMITTER_IDENT"] {
+        let known = Git::read(&dir)
+            .args(CONFIGURED_IDENTITY_ONLY)
+            .args(["var", who])
+            .exec()?;
+        if !known.status.success() {
+            return Err(Error::Conflict(
+                "git has no identity to commit with: set one with `git config --global \
+                 user.name \"Your Name\"` and `git config --global user.email you@example.com`"
+                    .to_owned(),
+            ));
+        }
+    }
+    // The message goes through stdin: it is the user's text, whatever it holds.
+    Git::write(&dir)
+        .args(CONFIGURED_IDENTITY_ONLY)
+        .args(["commit", "--quiet", "--file=-"])
+        .stdin(message.as_bytes().to_vec())
+        .run()?;
+    let head = resolve_commit(&dir, "HEAD")?
+        .ok_or_else(|| Error::NotFound("the commit that was just made".to_owned()))?;
+    Ok(CommitOutcome::Committed(head))
+}
+
+/// Pushes `branch` to the branch of the same name on `remote` and makes that
+/// its upstream. Never forced: a remote branch with commits the local one
+/// lacks rejects the push, which is an [`Error::Git`] with git's message.
+/// Nothing is ever asked on a terminal.
+///
+/// Refused before anything runs, with [`Error::Conflict`], when `branch` is
+/// the repo's default branch ([`default_branch`]): a session delivers through
+/// a pull request, never by pushing to the branch it would be merged into.
+/// [`Error::NotFound`] when there is no such remote or no such branch.
+pub fn push_branch(worktree: &Path, remote: &str, branch: &str) -> Result<()> {
+    let dir = work_dir(worktree)?;
+    if !has_remote(&dir, remote)? {
+        return Err(Error::NotFound(format!("remote {remote}")));
+    }
+    let full_ref = local_ref(branch)?;
+    if default_branch(&dir, remote)?.as_deref() == Some(branch) {
+        return Err(Error::Conflict(format!(
+            "{branch} is the default branch of this repository and is never pushed to"
+        )));
+    }
+    require_commit(&dir, &full_ref)?;
+    // Both sides spelled out: a refspec that cannot start with `+` (which
+    // would force) and cannot be read as an option or a tag.
+    no_ssh_prompt(Git::write(&dir))
+        .args(["push", "--set-upstream", remote])
+        .arg(format!("{full_ref}:{full_ref}"))
+        .run()?;
+    Ok(())
+}
+
+/// True when `dir` has a remote called `remote`.
+pub fn has_remote(dir: &Path, remote: &str) -> Result<bool> {
+    let dir = work_dir(dir)?;
+    // A name that git would read as an option or as a config section of its own.
+    if remote.is_empty() || remote.starts_with('-') || remote.contains(['.', '\n', ' ']) {
+        return Ok(false);
+    }
+    let url = Git::read(&dir)
+        .args(["config", "--get", &format!("remote.{remote}.url")])
+        .probe()?;
+    Ok(url.is_some())
+}
+
+/// The branch pull requests of this repository go to: the one `remote`'s
+/// `HEAD` pointed to when it was last fetched, else the branch checked out
+/// in the clone itself (not in the worktree asking). `None` when neither is
+/// known.
+pub fn default_branch(dir: &Path, remote: &str) -> Result<Option<String>> {
+    let dir = work_dir(dir)?;
+    let prefix = format!("refs/remotes/{remote}/");
+    let remote_head = Git::read(&dir)
+        .args(["symbolic-ref", "--quiet", &format!("{prefix}HEAD")])
+        .probe()?
+        .and_then(|name| name.strip_prefix(&prefix).map(str::to_owned));
+    match remote_head {
+        Some(branch) => Ok(Some(branch)),
+        None => main_branch(&dir),
+    }
+}
+
+/// The branch checked out in `dir`. `None` when `HEAD` is detached.
+pub fn current_branch(dir: &Path) -> Result<Option<String>> {
+    let dir = work_dir(dir)?;
+    Ok(Git::read(&dir)
+        .args(["symbolic-ref", "--quiet", "HEAD"])
+        .probe()?
+        .and_then(|name| name.strip_prefix("refs/heads/").map(str::to_owned)))
+}
+
+/// How many commits `branch` has that `base` does not.
+pub fn commits_ahead(dir: &Path, base: &str, branch: &str) -> Result<u32> {
+    let dir = work_dir(dir)?;
+    let base = require_commit(&dir, base)?;
+    let tip = require_commit(&dir, &local_ref(branch)?)?;
+    count(&dir, &format!("{base}..{tip}"))
+}
+
+/// True when `branch` has commits that the branch of the same name on
+/// `remote` did not have when it was last pushed to or fetched; also when
+/// that branch is not known to exist there at all.
+pub fn has_unpushed_commits(dir: &Path, remote: &str, branch: &str) -> Result<bool> {
+    let dir = work_dir(dir)?;
+    let tip = require_commit(&dir, &local_ref(branch)?)?;
+    let tracking = format!("refs/remotes/{remote}/{branch}");
+    match resolve_commit(&dir, &tracking)? {
+        Some(pushed) => Ok(count(&dir, &format!("{pushed}..{tip}"))? > 0),
+        None => Ok(true),
+    }
+}
+
+/// True when the work tree holds anything a commit would record: staged or
+/// unstaged changes, or untracked files that are not ignored.
+pub fn is_dirty(dir: &Path) -> Result<bool> {
+    let dir = work_dir(dir)?;
+    let status = Git::read(&dir)
+        .args(["status", "--porcelain", "-z", "--untracked-files=normal"])
+        .run()?;
+    Ok(!status.is_empty())
+}
+
+fn count(dir: &Path, range: &str) -> Result<u32> {
+    let text = Git::read(dir).args(["rev-list", "--count", range]).text()?;
+    text.trim().parse().map_err(|_| Error::Git {
+        command: format!("git rev-list --count {range}"),
+        stderr: format!("unexpected output {text:?}"),
+    })
+}
+
+/// `refs/heads/<branch>`, for a name that can be one.
+fn local_ref(branch: &str) -> Result<String> {
+    if branch.is_empty() || branch.starts_with(['-', '+']) || branch.contains(['\n', ':', ' ']) {
+        return Err(Error::Git {
+            command: "git push".to_owned(),
+            stderr: format!("{branch:?} is not a valid branch name"),
+        });
+    }
+    Ok(format!("refs/heads/{branch}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::testing::{Sandbox, commit_all as commit, git, git_ok, without_identity, write};
+    use crate::worktree::create_worktree;
+
+    const BRANCH: &str = "calin/feature-abc123";
+
+    /// A bare repository, a clone of it, and a worktree of the clone on [`BRANCH`].
+    struct Delivery {
+        sandbox: Sandbox,
+        remote: PathBuf,
+        clone: PathBuf,
+        worktree: PathBuf,
+    }
+
+    fn delivery() -> Delivery {
+        let sandbox = Sandbox::new();
+        let seed = sandbox.repo("seed");
+        let remote = sandbox.path().join("remote.git");
+        git(
+            sandbox.path(),
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                seed.to_str().unwrap(),
+                "remote.git",
+            ],
+        );
+        let clone = sandbox.path().join("clone");
+        git(
+            sandbox.path(),
+            &["clone", "-q", remote.to_str().unwrap(), "clone"],
+        );
+        let worktree = sandbox.path().join("session/clone");
+        create_worktree(&clone, &worktree, BRANCH, None).unwrap();
+        Delivery {
+            sandbox,
+            remote,
+            clone,
+            worktree,
+        }
+    }
+
+    fn remote_tip(remote: &Path, branch: &str) -> Option<String> {
+        let full = format!("refs/heads/{branch}");
+        git_ok(remote, &["rev-parse", "--verify", "--quiet", &full])
+            .then(|| git(remote, &["rev-parse", &full]))
+    }
+
+    #[test]
+    fn dirty_work_is_committed_on_the_checked_out_branch() {
+        let d = delivery();
+        let base = git(&d.worktree, &["rev-parse", "HEAD"]);
+        assert!(!is_dirty(&d.worktree).unwrap());
+        write(&d.worktree, "src/new.rs", "fn new() {}\n");
+        write(&d.worktree, "README.md", "# changed\n");
+        git(&d.worktree, &["add", "README.md"]);
+        assert!(is_dirty(&d.worktree).unwrap());
+
+        let message = "Add the thing\n\nCalin-Session: 01ABC\n";
+        let CommitOutcome::Committed(commit) = commit_all(&d.worktree, message).unwrap() else {
+            panic!("expected a commit");
+        };
+        assert_eq!(git(&d.worktree, &["rev-parse", "HEAD"]), commit);
+        assert_eq!(git(&d.worktree, &["rev-parse", "HEAD^"]), base);
+        assert_eq!(
+            git(&d.worktree, &["log", "-1", "--format=%B"]),
+            message.trim()
+        );
+        assert_eq!(
+            git(&d.worktree, &["log", "-1", "--format=%an <%ae>"]),
+            "Calin Test <test@calin.invalid>"
+        );
+        let files = git(&d.worktree, &["show", "--name-only", "--format=", "HEAD"]);
+        assert_eq!(files, "README.md\nsrc/new.rs");
+        assert!(!is_dirty(&d.worktree).unwrap());
+        assert_eq!(commits_ahead(&d.worktree, &base, BRANCH).unwrap(), 1);
+        assert_eq!(
+            current_branch(&d.worktree).unwrap().as_deref(),
+            Some(BRANCH)
+        );
+        // The clone's own branch did not move.
+        assert_eq!(git(&d.clone, &["rev-parse", "main"]), base);
+    }
+
+    #[test]
+    fn a_clean_tree_and_one_with_only_ignored_files_have_nothing_to_commit() {
+        let d = delivery();
+        let head = git(&d.worktree, &["rev-parse", "HEAD"]);
+        assert_eq!(
+            commit_all(&d.worktree, "nothing").unwrap(),
+            CommitOutcome::NothingToCommit
+        );
+
+        write(&d.worktree, ".gitignore", "target/\n*.log\n");
+        commit(&d.worktree, "ignore build output");
+        let head_after = git(&d.worktree, &["rev-parse", "HEAD"]);
+        assert_ne!(head, head_after);
+        write(&d.worktree, "target/debug/app", "binary");
+        write(&d.worktree, "run.log", "noise\n");
+        assert!(!is_dirty(&d.worktree).unwrap());
+        assert_eq!(
+            commit_all(&d.worktree, "nothing").unwrap(),
+            CommitOutcome::NothingToCommit
+        );
+        assert_eq!(git(&d.worktree, &["rev-parse", "HEAD"]), head_after);
+        assert!(d.worktree.join("run.log").is_file());
+
+        // A blank message is refused before anything is staged.
+        write(&d.worktree, "a.txt", "a\n");
+        assert!(matches!(
+            commit_all(&d.worktree, " \n"),
+            Err(Error::Conflict(_))
+        ));
+        assert_eq!(git(&d.worktree, &["diff", "--cached", "--name-only"]), "");
+    }
+
+    #[test]
+    fn without_an_identity_the_commit_is_refused_and_says_how_to_set_one() {
+        let d = delivery();
+        let head = git(&d.worktree, &["rev-parse", "HEAD"]);
+        write(&d.worktree, "a.txt", "a\n");
+        let err = without_identity(|| commit_all(&d.worktree, "no author")).unwrap_err();
+        let Error::Conflict(message) = &err else {
+            panic!("expected a conflict, got {err:?}");
+        };
+        assert!(message.contains("user.name"), "{message}");
+        assert!(message.contains("user.email"), "{message}");
+        assert_eq!(git(&d.worktree, &["rev-parse", "HEAD"]), head);
+        // Nothing to commit needs no identity.
+        git(&d.worktree, &["reset", "-q"]);
+        std::fs::remove_file(d.worktree.join("a.txt")).unwrap();
+        assert_eq!(
+            without_identity(|| commit_all(&d.worktree, "clean")).unwrap(),
+            CommitOutcome::NothingToCommit
+        );
+    }
+
+    #[test]
+    fn a_branch_is_pushed_to_the_remote_and_tracks_it() {
+        let d = delivery();
+        let base = git(&d.worktree, &["rev-parse", "HEAD"]);
+        assert!(has_remote(&d.worktree, "origin").unwrap());
+        assert!(has_unpushed_commits(&d.worktree, "origin", BRANCH).unwrap());
+        write(&d.worktree, "a.txt", "a\n");
+        let first = commit(&d.worktree, "first");
+
+        push_branch(&d.worktree, "origin", BRANCH).unwrap();
+        assert_eq!(remote_tip(&d.remote, BRANCH), Some(first.clone()));
+        assert_eq!(remote_tip(&d.remote, "main"), Some(base));
+        assert_eq!(
+            git(&d.worktree, &["rev-parse", "--abbrev-ref", "@{upstream}"]),
+            format!("origin/{BRANCH}")
+        );
+        assert!(!has_unpushed_commits(&d.worktree, "origin", BRANCH).unwrap());
+
+        // A second push carries the next commit; one with nothing new is fine.
+        write(&d.worktree, "b.txt", "b\n");
+        let second = commit(&d.worktree, "second");
+        assert!(has_unpushed_commits(&d.worktree, "origin", BRANCH).unwrap());
+        push_branch(&d.worktree, "origin", BRANCH).unwrap();
+        push_branch(&d.worktree, "origin", BRANCH).unwrap();
+        assert_eq!(remote_tip(&d.remote, BRANCH), Some(second));
+
+        // A file URL works like a path.
+        let url = format!("file://{}", d.remote.display());
+        git(&d.worktree, &["remote", "add", "mirror", &url]);
+        push_branch(&d.worktree, "mirror", BRANCH).unwrap();
+    }
+
+    #[test]
+    fn the_default_branch_is_never_pushed() {
+        let d = delivery();
+        assert_eq!(
+            default_branch(&d.worktree, "origin").unwrap().as_deref(),
+            Some("main")
+        );
+        write(&d.clone, "a.txt", "a\n");
+        commit(&d.clone, "on main");
+        let before = remote_tip(&d.remote, "main");
+        let err = push_branch(&d.clone, "origin", "main").unwrap_err();
+        assert!(
+            matches!(&err, Error::Conflict(m) if m.contains("default branch")),
+            "{err:?}"
+        );
+        assert_eq!(remote_tip(&d.remote, "main"), before);
+
+        // Without the remote's `HEAD`, the clone's own branch is the default,
+        // seen from a worktree too.
+        git(&d.clone, &["remote", "set-head", "origin", "--delete"]);
+        assert_eq!(
+            default_branch(&d.worktree, "origin").unwrap().as_deref(),
+            Some("main")
+        );
+        assert!(matches!(
+            push_branch(&d.worktree, "origin", "main"),
+            Err(Error::Conflict(_))
+        ));
+        assert_eq!(remote_tip(&d.remote, "main"), before);
+        // The session's branch still goes through.
+        push_branch(&d.worktree, "origin", BRANCH).unwrap();
+        assert!(remote_tip(&d.remote, BRANCH).is_some());
+    }
+
+    #[test]
+    fn a_push_the_remote_rejects_is_an_error_and_changes_nothing_there() {
+        let d = delivery();
+        write(&d.worktree, "a.txt", "a\n");
+        commit(&d.worktree, "first");
+        push_branch(&d.worktree, "origin", BRANCH).unwrap();
+
+        // Someone else pushes to the same branch.
+        let other = d.sandbox.path().join("other");
+        git(
+            d.sandbox.path(),
+            &["clone", "-q", d.remote.to_str().unwrap(), "other"],
+        );
+        git(&other, &["switch", "-q", BRANCH]);
+        write(&other, "theirs.txt", "theirs\n");
+        let theirs = commit(&other, "theirs");
+        git(&other, &["push", "-q", "origin", BRANCH]);
+
+        write(&d.worktree, "b.txt", "b\n");
+        let ours = commit(&d.worktree, "ours");
+        let err = push_branch(&d.worktree, "origin", BRANCH).unwrap_err();
+        let Error::Git { stderr, .. } = &err else {
+            panic!("expected git's error, got {err:?}");
+        };
+        assert!(stderr.contains("rejected"), "{stderr}");
+        assert_eq!(remote_tip(&d.remote, BRANCH), Some(theirs));
+        // Nothing was rewritten locally either.
+        assert_eq!(git(&d.worktree, &["rev-parse", "HEAD"]), ours);
+    }
+
+    #[test]
+    fn a_missing_remote_or_branch_is_not_found() {
+        let sandbox = Sandbox::new();
+        let repo = sandbox.repo("repo");
+        git(&repo, &["switch", "-q", "-c", BRANCH]);
+        assert!(!has_remote(&repo, "origin").unwrap());
+        assert!(!has_remote(&repo, "--upload-pack=x").unwrap());
+        assert!(matches!(
+            push_branch(&repo, "origin", BRANCH),
+            Err(Error::NotFound(what)) if what.contains("origin")
+        ));
+
+        let d = delivery();
+        assert!(matches!(
+            push_branch(&d.worktree, "origin", "calin/never-made"),
+            Err(Error::NotFound(_))
+        ));
+        assert!(matches!(
+            push_branch(&d.worktree, "upstream", BRANCH),
+            Err(Error::NotFound(_))
+        ));
+        for odd in ["", "-f", "+calin/x", "a:b"] {
+            assert!(
+                matches!(
+                    push_branch(&d.worktree, "origin", odd),
+                    Err(Error::Git { .. })
+                ),
+                "{odd:?}"
+            );
+        }
+        assert_eq!(remote_tip(&d.remote, BRANCH), None);
+        // A detached worktree has no branch to speak of.
+        git(&d.worktree, &["checkout", "-q", "--detach"]);
+        assert_eq!(current_branch(&d.worktree).unwrap(), None);
+    }
+}

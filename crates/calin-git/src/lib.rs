@@ -19,6 +19,10 @@
 //!   and [`file_diff`] compare the base with the files on disk, so commits,
 //!   staged, unstaged and untracked work all count.
 //!
+//! - **Delivery** is what follows the review: [`commit_all`] records what is
+//!   uncommitted, [`push_branch`] publishes the session's branch, and
+//!   [`GitHub`] opens and reads its pull request through the `gh` CLI.
+//!
 //! # Blocking
 //!
 //! Every function here blocks: it runs `git` and waits, or reads and writes
@@ -33,15 +37,16 @@
 //!
 //! # What this crate never does
 //!
-//! Delete a branch, force-push, or reset or clean a checkout. Read-only git
+//! Delete a branch, force-push, push to a default branch, amend or merge a
+//! commit, or reset or clean a checkout. Read-only git
 //! commands take no optional locks, so they do not get in the way of an
 //! agent's own git in the same work tree.
 //!
 //! # Errors
 //!
 //! One [`Error`], whose variants map to HTTP statuses: `InvalidPath` and
-//! `NotARepository` to 400, `NotFound` to 404, `Conflict` to 409, `Git` and
-//! `Io` to 500.
+//! `NotARepository` to 400, `NotFound` to 404, `Conflict` to 409, `Git` (which
+//! is also how a failing `gh` is reported) and `Io` to 500.
 //!
 //! # Example
 //!
@@ -77,8 +82,10 @@ mod changes;
 mod clone;
 mod cmd;
 mod content;
+mod delivery;
 mod error;
 mod files;
+mod github;
 mod path;
 mod repo;
 mod setup;
@@ -89,8 +96,13 @@ mod worktree;
 pub use branch::session_branch_name;
 pub use changes::{changes, file_diff};
 pub use clone::clone_repo;
+pub use delivery::{
+    CommitOutcome, commit_all, commits_ahead, current_branch, default_branch, has_remote,
+    has_unpushed_commits, is_dirty, push_branch,
+};
 pub use error::{Error, Result};
 pub use files::{list_dir, read_file, write_file};
+pub use github::{GitHub, PullRequestInfo};
 pub use path::resolve_path;
 pub use repo::{CloneInfo, head_commit, inspect_clone};
 pub use setup::{SetupEnd, SetupRun, run_setup};

@@ -135,13 +135,13 @@ fn lock(tail: &Mutex<Tail>) -> std::sync::MutexGuard<'_, Tail> {
 }
 
 /// Kills the command and everything in its group, and reaps it.
-fn kill(child: &mut Child) {
+pub(crate) fn kill(child: &mut Child) {
     kill_group(child);
     let _ = child.kill();
     let _ = child.wait();
 }
 
-fn kill_group(child: &Child) {
+pub(crate) fn kill_group(child: &Child) {
     #[cfg(unix)]
     {
         let leader = i32::try_from(child.id())

@@ -1,8 +1,9 @@
 //! Test support: throwaway git repositories, made with a git that ignores
 //! this machine's configuration.
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 /// Runs git in `dir`, panics when it fails, returns trimmed standard output.
 pub(crate) fn git(dir: &Path, args: &[&str]) -> String {
@@ -46,4 +47,20 @@ pub(crate) fn git_repo(parent: &Path, name: &str) -> PathBuf {
     git(&path, &["add", "-A"]);
     git(&path, &["commit", "-q", "-m", "initial"]);
     std::fs::canonicalize(path).unwrap()
+}
+
+/// Writes an executable without this process ever holding it open for
+/// writing. Otherwise a test that forks at the wrong moment passes the open
+/// file on to its child, and running the script fails with "text file busy".
+pub(crate) fn write_executable(path: &Path, content: &str) {
+    let mut writer = Command::new("/bin/sh")
+        .args(["-c", r#"cat > "$0" && chmod 755 "$0""#])
+        .arg(path)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = writer.stdin.take().unwrap();
+    stdin.write_all(content.as_bytes()).unwrap();
+    drop(stdin);
+    assert!(writer.wait().unwrap().success());
 }

@@ -225,7 +225,8 @@ impl Store {
         self.call(|reply| Cmd::Sessions { reply }).await
     }
 
-    /// A session, its agents in spawn order and its repo set, primary first.
+    /// A session, its agents in spawn order, its repo set, primary first, and
+    /// its pull requests in the order of the repo set.
     pub async fn session(&self, session_id: &str) -> Result<SessionDetail> {
         let session_id = session_id.to_owned();
         self.call(|reply| Cmd::Session { session_id, reply }).await
@@ -266,6 +267,19 @@ impl Store {
         let session_id = session_id.map(str::to_owned);
         self.call(|reply| Cmd::OpenPermissions { session_id, reply })
             .await
+    }
+
+    /// The highest number among the pull requests recorded for a repo, in
+    /// any session, whose URL starts with `url_prefix`; 0 when there is none.
+    /// This is how made-up pull requests are numbered in dry run.
+    pub async fn last_pull_request_number(&self, repo_id: &str, url_prefix: &str) -> Result<u32> {
+        let (repo_id, url_prefix) = (repo_id.to_owned(), url_prefix.to_owned());
+        self.call(|reply| Cmd::LastPullRequestNumber {
+            repo_id,
+            url_prefix,
+            reply,
+        })
+        .await
     }
 
     async fn call<T>(&self, command: impl FnOnce(oneshot::Sender<Result<T>>) -> Cmd) -> Result<T> {

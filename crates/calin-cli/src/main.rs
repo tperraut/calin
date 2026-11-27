@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use calin_agents::{RegistryConfig, RunnerRegistry};
-use calin_core::{SessionManager, Store, resolve_home};
+use calin_core::{ManagerConfig, SessionManager, Store, resolve_home};
 use calin_server::{AppState, Assets, Server};
 use clap::{Args, Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
@@ -15,6 +15,8 @@ const DEFAULT_BIND: &str = "127.0.0.1:4680";
 /// Sets the log filter, in `tracing` syntax: `debug`, `calin_core=trace,info`.
 const ENV_LOG: &str = "CALIN_LOG";
 const DEFAULT_LOG: &str = "info";
+/// Path of the GitHub CLI that opens and reads pull requests.
+const ENV_GH_BIN: &str = "CALIN_GH_BIN";
 
 #[derive(Parser)]
 #[command(
@@ -80,7 +82,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
     let store = Store::open(home.clone())
         .await
         .with_context(|| format!("cannot open the data directory {}", home.root().display()))?;
-    let manager = SessionManager::start(store.clone(), registry)
+    let manager = SessionManager::start_with(store.clone(), registry, manager_config())
         .await
         .context("cannot recover the sessions of the previous run")?;
     let server = Server::bind(addr, AppState::new(manager.clone()))
@@ -100,6 +102,19 @@ async fn serve(args: ServeArgs) -> Result<()> {
     store.close().await;
     tracing::info!("server stopped");
     Ok(())
+}
+
+/// The defaults, with `gh` replaced by `CALIN_GH_BIN` when that is set.
+fn manager_config() -> ManagerConfig {
+    with_gh_bin(ManagerConfig::default(), std::env::var_os(ENV_GH_BIN))
+}
+
+fn with_gh_bin(mut config: ManagerConfig, gh_bin: Option<std::ffi::OsString>) -> ManagerConfig {
+    // An empty value is how a shell spells "not set".
+    if let Some(path) = gh_bin.filter(|path| !path.is_empty()) {
+        config.gh_bin = PathBuf::from(path);
+    }
+    config
 }
 
 /// Parses `--bind` and refuses anything a remote machine could reach.
@@ -195,6 +210,17 @@ mod tests {
         };
         assert_eq!(args.bind, "[::1]:9");
         assert_eq!(args.home, Some(PathBuf::from("/tmp/x")));
+    }
+
+    #[test]
+    fn the_github_cli_is_gh_unless_the_environment_names_another() {
+        let default = ManagerConfig::default();
+        assert_eq!(default.gh_bin, PathBuf::from("gh"));
+        assert_eq!(with_gh_bin(default.clone(), None), default);
+        assert_eq!(with_gh_bin(default.clone(), Some("".into())), default);
+        let named = with_gh_bin(default.clone(), Some("/opt/gh/bin/gh".into()));
+        assert_eq!(named.gh_bin, PathBuf::from("/opt/gh/bin/gh"));
+        assert_eq!(named.setup_limit, default.setup_limit);
     }
 
     #[test]

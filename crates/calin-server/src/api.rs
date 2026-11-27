@@ -10,7 +10,7 @@ use axum::response::{IntoResponse, Response};
 use calin_proto::{
     ApiError, AttachRepoRequest, CreateSessionRequest, FileContent, FileDiff, Health,
     RegisterRepoRequest, Repo, RepoChanges, RepoSet, ResolvePermissionRequest, SendMessageRequest,
-    Session, SessionDetail, SessionRepo, Settings, TreeEntry, WriteFileRequest,
+    Session, SessionDetail, SessionRepo, Settings, ShipRequest, TreeEntry, WriteFileRequest,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -129,6 +129,8 @@ pub(crate) async fn health(State(state): State<AppState>) -> Json<Health> {
         version: env!("CARGO_PKG_VERSION").to_owned(),
         dry_run: registry.dry_run(),
         runners: registry.ids(),
+        // Asked of `gh` at most once a minute, however often clients poll.
+        github_problem: state.manager.github_problem().await,
     })
 }
 
@@ -247,6 +249,33 @@ pub(crate) async fn attach_repo(
 ) -> ApiResult<(StatusCode, Json<SessionRepo>)> {
     let repo = state.manager.attach_repo(&session_id, request).await?;
     Ok((StatusCode::CREATED, Json(repo)))
+}
+
+pub(crate) async fn ship_session(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    ApiJson(body): ApiJson<serde_json::Value>,
+) -> ApiResult<StatusCode> {
+    // Every field is optional, so a list would read as a request that asks
+    // for nothing in particular, and ship.
+    if !body.is_object() {
+        return Err(ApiFailure::new(
+            StatusCode::BAD_REQUEST,
+            "the request must be a JSON object",
+        ));
+    }
+    let request: ShipRequest = serde_json::from_value(body)
+        .map_err(|err| ApiFailure::new(StatusCode::BAD_REQUEST, err.to_string()))?;
+    state.manager.ship(&session_id, request).await?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+pub(crate) async fn refresh_pull_requests(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> ApiResult<StatusCode> {
+    state.manager.refresh_pull_requests(&session_id).await?;
+    Ok(StatusCode::ACCEPTED)
 }
 
 pub(crate) async fn session_changes(

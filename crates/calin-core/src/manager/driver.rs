@@ -13,15 +13,17 @@ use calin_agents::{
 };
 use calin_proto::{
     Agent, AgentKind, AgentStatus, AttachRepoRequest, DecisionSource, Event, EventBody, FileOp,
-    Item, ItemContent, ItemStatus, PermissionDecision, PermissionMode, PermissionRequest, Repo,
-    RepoMode, SessionDetail, SessionRepo, SessionStatus, ToolKind,
+    Item, ItemContent, ItemStatus, PermissionDecision, PermissionMode, PermissionRequest,
+    PullRequest, PullRequestState, Repo, RepoMode, SessionDetail, SessionRepo, SessionStatus,
+    ToolKind,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use ulid::Ulid;
 
+use super::delivery::{self, ShipPlan, Shipped};
 use super::{
     Command, Inner, Reply, agent_ended, closed, expired, has_turn, is_closed, no_attaching,
-    no_longer_active, no_turn, takes_messages, takes_repos,
+    no_longer_active, no_shipping, no_turn, ships, takes_messages, takes_repos,
 };
 use crate::briefing;
 use crate::error::{Error, Result};
@@ -126,6 +128,23 @@ struct Preparation {
     _reservation: Option<Reservation>,
 }
 
+/// A ship in progress: the background work reports each step here.
+struct Shipping {
+    results: mpsc::Receiver<Shipped>,
+    /// Set to end the ship between two steps.
+    cancel: Arc<AtomicBool>,
+    /// A pull request was opened or found: the session is being shipped.
+    delivered: bool,
+}
+
+/// A look at the session's pull requests on GitHub, in progress.
+struct Polling {
+    /// The pull requests that could be read, as they are now.
+    observed: oneshot::Receiver<Vec<PullRequest>>,
+    /// Everyone who asked for a look and is told when this one is on record.
+    waiting: Vec<Reply>,
+}
+
 /// The driver hit a storage error and cannot go on.
 struct Halt;
 
@@ -134,6 +153,8 @@ enum Step {
     Output(Option<RunnerOutput>),
     Prepared(Option<Prepared>),
     Attached(Option<Prepared>),
+    Shipped(Option<Shipped>),
+    Polled(Vec<PullRequest>),
 }
 
 pub(super) struct Driver {
@@ -179,6 +200,12 @@ pub(super) struct Driver {
     granted: HashSet<String>,
     /// The running agent's key to Calin's tools. Revoked when dropped.
     token: Option<Token>,
+    /// The session's pull requests on record, at most one per repo.
+    pull_requests: Vec<PullRequest>,
+    /// The ship in progress: one at a time, so two never push the same
+    /// branch or open the same pull request twice.
+    shipping: Option<Shipping>,
+    polling: Option<Polling>,
 }
 
 async fn next_output(handle: &mut Option<AgentHandle>) -> Option<RunnerOutput> {
@@ -198,6 +225,21 @@ async fn next_prepared(preparation: &mut Option<Preparation>) -> Option<Prepared
 async fn next_attached(attaching: &mut Option<Attaching>) -> Option<Prepared> {
     match attaching {
         Some(attaching) => attaching.results.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn next_shipped(shipping: &mut Option<Shipping>) -> Option<Shipped> {
+    match shipping {
+        Some(shipping) => shipping.results.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn next_polled(polling: &mut Option<Polling>) -> Vec<PullRequest> {
+    match polling {
+        // A look that died saw nothing; the next one starts over.
+        Some(polling) => (&mut polling.observed).await.unwrap_or_default(),
         None => std::future::pending().await,
     }
 }
@@ -236,6 +278,9 @@ impl Driver {
             notes: Vec::new(),
             granted: HashSet::new(),
             token: None,
+            pull_requests: Vec::new(),
+            shipping: None,
+            polling: None,
         }
     }
 
@@ -245,6 +290,8 @@ impl Driver {
             self.inner.drivers().remove(&self.session_id);
         }
         self.abort_attaching();
+        self.abort_shipping();
+        self.end_polling(Err(no_longer_active()));
         // Off the map, so nothing new arrives; what is queued came too late.
         self.commands.close();
         while let Ok(command) = self.commands.try_recv() {
@@ -260,8 +307,11 @@ impl Driver {
             return false;
         }
         loop {
-            let idle =
-                self.handle.is_none() && self.preparation.is_none() && self.attaching.is_none();
+            let idle = self.handle.is_none()
+                && self.preparation.is_none()
+                && self.attaching.is_none()
+                && self.shipping.is_none()
+                && self.polling.is_none();
             let step = if idle {
                 match self.commands.try_recv() {
                     Ok(command) => Step::Command(command),
@@ -283,6 +333,8 @@ impl Driver {
                     output = next_output(&mut self.handle) => Step::Output(output),
                     prepared = next_prepared(&mut self.preparation) => Step::Prepared(prepared),
                     attached = next_attached(&mut self.attaching) => Step::Attached(attached),
+                    shipped = next_shipped(&mut self.shipping) => Step::Shipped(shipped),
+                    polled = next_polled(&mut self.polling) => Step::Polled(polled),
                 }
             };
             let result = match step {
@@ -297,6 +349,14 @@ impl Driver {
                 }),
                 Step::Attached(attached) => self.on_attached(attached).await.map_err(|err| {
                     tracing::error!(session = %self.session_id, %err, "could not record an attached repo");
+                    Halt
+                }),
+                Step::Shipped(shipped) => self.on_shipped(shipped).await.map_err(|err| {
+                    tracing::error!(session = %self.session_id, %err, "could not record a step of the ship");
+                    Halt
+                }),
+                Step::Polled(observed) => self.on_polled(observed).await.map_err(|err| {
+                    tracing::error!(session = %self.session_id, %err, "could not record the pull requests");
                     Halt
                 }),
             };
@@ -316,6 +376,7 @@ impl Driver {
         self.permission_mode = detail.session.permission_mode;
         self.head_seq = detail.session.head_seq;
         self.repos = detail.repos;
+        self.pull_requests = detail.pull_requests;
         self.lead = detail
             .agents
             .into_iter()
@@ -377,6 +438,19 @@ impl Driver {
                 }
                 self.begin_attach(queued).await
             }
+            Command::Ship {
+                title,
+                body,
+                draft,
+                reply,
+            } => {
+                let result = self.begin_ship(title, body, draft);
+                self.answer(reply, result)
+            }
+            Command::Poll { reply } => self.begin_poll(reply).await.map_err(|err| {
+                tracing::error!(session = %self.session_id, %err, "could not record the pull requests");
+                Halt
+            }),
         }
     }
 
@@ -459,11 +533,18 @@ impl Driver {
             text,
             event_id: message.id.clone(),
         });
-        if self.in_turn || self.preparation.is_some() {
+        // A ship commits and pushes what is in the worktrees: the agent
+        // stays out of them until it is over.
+        if self.in_turn || self.preparation.is_some() || self.shipping.is_some() {
             return Ok(());
         }
-        // The front of the queue is this message, unless an interrupt held
-        // earlier ones back: those run first.
+        self.run_pending().await
+    }
+
+    /// Starts a turn on the message that waited longest, if one waits.
+    async fn run_pending(&mut self) -> Result<()> {
+        // The front of the queue is the newest message, unless an interrupt
+        // or a ship held earlier ones back: those run first.
         let Some(next) = self.pending.pop_front() else {
             return Ok(());
         };
@@ -947,6 +1028,23 @@ impl Driver {
                 }
             }
         }
+        if let Some(mut shipping) = self.shipping.take() {
+            shipping.cancel.store(true, Ordering::Relaxed);
+            // The push or the `gh` call already running cannot be recalled.
+            // Wait for it, so a pull request it opens is on record.
+            let grace = tokio::time::sleep(STOP_GRACE);
+            tokio::pin!(grace);
+            loop {
+                tokio::select! {
+                    shipped = shipping.results.recv() => match shipped {
+                        Some(shipped) => self.record_shipped(shipped).await?,
+                        None => break,
+                    },
+                    () = &mut grace => break,
+                }
+            }
+        }
+        self.end_polling(Ok(()));
         self.expire_permissions().await?;
         if let Some(mut handle) = self.handle.take()
             && handle.stop().is_ok()
@@ -987,6 +1085,7 @@ impl Driver {
     async fn fail(&mut self, message: String) -> Result<()> {
         self.drop_agent();
         self.abort_attaching();
+        self.abort_shipping();
         self.preparation = None;
         self.in_turn = false;
         self.interrupted = false;
@@ -1298,10 +1397,239 @@ impl Driver {
                 }
             }
             EventBody::RepoAttached { repo } => self.repos.push(repo.clone()),
+            EventBody::PullRequestOpened { pull_request }
+            | EventBody::PullRequestUpdated { pull_request } => {
+                let same_repo = |known: &&mut PullRequest| {
+                    known.session_repo_id == pull_request.session_repo_id
+                };
+                match self.pull_requests.iter_mut().find(same_repo) {
+                    Some(known) => *known = pull_request.clone(),
+                    None => self.pull_requests.push(pull_request.clone()),
+                }
+            }
             _ => {}
         }
         Ok(event)
     }
+
+    /// Starts delivering the session in the background (the "Shipping"
+    /// semantics in `calin-proto/src/api.rs`). The caller is answered at
+    /// once; what happens shows as events.
+    fn begin_ship(
+        &mut self,
+        title: Option<String>,
+        body: Option<String>,
+        draft: bool,
+    ) -> Result<()> {
+        if !ships(self.status) || self.in_turn || self.preparation.is_some() {
+            return Err(no_shipping(self.status));
+        }
+        if self.shipping.is_some() {
+            return Err(Error::Conflict(
+                "the session is already being shipped; wait for that to finish".to_owned(),
+            ));
+        }
+        let known = |repo: &SessionRepo| {
+            let its = |pull_request: &&PullRequest| pull_request.session_repo_id == repo.id;
+            self.pull_requests.iter().find(its).cloned()
+        };
+        let plan = ShipPlan {
+            session_id: self.session_id.clone(),
+            title: title.unwrap_or_else(|| one_line(&self.title)),
+            body,
+            draft,
+            dry_run: self.inner.registry.dry_run(),
+            github: self.inner.github.clone(),
+            store: self.inner.store.clone(),
+            repos: self
+                .repos
+                .iter()
+                .map(|repo| (repo.clone(), known(repo)))
+                .collect(),
+        };
+        let (results, receiver) = mpsc::channel(8);
+        let cancel = Arc::new(AtomicBool::new(false));
+        tokio::spawn(delivery::ship(plan, results, Arc::clone(&cancel)));
+        self.shipping = Some(Shipping {
+            results: receiver,
+            cancel,
+            delivered: false,
+        });
+        Ok(())
+    }
+
+    async fn on_shipped(&mut self, shipped: Option<Shipped>) -> Result<()> {
+        if let Some(shipped) = shipped {
+            return self.record_shipped(shipped).await;
+        }
+        // Every repo was attempted.
+        let Some(shipping) = self.shipping.take() else {
+            return Ok(());
+        };
+        // Without a pull request the session stays where it was, with the
+        // reasons in its log.
+        if shipping.delivered && self.status == SessionStatus::Review {
+            self.settle(SessionStatus::Shipping).await?;
+        }
+        // Messages sent meanwhile waited for the worktrees to be left alone.
+        self.run_pending().await
+    }
+
+    /// Appends what one step of a ship did. Its cause is the user's
+    /// request, which is no event, so these have no parent.
+    async fn record_shipped(&mut self, shipped: Shipped) -> Result<()> {
+        let body = match shipped {
+            Shipped::Opened(pull_request) => EventBody::PullRequestOpened { pull_request },
+            Shipped::Updated(pull_request) => EventBody::PullRequestUpdated { pull_request },
+            Shipped::Kept => {
+                if let Some(shipping) = &mut self.shipping {
+                    shipping.delivered = true;
+                }
+                return Ok(());
+            }
+            // A repo that fails does not fail the session: the others carry on.
+            Shipped::Failed(message) => {
+                self.append(EventDraft::new(EventBody::Error { message }))
+                    .await?;
+                return Ok(());
+            }
+        };
+        if let Some(shipping) = &mut self.shipping {
+            shipping.delivered = true;
+        }
+        self.append(EventDraft::new(body)).await?;
+        Ok(())
+    }
+
+    /// Ends the ship in progress between two of its steps. What it already
+    /// did stays done; what it still reports is dropped.
+    fn abort_shipping(&mut self) {
+        if let Some(shipping) = self.shipping.take() {
+            shipping.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Starts a look at the session's pull requests (the "While `shipping`"
+    /// semantics in `calin-proto/src/api.rs`). `reply` is answered once what
+    /// the look saw is on record.
+    async fn begin_poll(&mut self, reply: Reply) -> Result<()> {
+        if let Some(polling) = &mut self.polling {
+            polling.waiting.push(reply);
+            return Ok(());
+        }
+        // Not watched: any other status, a dry run (its pull requests are
+        // made up), and a ship in progress, which reads them itself.
+        let watched = self.status == SessionStatus::Shipping
+            && self.shipping.is_none()
+            && !self.inner.registry.dry_run();
+        if !watched {
+            let _ = reply.send(Ok(()));
+            return Ok(());
+        }
+        // A merged pull request stays merged; a closed one can be reopened.
+        let targets: Vec<(SessionRepo, PullRequest)> = self
+            .pull_requests
+            .iter()
+            .filter(|pull_request| pull_request.state != PullRequestState::Merged)
+            .filter_map(|pull_request| {
+                let repo = self
+                    .repos
+                    .iter()
+                    .find(|repo| repo.id == pull_request.session_repo_id)?;
+                Some((repo.clone(), pull_request.clone()))
+            })
+            .collect();
+        if targets.is_empty() {
+            let result = self.finish_when_delivered().await;
+            let _ = reply.send(Ok(()));
+            return result;
+        }
+        let (done, observed) = oneshot::channel();
+        let (session_id, github) = (self.session_id.clone(), self.inner.github.clone());
+        tokio::spawn(async move {
+            // The driver may be gone by then; nobody is left to tell.
+            let _ = done.send(delivery::poll(session_id, github, targets).await);
+        });
+        self.polling = Some(Polling {
+            observed,
+            waiting: vec![reply],
+        });
+        Ok(())
+    }
+
+    /// Records the pull requests that are not as they were on record.
+    async fn on_polled(&mut self, observed: Vec<PullRequest>) -> Result<()> {
+        for now in observed {
+            let on_record = self.pull_requests.iter().find(|known| {
+                known.session_repo_id == now.session_repo_id && known.number == now.number
+            });
+            // No longer the repo's pull request: a ship replaced it meanwhile.
+            let Some(known) = on_record else {
+                continue;
+            };
+            if !delivery::same(known, &now) {
+                let updated = EventBody::PullRequestUpdated { pull_request: now };
+                self.append(EventDraft::new(updated)).await?;
+            }
+        }
+        let result = self.finish_when_delivered().await;
+        self.end_polling(Ok(()));
+        result
+    }
+
+    /// Answers everyone who waits for the look in progress, and forgets it.
+    fn end_polling(&mut self, result: Result<()>) {
+        if let Some(polling) = self.polling.take() {
+            for reply in polling.waiting {
+                let answer = match &result {
+                    Ok(()) => Ok(()),
+                    Err(_) => Err(no_longer_active()),
+                };
+                let _ = reply.send(answer);
+            }
+        }
+    }
+
+    /// A `shipping` session whose pull requests are all merged or closed is
+    /// `done`. Not while a ship is still at work on them.
+    async fn finish_when_delivered(&mut self) -> Result<()> {
+        let over = |pull_request: &PullRequest| {
+            matches!(
+                pull_request.state,
+                PullRequestState::Merged | PullRequestState::Closed
+            )
+        };
+        let delivered = self.status == SessionStatus::Shipping
+            && self.shipping.is_none()
+            && !self.pull_requests.is_empty()
+            && self.pull_requests.iter().all(over);
+        if !delivered {
+            return Ok(());
+        }
+        // A done session takes no more messages: its agent, idle since the
+        // last turn, has nothing left to wait for.
+        self.drop_agent();
+        self.set_agent_status(AgentStatus::Done).await?;
+        self.settle(SessionStatus::Done).await
+    }
+
+    /// A status the session reaches through delivery: nothing the user
+    /// said caused it, so it has no parent.
+    async fn settle(&mut self, status: SessionStatus) -> Result<()> {
+        let body = EventBody::SessionStatus {
+            status,
+            reason: None,
+        };
+        self.append(EventDraft::new(body)).await?;
+        Ok(())
+    }
+}
+
+/// The first line of a session's title that says something: what a commit
+/// and a pull request are called when the ship request names nothing.
+fn one_line(title: &str) -> String {
+    let line = title.lines().map(str::trim).find(|line| !line.is_empty());
+    line.unwrap_or("Calin session").to_owned()
 }
 
 /// Makes the repos ready one after the other and reports each step. Ends at

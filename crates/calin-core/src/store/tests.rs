@@ -3,9 +3,9 @@ use std::io::Write;
 use std::time::Duration;
 
 use calin_proto::{
-    Agent, AgentKind, AgentStatus, AttachRepoRequest, DecisionSource, Event, EventBody, FileOp,
-    PermissionDecision, PermissionMode, PermissionRequest, RepoMode, SessionRepo, SessionStatus,
-    ToolKind,
+    Agent, AgentKind, AgentStatus, AttachRepoRequest, CheckState, DecisionSource, Event, EventBody,
+    FileOp, PermissionDecision, PermissionMode, PermissionRequest, PullRequest, PullRequestState,
+    RepoMode, ReviewState, SessionRepo, SessionStatus, ToolKind,
 };
 use tempfile::TempDir;
 use tokio::task::JoinSet;
@@ -719,6 +719,129 @@ async fn what_a_session_was_created_with_survives_a_reindex() {
     assert_eq!(
         again.setup(&plain.id).await.unwrap(),
         SessionSetup::default()
+    );
+}
+
+fn pull_request(session_repo_id: &str, number: u32, state: PullRequestState) -> PullRequest {
+    PullRequest {
+        session_repo_id: session_repo_id.to_owned(),
+        number,
+        url: format!("https://example.invalid/x/pull/{number}"),
+        title: "Add the thing".to_owned(),
+        state,
+        checks: CheckState::None,
+        review: ReviewState::None,
+        updated_at: 1_000 + i64::from(number),
+    }
+}
+
+#[tokio::test]
+async fn pull_requests_are_projected_per_repo_and_survive_a_reindex() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir).await;
+    let session = store.create_session(new_session("ship")).await.unwrap();
+    let other = store.create_session(new_session("other")).await.unwrap();
+    let id = session.id.as_str();
+    let (api, web, docs) = (
+        session_repo(id, "api", true),
+        session_repo(id, "web", false),
+        session_repo(id, "docs", false),
+    );
+    let elsewhere = session_repo(&other.id, "api", true);
+    let append = async |session_id: &str, body: EventBody| {
+        store
+            .append(session_id, EventDraft::new(body))
+            .await
+            .unwrap();
+    };
+    for repo in [&api, &web, &docs] {
+        append(id, EventBody::RepoAttached { repo: repo.clone() }).await;
+    }
+    let attached = EventBody::RepoAttached {
+        repo: elsewhere.clone(),
+    };
+    append(&other.id, attached).await;
+    assert!(store.session(id).await.unwrap().pull_requests.is_empty());
+
+    // Opened in another order than the repos were attached in.
+    let opened = |pull_request: PullRequest| EventBody::PullRequestOpened { pull_request };
+    let updated = |pull_request: PullRequest| EventBody::PullRequestUpdated { pull_request };
+    append(
+        id,
+        opened(pull_request(&docs.id, 7, PullRequestState::Draft)),
+    )
+    .await;
+    append(
+        id,
+        opened(pull_request(&api.id, 3, PullRequestState::Draft)),
+    )
+    .await;
+    append(
+        &other.id,
+        opened(pull_request(&elsewhere.id, 5, PullRequestState::Open)),
+    )
+    .await;
+    // An update replaces the whole value; so does a newer pull request for the same repo.
+    let approved = PullRequest {
+        state: PullRequestState::Open,
+        checks: CheckState::Passing,
+        review: ReviewState::Approved,
+        title: "Renamed on GitHub".to_owned(),
+        updated_at: 9_000,
+        ..pull_request(&api.id, 3, PullRequestState::Draft)
+    };
+    append(id, updated(approved.clone())).await;
+    append(
+        id,
+        opened(pull_request(&docs.id, 8, PullRequestState::Open)),
+    )
+    .await;
+    // An update for a repo that has none on record yet still counts.
+    append(
+        id,
+        updated(pull_request(&web.id, 4, PullRequestState::Merged)),
+    )
+    .await;
+
+    let expected = vec![
+        approved,
+        pull_request(&web.id, 4, PullRequestState::Merged),
+        pull_request(&docs.id, 8, PullRequestState::Open),
+    ];
+    let detail = store.session(id).await.unwrap();
+    assert_eq!(detail.pull_requests, expected);
+    assert_eq!(
+        store.session(&other.id).await.unwrap().pull_requests,
+        [pull_request(&elsewhere.id, 5, PullRequestState::Open)]
+    );
+    // Numbers are counted per repo across sessions, among URLs that match.
+    let last = async |store: &Store, repo_id: &str, prefix: &str| {
+        store
+            .last_pull_request_number(repo_id, prefix)
+            .await
+            .unwrap()
+    };
+    assert_eq!(
+        last(&store, "repo-api", "https://example.invalid/").await,
+        5
+    );
+    assert_eq!(
+        last(&store, "repo-docs", "https://example.invalid/").await,
+        8
+    );
+    assert_eq!(last(&store, "repo-api", "https://github.com/").await, 0);
+    assert_eq!(
+        last(&store, "repo-none", "https://example.invalid/").await,
+        0
+    );
+
+    store.close().await;
+    std::fs::remove_file(store.home().db_path()).unwrap();
+    let reopened = open(&dir).await;
+    assert_eq!(reopened.session(id).await.unwrap(), detail);
+    assert_eq!(
+        last(&reopened, "repo-api", "https://example.invalid/").await,
+        5
     );
 }
 

@@ -3,14 +3,10 @@
 use std::fs;
 use std::path::Path;
 
-use crate::cmd::{Git, work_dir};
+use crate::cmd::{Git, no_ssh_prompt, work_dir};
 use crate::error::{Error, Result};
 use crate::path::absolutize;
 use crate::repo::{CloneInfo, inspect_clone};
-
-/// Keeps ssh from asking for a passphrase or a host key on the server's
-/// terminal: a clone nobody watches must fail instead of waiting.
-const SSH_NO_PROMPT: &str = "ssh -oBatchMode=yes";
 
 /// Clones `url` into `dest`, which must be absolute and must not exist yet.
 /// Missing parent directories are created.
@@ -37,13 +33,8 @@ pub fn clone_repo(url: &str, dest: &Path) -> Result<CloneInfo> {
     fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
     let parent = work_dir(parent)?;
 
-    let mut clone = Git::write(&parent);
-    // A user who configured their own ssh command knows what it may ask.
-    if std::env::var_os("GIT_SSH_COMMAND").is_none() {
-        clone = clone.env("GIT_SSH_COMMAND", SSH_NO_PROMPT);
-    }
     // `--`: a URL that starts with a hyphen is still a URL, not an option.
-    let cloned = clone
+    let cloned = no_ssh_prompt(Git::write(&parent))
         .args(["clone", "--quiet", "--"])
         .arg(url)
         .arg(&dest)

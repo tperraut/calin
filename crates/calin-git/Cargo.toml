@@ -7,6 +7,8 @@ rust-version.workspace = true
 
 [dependencies]
 calin-proto = { version = "0.0.1", path = "../calin-proto" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
 sha2 = "0.11.2"
 thiserror = "2.0.21"
 

@@ -43,6 +43,7 @@ login is needed. The server only listens on loopback addresses until sign-in exi
 | `CALIN_DRY_RUN=1` | Run every agent on the built-in mock runner. |
 | `CALIN_MOCK_DELAY_MS` | Delay between the mock runner's chunks. Default 40. |
 | `CALIN_CLAUDE_BIN` | Path of the Claude Code CLI. Default `claude` on `PATH`. When it runs, `claude` is the default runner; without it sessions run on the mock runner. |
+| `CALIN_GH_BIN` | Path of the GitHub CLI, which opens and watches pull requests with your `gh` login. Default `gh` on `PATH`. Never run in dry run, where pull requests are made up. |
 | `CALIN_LOG` | Log filter, for example `debug` or `calin_core=trace`. Default `info`. |
 | `CLAUDE_CODE_ENABLE_TODO_TOOLS=1` | Not Calin's own: it is passed on to Claude Code, which then offers its task tools to every model. A session shows the agent's plan only when the agent has those tools. |
 

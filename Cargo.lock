@@ -220,6 +220,8 @@ version = "0.0.1"
 dependencies = [
  "calin-proto",
  "rustix",
+ "serde",
+ "serde_json",
  "sha2",
  "tempfile",
  "thiserror",

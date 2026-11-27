@@ -107,6 +107,11 @@ pub fn router(state: AppState) -> Router {
             post(api::resolve_permission),
         )
         .route("/sessions/{id}/repos", post(api::attach_repo))
+        .route("/sessions/{id}/ship", post(api::ship_session))
+        .route(
+            "/sessions/{id}/pull-requests/refresh",
+            post(api::refresh_pull_requests),
+        )
         .route("/sessions/{id}/changes", get(api::session_changes))
         .route(
             "/sessions/{id}/repos/{session_repo_id}/diff",

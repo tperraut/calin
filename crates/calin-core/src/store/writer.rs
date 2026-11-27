@@ -79,6 +79,11 @@ pub(super) enum Cmd {
         session_id: Option<String>,
         reply: Reply<Vec<OpenPermission>>,
     },
+    LastPullRequestNumber {
+        repo_id: String,
+        url_prefix: String,
+        reply: Reply<u32>,
+    },
     /// Sent by the store's timer when a delayed upsert is due.
     FlushUpserts,
     Close {
@@ -220,6 +225,17 @@ impl Writer {
                 }
                 Cmd::OpenPermissions { session_id, reply } => {
                     let _ = reply.send(index::open_permissions(&self.db, session_id.as_deref()));
+                }
+                Cmd::LastPullRequestNumber {
+                    repo_id,
+                    url_prefix,
+                    reply,
+                } => {
+                    let _ = reply.send(index::last_pull_request_number(
+                        &self.db,
+                        &repo_id,
+                        &url_prefix,
+                    ));
                 }
                 Cmd::FlushUpserts => self.flush_upserts(),
                 Cmd::Close { reply } => {
@@ -420,10 +436,12 @@ impl Writer {
             .ok_or_else(|| Error::NotFound(session_id.to_owned()))?;
         let agents = index::agents(&self.db, session_id)?;
         let repos = index::session_repos(&self.db, session_id)?;
+        let pull_requests = index::pull_requests(&self.db, session_id)?;
         Ok(SessionDetail {
             session,
             agents,
             repos,
+            pull_requests,
         })
     }
 

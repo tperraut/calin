@@ -1007,6 +1007,7 @@ async fn with_setup(setup: &str) -> (Fixture, TempDir, Repo) {
     let dir = TempDir::new().unwrap();
     let config = ManagerConfig {
         setup_limit: Duration::from_millis(400),
+        ..config()
     };
     let (manager, starts) = manager_with(&dir, false, config).await;
     let clones = TempDir::new().unwrap();

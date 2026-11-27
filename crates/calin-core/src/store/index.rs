@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use calin_proto::{Agent, Event, EventBody, Session, SessionRepo};
+use calin_proto::{Agent, Event, EventBody, PullRequest, Session, SessionRepo};
 use rusqlite::types::Type;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::Serialize;
@@ -14,7 +14,7 @@ use crate::error::Result;
 
 /// Bumped when the tables change. A database with another version is
 /// dropped and rebuilt from the logs, so there are no migrations to write.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 const SCHEMA: &str = "
 CREATE TABLE sessions (
@@ -91,10 +91,26 @@ CREATE TABLE permissions (
     PRIMARY KEY (session_id, request_id)
 ) WITHOUT ROWID;
 CREATE INDEX permissions_open ON permissions (resolved, session_id);
+
+-- The pull request of each repo of a session, as last recorded: one per
+-- session repo, replaced when a newer event describes it.
+CREATE TABLE pull_requests (
+    session_repo_id TEXT PRIMARY KEY,
+    session_id      TEXT NOT NULL,
+    number          INTEGER NOT NULL,
+    url             TEXT NOT NULL,
+    title           TEXT NOT NULL,
+    state           TEXT NOT NULL,
+    checks          TEXT NOT NULL,
+    review          TEXT NOT NULL,
+    updated_at      INTEGER NOT NULL
+) WITHOUT ROWID;
+CREATE INDEX pull_requests_by_session ON pull_requests (session_id);
 ";
 
 /// Every table, for dropping a database of another schema version.
-const TABLES: [&str; 5] = [
+const TABLES: [&str; 6] = [
+    "pull_requests",
     "permissions",
     "session_repos",
     "events",
@@ -103,7 +119,13 @@ const TABLES: [&str; 5] = [
 ];
 
 /// The tables that hold what a session's events projected, keyed by `session_id`.
-const PROJECTIONS: [&str; 4] = ["permissions", "session_repos", "events", "agents"];
+const PROJECTIONS: [&str; 5] = [
+    "pull_requests",
+    "permissions",
+    "session_repos",
+    "events",
+    "agents",
+];
 
 const SESSION_COLUMNS: &str = "id, title, prompt, status, runner, branch, parent_session_id, \
      root_session_id, head_seq, created_at, updated_at, permission_mode";
@@ -252,6 +274,48 @@ pub(super) fn session_repos(db: &Connection, session_id: &str) -> Result<Vec<Ses
         .query_map([session_id], repo_from_row)?
         .collect::<rusqlite::Result<_>>()?;
     Ok(repos)
+}
+
+/// The session's pull requests, in the order of its repo set.
+pub(super) fn pull_requests(db: &Connection, session_id: &str) -> Result<Vec<PullRequest>> {
+    let mut statement = db.prepare_cached(
+        "SELECT p.session_repo_id, p.number, p.url, p.title, p.state, p.checks, p.review, \
+         p.updated_at FROM pull_requests p \
+         LEFT JOIN session_repos r ON r.id = p.session_repo_id \
+         WHERE p.session_id = ?1 \
+         ORDER BY r.attached_seq IS NULL, r.attached_seq, p.session_repo_id",
+    )?;
+    let pull_requests = statement
+        .query_map([session_id], |row| {
+            Ok(PullRequest {
+                session_repo_id: row.get(0)?,
+                number: row.get(1)?,
+                url: row.get(2)?,
+                title: row.get(3)?,
+                state: from_wire_name(row, 4)?,
+                checks: from_wire_name(row, 5)?,
+                review: from_wire_name(row, 6)?,
+                updated_at: row.get(7)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(pull_requests)
+}
+
+/// The highest number among the pull requests recorded for `repo_id`, in any
+/// session, whose URL starts with `url_prefix`. 0 when there is none.
+pub(super) fn last_pull_request_number(
+    db: &Connection,
+    repo_id: &str,
+    url_prefix: &str,
+) -> Result<u32> {
+    Ok(db
+        .prepare_cached(
+            "SELECT COALESCE(MAX(p.number), 0) FROM pull_requests p \
+             JOIN session_repos r ON r.id = p.session_repo_id \
+             WHERE r.repo_id = ?1 AND substr(p.url, 1, length(?2)) = ?2",
+        )?
+        .query_row([repo_id, url_prefix], |row| row.get(0))?)
 }
 
 /// True when the repo is attached to a session that may still work in it.
@@ -445,6 +509,26 @@ pub(super) fn index_event(db: &Connection, event: &Event, offset: u64, end: u64)
                 ])?;
             }
         }
+        // Opened or updated, the event carries the whole value: the newest wins.
+        EventBody::PullRequestOpened { pull_request }
+        | EventBody::PullRequestUpdated { pull_request } => {
+            db.prepare_cached(
+                "INSERT OR REPLACE INTO pull_requests (session_repo_id, session_id, number, \
+                 url, title, state, checks, review, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )?
+            .execute(params![
+                pull_request.session_repo_id,
+                event.session_id,
+                pull_request.number,
+                pull_request.url,
+                pull_request.title,
+                wire_name(&pull_request.state)?,
+                wire_name(&pull_request.checks)?,
+                wire_name(&pull_request.review)?,
+                pull_request.updated_at,
+            ])?;
+        }
         EventBody::UserMessage { .. }
         | EventBody::ItemStarted { .. }
         | EventBody::ItemDelta { .. }
@@ -483,6 +567,8 @@ fn kind(body: &EventBody) -> &'static str {
         EventBody::PermissionRequested { .. } => "permission_requested",
         EventBody::PermissionResolved { .. } => "permission_resolved",
         EventBody::FileChanged { .. } => "file_changed",
+        EventBody::PullRequestOpened { .. } => "pull_request_opened",
+        EventBody::PullRequestUpdated { .. } => "pull_request_updated",
         EventBody::Error { .. } => "error",
     }
 }
@@ -566,6 +652,19 @@ mod tests {
         assert_eq!(wire_name(&AgentStatus::Idle).unwrap(), "idle");
     }
 
+    fn pull_request() -> PullRequest {
+        PullRequest {
+            session_repo_id: "r".into(),
+            number: 1,
+            url: "https://example.invalid/x/pull/1".into(),
+            title: "t".into(),
+            state: calin_proto::PullRequestState::Draft,
+            checks: calin_proto::CheckState::None,
+            review: calin_proto::ReviewState::None,
+            updated_at: 0,
+        }
+    }
+
     #[test]
     fn the_kind_column_matches_the_wire_tag() {
         let bodies = [
@@ -596,6 +695,12 @@ mod tests {
                 session_repo_id: None,
                 path: "/x".into(),
                 op: calin_proto::FileOp::Edit,
+            },
+            EventBody::PullRequestOpened {
+                pull_request: pull_request(),
+            },
+            EventBody::PullRequestUpdated {
+                pull_request: pull_request(),
             },
         ];
         for body in bodies {

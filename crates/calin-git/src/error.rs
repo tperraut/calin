@@ -23,12 +23,13 @@ pub enum Error {
     #[error("{} is not the root of a git work tree: {reason}", path.display())]
     NotARepository { path: PathBuf, reason: String },
 
-    /// `git` ran and failed for a reason none of the variants above covers. 500.
+    /// `git` (or `gh`) ran and failed for a reason none of the variants above
+    /// covers, or answered with something that makes no sense. 500.
     #[error("`{command}` failed: {stderr}")]
     Git {
         /// The command line, for logs.
         command: String,
-        /// Trimmed standard error, or the exit status when git printed nothing.
+        /// Trimmed standard error, or the exit status when nothing was printed.
         stderr: String,
     },
 

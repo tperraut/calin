@@ -149,7 +149,9 @@ async fn state_reopened(dir: &TempDir) -> AppState {
         dry_run: true,
         ..RegistryConfig::default()
     });
-    let manager = SessionManager::start(store, registry).await.unwrap();
+    let manager = SessionManager::start_with(store, registry, config())
+        .await
+        .unwrap();
     AppState::new(manager).with_assets(Assets::empty())
 }
 
@@ -599,7 +601,9 @@ async fn capturing_state(dir: &TempDir) -> (AppState, Starts) {
     });
     let (starts, started) = mpsc::unbounded_channel();
     registry.register(Arc::new(Capture { starts }));
-    let manager = SessionManager::start(store, registry).await.unwrap();
+    let manager = SessionManager::start_with(store, registry, config())
+        .await
+        .unwrap();
     (AppState::new(manager).with_assets(Assets::empty()), started)
 }
 

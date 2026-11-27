@@ -7,7 +7,7 @@ use axum::body::Body;
 use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, HOST, ORIGIN};
 use axum::http::{HeaderMap, Method, Request, StatusCode};
 use calin_agents::{ClaudeConfig, MockConfig, RegistryConfig, RunnerRegistry};
-use calin_core::{EventDraft, Home, MAX_FILE_BYTES, SessionManager, Store};
+use calin_core::{EventDraft, Home, MAX_FILE_BYTES, ManagerConfig, SessionManager, Store};
 use calin_proto::{
     ApiError, ChangeStatus, ClientMsg, CreateSessionRequest, DecisionSource, EntryKind, Event,
     EventBody, FileContent, FileDiff, FileOp, Health, PermissionDecision, PermissionMode,
@@ -29,6 +29,7 @@ use tower::ServiceExt;
 use super::*;
 
 mod catalog;
+mod delivery;
 
 const TIMEOUT: Duration = Duration::from_secs(20);
 const LOCAL: &str = "127.0.0.1:4680";
@@ -47,6 +48,15 @@ async fn state(dir: &TempDir, dry_run: bool) -> AppState {
 }
 
 async fn state_with(dir: &TempDir, dry_run: bool, claude: Option<ClaudeConfig>) -> AppState {
+    state_on(dir, dry_run, claude, config()).await
+}
+
+async fn state_on(
+    dir: &TempDir,
+    dry_run: bool,
+    claude: Option<ClaudeConfig>,
+    config: ManagerConfig,
+) -> AppState {
     let store = Store::open(Home::new(dir.path())).await.unwrap();
     let registry = RunnerRegistry::new(RegistryConfig {
         dry_run,
@@ -55,10 +65,21 @@ async fn state_with(dir: &TempDir, dry_run: bool, claude: Option<ClaudeConfig>) 
         },
         claude,
     });
-    let manager = SessionManager::start(store, registry).await.unwrap();
+    let manager = SessionManager::start_with(store, registry, config)
+        .await
+        .unwrap();
     AppState::new(manager)
         .with_assets(Assets::empty())
         .with_terminal_command("/bin/sh", [] as [&str; 0])
+}
+
+/// The defaults, except that the GitHub CLI is one that does not exist: no
+/// test may run the one this machine has.
+fn config() -> ManagerConfig {
+    ManagerConfig {
+        gh_bin: PathBuf::from("/nonexistent/calin/gh"),
+        ..ManagerConfig::default()
+    }
 }
 
 struct Reply {
@@ -295,6 +316,7 @@ async fn health_reports_version_dry_run_and_runners() {
             version: env!("CARGO_PKG_VERSION").to_owned(),
             dry_run: true,
             runners: vec!["mock".to_owned()],
+            github_problem: None,
         }
     );
 

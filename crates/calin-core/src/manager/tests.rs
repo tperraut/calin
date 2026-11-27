@@ -19,6 +19,7 @@ use crate::home::Home;
 use crate::testing::{git, git_repo, write_file};
 
 mod attach;
+mod shipping;
 
 const TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -77,8 +78,17 @@ fn registry(dry_run: bool) -> (RunnerRegistry, Starts) {
     (registry, started)
 }
 
+/// The defaults, except that the GitHub CLI is one that does not exist: no
+/// test may run the one this machine has.
+fn config() -> ManagerConfig {
+    ManagerConfig {
+        gh_bin: PathBuf::from("/nonexistent/calin/gh"),
+        ..ManagerConfig::default()
+    }
+}
+
 async fn manager_in(dir: &TempDir, dry_run: bool) -> (SessionManager, Starts) {
-    manager_with(dir, dry_run, ManagerConfig::default()).await
+    manager_with(dir, dry_run, config()).await
 }
 
 async fn manager_with(
@@ -208,6 +218,12 @@ fn label(event: &Event) -> String {
         ),
         EventBody::FileChanged { op, .. } => {
             format!("file_changed:{}", format!("{op:?}").to_lowercase())
+        }
+        EventBody::PullRequestOpened { pull_request } => {
+            format!("pull_request_opened:{}", pull_request.url)
+        }
+        EventBody::PullRequestUpdated { pull_request } => {
+            format!("pull_request_updated:{}", pull_request.url)
         }
     }
 }

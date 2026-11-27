@@ -7,20 +7,24 @@
 //! one step at a time, so the order of a session's events never depends on a
 //! race.
 
+mod delivery;
 mod driver;
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::time::{Duration, Instant};
 
 use calin_agents::{Runner, RunnerRegistry};
+use calin_git::GitHub;
 use calin_proto::{
     AgentStatus, AttachRepoRequest, CreateSessionRequest, DecisionSource, EventBody,
     PermissionDecision, RegisterRepoRequest, Repo, RepoMode, RepoSet, Session, SessionDetail,
-    SessionRepo, SessionStatus, Settings,
+    SessionRepo, SessionStatus, Settings, ShipRequest,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
+use tokio::time::MissedTickBehavior;
 
 use self::driver::Driver;
 use crate::error::{Error, Result};
@@ -33,6 +37,17 @@ use crate::tokens::{AgentRef, Tokens};
 /// How long the setup command of a new worktree may run (the task of a
 /// dependency install, not of a build farm).
 const SETUP_LIMIT: Duration = Duration::from_secs(10 * 60);
+
+/// The GitHub CLI, found on `PATH`.
+const GH_BIN: &str = "gh";
+/// One call to GitHub through `gh`: a round trip or two, never a transfer.
+const GH_TIMEOUT: Duration = Duration::from_secs(60);
+/// How often the pull requests of a `shipping` session are looked at. A
+/// merge or a finished check shows within the minute, at one `gh` call per
+/// pull request.
+const PULL_REQUEST_POLL: Duration = Duration::from_secs(60);
+/// How long an answer about `gh` (is it there, is it signed in) is trusted.
+const GITHUB_STATUS_TTL: Duration = Duration::from_secs(60);
 
 const RESTART_REASON: &str = "server restarted";
 /// Recorded with a request that nobody answered while it could be answered.
@@ -59,12 +74,22 @@ pub struct ManagerConfig {
     /// How long the setup command of a new worktree may run before it is
     /// stopped and counted as failed.
     pub setup_limit: Duration,
+    /// The GitHub CLI that opens and reads pull requests: a name looked up
+    /// on `PATH`, or a path. Never run in dry run.
+    pub gh_bin: PathBuf,
+    /// How long one invocation of it may take before it is killed.
+    pub gh_timeout: Duration,
+    /// How often the pull requests of a `shipping` session are looked at.
+    pub pull_request_poll: Duration,
 }
 
 impl Default for ManagerConfig {
     fn default() -> Self {
         Self {
             setup_limit: SETUP_LIMIT,
+            gh_bin: PathBuf::from(GH_BIN),
+            gh_timeout: GH_TIMEOUT,
+            pull_request_poll: PULL_REQUEST_POLL,
         }
     }
 }
@@ -83,6 +108,14 @@ struct Inner {
     repos: Arc<RepoRegistry>,
     settings: SettingsStore,
     config: ManagerConfig,
+    /// How `gh` is run, from the config.
+    github: GitHub,
+    /// Why GitHub could not be used when that was last checked (`None` in
+    /// the pair when it could), and when. Held while checking, so that a
+    /// burst of requests asks `gh` once.
+    github_status: tokio::sync::Mutex<Option<(Instant, Option<String>)>>,
+    /// Looks at the pull requests of `shipping` sessions. `None` in dry run.
+    watcher: Mutex<Option<JoinHandle<()>>>,
     tokens: Arc<Tokens>,
     /// Where agents reach Calin's tools, without the token: known once the
     /// server has bound its port. Until then agents start without tools.
@@ -104,6 +137,31 @@ impl Inner {
         // One read or one write of the value per critical section.
         let endpoint = self.tool_endpoint.lock();
         endpoint.unwrap_or_else(PoisonError::into_inner).clone()
+    }
+
+    /// Why pull requests cannot be opened from this server, or `None` when
+    /// they can. Dry run never uses GitHub, so it has no problem with it.
+    /// The answer is remembered for a minute; with `recheck`, a remembered
+    /// problem is asked about again, so that fixing it works at once.
+    async fn github_problem(&self, recheck: bool) -> Option<String> {
+        if self.registry.dry_run() {
+            return None;
+        }
+        let mut status = self.github_status.lock().await;
+        if let Some((at, problem)) = &*status {
+            let stale = at.elapsed() >= GITHUB_STATUS_TTL || (recheck && problem.is_some());
+            if !stale {
+                return problem.clone();
+            }
+        }
+        let github = self.github.clone();
+        let problem = match tokio::task::spawn_blocking(move || github.status()).await {
+            Ok(Ok(())) => None,
+            Ok(Err(reason)) => Some(reason),
+            Err(err) => Some(format!("the GitHub CLI could not be checked: {err}")),
+        };
+        *status = Some((Instant::now(), problem.clone()));
+        problem
     }
 }
 
@@ -139,6 +197,19 @@ enum Command {
         agent_id: Option<String>,
         reply: Reply<SessionRepo>,
     },
+    /// Commit, push and open or update the session's pull requests. The
+    /// answer comes as soon as that is under way.
+    Ship {
+        title: Option<String>,
+        body: Option<String>,
+        draft: bool,
+        reply: Reply,
+    },
+    /// Look at the session's pull requests on GitHub and record what
+    /// changed. The answer comes once that is done.
+    Poll {
+        reply: Reply,
+    },
 }
 
 impl Command {
@@ -154,6 +225,8 @@ impl Command {
             Self::Message { reply, .. }
             | Self::Interrupt { reply }
             | Self::Stop { reply }
+            | Self::Ship { reply, .. }
+            | Self::Poll { reply }
             | Self::Permission { reply, .. } => {
                 let _ = reply.send(Err(err));
             }
@@ -180,6 +253,7 @@ impl SessionManager {
         if let Err(err) = repos.refresh(&settings.get().await).await {
             tracing::warn!(%err, "could not scan for repos; listing the registered ones only");
         }
+        let github = GitHub::new(&config.gh_bin).with_timeout(config.gh_timeout);
         let manager = Self {
             inner: Arc::new(Inner {
                 store,
@@ -187,12 +261,22 @@ impl SessionManager {
                 repos,
                 settings,
                 config,
+                github,
+                github_status: tokio::sync::Mutex::new(None),
+                watcher: Mutex::new(None),
                 tokens: Arc::default(),
                 tool_endpoint: Mutex::new(None),
                 drivers: Mutex::new(HashMap::new()),
             }),
         };
         manager.recover().await?;
+        // Dry run has made-up pull requests: there is nothing to look at.
+        if !manager.inner.registry.dry_run() {
+            let every = manager.inner.config.pull_request_poll;
+            let watcher = tokio::spawn(watch(Arc::downgrade(&manager.inner), every));
+            let slot = manager.inner.watcher.lock();
+            *slot.unwrap_or_else(PoisonError::into_inner) = Some(watcher);
+        }
         Ok(manager)
     }
 
@@ -454,9 +538,95 @@ impl SessionManager {
         .await
     }
 
+    /// Why pull requests cannot be opened from this server (`gh` is missing
+    /// or not signed in), or `None` when they can. Always `None` in dry run.
+    /// Asks `gh` at most once a minute.
+    pub async fn github_problem(&self) -> Option<String> {
+        self.inner.github_problem(false).await
+    }
+
+    /// Delivers a session that is in `review` or `shipping`: commits what is
+    /// uncommitted in each `write` repo that differs from its base, pushes
+    /// the session's branch and opens a pull request per repo, or updates
+    /// the ones there are. Returns as soon as that is under way; every step
+    /// shows as an event (the semantics in `calin-proto/src/api.rs`).
+    ///
+    /// `Conflict` in any other status, while another ship of the session is
+    /// running, and with the reason when GitHub cannot be used. `Invalid`
+    /// for a title of more than one line.
+    pub async fn ship(&self, session_id: &str, request: ShipRequest) -> Result<()> {
+        let status = self.get(session_id).await?.session.status;
+        let title = request
+            .title
+            .map(|title| title.trim().to_owned())
+            .filter(|title| !title.is_empty());
+        // It becomes the subject of a commit and the title of a pull request.
+        if title
+            .as_ref()
+            .is_some_and(|title| title.contains(['\n', '\r']))
+        {
+            return Err(Error::Invalid("the title must be a single line".to_owned()));
+        }
+        if !ships(status) {
+            return Err(no_shipping(status));
+        }
+        if let Some(problem) = self.inner.github_problem(true).await {
+            return Err(Error::Conflict(format!(
+                "pull requests cannot be opened: {problem}"
+            )));
+        }
+        let (body, draft) = (request.body, request.draft.unwrap_or(true));
+        self.command(session_id, |reply| Command::Ship {
+            title,
+            body,
+            draft,
+            reply,
+        })
+        .await
+    }
+
+    /// Looks at the pull requests of a `shipping` session now instead of at
+    /// the next tick, in the background. `Conflict` in any other status.
+    pub async fn refresh_pull_requests(&self, session_id: &str) -> Result<()> {
+        let status = self.get(session_id).await?.session.status;
+        if status != SessionStatus::Shipping {
+            return Err(Error::Conflict(format!(
+                "pull requests are only watched while the session is shipping; it is {}",
+                status_name(status)
+            )));
+        }
+        let (manager, session_id) = (self.clone(), session_id.to_owned());
+        tokio::spawn(async move { manager.look_at_pull_requests(&session_id).await });
+        Ok(())
+    }
+
+    /// Looks at the session's pull requests on GitHub, records the ones
+    /// that changed, and ends the session as `done` once all of them are
+    /// merged or closed. Returns when that is on record. A session that is
+    /// not `shipping` is left alone, as is every session in dry run.
+    pub(crate) async fn poll_pull_requests(&self, session_id: &str) -> Result<()> {
+        self.command(session_id, |reply| Command::Poll { reply })
+            .await
+    }
+
+    /// [`Self::poll_pull_requests`] for callers with nobody to tell: a look
+    /// that fails is tried again at the next tick.
+    async fn look_at_pull_requests(&self, session_id: &str) {
+        if let Err(err) = self.poll_pull_requests(session_id).await {
+            tracing::warn!(session = %session_id, %err, "could not look at the session's pull requests");
+        }
+    }
+
     /// Ends every agent without recording anything, for a clean exit. The
     /// sessions that were running are failed by the recovery of the next start.
     pub async fn shutdown(&self) {
+        let watcher = {
+            let slot = self.inner.watcher.lock();
+            slot.unwrap_or_else(PoisonError::into_inner).take()
+        };
+        if let Some(watcher) = watcher {
+            watcher.abort();
+        }
         let drivers: Vec<DriverHandle> = self.inner.drivers().drain().map(|(_, d)| d).collect();
         for driver in drivers {
             // A driver ends, and drops its agent, when its command queue closes.
@@ -470,7 +640,7 @@ impl SessionManager {
         self.inner.store.sessions().await
     }
 
-    /// A session, its agents and its repo set.
+    /// A session, its agents, its repo set and its pull requests.
     pub async fn get(&self, session_id: &str) -> Result<SessionDetail> {
         self.inner.store.session(session_id).await
     }
@@ -572,6 +742,46 @@ impl SessionManager {
         }
         Ok(())
     }
+}
+
+/// Looks at the pull requests of every `shipping` session, at once and then
+/// every `every`: also the sessions that were shipping when the server was
+/// last stopped. Ends with the manager or its store.
+async fn watch(inner: Weak<Inner>, every: Duration) {
+    // An interval cannot be zero.
+    let mut ticks = tokio::time::interval(every.max(Duration::from_millis(1)));
+    // A slow round is followed by a full wait, not by a burst.
+    ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    loop {
+        ticks.tick().await;
+        let Some(inner) = inner.upgrade() else {
+            return;
+        };
+        let manager = SessionManager { inner };
+        let Ok(sessions) = manager.inner.store.sessions().await else {
+            return;
+        };
+        for session in sessions {
+            if session.status == SessionStatus::Shipping {
+                let manager = manager.clone();
+                // Each on its own: a slow `gh` for one session holds up no other.
+                tokio::spawn(async move { manager.look_at_pull_requests(&session.id).await });
+            }
+        }
+    }
+}
+
+/// True while the session can be delivered: its agent is done for now, and
+/// nothing says the work is over (the semantics in `calin-proto/src/api.rs`).
+fn ships(status: SessionStatus) -> bool {
+    matches!(status, SessionStatus::Review | SessionStatus::Shipping)
+}
+
+fn no_shipping(status: SessionStatus) -> Error {
+    Error::Conflict(format!(
+        "a session can only be shipped while it is in review or shipping; it is {}",
+        status_name(status)
+    ))
 }
 
 /// True once the session is over for good or until the user continues it.

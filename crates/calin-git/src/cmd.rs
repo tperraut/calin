@@ -199,6 +199,20 @@ impl Git {
     }
 }
 
+/// Keeps ssh from asking for a passphrase or a host key on the server's
+/// terminal: a clone or a push nobody watches must fail instead of waiting.
+const SSH_NO_PROMPT: &str = "ssh -oBatchMode=yes";
+
+/// Makes a command that talks to a remote fail where ssh would ask something.
+pub(crate) fn no_ssh_prompt(git: Git) -> Git {
+    // A user who configured their own ssh command knows what it may ask.
+    if std::env::var_os("GIT_SSH_COMMAND").is_some() {
+        git
+    } else {
+        git.env("GIT_SSH_COMMAND", SSH_NO_PROMPT)
+    }
+}
+
 /// A finished command.
 pub(crate) struct Done {
     pub(crate) status: ExitStatus,
