@@ -9,8 +9,9 @@
 use std::path::Path;
 
 use calin_proto::{
-    Agent, AgentKind, AgentMessage, AgentStatus, Event, EventBody, ItemContent, PullRequest,
-    Session, SessionRepo, SessionStatus,
+    Agent, AgentKind, AgentMessage, AgentStatus, Event, EventBody, ItemContent, NodePhase,
+    NodeRunState, PullRequest, Session, SessionRepo, SessionStatus, WorkflowEdge, WorkflowGraph,
+    WorkflowNodeRun, WorkflowRun, WorkflowStatus,
 };
 use rusqlite::types::Type;
 use rusqlite::{Connection, OptionalExtension, Row, params};
@@ -20,10 +21,11 @@ use serde::de::DeserializeOwned;
 use super::{OpenPermission, OpenQuestion};
 use crate::error::Result;
 use crate::title::excerpt;
+use crate::workflows::loop_max;
 
 /// Bumped when the tables change. A database with another version is
 /// dropped and rebuilt from the logs, so there are no migrations to write.
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 const SCHEMA: &str = "
 CREATE TABLE sessions (
@@ -33,6 +35,8 @@ CREATE TABLE sessions (
     status            TEXT NOT NULL,
     runner            TEXT NOT NULL,
     permission_mode   TEXT NOT NULL,
+    -- The workflow the session was created with; NULL for the built-in `quick`.
+    workflow          TEXT,
     branch            TEXT,
     parent_session_id TEXT,
     root_session_id   TEXT NOT NULL,
@@ -207,10 +211,54 @@ CREATE TABLE session_states (
     status     TEXT NOT NULL,
     PRIMARY KEY (session_id, seq)
 ) WITHOUT ROWID;
+
+-- The workflow run of a session, from its `workflow_started` and
+-- `workflow_finished` events (workflows spec, section 6).
+CREATE TABLE workflow_runs (
+    session_id  TEXT PRIMARY KEY,
+    workflow_id TEXT NOT NULL,
+    name        TEXT NOT NULL,
+    -- The graph as it was when the run started, as JSON.
+    graph       TEXT NOT NULL,
+    budget_usd  REAL,
+    status      TEXT NOT NULL,
+    reason      TEXT
+) WITHOUT ROWID;
+
+-- One row per node of the run's graph, kept current by `workflow_node` events.
+CREATE TABLE workflow_nodes (
+    session_id TEXT NOT NULL,
+    -- Position in the graph, which is the order they are served in.
+    position   INTEGER NOT NULL,
+    node_id    TEXT NOT NULL,
+    is_loop    INTEGER NOT NULL,
+    -- A loop's limit.
+    max        INTEGER,
+    state      TEXT NOT NULL,
+    runs       INTEGER NOT NULL,
+    last_port  TEXT,
+    outcome    TEXT,
+    PRIMARY KEY (session_id, position)
+) WITHOUT ROWID;
+CREATE INDEX workflow_nodes_by_id ON workflow_nodes (session_id, node_id);
+
+-- The edges a run went through, in order: one row per node that finished
+-- through a wired port.
+CREATE TABLE workflow_edges (
+    session_id TEXT NOT NULL,
+    seq        INTEGER NOT NULL,
+    from_node  TEXT NOT NULL,
+    port       TEXT NOT NULL,
+    to_node    TEXT NOT NULL,
+    PRIMARY KEY (session_id, seq)
+) WITHOUT ROWID;
 ";
 
 /// Every table, for dropping a database of another schema version.
-const TABLES: [&str; 12] = [
+const TABLES: [&str; 15] = [
+    "workflow_edges",
+    "workflow_nodes",
+    "workflow_runs",
     "session_states",
     "agent_states",
     "file_changes",
@@ -226,7 +274,10 @@ const TABLES: [&str; 12] = [
 ];
 
 /// The tables that hold what a session's events projected, keyed by `session_id`.
-const PROJECTIONS: [&str; 11] = [
+const PROJECTIONS: [&str; 14] = [
+    "workflow_edges",
+    "workflow_nodes",
+    "workflow_runs",
     "session_states",
     "agent_states",
     "file_changes",
@@ -241,7 +292,7 @@ const PROJECTIONS: [&str; 11] = [
 ];
 
 const SESSION_COLUMNS: &str = "id, title, prompt, status, runner, branch, parent_session_id, \
-     root_session_id, head_seq, created_at, updated_at, permission_mode";
+     root_session_id, head_seq, created_at, updated_at, permission_mode, workflow";
 
 const AGENT_COLUMNS: &str = "id, session_id, parent_agent_id, kind, role, runner, model, status, \
      cost_usd, tokens_in, tokens_out, native_session_id";
@@ -297,8 +348,8 @@ pub(super) fn insert_session(db: &Connection, session: &Session) -> Result<()> {
     db.prepare_cached(
         "INSERT OR REPLACE INTO sessions (id, title, prompt, status, runner, branch, \
          parent_session_id, root_session_id, head_seq, created_at, updated_at, \
-         permission_mode, log_len) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 0)",
+         permission_mode, workflow, log_len) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 0)",
     )?
     .execute(params![
         session.id,
@@ -313,6 +364,7 @@ pub(super) fn insert_session(db: &Connection, session: &Session) -> Result<()> {
         session.created_at,
         session.updated_at,
         wire_name(&session.permission_mode)?,
+        session.workflow,
     ])?;
     Ok(())
 }
@@ -528,6 +580,7 @@ pub(super) fn index_event(db: &Connection, event: &Event, offset: u64, end: u64)
                 let title = match reason.as_deref() {
                     Some("permission") => "Waiting for permission",
                     Some("question") => "Waiting for an answer",
+                    Some("gate") => "Waiting at a gate",
                     _ => "Waiting",
                 };
                 open_span(db, event, "wait", &lead, "waiting", title, event.ts)?;
@@ -773,6 +826,113 @@ pub(super) fn index_event(db: &Connection, event: &Event, offset: u64, end: u64)
                 event.ts,
             ])?;
         }
+        EventBody::WorkflowStarted {
+            workflow_id,
+            name,
+            graph,
+            budget_usd,
+        } => {
+            // A session runs one workflow; a second start would replace it whole.
+            for table in ["workflow_nodes", "workflow_edges"] {
+                db.prepare_cached(&format!("DELETE FROM {table} WHERE session_id = ?1"))?
+                    .execute([&event.session_id])?;
+            }
+            db.prepare_cached(
+                "INSERT OR REPLACE INTO workflow_runs (session_id, workflow_id, name, graph, \
+                 budget_usd, status, reason) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+            )?
+            .execute(params![
+                event.session_id,
+                workflow_id,
+                name,
+                serde_json::to_string(graph)?,
+                budget_usd,
+                wire_name(&WorkflowStatus::Running)?,
+            ])?;
+            let mut insert = db.prepare_cached(
+                "INSERT INTO workflow_nodes (session_id, position, node_id, is_loop, max, \
+                 state, runs) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
+            )?;
+            for (position, node) in graph.nodes.iter().enumerate() {
+                insert.execute(params![
+                    event.session_id,
+                    position as i64,
+                    node.id,
+                    node.kind == "loop",
+                    loop_max(node),
+                    wire_name(&NodeRunState::Idle)?,
+                ])?;
+            }
+        }
+        EventBody::WorkflowNode {
+            node_id,
+            phase: NodePhase::Started,
+            ..
+        } => {
+            db.prepare_cached(
+                "UPDATE workflow_nodes SET state = ?1, runs = runs + 1 \
+                 WHERE session_id = ?2 AND node_id = ?3",
+            )?
+            .execute(params![
+                wire_name(&NodeRunState::Active)?,
+                event.session_id,
+                node_id
+            ])?;
+        }
+        EventBody::WorkflowNode {
+            node_id,
+            phase: NodePhase::Finished,
+            port,
+            outcome,
+        } => {
+            // A node cut short finishes without a port and keeps its last one.
+            db.prepare_cached(
+                "UPDATE workflow_nodes SET state = ?1, last_port = COALESCE(?2, last_port), \
+                 outcome = ?3 WHERE session_id = ?4 AND node_id = ?5",
+            )?
+            .execute(params![
+                wire_name(&NodeRunState::Finished)?,
+                port,
+                outcome,
+                event.session_id,
+                node_id
+            ])?;
+            let edge = match port {
+                Some(port) => workflow_graph(db, &event.session_id)?.and_then(|graph| {
+                    let wired = |edge: &WorkflowEdge| edge.from == *node_id && edge.port == *port;
+                    graph.edges.into_iter().find(wired)
+                }),
+                None => None,
+            };
+            if let Some(edge) = edge {
+                db.prepare_cached(
+                    "INSERT OR REPLACE INTO workflow_edges (session_id, seq, from_node, port, \
+                     to_node) VALUES (?1, ?2, ?3, ?4, ?5)",
+                )?
+                .execute(params![
+                    event.session_id,
+                    event.seq as i64,
+                    edge.from,
+                    edge.port,
+                    edge.to
+                ])?;
+            }
+        }
+        EventBody::WorkflowFinished { status, reason } => {
+            db.prepare_cached(
+                "UPDATE workflow_runs SET status = ?1, reason = ?2 WHERE session_id = ?3",
+            )?
+            .execute(params![wire_name(status)?, reason, event.session_id])?;
+            // Nothing is at work in a run that is over.
+            db.prepare_cached(
+                "UPDATE workflow_nodes SET state = ?1 WHERE session_id = ?2 AND state = ?3",
+            )?
+            .execute(params![
+                wire_name(&NodeRunState::Finished)?,
+                event.session_id,
+                wire_name(&NodeRunState::Active)?
+            ])?;
+        }
         EventBody::UserMessage { .. }
         | EventBody::ItemDelta { .. }
         | EventBody::PlanUpdated { .. }
@@ -797,6 +957,13 @@ fn input_label(body: &EventBody) -> Option<String> {
         EventBody::UserMessage { text } => text,
         EventBody::MessageReceived { message } => &message.body,
         EventBody::QuestionAnswered { answer, .. } => answer,
+        // A workflow's agent node starts a turn on its prompt, whose first
+        // line is what the node says it started with.
+        EventBody::WorkflowNode {
+            phase: NodePhase::Started,
+            outcome: Some(line),
+            ..
+        } => line,
         _ => return None,
     };
     Some(excerpt(text)).filter(|label| !label.is_empty())
@@ -992,6 +1159,99 @@ pub(super) fn open_questions(
     Ok(open)
 }
 
+/// The graph a session's run started with; `None` when it runs no workflow.
+fn workflow_graph(db: &Connection, session_id: &str) -> Result<Option<WorkflowGraph>> {
+    let json: Option<String> = db
+        .prepare_cached("SELECT graph FROM workflow_runs WHERE session_id = ?1")?
+        .query_row([session_id], |row| row.get(0))
+        .optional()?;
+    Ok(match json {
+        Some(json) => Some(serde_json::from_str(&json)?),
+        None => None,
+    })
+}
+
+/// What every agent of the tree `session_id` belongs to has cost so far.
+pub(super) fn tree_cost(db: &Connection, session_id: &str) -> Result<f64> {
+    Ok(db
+        .prepare_cached(
+            "SELECT COALESCE(SUM(a.cost_usd), 0.0) FROM agents a \
+             JOIN sessions s ON s.id = a.session_id \
+             WHERE s.root_session_id = (SELECT root_session_id FROM sessions WHERE id = ?1)",
+        )?
+        .query_row([session_id], |row| row.get(0))?)
+}
+
+/// The session's workflow run as its events left it, with what the tree
+/// has cost. `None` for a session without a run.
+pub(super) fn workflow_run(db: &Connection, session_id: &str) -> Result<Option<WorkflowRun>> {
+    let run = db
+        .prepare_cached(
+            "SELECT workflow_id, name, graph, budget_usd, status, reason FROM workflow_runs \
+             WHERE session_id = ?1",
+        )?
+        .query_row([session_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<f64>>(3)?,
+                from_wire_name::<WorkflowStatus>(row, 4)?,
+                row.get::<_, Option<String>>(5)?,
+            ))
+        })
+        .optional()?;
+    let Some((workflow_id, name, graph, budget_usd, status, reason)) = run else {
+        return Ok(None);
+    };
+    let mut statement = db.prepare_cached(
+        "SELECT node_id, state, runs, last_port, outcome, is_loop, max FROM workflow_nodes \
+         WHERE session_id = ?1 ORDER BY position",
+    )?;
+    let nodes = statement
+        .query_map([session_id], |row| {
+            let runs: u32 = row.get(2)?;
+            let max: Option<u32> = row.get(6)?;
+            // A loop counts its entries up to its limit (spec section 3).
+            let iteration = row
+                .get::<_, bool>(5)?
+                .then(|| max.map_or(runs, |max| runs.min(max)));
+            Ok(WorkflowNodeRun {
+                id: row.get(0)?,
+                state: from_wire_name(row, 1)?,
+                runs,
+                last_port: row.get(3)?,
+                outcome: row.get(4)?,
+                iteration,
+                max,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut statement = db.prepare_cached(
+        "SELECT from_node, port, to_node FROM workflow_edges WHERE session_id = ?1 ORDER BY seq",
+    )?;
+    let taken = statement
+        .query_map([session_id], |row| {
+            Ok(WorkflowEdge {
+                from: row.get(0)?,
+                port: row.get(1)?,
+                to: row.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(Some(WorkflowRun {
+        workflow_id,
+        name,
+        graph: serde_json::from_str(&graph)?,
+        nodes,
+        taken,
+        status,
+        reason,
+        budget_usd,
+        cost_usd: tree_cost(db, session_id)?,
+    }))
+}
+
 /// The event's `type` tag, as it appears on the wire.
 fn kind(body: &EventBody) -> &'static str {
     match body {
@@ -1015,6 +1275,9 @@ fn kind(body: &EventBody) -> &'static str {
         EventBody::MessageReceived { .. } => "message_received",
         EventBody::QuestionAsked { .. } => "question_asked",
         EventBody::QuestionAnswered { .. } => "question_answered",
+        EventBody::WorkflowStarted { .. } => "workflow_started",
+        EventBody::WorkflowNode { .. } => "workflow_node",
+        EventBody::WorkflowFinished { .. } => "workflow_finished",
         EventBody::Error { .. } => "error",
     }
 }
@@ -1055,6 +1318,7 @@ fn session_from_row(row: &Row<'_>) -> rusqlite::Result<Session> {
         created_at: row.get(9)?,
         updated_at: row.get(10)?,
         permission_mode: from_wire_name(row, 11)?,
+        workflow: row.get(12)?,
     })
 }
 
@@ -1172,12 +1436,32 @@ mod tests {
                     id: "q".into(),
                     text: "?".into(),
                     options: vec![],
+                    gate: false,
                 },
             },
             EventBody::QuestionAnswered {
                 question_id: "q".into(),
                 answer: String::new(),
                 by: calin_proto::DecisionSource::Expired,
+            },
+            EventBody::WorkflowStarted {
+                workflow_id: "w".into(),
+                name: "W".into(),
+                graph: WorkflowGraph {
+                    nodes: vec![],
+                    edges: vec![],
+                },
+                budget_usd: None,
+            },
+            EventBody::WorkflowNode {
+                node_id: "n".into(),
+                phase: NodePhase::Started,
+                port: None,
+                outcome: None,
+            },
+            EventBody::WorkflowFinished {
+                status: WorkflowStatus::Success,
+                reason: None,
             },
         ];
         for body in bodies {

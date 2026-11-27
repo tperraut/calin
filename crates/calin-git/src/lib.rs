@@ -8,7 +8,8 @@
 //! - A **worktree** is a `git worktree` of a clone, on the session's branch
 //!   ([`session_branch_name`]). [`create_worktree`] and [`remove_worktree`]
 //!   manage it; the branch outlives the worktree, which is how a session
-//!   resumes. [`run_setup`] runs a repo's setup command in a new one.
+//!   resumes. [`run_setup`] runs a repo's setup command in a new one, and
+//!   [`run_check`] a command that checks the work in one.
 //! - A **work directory** is where a session's files are: a worktree, or the
 //!   clone itself for a repo attached `read` or `live`. The functions that
 //!   take a `dir` want the root of one. They do not search parent
@@ -106,6 +107,6 @@ pub use files::{list_dir, read_file, write_file};
 pub use github::{GitHub, PullRequestInfo};
 pub use path::resolve_path;
 pub use repo::{CloneInfo, head_commit, inspect_clone};
-pub use setup::{SetupEnd, SetupRun, run_setup};
+pub use setup::{CHECK_OUTPUT_CAP, CheckEnd, CheckRun, SetupEnd, SetupRun, run_check, run_setup};
 pub use state::{FileState, file_states};
 pub use worktree::{Worktree, WorktreeOutcome, create_worktree, remove_worktree};

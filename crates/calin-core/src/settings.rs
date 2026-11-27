@@ -9,6 +9,12 @@ use crate::home::Home;
 use crate::json_file;
 use crate::repos::blocking;
 
+/// How many root sessions prepare or run at once when the settings do not
+/// say (the "queue" semantics in `calin-proto/src/api.rs`).
+pub(crate) const DEFAULT_MAX_PARALLEL: u32 = 4;
+/// The most the limit can be set to: each running session is an agent process.
+const MAX_MAX_PARALLEL: u32 = 64;
+
 pub(crate) struct SettingsStore {
     path: PathBuf,
     default_clone_root: PathBuf,
@@ -31,7 +37,8 @@ impl SettingsStore {
         }
     }
 
-    /// The settings in effect: what is stored, with the clone root filled in.
+    /// The settings in effect: what is stored, with the clone root and the
+    /// session limit filled in.
     pub(crate) async fn get(&self) -> Settings {
         self.effective(self.current.lock().await.clone())
     }
@@ -51,6 +58,9 @@ impl SettingsStore {
         if settings.clone_root.is_none() {
             settings.clone_root = Some(self.default_clone_root.to_string_lossy().into_owned());
         }
+        // A file edited by hand may hold a limit `replace` would refuse.
+        let limit = settings.max_parallel.unwrap_or(DEFAULT_MAX_PARALLEL);
+        settings.max_parallel = Some(limit.clamp(1, MAX_MAX_PARALLEL));
         settings
     }
 }
@@ -114,10 +124,18 @@ fn validate(wanted: Settings) -> Result<Settings> {
             Some(utf8("the clone root", &path)?)
         }
     };
+    if let Some(limit) = wanted.max_parallel
+        && !(1..=MAX_MAX_PARALLEL).contains(&limit)
+    {
+        return Err(Error::Invalid(format!(
+            "max_parallel must be between 1 and {MAX_MAX_PARALLEL}; it is {limit}"
+        )));
+    }
     Ok(Settings {
         home_repo,
         scan_roots,
         clone_root,
+        max_parallel: wanted.max_parallel,
     })
 }
 
@@ -167,6 +185,7 @@ mod tests {
                 home_repo: None,
                 scan_roots: Vec::new(),
                 clone_root: Some(text(&dir.path().join("repos"))),
+                max_parallel: Some(4),
             }
         );
         assert!(!home.settings_path().exists());
@@ -188,6 +207,7 @@ mod tests {
                 home_repo: Some(format!("  {}/../home ", repo.display())),
                 scan_roots: vec![text(&code), "  ".to_owned(), format!("{}/", code.display())],
                 clone_root: Some(text(&work.path().join("not/yet/there"))),
+                max_parallel: Some(2),
             })
             .await
             .unwrap();
@@ -195,6 +215,7 @@ mod tests {
             home_repo: Some(text(&repo)),
             scan_roots: vec![text(&code)],
             clone_root: Some(text(&work.path().join("not/yet/there"))),
+            max_parallel: Some(2),
         };
         assert_eq!(stored, expected);
         assert_eq!(store.get().await, expected);
@@ -209,11 +230,14 @@ mod tests {
                 home_repo: Some(String::new()),
                 scan_roots: Vec::new(),
                 clone_root: Some("  ".to_owned()),
+                max_parallel: None,
             })
             .await
             .unwrap();
         assert_eq!(cleared.home_repo, None);
         assert_eq!(cleared.clone_root, Some(text(&dir.path().join("repos"))));
+        // The default is filled in on read and never stored.
+        assert_eq!(cleared.max_parallel, Some(4));
         let on_disk: Settings =
             serde_json::from_slice(&std::fs::read(home.settings_path()).unwrap()).unwrap();
         assert_eq!(on_disk, Settings::default());
@@ -232,7 +256,7 @@ mod tests {
             home_repo: Some(text(&repo)),
             ..Settings::default()
         };
-        let before = store.replace(good.clone()).await.unwrap();
+        store.replace(good.clone()).await.unwrap();
 
         let with_home = |home: &str| Settings {
             home_repo: Some(home.to_owned()),
@@ -246,7 +270,18 @@ mod tests {
             clone_root: Some(root.to_owned()),
             ..good.clone()
         };
+        let with_limit = |limit: u32| Settings {
+            max_parallel: Some(limit),
+            ..good.clone()
+        };
+        for limit in [1, 64] {
+            store.replace(with_limit(limit)).await.unwrap();
+            assert_eq!(store.get().await.max_parallel, Some(limit));
+        }
+        let before = store.replace(good.clone()).await.unwrap();
         let bad = [
+            with_limit(0),
+            with_limit(65),
             // Not the root of a work tree, in each way a path can fail to be.
             with_home(&text(&repo.join("src"))),
             with_home(&text(work.path())),
@@ -283,6 +318,13 @@ mod tests {
         std::fs::create_dir(&path).unwrap();
         assert_eq!(SettingsStore::load(&home).await.get().await, defaults);
         std::fs::remove_dir(&path).unwrap();
+
+        // A limit out of range in a file edited by hand is brought into it.
+        for (stored, limit) in [("0", 1), ("900", 64), ("7", 7)] {
+            std::fs::write(&path, format!("{{\"max_parallel\": {stored}}}")).unwrap();
+            let read = SettingsStore::load(&home).await.get().await;
+            assert_eq!(read.max_parallel, Some(limit), "{stored}");
+        }
 
         // Unknown keys of a newer version are ignored, and saving replaces garbage.
         std::fs::write(&path, "{\"scan_roots\": [], \"later\": true}").unwrap();

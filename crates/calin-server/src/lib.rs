@@ -94,6 +94,7 @@ pub fn router(state: AppState) -> Router {
         .route("/repos/{id}/clone", post(api::clone_repo))
         .route("/repos/{id}", delete(api::remove_repo))
         .route("/repo-sets", get(api::list_repo_sets))
+        .route("/workflows", get(api::list_workflows))
         .route(
             "/sessions",
             get(api::list_sessions).post(api::create_session),
@@ -112,6 +113,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/sessions/{id}/graph", get(api::session_graph))
         .route("/sessions/{id}/timeline", get(api::session_timeline))
+        .route("/sessions/{id}/workflow", get(api::session_workflow))
         .route("/sessions/{id}/repos", post(api::attach_repo))
         .route("/sessions/{id}/ship", post(api::ship_session))
         .route(

@@ -31,6 +31,7 @@ use super::*;
 mod catalog;
 mod delivery;
 mod orchestration;
+mod workflows;
 
 const TIMEOUT: Duration = Duration::from_secs(20);
 const LOCAL: &str = "127.0.0.1:4680";
@@ -883,6 +884,7 @@ async fn new_session(state: &AppState, prompt: &str) -> String {
         runner: None,
         model: None,
         permission_mode: Some(PermissionMode::Autonomous),
+        workflow: None,
         repos: Vec::new(),
     };
     let detail = state.manager().create_session(request).await.unwrap();

@@ -20,8 +20,10 @@ use crate::testing::{git, git_repo, write_file};
 
 mod attach;
 mod orchestration;
+mod queue;
 mod shipping;
 mod unreported;
+mod workflow;
 
 const TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -129,6 +131,7 @@ fn request_in(mode: PermissionMode, prompt: &str, runner: Option<&str>) -> Creat
         runner: runner.map(str::to_owned),
         model: None,
         permission_mode: Some(mode),
+        workflow: None,
         repos: Vec::new(),
     }
 }
@@ -244,6 +247,22 @@ fn label(event: &Event) -> String {
             "question_answered:{answer}:{}",
             format!("{by:?}").to_lowercase()
         ),
+        EventBody::WorkflowStarted { workflow_id, .. } => format!("workflow_started:{workflow_id}"),
+        EventBody::WorkflowNode {
+            node_id,
+            phase,
+            port,
+            ..
+        } => {
+            let phase = format!("{phase:?}").to_lowercase();
+            match port {
+                Some(port) => format!("workflow_node:{node_id}:{phase}:{port}"),
+                None => format!("workflow_node:{node_id}:{phase}"),
+            }
+        }
+        EventBody::WorkflowFinished { status, .. } => {
+            format!("workflow_finished:{}", format!("{status:?}").to_lowercase())
+        }
     }
 }
 

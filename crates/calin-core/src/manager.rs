@@ -9,6 +9,7 @@
 
 mod delivery;
 mod driver;
+mod queue;
 mod unreported;
 
 use std::collections::HashMap;
@@ -21,20 +22,23 @@ use calin_agents::{Runner, RunnerRegistry};
 use calin_git::GitHub;
 use calin_proto::{
     AgentMessage, AgentStatus, AttachRepoRequest, CreateSessionRequest, DecisionSource, EventBody,
-    Graph, PermissionDecision, RegisterRepoRequest, Repo, RepoMode, RepoSet, Session,
-    SessionDetail, SessionRepo, SessionStatus, Settings, ShipRequest, Timeline,
+    Graph, NodePhase, NodeRunState, PermissionDecision, RegisterRepoRequest, Repo, RepoMode,
+    RepoSet, Session, SessionDetail, SessionRepo, SessionStatus, Settings, ShipRequest, Timeline,
+    WorkflowInfo, WorkflowRun, WorkflowStatus,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
 use self::driver::Driver;
+use self::queue::Queue;
 use crate::error::{Error, Result};
 use crate::repos::{RepoRegistry, Reservation};
-use crate::settings::SettingsStore;
+use crate::settings::{DEFAULT_MAX_PARALLEL, SettingsStore};
 use crate::store::{EventDraft, NewSession, Store};
 use crate::title::default_title;
 use crate::tokens::{AgentRef, Tokens};
+use crate::workflows::WorkflowCatalog;
 
 /// How long the setup command of a new worktree may run (the task of a
 /// dependency install, not of a build farm).
@@ -146,6 +150,10 @@ struct Inner {
     registry: RunnerRegistry,
     repos: Arc<RepoRegistry>,
     settings: SettingsStore,
+    /// The home repo's workflows, read again when their files change.
+    workflows: WorkflowCatalog,
+    /// Who may prepare or run now, and who waits for it.
+    queue: Queue,
     config: ManagerConfig,
     /// How `gh` is run, from the config.
     github: GitHub,
@@ -217,6 +225,9 @@ enum Command {
         /// For a child session: the dispatch message that is its prompt, and
         /// the `message_sent` event of it in the parent's log.
         brief: Option<(AgentMessage, String)>,
+        /// The workflow the session runs once its repos are ready; `None`
+        /// for the built-in `quick` behavior.
+        workflow: Option<Box<calin_workflow::Workflow>>,
         reply: Reply<SessionDetail>,
     },
     Message {
@@ -287,6 +298,8 @@ enum Command {
     Answer {
         question_id: String,
         answer: String,
+        /// The note that goes with the answer at a workflow gate.
+        comment: Option<String>,
         reply: Reply,
     },
     /// A message from another session arrived for this one's agent: record
@@ -298,7 +311,24 @@ enum Command {
         /// The `message_sent` event in the sender's log.
         cause: String,
         text: String,
+        /// For a report: how the child session behind it ended.
+        ended: Option<ChildEnd>,
     },
+    /// A child session's agents cost more than they did: a workflow run of
+    /// this session has a budget to check. Nobody waits for this.
+    Spent,
+    /// A child session was stopped, so it will never report. Nobody waits
+    /// for this.
+    ChildStopped {
+        session_id: String,
+    },
+}
+
+/// How a child session ended when it reported.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChildEnd {
+    Review,
+    Failed,
 }
 
 impl Command {
@@ -330,8 +360,8 @@ impl Command {
             | Self::Permission { reply, .. } => {
                 let _ = reply.send(Err(err));
             }
-            // Nobody waits for a delivery.
-            Self::Deliver { .. } => {}
+            // Nobody waits for these.
+            Self::Deliver { .. } | Self::Spent | Self::ChildStopped { .. } => {}
         }
     }
 }
@@ -351,10 +381,14 @@ impl SessionManager {
     ) -> Result<Self> {
         let settings = SettingsStore::load(store.home()).await;
         let repos = Arc::new(RepoRegistry::load(store.home().repos_path()).await);
+        let in_effect = settings.get().await;
         // The repo list must be whole before the first request reads it.
-        if let Err(err) = repos.refresh(&settings.get().await).await {
+        if let Err(err) = repos.refresh(&in_effect).await {
             tracing::warn!(%err, "could not scan for repos; listing the registered ones only");
         }
+        let workflows = WorkflowCatalog::default();
+        workflows.reload(in_effect.home_repo.as_deref()).await;
+        let queue = Queue::new(in_effect.max_parallel.unwrap_or(DEFAULT_MAX_PARALLEL));
         let github = GitHub::new(&config.gh_bin).with_timeout(config.gh_timeout);
         let manager = Self {
             inner: Arc::new(Inner {
@@ -362,6 +396,8 @@ impl SessionManager {
                 registry,
                 repos,
                 settings,
+                workflows,
+                queue,
                 config,
                 github,
                 github_status: tokio::sync::Mutex::new(None),
@@ -391,18 +427,40 @@ impl SessionManager {
         &self.inner.registry
     }
 
-    /// The settings in effect, with the default clone root filled in.
+    /// The settings in effect, with the default clone root and the default
+    /// session limit filled in.
     pub async fn settings(&self) -> Settings {
         self.inner.settings.get().await
     }
 
     /// Replaces the settings, then reads the home repo again and rescans.
-    /// `Invalid` when the home repo is not the root of a git work tree or a
-    /// scan root is not an existing directory; nothing is changed then.
+    /// A higher session limit starts the sessions that wait at once.
+    /// `Invalid` when the home repo is not the root of a git work tree, a
+    /// scan root is not an existing directory or the session limit is not
+    /// between 1 and 64; nothing is changed then.
     pub async fn update_settings(&self, settings: Settings) -> Result<Settings> {
         let stored = self.inner.settings.replace(settings).await?;
+        let limit = stored.max_parallel.unwrap_or(DEFAULT_MAX_PARALLEL);
+        self.inner.queue.set_limit(limit);
+        let home = stored.home_repo.as_deref();
+        self.inner.workflows.reload(home).await;
         self.inner.repos.refresh(&stored).await?;
         Ok(stored)
+    }
+
+    /// The workflows a session can run: the built-in `quick` first, then the
+    /// home repo's by id. A file that does not validate is listed with its
+    /// problems and no graph. The files are read again when they changed.
+    pub async fn workflows(&self) -> Vec<WorkflowInfo> {
+        self.inner.workflows.list().await
+    }
+
+    /// The session's workflow run: the graph it started with and where each
+    /// node stands. `NotFound` for an unknown session, `Missing` for one
+    /// that runs no workflow.
+    pub async fn workflow_run(&self, session_id: &str) -> Result<WorkflowRun> {
+        let run = self.inner.store.workflow_run(session_id).await?;
+        run.ok_or_else(|| Error::Missing(format!("session {session_id} runs no workflow")))
     }
 
     /// Every repo this machine knows: the home repo first, then by name.
@@ -414,6 +472,8 @@ impl SessionManager {
     /// and returns the list that results.
     pub async fn refresh_repos(&self) -> Result<Vec<Repo>> {
         let settings = self.inner.settings.get().await;
+        let home = settings.home_repo.as_deref();
+        self.inner.workflows.reload(home).await;
         self.inner.repos.refresh(&settings).await?;
         Ok(self.inner.repos.list().await)
     }
@@ -533,11 +593,20 @@ impl SessionManager {
 
     /// Creates a session and returns it as soon as its prompt is recorded,
     /// with status `queued`. Its repos are then prepared and its lead agent
-    /// started in the background; both show up as events.
+    /// started in the background, or its workflow when it names one; all of
+    /// it shows up as events. With every slot taken it stays `queued` until
+    /// one is free (the "queue" semantics in `calin-proto/src/api.rs`).
+    /// `Invalid` also for a workflow that is unknown or does not validate.
     pub async fn create_session(&self, request: CreateSessionRequest) -> Result<SessionDetail> {
         if request.prompt.trim().is_empty() {
             return Err(Error::Invalid("the prompt must not be blank".to_owned()));
         }
+        // `None` for the built-in `quick`, however the request spells it.
+        let workflow = self
+            .inner
+            .workflows
+            .resolve(request.workflow.as_deref())
+            .await?;
         let requested = request.runner.as_deref().filter(|id| !id.trim().is_empty());
         let runner = self.inner.registry.resolve(requested).ok_or_else(|| {
             Error::Invalid(format!("unknown runner {}", requested.unwrap_or_default()))
@@ -571,15 +640,19 @@ impl SessionManager {
                 // The runner that actually runs, which in dry run is the mock.
                 runner: runner.id().to_owned(),
                 permission_mode: request.permission_mode.unwrap_or_default(),
+                workflow: workflow.as_ref().map(|workflow| workflow.id().to_owned()),
                 model,
                 repos: request.repos,
                 dispatch: None,
             })
             .await?;
+        // The workflow as it is now: a later edit of its file changes
+        // nothing for this session.
         self.command(&session.id, |reply| Command::Start {
             runner,
             reservation,
             brief: None,
+            workflow: workflow.map(Box::new),
             reply,
         })
         .await
@@ -606,7 +679,8 @@ impl SessionManager {
     /// `review` when the agent has done so.
     pub async fn interrupt(&self, session_id: &str) -> Result<()> {
         let status = self.get(session_id).await?.session.status;
-        if !has_turn(status) {
+        // A turn may be waiting for a slot; the driver knows whether one is.
+        if !has_turn(status) && status != SessionStatus::Queued {
             return Err(no_turn(status));
         }
         self.command(session_id, |reply| Command::Interrupt { reply })
@@ -782,6 +856,19 @@ impl SessionManager {
         question_id: &str,
         answer: &str,
     ) -> Result<()> {
+        self.answer(session_id, question_id, answer, None).await
+    }
+
+    /// [`Self::answer_question`] with the note that goes with the decision
+    /// at a workflow gate. A gate only takes `approve` or `reject`
+    /// (`Invalid` otherwise); the comment of any other question is dropped.
+    pub async fn answer(
+        &self,
+        session_id: &str,
+        question_id: &str,
+        answer: &str,
+        comment: Option<String>,
+    ) -> Result<()> {
         self.get(session_id).await?;
         if answer.trim().is_empty() {
             return Err(Error::Invalid("the answer must not be blank".to_owned()));
@@ -790,6 +877,7 @@ impl SessionManager {
         self.command(session_id, |reply| Command::Answer {
             question_id,
             answer,
+            comment,
             reply,
         })
         .await
@@ -1043,6 +1131,28 @@ impl SessionManager {
                         .parent(Some(question.event_id));
                     closing.agent_id = question.agent_id;
                     store.append(&session.id, closing).await?;
+                }
+                // A workflow run is not resumed: it ends where the restart
+                // cut it, so that its picture agrees with the session's.
+                let run = store.workflow_run(&session.id).await?;
+                if let Some(run) = run.filter(|run| run.status == WorkflowStatus::Running) {
+                    for node in run.nodes {
+                        if node.state != NodeRunState::Active {
+                            continue;
+                        }
+                        let cut = EventBody::WorkflowNode {
+                            node_id: node.id,
+                            phase: NodePhase::Finished,
+                            port: None,
+                            outcome: Some(format!("stopped: {RESTART_REASON}")),
+                        };
+                        store.append(&session.id, EventDraft::new(cut)).await?;
+                    }
+                    let finished = EventBody::WorkflowFinished {
+                        status: WorkflowStatus::Failed,
+                        reason: Some(RESTART_REASON.to_owned()),
+                    };
+                    store.append(&session.id, EventDraft::new(finished)).await?;
                 }
                 for agent in store.session(&session.id).await?.agents {
                     if !agent_ended(agent.status) {

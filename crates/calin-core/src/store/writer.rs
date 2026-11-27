@@ -10,6 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use calin_proto::{
     AttachRepoRequest, Event, EventBody, Graph, Session, SessionDetail, SessionStatus, Timeline,
+    WorkflowRun,
 };
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -105,6 +106,14 @@ pub(super) enum Cmd {
     Timeline {
         session_id: String,
         reply: Reply<Timeline>,
+    },
+    WorkflowRun {
+        session_id: String,
+        reply: Reply<Option<WorkflowRun>>,
+    },
+    TreeCost {
+        session_id: String,
+        reply: Reply<f64>,
     },
     /// Sent by the store's timer when a delayed upsert is due.
     FlushUpserts,
@@ -289,6 +298,17 @@ impl Writer {
                         .and_then(|timeline| timeline.ok_or(Error::NotFound(session_id)));
                     let _ = reply.send(timeline);
                 }
+                Cmd::WorkflowRun { session_id, reply } => {
+                    let run = match index::indexed(&self.db, &session_id) {
+                        Ok(Some(_)) => index::workflow_run(&self.db, &session_id),
+                        Ok(None) => Err(Error::NotFound(session_id)),
+                        Err(err) => Err(err),
+                    };
+                    let _ = reply.send(run);
+                }
+                Cmd::TreeCost { session_id, reply } => {
+                    let _ = reply.send(index::tree_cost(&self.db, &session_id));
+                }
                 Cmd::FlushUpserts => self.flush_upserts(),
                 Cmd::Close { reply } => {
                     // Closing the connection first checkpoints the WAL before the caller moves on.
@@ -310,6 +330,7 @@ impl Writer {
             status: SessionStatus::Queued,
             runner: new.runner,
             permission_mode: new.permission_mode,
+            workflow: new.workflow,
             branch: None,
             parent_session_id: new
                 .dispatch
@@ -692,6 +713,8 @@ impl Writer {
             status: SessionStatus::Queued,
             runner: runner.unwrap_or_else(|| "unknown".to_owned()),
             permission_mode: Default::default(),
+            // Which file it was is not in the log; the run itself still is.
+            workflow: None,
             branch: None,
             parent_session_id: None,
             root_session_id: session_id.to_owned(),

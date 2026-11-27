@@ -20,6 +20,7 @@ mod store;
 mod testing;
 mod title;
 mod tokens;
+mod workflows;
 mod workspace;
 
 pub use error::{Error, Result};

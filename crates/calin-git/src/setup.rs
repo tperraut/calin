@@ -1,8 +1,9 @@
-//! Running a repo's setup command in a worktree that was just created.
+//! Running a shell command in a work directory: a repo's setup command in a
+//! worktree that was just created, and the commands that check a change.
 
 use std::io::Read;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::thread;
@@ -11,9 +12,12 @@ use std::time::{Duration, Instant};
 use crate::cmd::{INHERITED, work_dir};
 use crate::error::{Error, Result};
 
-/// How much of the command's output is kept: the end of it, where a failing
-/// command says why.
+/// How much of a setup command's output is kept: the end of it, where a
+/// failing command says why.
 const OUTPUT_CAP: usize = 64 * 1024;
+
+/// How much of a check's output is kept (workflows spec, section 3).
+pub const CHECK_OUTPUT_CAP: usize = 16 * 1024;
 
 /// How often the command is checked for its end, the limit and a cancellation.
 const POLL: Duration = Duration::from_millis(20);
@@ -57,9 +61,94 @@ pub fn run_setup(
     limit: Duration,
     cancel: &AtomicBool,
 ) -> Result<SetupRun> {
+    let (output, ended) = run(
+        dir,
+        command,
+        limit,
+        cancel,
+        (OUTPUT_CAP, true),
+        "the setup command",
+    )?;
+    let end = match ended {
+        Ended::Exited(status) if status.success() => SetupEnd::Succeeded,
+        Ended::Exited(status) => SetupEnd::Failed(status.to_string()),
+        Ended::TimedOut => SetupEnd::TimedOut,
+        Ended::Cancelled => SetupEnd::Cancelled,
+    };
+    Ok(SetupRun { output, end })
+}
+
+/// A check command that ran, however it ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckRun {
+    /// Standard output and standard error in the order they were written,
+    /// cut to its last 16 KiB.
+    pub output: String,
+    pub end: CheckEnd,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CheckEnd {
+    /// The command exited: with this code, or `None` when a signal ended it.
+    Exited(Option<i32>),
+    /// The command was still running at the limit and was killed.
+    TimedOut,
+    /// `cancel` was set and the command was killed.
+    Cancelled,
+}
+
+impl CheckRun {
+    /// True when the command exited with status 0.
+    pub fn passed(&self) -> bool {
+        self.end == CheckEnd::Exited(Some(0))
+    }
+}
+
+/// Runs a check: `command` with `sh -c` in `dir`, as [`run_setup`] runs a
+/// setup command, but reporting the exit code and keeping only the last
+/// [`CHECK_OUTPUT_CAP`] bytes of what it wrote, without a note about the cut.
+pub fn run_check(
+    dir: &Path,
+    command: &str,
+    limit: Duration,
+    cancel: &AtomicBool,
+) -> Result<CheckRun> {
+    let (output, ended) = run(
+        dir,
+        command,
+        limit,
+        cancel,
+        (CHECK_OUTPUT_CAP, false),
+        "the check command",
+    )?;
+    let end = match ended {
+        Ended::Exited(status) => CheckEnd::Exited(status.code()),
+        Ended::TimedOut => CheckEnd::TimedOut,
+        Ended::Cancelled => CheckEnd::Cancelled,
+    };
+    Ok(CheckRun { output, end })
+}
+
+/// How a command stopped running.
+enum Ended {
+    Exited(ExitStatus),
+    TimedOut,
+    Cancelled,
+}
+
+/// Runs `command` and returns the end of what it wrote: its last `cap`
+/// bytes, under a line saying what was cut when `noted`.
+fn run(
+    dir: &Path,
+    command: &str,
+    limit: Duration,
+    cancel: &AtomicBool,
+    (cap, noted): (usize, bool),
+    what: &str,
+) -> Result<(String, Ended)> {
     let dir = work_dir(dir)?;
     let failed = |source| Error::Io {
-        context: format!("running the setup command in {}", dir.display()),
+        context: format!("running {what} in {}", dir.display()),
         source,
     };
     // One pipe for both streams keeps their lines in order.
@@ -85,7 +174,7 @@ pub fn run_setup(
     // reader to see the end.
     drop(cmd);
 
-    let tail = Arc::new(Mutex::new(Tail::default()));
+    let tail = Arc::new(Mutex::new(Tail::new(cap)));
     let (finished, drained) = mpsc::channel();
     let collector = Arc::clone(&tail);
     thread::spawn(move || {
@@ -103,8 +192,7 @@ pub fn run_setup(
     let started = Instant::now();
     let end = loop {
         match child.try_wait() {
-            Ok(Some(status)) if status.success() => break SetupEnd::Succeeded,
-            Ok(Some(status)) => break SetupEnd::Failed(status.to_string()),
+            Ok(Some(status)) => break Ended::Exited(status),
             Ok(None) => {}
             Err(err) => {
                 kill(&mut child);
@@ -113,11 +201,11 @@ pub fn run_setup(
         }
         if cancel.load(Ordering::Relaxed) {
             kill(&mut child);
-            break SetupEnd::Cancelled;
+            break Ended::Cancelled;
         }
         if started.elapsed() >= limit {
             kill(&mut child);
-            break SetupEnd::TimedOut;
+            break Ended::TimedOut;
         }
         thread::sleep(POLL);
     };
@@ -125,8 +213,8 @@ pub fn run_setup(
     // even after a clean exit, then take what was written.
     kill_group(&child);
     let _ = drained.recv_timeout(DRAIN);
-    let output = lock(&tail).text();
-    Ok(SetupRun { output, end })
+    let output = lock(&tail).text(noted);
+    Ok((output, end))
 }
 
 fn lock(tail: &Mutex<Tail>) -> std::sync::MutexGuard<'_, Tail> {
@@ -157,28 +245,39 @@ pub(crate) fn kill_group(child: &Child) {
 }
 
 /// The end of a stream of bytes, and how long the stream was.
-#[derive(Default)]
 struct Tail {
     bytes: Vec<u8>,
     total: usize,
+    /// How many bytes of the end are kept.
+    cap: usize,
 }
 
 impl Tail {
+    fn new(cap: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            total: 0,
+            cap,
+        }
+    }
+
     fn push(&mut self, chunk: &[u8]) {
         self.total += chunk.len();
         self.bytes.extend_from_slice(chunk);
         // Twice the cap before trimming, so that a long output is not
         // shifted on every chunk.
-        if self.bytes.len() > 2 * OUTPUT_CAP {
-            let excess = self.bytes.len() - OUTPUT_CAP;
+        if self.bytes.len() > 2 * self.cap {
+            let excess = self.bytes.len() - self.cap;
             self.bytes.drain(..excess);
         }
     }
 
-    fn text(&self) -> String {
-        let start = self.bytes.len().saturating_sub(OUTPUT_CAP);
+    /// The kept end as text, with a first line saying what was cut when
+    /// `noted` and something was.
+    fn text(&self, noted: bool) -> String {
+        let start = self.bytes.len().saturating_sub(self.cap);
         let text = String::from_utf8_lossy(&self.bytes[start..]);
-        if self.total <= OUTPUT_CAP {
+        if self.total <= self.cap || !noted {
             return text.into_owned();
         }
         format!(
@@ -287,8 +386,46 @@ mod tests {
         assert_eq!(kept.len(), OUTPUT_CAP);
         assert!(kept.ends_with("line-29999\n"));
 
-        let mut tail = Tail::default();
+        let mut tail = Tail::new(OUTPUT_CAP);
         tail.push(b"short");
-        assert_eq!(tail.text(), "short");
+        assert_eq!(tail.text(true), "short");
+    }
+
+    #[test]
+    fn a_check_reports_its_exit_code_and_the_last_16_kib_of_its_output() {
+        let sandbox = Sandbox::new();
+        let dir = sandbox.dir("work");
+        let no = AtomicBool::new(false);
+        let ran = run_check(&dir, "echo fine; pwd", LIMIT, &no).unwrap();
+        assert!(ran.passed());
+        assert_eq!(ran.end, CheckEnd::Exited(Some(0)));
+        assert_eq!(ran.output, format!("fine\n{}\n", dir.display()));
+
+        let ran = run_check(&dir, "echo broken >&2; exit 7", LIMIT, &no).unwrap();
+        assert!(!ran.passed());
+        assert_eq!(ran.end, CheckEnd::Exited(Some(7)));
+        assert_eq!(ran.output, "broken\n");
+
+        // The end of a long output, cut without a note: templates quote it.
+        let long = "i=0; while [ $i -lt 9000 ]; do echo line-$i; i=$((i+1)); done; exit 1";
+        let ran = run_check(&dir, long, LIMIT, &no).unwrap();
+        assert_eq!(ran.end, CheckEnd::Exited(Some(1)));
+        assert_eq!(ran.output.len(), CHECK_OUTPUT_CAP);
+        assert!(ran.output.ends_with("line-8999\n"));
+
+        let slow = run_check(
+            &dir,
+            "echo begun; sleep 60",
+            Duration::from_millis(200),
+            &no,
+        );
+        let slow = slow.unwrap();
+        assert_eq!(slow.end, CheckEnd::TimedOut);
+        assert_eq!(slow.output, "begun\n");
+        let cancelled = run_check(&dir, "sleep 60", LIMIT, &AtomicBool::new(true)).unwrap();
+        assert_eq!(cancelled.end, CheckEnd::Cancelled);
+        // A signal leaves no code.
+        let killed = run_check(&dir, "kill -9 $$", LIMIT, &no).unwrap();
+        assert_eq!(killed.end, CheckEnd::Exited(None));
     }
 }

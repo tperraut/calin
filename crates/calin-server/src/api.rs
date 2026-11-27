@@ -11,7 +11,7 @@ use calin_proto::{
     AnswerQuestionRequest, ApiError, AttachRepoRequest, CreateSessionRequest, FileContent,
     FileDiff, Graph, Health, RegisterRepoRequest, Repo, RepoChanges, RepoSet,
     ResolvePermissionRequest, SendMessageRequest, Session, SessionDetail, SessionRepo, Settings,
-    ShipRequest, Timeline, TreeEntry, WriteFileRequest,
+    ShipRequest, Timeline, TreeEntry, WorkflowInfo, WorkflowRun, WriteFileRequest,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -176,6 +176,10 @@ pub(crate) async fn list_repo_sets(State(state): State<AppState>) -> Json<Vec<Re
     Json(state.manager.repo_sets().await)
 }
 
+pub(crate) async fn list_workflows(State(state): State<AppState>) -> Json<Vec<WorkflowInfo>> {
+    Json(state.manager.workflows().await)
+}
+
 pub(crate) async fn register_repo(
     State(state): State<AppState>,
     ApiJson(request): ApiJson<RegisterRepoRequest>,
@@ -250,7 +254,7 @@ pub(crate) async fn answer_question(
 ) -> ApiResult<StatusCode> {
     state
         .manager
-        .answer_question(&session_id, &question_id, &request.answer)
+        .answer(&session_id, &question_id, &request.answer, request.comment)
         .await?;
     Ok(StatusCode::ACCEPTED)
 }
@@ -275,6 +279,13 @@ pub(crate) async fn session_timeline(
     Path(session_id): Path<String>,
 ) -> ApiResult<Json<Timeline>> {
     Ok(Json(state.manager.timeline(&session_id).await?))
+}
+
+pub(crate) async fn session_workflow(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> ApiResult<Json<WorkflowRun>> {
+    Ok(Json(state.manager.workflow_run(&session_id).await?))
 }
 
 pub(crate) async fn attach_repo(

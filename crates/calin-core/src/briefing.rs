@@ -205,6 +205,45 @@ pub(crate) fn answer_text(answer: &str) -> String {
     format!("[Calin] The user answered: {answer}")
 }
 
+/// A child session a workflow node dispatched, as the lead is told of it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WorkflowChild {
+    /// The node, or the child's branch of a `parallel` node.
+    pub label: String,
+    pub failed: bool,
+    /// Each repo of the child with the git branch its work is on.
+    pub branches: Vec<(String, String)>,
+}
+
+/// What the lead agent is told, ahead of its next prompt, about the child
+/// sessions a workflow node dispatched: where each one's work is. `None`
+/// when no child has a branch to name.
+pub(crate) fn workflow_children_note(node: &str, children: &[WorkflowChild]) -> Option<String> {
+    if children.iter().all(|child| child.branches.is_empty()) {
+        return None;
+    }
+    let mut text = format!(
+        "[Calin] The workflow step `{node}` ran in child sessions, each on branches of its own:\n"
+    );
+    for child in children {
+        let places: Vec<String> = child
+            .branches
+            .iter()
+            .map(|(repo, branch)| format!("{repo} on branch `{branch}`"))
+            .collect();
+        let places = match places.is_empty() {
+            true => "no branch".to_owned(),
+            false => places.join(", "),
+        };
+        let ended = if child.failed { " (failed)" } else { "" };
+        text.push_str(&format!("- {}{ended}: {places}\n", child.label));
+    }
+    text.push_str(
+        "Bring a branch in with `git merge <branch>` from your worktree of that repository.",
+    );
+    Some(text)
+}
+
 /// Tells the agent about a repo the user attached while it was running.
 pub(crate) fn attach_note(repo: &SessionRepo) -> String {
     format!(
@@ -368,6 +407,39 @@ mod tests {
              to merge.\n"
         ));
         assert!(text.contains("- lib: branch `calin/lib-1`, commits not counted. Bring it in"));
+    }
+
+    #[test]
+    fn a_workflows_children_are_named_with_their_branches() {
+        let child = |label: &str, failed: bool, branches: &[(&str, &str)]| WorkflowChild {
+            label: label.to_owned(),
+            failed,
+            branches: branches
+                .iter()
+                .map(|(repo, branch)| ((*repo).to_owned(), (*branch).to_owned()))
+                .collect(),
+        };
+        assert_eq!(workflow_children_note("review", &[]), None);
+        let no_repos = [child("review", false, &[])];
+        assert_eq!(workflow_children_note("review", &no_repos), None);
+        let children = [
+            child(
+                "docs",
+                false,
+                &[("api", "calin/docs-1"), ("web", "calin/docs-2")],
+            ),
+            child("tests", true, &[("api", "calin/tests-1")]),
+            child("notes", false, &[]),
+        ];
+        assert_eq!(
+            workflow_children_note("split", &children).unwrap(),
+            "[Calin] The workflow step `split` ran in child sessions, each on branches of its \
+             own:\n\
+             - docs: api on branch `calin/docs-1`, web on branch `calin/docs-2`\n\
+             - tests (failed): api on branch `calin/tests-1`\n\
+             - notes: no branch\n\
+             Bring a branch in with `git merge <branch>` from your worktree of that repository."
+        );
     }
 
     #[test]

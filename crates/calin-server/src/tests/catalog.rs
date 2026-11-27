@@ -100,13 +100,15 @@ async fn settings_have_defaults_and_are_replaced_whole() {
     let reply = get(&app, "/api/v1/settings").await;
     assert_eq!(reply.status, StatusCode::OK);
     let defaults: Settings = reply.json();
-    // The clone root is always filled in: the data directory's `repos`.
+    // The clone root is always filled in: the data directory's `repos`. So
+    // is the session limit.
     assert_eq!(
         defaults,
         Settings {
             home_repo: None,
             scan_roots: Vec::new(),
             clone_root: Some(data.path().join("repos").to_str().unwrap().to_owned()),
+            max_parallel: Some(4),
         }
     );
 

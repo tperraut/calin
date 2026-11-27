@@ -16,6 +16,7 @@ use std::time::Instant;
 
 use calin_proto::{
     AttachRepoRequest, Event, EventBody, Graph, PermissionMode, Session, SessionDetail, Timeline,
+    WorkflowRun,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -35,6 +36,8 @@ pub struct NewSession {
     pub prompt: String,
     pub runner: String,
     pub permission_mode: PermissionMode,
+    /// The workflow the session runs; `None` for the built-in `quick`.
+    pub workflow: Option<String>,
     /// The model the request asked for, if any.
     pub model: Option<String>,
     /// The repos the request asked for, in order.
@@ -348,6 +351,21 @@ impl Store {
     pub async fn timeline(&self, session_id: &str) -> Result<Timeline> {
         let session_id = session_id.to_owned();
         self.call(|reply| Cmd::Timeline { session_id, reply }).await
+    }
+
+    /// The session's workflow run, as its `workflow_*` events left it, with
+    /// what the session tree has cost. `None` for a session without a run.
+    pub async fn workflow_run(&self, session_id: &str) -> Result<Option<WorkflowRun>> {
+        let session_id = session_id.to_owned();
+        self.call(|reply| Cmd::WorkflowRun { session_id, reply })
+            .await
+    }
+
+    /// What every agent of the tree the session belongs to has cost so far,
+    /// from the agents' own totals.
+    pub async fn tree_cost(&self, session_id: &str) -> Result<f64> {
+        let session_id = session_id.to_owned();
+        self.call(|reply| Cmd::TreeCost { session_id, reply }).await
     }
 
     /// The highest number among the pull requests recorded for a repo, in

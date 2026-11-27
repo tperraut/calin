@@ -12,11 +12,11 @@ use crate::tokens::AgentRef;
 const TOOLS: &str = "http://127.0.0.1:4680/api/v1/mcp";
 
 /// One session on the puppet runner: who its agent is and the agent's end.
-struct Played {
-    id: String,
-    agent: AgentRef,
-    params: StartParams,
-    io: AgentIo,
+pub(super) struct Played {
+    pub(super) id: String,
+    pub(super) agent: AgentRef,
+    pub(super) params: StartParams,
+    pub(super) io: AgentIo,
 }
 
 /// A root session ("start") with `api` attached for writing, its agent
@@ -30,7 +30,7 @@ struct Tree {
 }
 
 /// Takes the agent the puppet runner was just asked to start.
-async fn play(starts: &mut Starts) -> Played {
+pub(super) async fn play(starts: &mut Starts) -> Played {
     let (params, io) = within(starts.recv()).await.unwrap();
     Played {
         id: params.session_id.clone(),
@@ -92,38 +92,43 @@ impl Tree {
     }
 }
 
-async fn all_events(manager: &SessionManager, id: &str) -> Vec<Event> {
+pub(super) async fn all_events(manager: &SessionManager, id: &str) -> Vec<Event> {
     manager.store().subscribe(id, 0).await.unwrap().backlog
 }
 
-async fn head(manager: &SessionManager, id: &str) -> u64 {
+pub(super) async fn head(manager: &SessionManager, id: &str) -> u64 {
     manager.get(id).await.unwrap().session.head_seq
 }
 
-async fn status(manager: &SessionManager, id: &str) -> SessionStatus {
+pub(super) async fn status(manager: &SessionManager, id: &str) -> SessionStatus {
     manager.get(id).await.unwrap().session.status
 }
 
 /// The session's events after `after`, up to the first with this label.
-async fn until_label(manager: &SessionManager, id: &str, after: u64, wanted: &str) -> Vec<Event> {
+pub(super) async fn until_label(
+    manager: &SessionManager,
+    id: &str,
+    after: u64,
+    wanted: &str,
+) -> Vec<Event> {
     events_until(manager, id, after, |event| label(event) == wanted).await
 }
 
-async fn end_turn(manager: &SessionManager, played: &Played) {
+pub(super) async fn end_turn(manager: &SessionManager, played: &Played) {
     let after = head(manager, &played.id).await;
     emit(&played.io, RunnerOutput::TurnEnded).await;
     until_label(manager, &played.id, after, "agent_status:idle").await;
 }
 
 /// What the agent is handed next.
-async fn input(played: &mut Played) -> String {
+pub(super) async fn input(played: &mut Played) -> String {
     match within(played.io.inputs.recv()).await {
         Some(RunnerInput::UserMessage(text)) => text,
         other => panic!("expected a message for the agent, got {other:?}"),
     }
 }
 
-fn nothing_for(played: &mut Played) {
+pub(super) fn nothing_for(played: &mut Played) {
     assert!(
         played.io.inputs.try_recv().is_err(),
         "the agent of {} was handed something",
@@ -132,7 +137,7 @@ fn nothing_for(played: &mut Played) {
 }
 
 /// Obeys the stop request the agent is about to get.
-async fn exit_on_stop(played: &mut Played) {
+pub(super) async fn exit_on_stop(played: &mut Played) {
     assert_eq!(
         within(played.io.inputs.recv()).await,
         Some(RunnerInput::Stop)
@@ -140,7 +145,7 @@ async fn exit_on_stop(played: &mut Played) {
     emit(&played.io, RunnerOutput::Exited(Exit::Ok)).await;
 }
 
-fn sent(events: &[Event]) -> Vec<(&Event, &AgentMessage)> {
+pub(super) fn sent(events: &[Event]) -> Vec<(&Event, &AgentMessage)> {
     events
         .iter()
         .filter_map(|event| match &event.body {
@@ -150,7 +155,7 @@ fn sent(events: &[Event]) -> Vec<(&Event, &AgentMessage)> {
         .collect()
 }
 
-fn received(events: &[Event]) -> Vec<(&Event, &AgentMessage)> {
+pub(super) fn received(events: &[Event]) -> Vec<(&Event, &AgentMessage)> {
     events
         .iter()
         .filter_map(|event| match &event.body {
@@ -160,7 +165,7 @@ fn received(events: &[Event]) -> Vec<(&Event, &AgentMessage)> {
         .collect()
 }
 
-async fn repo_path(manager: &SessionManager, id: &str, name: &str) -> PathBuf {
+pub(super) async fn repo_path(manager: &SessionManager, id: &str, name: &str) -> PathBuf {
     let repos = manager.get(id).await.unwrap().repos;
     let repo = repos.iter().find(|repo| repo.name == name);
     PathBuf::from(
@@ -170,14 +175,14 @@ async fn repo_path(manager: &SessionManager, id: &str, name: &str) -> PathBuf {
     )
 }
 
-fn commit(dir: &Path, file: &str, message: &str) -> String {
+pub(super) fn commit(dir: &Path, file: &str, message: &str) -> String {
     write_file(dir, file, "content\n");
     git(dir, &["add", "-A"]);
     git(dir, &["commit", "-q", "-m", message]);
     git(dir, &["rev-parse", "HEAD"])
 }
 
-fn text_item(id: &str, text: &str) -> Item {
+pub(super) fn text_item(id: &str, text: &str) -> Item {
     Item {
         id: id.to_owned(),
         status: ItemStatus::Completed,
@@ -188,7 +193,7 @@ fn text_item(id: &str, text: &str) -> Item {
 }
 
 /// The agent says `text`, as one finished item.
-async fn say(played: &Played, id: &str, text: &str) {
+pub(super) async fn say(played: &Played, id: &str, text: &str) {
     let running = EventBody::ItemStarted { item: item(id) };
     emit(&played.io, RunnerOutput::Event(running)).await;
     let done = EventBody::ItemCompleted {

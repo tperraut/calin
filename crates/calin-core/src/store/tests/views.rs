@@ -1063,6 +1063,7 @@ async fn questions_are_projected_as_open_until_they_are_answered() {
         id: "q1".to_owned(),
         text: "Which color?".to_owned(),
         options: vec!["blue".to_owned()],
+        gate: false,
     };
     let asked = EventDraft::new(EventBody::QuestionAsked { question }).agent("L");
     let asked = add(&store, &id, asked).await;

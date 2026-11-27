@@ -27,6 +27,7 @@ fn new_session(prompt: &str) -> NewSession {
         prompt: prompt.to_owned(),
         runner: "mock".to_owned(),
         permission_mode: PermissionMode::Ask,
+        workflow: None,
         model: None,
         repos: Vec::new(),
         dispatch: None,

@@ -47,6 +47,7 @@ impl Machine {
             home_repo: Some(text(&self.home)),
             scan_roots: vec![text(&self.root.join("code"))],
             clone_root: Some(text(&self.root.join("clones"))),
+            max_parallel: None,
         }
     }
 
