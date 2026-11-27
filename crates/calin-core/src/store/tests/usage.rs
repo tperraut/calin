@@ -413,17 +413,34 @@ async fn by_session_lists_the_200_most_expensive_roots() {
     assert!(!usage.rows.iter().any(|row| ids[..5].contains(&row.key)));
 }
 
+#[tokio::test]
+async fn the_default_range_includes_what_was_spent_just_now() {
+    let spent = spent().await;
+    // The moment `d` reported its usage.
+    let now = local("2026-10-01T09:00:00");
+    let (from, to) = resolve_range(None, None, now).unwrap();
+    let query = UsageQuery {
+        from,
+        to,
+        by: UsageBy::Runner,
+        zone: zone(),
+    };
+    let usage = spent.store.usage(query).await.unwrap();
+    assert_eq!(usage.totals.sessions, 1);
+    assert_eq!((usage.totals.tokens_in, usage.totals.tokens_out), (900, 90));
+}
+
 #[test]
 fn the_range_defaults_to_30_days_and_is_cut_to_366() {
     const DAY: i64 = 24 * 60 * 60 * 1000;
     let now = 1_800_000_000_000;
     assert_eq!(
         resolve_range(None, None, now).unwrap(),
-        (now - 30 * DAY, now)
+        (now + 1 - 30 * DAY, now + 1)
     );
     assert_eq!(
         resolve_range(Some(now - DAY), None, now).unwrap(),
-        (now - DAY, now)
+        (now - DAY, now + 1)
     );
     assert_eq!(
         resolve_range(None, Some(now - 10 * DAY), now).unwrap(),

@@ -36,7 +36,9 @@ pub(crate) struct UsageQuery {
 /// `now`) and the clamping (at most 366 days, cut at the start). `Invalid`
 /// when it ends before it starts or starts before 1970.
 pub(crate) fn resolve_range(from: Option<i64>, to: Option<i64>, now: i64) -> Result<(i64, i64)> {
-    let to = to.unwrap_or(now);
+    // The end is exclusive: by default it is just after now, so what was
+    // reported this very millisecond is in "the last 30 days".
+    let to = to.unwrap_or(now.saturating_add(1));
     let from = from.unwrap_or(to.saturating_sub(DEFAULT_RANGE_MS));
     if from < 0 || to < 0 {
         return Err(Error::Invalid(
