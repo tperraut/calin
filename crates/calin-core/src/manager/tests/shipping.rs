@@ -1390,9 +1390,13 @@ async fn a_session_from_an_issue_hands_the_agent_its_text_and_keeps_the_users_ow
         matches!(&err, Error::Invalid(what) if what.contains("nope")),
         "{err:?}"
     );
-    // The prompt is still the user's to write, as the contract says.
+    // An issue can stand in for the prompt; a blank prompt alone is refused.
     unknown.issue = Some(from_issue(&api, 12));
     unknown.prompt = "  ".to_owned();
+    let stood_in = d.manager.create_session(unknown.clone()).await.unwrap();
+    assert_eq!(stood_in.session.prompt, "Work on issue #12: Login fails");
+    assert_eq!(stood_in.session.title, "Work on issue #12: Login fails");
+    unknown.issue = None;
     let err = d.manager.create_session(unknown).await.unwrap_err();
     assert!(matches!(err, Error::Invalid(_)), "{err:?}");
     // A repo that is not on GitHub has no issues.
