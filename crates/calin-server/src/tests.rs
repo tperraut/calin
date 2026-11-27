@@ -31,6 +31,7 @@ use super::*;
 
 mod catalog;
 mod delivery;
+mod demo;
 mod integrations;
 mod orchestration;
 mod signin;

@@ -56,6 +56,20 @@ devices, run it behind a reverse proxy with sign-in: see [Running on a server](#
 | `CALIN_UNSAFE_DEV_ALLOW_HTTP_LOOPBACK=1` | **Unsafe, for development and automated browser tests only.** Lets `CALIN_PUBLIC_URL` and `CALIN_OIDC_ISSUER` be plain `http` on `localhost` or `127.0.0.1` with an explicit port, and push subscriptions point at a push service on `http://127.0.0.1:<port>`. Never set it on a real server: sign-in over plain HTTP protects nothing. Any value other than `1` is an error. |
 | `CLAUDE_CODE_ENABLE_TODO_TOOLS=1` | Not Calin's own: it is passed on to Claude Code, which then offers its task tools to every model. A session shows the agent's plan only when the agent has those tools. |
 
+### Trying orchestration without an agent
+
+In dry run the simulated agent follows a few words in the prompt, so you can see child sessions,
+notes, reports and questions in the graph and timeline without using any plan:
+
+| In the prompt | What the simulated agent does |
+| --- | --- |
+| `demo: orchestrate` | Dispatches two child sessions, tells you so, answers each child's report and then sums up. |
+| `demo: orchestrate demo: note` | The same, and the second child also sends its parent a note before reporting. |
+| `demo: ask` | Asks you a question with two suggested answers, then repeats your answer. |
+
+A child session receives `demo: child` (or `demo: note`) in its brief: it changes a notes file and
+reports back.
+
 ## Running on a server
 
 Calin can run on a small Linux machine behind a domain, with sign-in through any OpenID Connect

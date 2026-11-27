@@ -1,5 +1,9 @@
 //! A scripted agent with no network and no randomness, for tests, demos and
-//! `CALIN_DRY_RUN=1`.
+//! `CALIN_DRY_RUN=1`. Directives in a prompt (see `demo`) make it call
+//! Calin's own tool endpoint on loopback, and nothing else.
+
+mod demo;
+mod tools;
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -105,6 +109,13 @@ impl MockRunner {
             inside: None,
             calling: None,
             queued: VecDeque::new(),
+            tools: match params.tool_endpoint.as_deref() {
+                Some(url) => tools::Endpoint::parse(url),
+                None => Err("none was given".to_owned()),
+            },
+            rpc_ids: 0,
+            dispatched: Vec::new(),
+            reported: Vec::new(),
         };
         tokio::spawn(agent.run(native_session, params.prompt));
     }
@@ -138,6 +149,14 @@ struct MockAgent {
     calling: Option<Item>,
     /// Messages that arrived mid-turn; each starts a turn of its own.
     queued: VecDeque<String>,
+    /// Calin's tool endpoint, or why the demo directives cannot use it.
+    tools: Result<tools::Endpoint, String>,
+    /// The last JSON-RPC id used.
+    rpc_ids: u64,
+    /// The titles of the children the last `demo: orchestrate` dispatched.
+    dispatched: Vec<String>,
+    /// The titles of the children that reported since.
+    reported: Vec<String>,
 }
 
 impl MockAgent {
@@ -214,6 +233,9 @@ impl MockAgent {
 
     async fn turn(&mut self, user_text: &str) -> Result<(), Cut> {
         self.turns += 1;
+        if let Some(script) = demo::script(user_text) {
+            return self.demo(script).await;
+        }
         let quote = quote(user_text);
 
         self.streamed(
@@ -260,23 +282,8 @@ impl MockAgent {
             .iter()
             .map(|path| path.to_string_lossy().into_owned())
             .collect();
-        self.subagent(locations.clone()).await?;
-
-        let note = format!("- turn {}: {quote}\n", self.turns);
-        self.tool(
-            "Edit",
-            ToolKind::Edit,
-            EDITED_FILE,
-            json!({
-                "file_path": EDITED_FILE,
-                "old_string": "",
-                "new_string": note,
-            }),
-            locations,
-            &[],
-            Some(note),
-        )
-        .await?;
+        self.subagent(locations).await?;
+        self.edit_notes(&quote).await?;
         self.plan(2).await?;
 
         self.streamed(
@@ -303,6 +310,30 @@ impl MockAgent {
             self.turns,
             now_ms(),
         )]))
+        .await
+    }
+
+    /// Appends a line naming the turn to the notes file: a real change.
+    async fn edit_notes(&mut self, quote: &str) -> Result<(), Cut> {
+        let locations: Vec<String> = self
+            .edited
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+        let note = format!("- turn {}: {quote}\n", self.turns);
+        self.tool(
+            "Edit",
+            ToolKind::Edit,
+            EDITED_FILE,
+            json!({
+                "file_path": EDITED_FILE,
+                "old_string": "",
+                "new_string": note,
+            }),
+            locations,
+            &[],
+            Some(note),
+        )
         .await
     }
 
@@ -705,6 +736,8 @@ mod tests {
     use std::collections::{HashMap, HashSet};
 
     use super::*;
+
+    mod demo;
 
     const TIMEOUT: Duration = Duration::from_secs(5);
 

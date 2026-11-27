@@ -215,6 +215,9 @@ name = "calin-agents"
 version = "0.0.1"
 dependencies = [
  "calin-proto",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "rustix",
  "serde_json",
  "tempfile",

@@ -20,6 +20,7 @@ use crate::testing::{git, git_repo, write_file};
 
 mod attach;
 mod automations;
+mod demo;
 mod issues;
 mod limits;
 mod orchestration;
