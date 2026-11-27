@@ -420,7 +420,7 @@ export function TimelineView(props: {
                   }}
                   title={lane().label}
                 >
-                  <span class="line-clamp-2 min-w-0 wrap-anywhere">{lane().label}</span>
+                  <span class="line-clamp-2 min-w-0 wrap-anywhere">{lane().short}</span>
                 </div>
               )}
             </For>

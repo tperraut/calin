@@ -29,6 +29,11 @@ export type LaneView = {
   readonly depth: number;
   /** The agent's role; a lead is known by its session's title when it is given. */
   readonly label: string;
+  /**
+   * The label as the narrow lane column shows it: sibling sessions share their
+   * start, so the title is cut in the middle and keeps the end that tells them apart.
+   */
+  readonly short: string;
   /** True for the agents of the session on screen. */
   readonly own: boolean;
 };
@@ -56,8 +61,9 @@ export function laneViews(
       id: lane.agent.id,
       lane,
       depth: depthOf(lane, new Set()),
-      label:
-        title === undefined ? lane.agent.role : `${lane.agent.role} · ${clipMiddle(title, 24)}`,
+      label: title === undefined ? lane.agent.role : `${lane.agent.role} · ${title}`,
+      short:
+        title === undefined ? lane.agent.role : `${lane.agent.role} · ${clipMiddle(title, 22)}`,
       own: lane.session_id === openSessionId,
     };
   });

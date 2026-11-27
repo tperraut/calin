@@ -148,7 +148,8 @@ describe("lanes and arrows", () => {
     expect(laneViews(makeTimeline(), "s1", () => undefined)[2].label).toBe("lead");
     // Sibling sessions share their start: the label keeps the end that tells them apart.
     const long = laneViews(makeTimeline(), "s1", () => "Ship the health check: part B")[2];
-    expect(long.label).toBe("lead · Ship the hea…eck: part B");
+    expect(long.short).toBe("lead · Ship the he…ck: part B");
+    expect(long.label).toBe("lead · Ship the health check: part B");
   });
 
   it("draws an arrow at its moment from the sender's lane to the recipient's", () => {
