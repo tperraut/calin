@@ -152,7 +152,7 @@ async fn full_flow_as_a_public_client() {
         .await
         .unwrap();
     let cookie = start.set_cookie().to_owned();
-    assert!(cookie.starts_with("calin_login="));
+    assert!(cookie.starts_with("__Secure-calin_login="));
     assert!(cookie.ends_with("; Path=/auth; Max-Age=600; HttpOnly; Secure; SameSite=Lax"));
 
     let url = start.authorization_url();
@@ -1499,20 +1499,21 @@ async fn the_provider_going_down_later_fails_only_the_exchange() {
 // ------------------------------------------------------------ rate limiting
 
 #[tokio::test]
-async fn ten_failed_callbacks_block_the_address_for_ten_minutes() {
+async fn ten_failures_with_live_pending_logins_block_the_address_for_ten_minutes() {
     let harness = Harness::new().await;
     harness.client.warm_up().await.unwrap();
     let attacker = address(66);
-    let stranger = PendingLoginRef::generate().unwrap();
     let junk = CallbackParams::from_query("code=x&state=y");
     for _ in 0..10 {
+        // A login this server started, finished with the wrong state.
+        let (_url, reference) = harness.begin_from(attacker, None).await;
         assert_eq!(
             harness
                 .client
-                .finish_login(attacker, Some(&stranger), &junk)
+                .finish_login(attacker, Some(&reference), &junk)
                 .await
                 .unwrap_err(),
-            LoginError::UnknownPendingLogin
+            LoginError::StateMismatch
         );
     }
     // The eleventh is refused whatever it carries, even a genuine callback,
@@ -1524,6 +1525,15 @@ async fn ten_failed_callbacks_block_the_address_for_ten_minutes() {
         harness
             .client
             .finish_login(attacker, Some(&reference), &genuine)
+            .await
+            .unwrap_err(),
+        LoginError::RateLimited
+    );
+    // So is a callback with no cookie at all.
+    assert_eq!(
+        harness
+            .client
+            .finish_login(attacker, None, &junk)
             .await
             .unwrap_err(),
         LoginError::RateLimited
@@ -1540,10 +1550,11 @@ async fn ten_failed_callbacks_block_the_address_for_ten_minutes() {
 
     // Ten minutes after the failures the address may try again.
     harness.clock.advance(599);
+    let (_url, reference) = harness.begin_from(attacker, None).await;
     assert_eq!(
         harness
             .client
-            .finish_login(attacker, None, &junk)
+            .finish_login(attacker, Some(&reference), &junk)
             .await
             .unwrap_err(),
         LoginError::RateLimited
@@ -1556,28 +1567,126 @@ async fn ten_failed_callbacks_block_the_address_for_ten_minutes() {
 }
 
 #[tokio::test]
-async fn successful_logins_do_not_count_and_every_kind_of_failure_does() {
+async fn junk_callbacks_without_a_live_pending_login_do_not_block_the_address() {
+    let harness = Harness::new().await;
+    harness.client.warm_up().await.unwrap();
+    let victim = address(7);
+    let junk = CallbackParams::from_query("code=x&state=y");
+
+    // What a hostile page makes the victim's browser send: callbacks with
+    // no pending-login cookie. Ten of them, and many more.
+    for _ in 0..10 {
+        assert_eq!(
+            harness
+                .client
+                .finish_login(victim, None, &junk)
+                .await
+                .unwrap_err(),
+            LoginError::NoPendingLogin
+        );
+    }
+    signed_in(harness.login_from(victim).await);
+    for _ in 0..100 {
+        assert_eq!(
+            harness
+                .client
+                .finish_login(victim, None, &junk)
+                .await
+                .unwrap_err(),
+            LoginError::NoPendingLogin
+        );
+    }
+
+    // A cookie this server never issued, one already used, one expired.
+    let stranger = PendingLoginRef::generate().unwrap();
+    let (url, used) = harness.begin_from(victim, None).await;
+    let query = harness.provider.authorize(&url).await;
+    signed_in(
+        harness
+            .client
+            .finish_login(victim, Some(&used), &CallbackParams::from_query(&query))
+            .await,
+    );
+    let (_url, expired) = harness.begin_from(victim, None).await;
+    harness.clock.advance(600);
+    for reference in [&stranger, &used, &expired] {
+        for _ in 0..10 {
+            assert_eq!(
+                harness
+                    .client
+                    .finish_login(victim, Some(reference), &junk)
+                    .await
+                    .unwrap_err(),
+                LoginError::UnknownPendingLogin
+            );
+        }
+    }
+    assert_eq!(harness.provider.state().hits.token, 2);
+
+    // None of it counted: the victim signs in, and still has all ten
+    // failures of their own before being limited.
+    signed_in(harness.login_from(victim).await);
+    for _ in 0..10 {
+        let (_url, reference) = harness.begin_from(victim, None).await;
+        assert_eq!(
+            harness
+                .client
+                .finish_login(victim, Some(&reference), &junk)
+                .await
+                .unwrap_err(),
+            LoginError::StateMismatch
+        );
+    }
+    assert_eq!(
+        harness.login_from(victim).await.unwrap_err(),
+        LoginError::RateLimited
+    );
+}
+
+#[tokio::test]
+async fn successful_logins_do_not_count_and_every_failure_after_the_pending_login_does() {
     let harness = Harness::new().await;
     for _ in 0..25 {
         signed_in(harness.login().await);
     }
-    // Ten failures of different kinds, from one address.
+    // Ten failures of different kinds, from one address, each with a
+    // pending login of its own.
     harness.provider.state().claim_edits = vec![("aud", Some(json!("another-client")))];
-    for _ in 0..5 {
+    for _ in 0..3 {
         assert_eq!(
             id_token_error(harness.login().await),
             IdTokenError::WrongAudience
         );
     }
     harness.provider.state().claim_edits.clear();
-    for _ in 0..5 {
+    harness.provider.state().user.email = Some("mallory@example.com".to_owned());
+    assert!(matches!(
+        harness.login().await,
+        Err(LoginError::NotAllowed(_))
+    ));
+    harness.provider.state().user.email = Some("alice@example.com".to_owned());
+    harness.provider.state().token = Some(Misbehavior::Answer(500, String::new()));
+    assert!(matches!(
+        harness.login().await,
+        Err(LoginError::TokenEndpoint(_))
+    ));
+    harness.provider.state().token = None;
+    let cases: [(&str, LoginError); 5] = [
+        ("code=x&state=wrong", LoginError::StateMismatch),
+        ("code=x", LoginError::StateMismatch),
+        ("code=x&code=y&state=STATE", LoginError::MalformedCallback),
+        ("state=STATE", LoginError::NoCode),
+        (
+            "error=access_denied&state=STATE",
+            LoginError::ProviderRefused("access_denied".to_owned()),
+        ),
+    ];
+    for (query, expected) in cases {
+        let (url, reference) = harness.begin(None).await;
+        let query = query.replace("STATE", &query_of(&url)["state"]);
         assert_eq!(
-            harness
-                .client
-                .finish_login(address(1), None, &CallbackParams::default())
-                .await
-                .unwrap_err(),
-            LoginError::NoPendingLogin
+            harness.finish(&reference, &query).await.unwrap_err(),
+            expected
         );
     }
     assert_eq!(harness.login().await.unwrap_err(), LoginError::RateLimited);
@@ -1610,8 +1719,10 @@ async fn no_secret_appears_in_any_debug_or_display_output() {
         .1
         .to_owned();
     let reference =
-        PendingLoginRef::from_cookie_headers([format!("calin_login={reference_text}").as_str()])
-            .unwrap();
+        PendingLoginRef::from_cookie_headers([
+            format!("__Secure-calin_login={reference_text}").as_str()
+        ])
+        .unwrap();
     let query = harness.provider.authorize(start.authorization_url()).await;
     let code = form_of(&query)["code"].clone();
     let params = CallbackParams::from_query(&query);

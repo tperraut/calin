@@ -18,8 +18,9 @@ const MAX_ADDRESSES: usize = 4096;
 /// Counts failed sign-in callbacks per client address: 10 per 10 minutes.
 ///
 /// An attempt takes its slot when it begins and gives it back only if it
-/// succeeds, so attempts running at the same time cannot all slip under the
-/// limit, and a caller cannot forget to count a failure.
+/// succeeds or turns out not to be a sign-in attempt at all, so attempts
+/// running at the same time cannot all slip under the limit, and a caller
+/// cannot forget to count a failure.
 ///
 /// IPv6 addresses are counted per /64, the smallest block one customer
 /// usually controls: counting single addresses would not limit anyone.
@@ -117,6 +118,18 @@ pub struct Attempt<'a> {
 impl Attempt<'_> {
     /// The attempt succeeded: it no longer counts against the address.
     pub fn succeeded(self) {
+        self.release();
+    }
+
+    /// The request was not a sign-in attempt from this client's browser (it
+    /// carried no live pending login): it does not count either. Counting
+    /// it would let anyone block an address by sending junk in its name,
+    /// which a page can make a visitor's browser do.
+    pub fn not_an_attempt(self) {
+        self.release();
+    }
+
+    fn release(self) {
         let mut entries = self.limiter.lock();
         if let Some(stamps) = entries.get_mut(&self.key) {
             if let Some(index) = stamps.iter().rposition(|stamp| *stamp == self.at) {
@@ -191,6 +204,17 @@ mod tests {
         fail(&limiter, "198.51.100.1", 9);
         limiter.begin(ip("198.51.100.1")).unwrap().succeeded();
         fail(&limiter, "198.51.100.1", 1);
+        assert!(limiter.begin(ip("198.51.100.1")).is_err());
+    }
+
+    #[test]
+    fn what_was_not_an_attempt_gives_its_slot_back() {
+        let (limiter, _clock) = limiter();
+        for _ in 0..100 {
+            limiter.begin(ip("198.51.100.1")).unwrap().not_an_attempt();
+        }
+        assert_eq!(limiter.tracked_addresses(), 0);
+        fail(&limiter, "198.51.100.1", 10);
         assert!(limiter.begin(ip("198.51.100.1")).is_err());
     }
 

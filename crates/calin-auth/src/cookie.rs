@@ -8,10 +8,13 @@ use crate::secret::{
     RandomError, TOKEN_CHARS, has_token_shape, random_token, redacted_debug, sha256,
 };
 
-/// Name of the session cookie (spec section 3).
-pub const SESSION_COOKIE: &str = "calin_session";
+/// Name of the session cookie (spec section 3). The `__Host-` prefix makes
+/// browsers refuse it unless it is `Secure`, has `Path=/` and no `Domain`,
+/// so a neighbouring subdomain cannot plant one.
+pub const SESSION_COOKIE: &str = "__Host-calin_session";
 /// Name of the cookie that references a pending login (spec section 2).
-pub const PENDING_LOGIN_COOKIE: &str = "calin_login";
+/// `__Secure-` and not `__Host-`, because it is limited to `Path=/auth`.
+pub const PENDING_LOGIN_COOKIE: &str = "__Secure-calin_login";
 /// Prefix of every device token (spec section 4).
 pub const DEVICE_TOKEN_PREFIX: &str = "calin_";
 
@@ -27,11 +30,11 @@ const MAX_SIGN_OUT_TOKENS: usize = 8;
 const MAX_AUTHORIZATION_BYTES: usize = 256;
 
 const CLEAR_SESSION_COOKIE: &str =
-    "calin_session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax";
+    "__Host-calin_session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax";
 const CLEAR_PENDING_LOGIN_COOKIE: &str =
-    "calin_login=; Path=/auth; Max-Age=0; HttpOnly; Secure; SameSite=Lax";
+    "__Secure-calin_login=; Path=/auth; Max-Age=0; HttpOnly; Secure; SameSite=Lax";
 
-/// A session token as presented in the `calin_session` cookie.
+/// A session token as presented in the `__Host-calin_session` cookie.
 ///
 /// Holding one proves nothing: it is a candidate until the store finds its
 /// hash. It has no `Display` and its `Debug` is redacted.
@@ -48,9 +51,10 @@ impl SessionToken {
     /// (HTTP/2 may split the header into several fields: pass them all).
     ///
     /// Returns nothing when the cookie is absent, is not shaped like a token,
-    /// or appears with two different values: a second `calin_session` is
-    /// what a neighbouring subdomain plants to swap a victim into another
-    /// session, and there is no telling which one is genuine.
+    /// or appears with two different values. The `__Host-` prefix keeps a
+    /// conforming browser from holding two; if two arrive anyway, one was
+    /// planted to swap the user into another session, and there is no
+    /// telling which one is genuine. Only the prefixed name is read.
     pub fn from_cookie_headers<'a>(headers: impl IntoIterator<Item = &'a str>) -> Option<Self> {
         single_cookie(headers, SESSION_COOKIE)
             .filter(|value| has_token_shape(value))
@@ -58,7 +62,7 @@ impl SessionToken {
     }
 
     /// Every distinct, well-shaped session token among the request's
-    /// cookies, for sign-out: when a second `calin_session` was planted,
+    /// cookies, for sign-out: when a second session cookie was planted,
     /// [`SessionToken::from_cookie_headers`] rightly authenticates nobody,
     /// but signing out must still end whichever of them is a session.
     pub(crate) fn all_from_cookie_headers<'a>(
@@ -95,7 +99,7 @@ impl SessionToken {
     }
 }
 
-/// The reference to a pending login, as carried by the `calin_login` cookie.
+/// The reference to a pending login, as carried by the `__Secure-calin_login` cookie.
 #[derive(Clone, PartialEq, Eq)]
 pub struct PendingLoginRef(String);
 redacted_debug!(PendingLoginRef);
@@ -251,12 +255,12 @@ mod tests {
         assert_eq!(
             token.set_cookie(),
             format!(
-                "calin_session={TOKEN}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Lax"
+                "__Host-calin_session={TOKEN}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Lax"
             )
         );
         assert_eq!(
             SessionToken::clear_cookie(),
-            "calin_session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax"
+            "__Host-calin_session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax"
         );
     }
 
@@ -265,11 +269,13 @@ mod tests {
         let pending = PendingLoginRef(TOKEN.to_owned());
         assert_eq!(
             pending.set_cookie(),
-            format!("calin_login={TOKEN}; Path=/auth; Max-Age=600; HttpOnly; Secure; SameSite=Lax")
+            format!(
+                "__Secure-calin_login={TOKEN}; Path=/auth; Max-Age=600; HttpOnly; Secure; SameSite=Lax"
+            )
         );
         assert_eq!(
             PendingLoginRef::clear_cookie(),
-            "calin_login=; Path=/auth; Max-Age=0; HttpOnly; Secure; SameSite=Lax"
+            "__Secure-calin_login=; Path=/auth; Max-Age=0; HttpOnly; Secure; SameSite=Lax"
         );
     }
 
@@ -290,74 +296,113 @@ mod tests {
     fn session_cookie_parsing_table() {
         let ok = Some(TOKEN.to_owned());
         let cases: Vec<(Vec<String>, Option<String>)> = vec![
-            (vec![format!("calin_session={TOKEN}")], ok.clone()),
+            (vec![format!("__Host-calin_session={TOKEN}")], ok.clone()),
             (
-                vec![format!("theme=dark; calin_session={TOKEN}; lang=fr")],
+                vec![format!("theme=dark; __Host-calin_session={TOKEN}; lang=fr")],
                 ok.clone(),
             ),
             (
-                vec![format!("theme=dark;calin_session={TOKEN};lang=fr")],
+                vec![format!("theme=dark;__Host-calin_session={TOKEN};lang=fr")],
                 ok.clone(),
             ),
-            (vec![format!("  calin_session = {TOKEN} ")], ok.clone()),
-            (vec![format!("calin_session=\"{TOKEN}\"")], ok.clone()),
+            (
+                vec![format!("  __Host-calin_session = {TOKEN} ")],
+                ok.clone(),
+            ),
+            (
+                vec![format!("__Host-calin_session=\"{TOKEN}\"")],
+                ok.clone(),
+            ),
             // Split across several header fields, as HTTP/2 allows.
             (
-                vec!["theme=dark".to_owned(), format!("calin_session={TOKEN}")],
+                vec![
+                    "theme=dark".to_owned(),
+                    format!("__Host-calin_session={TOKEN}"),
+                ],
                 ok.clone(),
             ),
             // The same value twice is not a conflict.
             (
-                vec![format!("calin_session={TOKEN}; calin_session={TOKEN}")],
+                vec![format!(
+                    "__Host-calin_session={TOKEN}; __Host-calin_session={TOKEN}"
+                )],
                 ok.clone(),
             ),
             // Other cookies with lookalike names are ignored.
             (
                 vec![format!(
-                    "xcalin_session={OTHER}; calin_session={TOKEN}; calin_session2={OTHER}"
+                    "x__Host-calin_session={OTHER}; __Host-calin_session={TOKEN}; __Host-calin_session2={OTHER}"
                 )],
                 ok.clone(),
             ),
             (
-                vec![format!("calin_login={OTHER}; calin_session={TOKEN}")],
+                vec![format!(
+                    "__Secure-calin_login={OTHER}; __Host-calin_session={TOKEN}"
+                )],
                 ok.clone(),
             ),
             (
-                vec![format!("a=b=c; =x; ; novalue; calin_session={TOKEN}")],
+                vec![format!(
+                    "a=b=c; =x; ; novalue; __Host-calin_session={TOKEN}"
+                )],
                 ok.clone(),
             ),
             // Two different values: refuse both.
             (
-                vec![format!("calin_session={OTHER}; calin_session={TOKEN}")],
+                vec![format!(
+                    "__Host-calin_session={OTHER}; __Host-calin_session={TOKEN}"
+                )],
                 None,
             ),
             (
                 vec![
-                    format!("calin_session={TOKEN}"),
-                    format!("calin_session={OTHER}"),
+                    format!("__Host-calin_session={TOKEN}"),
+                    format!("__Host-calin_session={OTHER}"),
                 ],
                 None,
             ),
             (
-                vec![format!("calin_session=garbage; calin_session={TOKEN}")],
+                vec![format!(
+                    "__Host-calin_session=garbage; __Host-calin_session={TOKEN}"
+                )],
                 None,
             ),
-            (vec![format!("calin_session=; calin_session={TOKEN}")], None),
+            (
+                vec![format!(
+                    "__Host-calin_session=; __Host-calin_session={TOKEN}"
+                )],
+                None,
+            ),
             // Absent, empty, misspelled, wrong shape.
             (vec![], None),
             (vec![String::new()], None),
             (vec!["theme=dark".to_owned()], None),
-            (vec!["calin_session".to_owned()], None),
-            (vec!["calin_session=".to_owned()], None),
-            (vec![format!("Calin_Session={TOKEN}")], None),
-            (vec![format!("calin_session={}", &TOKEN[1..])], None),
-            (vec![format!("calin_session={TOKEN}A")], None),
-            (vec![format!("calin_session={}+", &TOKEN[1..])], None),
-            (vec![format!("calin_session={}%41", &TOKEN[3..])], None),
-            (vec![format!("calin_session=\"{TOKEN}")], None),
-            (vec![format!("calin_session={}", "A".repeat(100_000))], None),
+            (vec!["__Host-calin_session".to_owned()], None),
+            (vec!["__Host-calin_session=".to_owned()], None),
+            (vec![format!("__host-calin_session={TOKEN}")], None),
+            (vec![format!("__HOST-CALIN_SESSION={TOKEN}")], None),
+            // The names without their prefix, or with the other one, are
+            // not the session cookie.
+            (vec![format!("calin_session={TOKEN}")], None),
+            (vec![format!("Host-calin_session={TOKEN}")], None),
+            (vec![format!("__Secure-calin_session={TOKEN}")], None),
+            (vec![format!("__Host-calin_login={TOKEN}")], None),
+            (vec![format!("__Host-calin_session={}", &TOKEN[1..])], None),
+            (vec![format!("__Host-calin_session={TOKEN}A")], None),
+            (vec![format!("__Host-calin_session={}+", &TOKEN[1..])], None),
             (
-                vec![format!("calin_session={TOKEN}, calin_session={TOKEN}")],
+                vec![format!("__Host-calin_session={}%41", &TOKEN[3..])],
+                None,
+            ),
+            (vec![format!("__Host-calin_session=\"{TOKEN}")], None),
+            (
+                vec![format!("__Host-calin_session={}", "A".repeat(100_000))],
+                None,
+            ),
+            (
+                vec![format!(
+                    "__Host-calin_session={TOKEN}, __Host-calin_session={TOKEN}"
+                )],
                 None,
             ),
             (vec![";;;===;;;".to_owned()], None),
@@ -380,20 +425,23 @@ mod tests {
                 .map(|token| token.0)
                 .collect()
         };
-        let both = format!("calin_session={OTHER}; theme=dark; calin_session=\"{TOKEN}\"");
+        let both =
+            format!("__Host-calin_session={OTHER}; theme=dark; __Host-calin_session=\"{TOKEN}\"");
         assert_eq!(all(&[&both]), [OTHER, TOKEN]);
-        let repeated = format!("calin_session={TOKEN}; calin_session={TOKEN}");
+        let repeated = format!("__Host-calin_session={TOKEN}; __Host-calin_session={TOKEN}");
         assert_eq!(all(&[&repeated, &repeated]), [TOKEN]);
         let with_junk = format!(
-            "calin_session=garbage; calin_session={}; calin_session={TOKEN}; calin_login={OTHER}",
+            "__Host-calin_session=garbage; __Host-calin_session={}; __Host-calin_session={TOKEN}; __Secure-calin_login={OTHER}",
             "A".repeat(5000)
         );
         assert_eq!(all(&[&with_junk]), [TOKEN]);
         assert!(all(&[]).is_empty());
-        assert!(all(&["theme=dark", "calin_session="]).is_empty());
+        assert!(all(&["theme=dark", "__Host-calin_session="]).is_empty());
 
         // Bounded, however many are sent.
-        let many: Vec<String> = (0..50).map(|n| format!("calin_session={n:0>43}")).collect();
+        let many: Vec<String> = (0..50)
+            .map(|n| format!("__Host-calin_session={n:0>43}"))
+            .collect();
         let many: Vec<&str> = many.iter().map(String::as_str).collect();
         assert_eq!(all(&many).len(), MAX_SIGN_OUT_TOKENS);
     }
@@ -401,23 +449,33 @@ mod tests {
     #[test]
     fn an_oversized_value_ends_the_search() {
         // A huge value is not kept around to be compared with later ones.
-        let header = format!("calin_session={}; calin_session={TOKEN}", "A".repeat(4096));
+        let header = format!(
+            "__Host-calin_session={}; __Host-calin_session={TOKEN}",
+            "A".repeat(4096)
+        );
         assert_eq!(session(&[&header]), None);
     }
 
     #[test]
     fn pending_login_cookie_is_read_from_its_own_name_only() {
-        let header = format!("calin_session={OTHER}; calin_login={TOKEN}");
+        let header = format!("__Host-calin_session={OTHER}; __Secure-calin_login={TOKEN}");
         assert_eq!(
             PendingLoginRef::from_cookie_headers([header.as_str()]).map(|p| p.0),
             Some(TOKEN.to_owned())
         );
-        let header = format!("calin_session={TOKEN}");
+        let header = format!("__Host-calin_session={TOKEN}");
         assert_eq!(
             PendingLoginRef::from_cookie_headers([header.as_str()]),
             None
         );
-        let header = format!("calin_login={TOKEN}; calin_login={OTHER}");
+        for name in ["calin_login", "__Host-calin_login", "__secure-calin_login"] {
+            let header = format!("{name}={TOKEN}");
+            assert_eq!(
+                PendingLoginRef::from_cookie_headers([header.as_str()]),
+                None
+            );
+        }
+        let header = format!("__Secure-calin_login={TOKEN}; __Secure-calin_login={OTHER}");
         assert_eq!(
             PendingLoginRef::from_cookie_headers([header.as_str()]),
             None

@@ -123,9 +123,14 @@
 //! - No redirect from the provider is followed, to any origin.
 //! - The session cookie has `Max-Age` of 30 days besides the attributes
 //!   section 3 lists: without an expiry there would be nothing to re-issue.
-//! - A request with two different `calin_session` cookies is not signed in.
+//! - A request with two different `__Host-calin_session` cookies is not signed in.
 //! - Sessions and device tokens are listed and revoked per identity.
-//! - The failure limit counts IPv6 addresses per /64.
+//! - The failure limit counts IPv6 addresses per /64, and counts a failed
+//!   callback only when it presented a live pending login of this server:
+//!   junk sent in a visitor's name cannot lock that visitor out.
+//! - The cookies are `__Host-calin_session` and `__Secure-calin_login`,
+//!   with or without the development flag; the names without their prefix
+//!   are not read.
 //! - The provider's certificate must chain to a root in the Mozilla set
 //!   compiled in (`webpki-roots`); the system trust store is not read, and
 //!   the provider is reached directly: proxy variables are not honored.

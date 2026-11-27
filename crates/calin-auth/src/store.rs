@@ -579,7 +579,7 @@ impl AuthStore {
     }
 
     /// Signs a request out (`POST /auth/logout`): ends every session whose
-    /// token is among the request's `calin_session` cookies, and returns
+    /// token is among the request's `__Host-calin_session` cookies, and returns
     /// how many that was. Unlike authentication, this does not give up when
     /// two different cookies are present. Errors as [`AuthStore::sign_out`].
     pub async fn sign_out_request<'a>(

@@ -110,7 +110,7 @@ async fn session_lifecycle() {
     assert_eq!(session.info.created, START);
     assert_eq!(session.info.last_used, START);
     assert_eq!(session.info.user_agent, "Firefox/140");
-    assert!(session.set_cookie().starts_with("calin_session="));
+    assert!(session.set_cookie().starts_with("__Host-calin_session="));
     assert!(
         session
             .set_cookie()
@@ -946,7 +946,7 @@ async fn request_authentication_table() {
         (
             "session token as bearer",
             vec![],
-            vec![cookie.strip_prefix("calin_session=").unwrap()],
+            vec![cookie.strip_prefix("__Host-calin_session=").unwrap()],
             None,
         ),
     ];
@@ -961,11 +961,44 @@ async fn request_authentication_table() {
         store.authenticate_request([], [as_bearer.as_str()]).await,
         None
     );
-    let as_cookie = format!("calin_session={}", device.token.expose());
+    let as_cookie = format!("__Host-calin_session={}", device.token.expose());
     assert_eq!(
         store.authenticate_request([as_cookie.as_str()], []).await,
         None
     );
+}
+
+#[tokio::test]
+async fn a_session_cookie_without_its_prefix_authenticates_nobody() {
+    let fixture = Fixture::new().await;
+    let store = &fixture.store;
+    let session = store.create_session(&alice(), None).await.unwrap();
+    let token = token_text(&session);
+    assert!(session.set_cookie().starts_with("__Host-calin_session="));
+
+    for name in [
+        "calin_session",
+        "__Secure-calin_session",
+        "__host-calin_session",
+        "Host-calin_session",
+    ] {
+        let header = format!("{name}={token}");
+        assert_eq!(
+            store.authenticate_request([header.as_str()], []).await,
+            None,
+            "{name}"
+        );
+        // Nor does it sign anybody out.
+        assert_eq!(
+            store.sign_out_request([header.as_str()]).await.unwrap(),
+            0,
+            "{name}"
+        );
+    }
+    // A plain one next to the real one changes nothing.
+    let header = format!("calin_session={token}; __Host-calin_session={token}; calin_session=x");
+    let authenticated = store.authenticate_request([header.as_str()], []).await;
+    assert_eq!(authenticated.map(|a| a.identity), Some(alice()));
 }
 
 #[tokio::test]
@@ -980,7 +1013,7 @@ async fn signing_out_ends_every_session_the_request_presents() {
     let stranger = SessionToken::generate().unwrap().set_cookie();
     // Two different session cookies: nobody is authenticated...
     let header = format!(
-        "{}; theme=dark; {}; {}; calin_session=junk",
+        "{}; theme=dark; {}; {}; __Host-calin_session=junk",
         cookie_pair(&planted_cookie),
         cookie_pair(&mine_cookie),
         cookie_pair(&stranger)

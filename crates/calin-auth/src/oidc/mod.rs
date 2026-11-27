@@ -359,11 +359,16 @@ impl OidcClient {
     ///
     /// `client_address` comes from [`crate::client_address`], `pending` from
     /// [`PendingLoginRef::from_cookie_headers`], `params` from the query.
-    /// Every failure counts against the address; the eleventh attempt
-    /// within 10 minutes of 10 failures is refused before anything else
-    /// happens, with [`LoginError::RateLimited`]. In every other case the
-    /// pending login is used up, whatever the outcome. Always answer with
-    /// [`PendingLoginRef::clear_cookie`].
+    ///
+    /// A failure counts against the address when the request presented a
+    /// pending login that this server issued and that was still live: a
+    /// real attempt from that browser. A request without the cookie, or
+    /// with an unknown or expired one, is refused without counting, so
+    /// junk sent in someone's name cannot lock them out. After 10 counted
+    /// failures in 10 minutes the address is refused before anything else
+    /// happens, with [`LoginError::RateLimited`]. In every other case a
+    /// pending login that was presented is used up, whatever the outcome.
+    /// Always answer with [`PendingLoginRef::clear_cookie`].
     pub async fn finish_login(
         &self,
         client_address: IpAddr,
@@ -374,22 +379,33 @@ impl OidcClient {
             .limiter
             .begin(client_address)
             .map_err(|_| LoginError::RateLimited)?;
-        let success = self.finish(pending, params).await?;
+        // Taken before anything is checked: one callback per pending login.
+        let taken = match pending {
+            None => Err(LoginError::NoPendingLogin),
+            Some(reference) => self
+                .pending
+                .take(reference, self.clock.now())
+                .ok_or(LoginError::UnknownPendingLogin),
+        };
+        let login = match taken {
+            Ok(login) => login,
+            Err(error) => {
+                attempt.not_an_attempt();
+                return Err(error);
+            }
+        };
+        let success = self.finish(login, params).await?;
         attempt.succeeded();
         Ok(success)
     }
 
+    /// Everything after the pending login was found. Any error from here
+    /// counts against the client address.
     async fn finish(
         &self,
-        pending: Option<&PendingLoginRef>,
+        login: PendingLogin,
         params: &CallbackParams,
     ) -> Result<LoginSuccess, LoginError> {
-        let reference = pending.ok_or(LoginError::NoPendingLogin)?;
-        // Taken before anything is checked: one callback per pending login.
-        let login = self
-            .pending
-            .take(reference, self.clock.now())
-            .ok_or(LoginError::UnknownPendingLogin)?;
         if params.malformed {
             return Err(LoginError::MalformedCallback);
         }
