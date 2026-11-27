@@ -1555,6 +1555,19 @@ pub(super) fn from_wire_name<T: DeserializeOwned>(
     index: usize,
 ) -> rusqlite::Result<T> {
     let name: String = row.get(index)?;
+    parse_wire_name(name, index)
+}
+
+/// Like [`from_wire_name`], for a column that may be NULL.
+pub(super) fn from_optional_wire_name<T: DeserializeOwned>(
+    row: &Row<'_>,
+    index: usize,
+) -> rusqlite::Result<Option<T>> {
+    let name: Option<String> = row.get(index)?;
+    name.map(|name| parse_wire_name(name, index)).transpose()
+}
+
+fn parse_wire_name<T: DeserializeOwned>(name: String, index: usize) -> rusqlite::Result<T> {
     serde_json::from_value(serde_json::Value::String(name))
         .map_err(|err| rusqlite::Error::FromSqlConversionFailure(index, Type::Text, Box::new(err)))
 }
@@ -1620,7 +1633,8 @@ fn from_json<T: DeserializeOwned>(row: &Row<'_>, index: usize) -> rusqlite::Resu
         .map_err(|err| rusqlite::Error::FromSqlConversionFailure(index, Type::Text, Box::new(err)))
 }
 
-fn agent_from_row(row: &Row<'_>) -> rusqlite::Result<Agent> {
+/// An agent from the first columns of a row, in the order of `AGENT_COLUMNS`.
+pub(super) fn agent_from_row(row: &Row<'_>) -> rusqlite::Result<Agent> {
     Ok(Agent {
         id: row.get(0)?,
         session_id: row.get(1)?,
