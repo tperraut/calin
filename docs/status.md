@@ -148,16 +148,35 @@ Known gaps carried forward from M4:
 - A file named `quick.yaml` is listed as invalid beside the built-in, so that id appears twice.
 - The sessions list cannot show why a session is queued; the session page can.
 
-## M5: Remote access (in progress)
+## M5: Remote access (done 2026-11-28, except the desktop app and the real-world checks)
 
 - [x] Spec: `docs/specs/2026-11-27-remote-access.md`
-- [ ] `calin-auth`: OpenID Connect sign-in, sessions, device tokens, as a library
-- [ ] Server: public mode, the `/auth` routes, guarding every route and socket, device tokens
-- [ ] Web: sign-in redirect, sessions and device tokens in Settings
-- [ ] Installable phone app and Web Push
-- [ ] `calin server install` / `check` / `uninstall`
-- [ ] Desktop app (needs WebKitGTK development packages installed with root)
-- [ ] Checks that need the owner: a real provider and domain, a real phone
+- [x] `calin-auth`: OpenID Connect sign-in, sessions, device tokens, as a library (206 tests)
+- [x] Server: public mode, the `/auth` routes, a guard on every route and both sockets, device
+      tokens, security headers and a Content-Security-Policy
+- [x] Web: sign-in screen, sign out, signed-in browsers and device tokens in Settings
+- [x] Installable web app: manifest, icons, a service worker that never touches `/api` or `/auth`
+- [x] Web Push: `calin-push` (reproduces the RFC 8291 example byte for byte), the `/push`
+      routes, triggers for waiting, review, failed and merged, notification settings
+- [x] `calin server install`, `check` and `uninstall`
+- [x] `make e2e` signs in through a stand-in provider against the real binary (14 checks)
+- [ ] Desktop app. Needs the WebKitGTK development packages installed with root.
+- [ ] Checks that need the owner: a real provider and domain; a real server (the generated Caddy
+      file has never been validated by Caddy); a real phone for install and notifications.
+
+Known gaps carried forward from M5:
+
+- Push to a real push service over TLS is untested from the server: the library's tests run on
+  loopback. A failed send is not retried.
+- An open WebSocket learns that its session ended only by being closed; the web app then asks
+  `/me` to find out why.
+- Device tokens can delete push subscriptions, change preferences and send a test; they are
+  refused only when creating a subscription or another token.
+- The read-only system paths of the generated unit stop agents from installing system packages.
+- `claude --version` in `calin server check` shows the CLI is installed, not that it is signed in.
+- A reverse proxy that rewrites `Host` and adds no forwarding header makes outside requests look
+  local to the tool endpoint's loopback check. Caddy's defaults are safe; the README says so.
+- The manifest has one theme color, so the installed app's splash screen is light in both themes.
 
 ## Later
 

@@ -56,7 +56,12 @@ function browserCommand() {
 
 export class NoBrowser extends Error {}
 
-export async function start({ binary, shots }) {
+/**
+ * `serverEnv(port)` may return extra environment for the server (it replaces
+ * the dry-run defaults it names), and `host` picks the name the browser uses
+ * for it; public mode needs `localhost` to match its public URL.
+ */
+export async function start({ binary, shots, serverEnv = () => ({}), host = "127.0.0.1" }) {
   const command = browserCommand();
   if (!command) throw new NoBrowser("no Chromium-family browser found; set CALIN_E2E_BROWSER");
 
@@ -76,9 +81,14 @@ export async function start({ binary, shots }) {
 
   try {
     const port = await freePort();
-    const base = `http://127.0.0.1:${port}`;
+    const base = `http://${host}:${port}`;
     const server = spawn(binary, ["serve", "--home", join(scratch, "home"), "--bind", `127.0.0.1:${port}`], {
-      env: { ...process.env, CALIN_DRY_RUN: "1", CALIN_MOCK_DELAY_MS: process.env.CALIN_MOCK_DELAY_MS ?? "30" },
+      env: {
+        ...process.env,
+        CALIN_DRY_RUN: "1",
+        CALIN_MOCK_DELAY_MS: process.env.CALIN_MOCK_DELAY_MS ?? "30",
+        ...(await serverEnv(port, { scratch, children })),
+      },
       stdio: "ignore",
       detached: true,
     });

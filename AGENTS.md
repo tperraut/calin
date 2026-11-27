@@ -20,7 +20,7 @@ Everything goes through `make`, which puts the toolchains on `PATH` itself. Do n
 | `make dev-server` | Server with the mock runner on `127.0.0.1:4680` |
 | `make dev-web` | Vite dev server, proxying `/api` to the server |
 | `make build` | Web app, then the release binary that embeds it |
-| `make e2e` | Drives the built binary in a headless browser with the mock runner. Exit 2 means no browser was found, which is not a pass. |
+| `make e2e` | Drives the built binary in a headless browser: the mock runner in local mode, then sign-in in public mode against a stand-in provider. Exit 2 means no browser was found, which is not a pass. |
 
 `make check` must pass before any commit. If you need a narrower loop, run the underlying command
 with the same `PATH` the Makefile exports.
@@ -33,6 +33,10 @@ with the same `PATH` the Makefile exports.
 | `crates/calin-core` | Sessions, the store (SQLite index + NDJSON logs), the event bus, the session manager | No HTTP and no process spawning here. The log is the source of truth; the index must be rebuildable from it. |
 | `crates/calin-git` | Everything that runs `git` or touches a checkout: worktrees, changes, diffs, directory listings, file reads and writes | A blocking library: callers use `spawn_blocking`. Shells out to the `git` CLI. Every path from outside goes through its one path-safety function. Never deletes a branch. |
 | `crates/calin-term` | Pseudo-terminals for the built-in terminal | No HTTP here; the server bridges a terminal to its socket. |
+| `crates/calin-workflow` | Workflow files: parsing, validation, templates and the engine | Pure: no I/O, no other crate of this workspace. Its rules are `docs/specs/2026-11-27-workflows.md`; change the spec first. |
+| `crates/calin-auth` | Sign-in with OpenID Connect, sessions, device tokens | The most security-sensitive code here. No web framework, no other crate of this workspace. Prefer refusing to guessing; every refusal has a test; no secret in any `Debug` or log. Its rules are `docs/specs/2026-11-27-remote-access.md`. |
+| `crates/calin-push` | Web Push: VAPID keys, subscriptions, encryption, sending | Crypto from `ring` only. An endpoint is a capability URL: log its host, never the URL. |
+| `crates/calin-install` | Renders and checks a server installation | Never changes the machine: it renders files and commands, and runs read-only probes. Rendered files have golden tests. |
 | `crates/calin-agents` | The runner interface and its implementations (`mock`, later `claude`, `acp`) | Nothing runner-specific leaks past the interface. Every runner emits `calin_proto::EventBody` only. A runner is tested against recorded fixtures in `fixtures/`. |
 | `crates/calin-server` | axum routes, the WebSocket, static assets | Routes live under `/api/v1` and match the table in `calin-proto/src/api.rs` exactly. Handlers stay thin and call `calin-core`. |
 | `crates/calin-cli` | The `calin` binary | Argument parsing and wiring only. |
@@ -54,6 +58,11 @@ with the same `PATH` the Makefile exports.
 - **Dry run always works.** `CALIN_DRY_RUN=1` runs every agent on the mock runner with no login
   and no network. Tests and end-to-end checks rely on it.
 - **Nothing merges on its own.** No code path merges, force-pushes or deletes a user's branch.
+- **Every route is guarded.** In public mode every `/api` route and both WebSocket upgrades need
+  a session or a device token. Routes are registered through the one list the guard test walks;
+  never add a route beside it.
+- **No OpenSSL, no C++ toolchain.** TLS is rustls on `ring`. A dependency that needs OpenSSL,
+  `aws-lc`, CMake or a C++ compiler does not go in.
 
 ## Rust
 
@@ -93,6 +102,8 @@ than restating it. Commit messages lead with what changed.
 ## Related documents
 
 - `docs/specs/2026-11-26-calin-design.md`: the design, with diagrams in `docs/specs/diagrams/`.
+- `docs/specs/2026-11-27-workflows.md`: workflow files, the engine, and how a run moves a session.
+- `docs/specs/2026-11-27-remote-access.md`: public mode, sign-in, device tokens, install, push, desktop.
 - `docs/status.md`: milestone progress.
 - `crates/calin-proto/src/api.rs`: the REST route table.
 - `crates/calin-proto/src/ws.rs`: the WebSocket protocol.

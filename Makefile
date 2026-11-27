@@ -51,5 +51,7 @@ dev-web: ## run the web dev server, proxying /api to the server
 e2e: ## browser end-to-end checks against the built binary with the mock runner (needs a Chromium-family browser)
 	cd $(WEB) && vp build
 	cargo build -q -p calin-cli
-	cd e2e && vp install && node run.mjs ../target/debug/calin
+	cargo build -q -p calin-auth --features test-provider --example test-provider
+	cd e2e && vp install && node run.mjs ../target/debug/calin \
+	  && node signin.mjs ../target/debug/calin ../target/debug/examples/test-provider
 

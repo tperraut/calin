@@ -10,7 +10,8 @@ Calin is inspired by [cezar](https://github.com/open-mercato/cezar) and differs 
 - **Orchestration is a graph.** Who spawned whom and who said what to whom is recorded and drawn.
 - **The workbench is built in.** Editor, diff, terminal and search are part of the app.
 
-**Status: early.** The design is written and the skeleton is being built. See
+**Status: early, and moving fast.** Sessions across several repos, workflows, the orchestration
+graph and sign-in work; nothing has been run on a real server or a real phone yet. See
 [docs/status.md](docs/status.md) and the [design spec](docs/specs/2026-11-26-calin-design.md).
 
 ## Development
@@ -35,7 +36,8 @@ CALIN_DRY_RUN=1 target/release/calin serve
 ```
 
 Open <http://127.0.0.1:4680>. With `CALIN_DRY_RUN=1` every agent is simulated, so no agent CLI or
-login is needed. The server only listens on loopback addresses until sign-in exists.
+login is needed. The server always listens on a loopback address. To reach it from other
+devices, run it behind a reverse proxy with sign-in: see [Running on a server](#running-on-a-server).
 
 | Variable | Effect |
 | --- | --- |
@@ -53,6 +55,28 @@ login is needed. The server only listens on loopback addresses until sign-in exi
 | `CALIN_PUSH_CONTACT` | Public mode, optional: a `mailto:` address, for example `mailto:admin@example.com`, that push services can reach whoever runs the server at. Default: the public URL. Push notifications keep their key pair in `push-vapid-key.json` and the devices that subscribed in `push-subscriptions.json`, in the data directory. |
 | `CALIN_UNSAFE_DEV_ALLOW_HTTP_LOOPBACK=1` | **Unsafe, for development and automated browser tests only.** Lets `CALIN_PUBLIC_URL` and `CALIN_OIDC_ISSUER` be plain `http` on `localhost` or `127.0.0.1` with an explicit port, and push subscriptions point at a push service on `http://127.0.0.1:<port>`. Never set it on a real server: sign-in over plain HTTP protects nothing. Any value other than `1` is an error. |
 | `CLAUDE_CODE_ENABLE_TODO_TOOLS=1` | Not Calin's own: it is passed on to Claude Code, which then offers its task tools to every model. A session shows the agent's plan only when the agent has those tools. |
+
+## Running on a server
+
+Calin can run on a small Linux machine behind a domain, with sign-in through any OpenID Connect
+provider (Auth0, for example) and an allow-list of who may sign in.
+
+```sh
+calin server install --domain calin.example.com \
+  --issuer https://your-tenant.eu.auth0.com/ --client-id <id> --allow you@example.com
+```
+
+This writes a systemd unit, an environment file and a Caddy site to a staging folder, and prints
+the commands to run as root. It changes nothing itself. `calin server check` verifies the result
+and `calin server uninstall` prints how to remove it.
+
+Whoever signs in gets a shell on that machine, so keep the allow-list short. Agents run as the
+service user and are not sandboxed. If you use a reverse proxy other than Caddy, it must keep the
+`Host` header and set `X-Forwarded-For`; a proxy that does neither makes outside requests look
+local. The design is in [docs/specs/2026-11-27-remote-access.md](docs/specs/2026-11-27-remote-access.md).
+
+Once it is served from its domain, the web app can be added to a phone's home screen and can send
+notifications when a session needs you (Settings → Notifications).
 
 ## License
 
