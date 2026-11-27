@@ -24,6 +24,10 @@ model?: string,
  */
 permission_mode?: PermissionMode, 
 /**
+ * Workflow id. The built-in `quick` when absent.
+ */
+workflow?: string, 
+/**
  * Repos to attach, in order. The first one is the primary repo: the
  * agent's working directory. With none, the agent works in an empty
  * folder inside the session's own directory.

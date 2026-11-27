@@ -52,13 +52,21 @@ pub struct Question {
     /// Suggested answers. The user may still answer in free text.
     #[serde(default)]
     pub options: Vec<String>,
+    /// True when a workflow gate asks: the answer must be `approve` or
+    /// `reject` (the two `options`), with an optional comment.
+    #[serde(default)]
+    pub gate: bool,
 }
 
 #[derive(Serialize, Deserialize, TS, Clone, Debug, PartialEq)]
 #[ts(export)]
 pub struct AnswerQuestionRequest {
-    /// Must not be blank.
+    /// Must not be blank. For a gate: `approve` or `reject`.
     pub answer: String,
+    /// For a gate: an optional note that goes with the decision.
+    #[serde(default)]
+    #[ts(optional)]
+    pub comment: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, TS, Clone, Copy, Debug, PartialEq, Eq, Hash)]

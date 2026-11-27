@@ -16,6 +16,11 @@ pub struct Settings {
     /// fills in its default (`<data dir>/repos`) when this is absent.
     #[serde(default)]
     pub clone_root: Option<String>,
+    /// How many root sessions may be preparing or running at once. Others wait
+    /// as `queued`, oldest first. The server fills in its default (4) when
+    /// this is absent. Child sessions do not count: they have their own limit.
+    #[serde(default)]
+    pub max_parallel: Option<u32>,
 }
 
 /// A named group of repos from the home repo's `.calin/repos.yaml`.

@@ -20,6 +20,7 @@ mod permission;
 mod repo;
 mod settings;
 mod terminal;
+mod workflow;
 mod ws;
 
 pub use api::*;
@@ -31,6 +32,7 @@ pub use permission::*;
 pub use repo::*;
 pub use settings::*;
 pub use terminal::*;
+pub use workflow::*;
 pub use ws::*;
 
 /// Topic carrying [`ServerMsg::SessionUpserted`] for every session.

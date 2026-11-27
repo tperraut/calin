@@ -62,6 +62,9 @@ pub struct Session {
     /// How tool permission requests are answered. Absent in logs written before M1.
     #[serde(default)]
     pub permission_mode: PermissionMode,
+    /// The workflow this session runs. Absent for the built-in `quick` behavior.
+    #[serde(default)]
+    pub workflow: Option<String>,
     /// Branch name used in every attached repo. Set once worktrees exist.
     pub branch: Option<String>,
     pub parent_session_id: Option<String>,

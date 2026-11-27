@@ -15,6 +15,10 @@ runner: string,
  */
 permission_mode: PermissionMode, 
 /**
+ * The workflow this session runs. Absent for the built-in `quick` behavior.
+ */
+workflow: string | null, 
+/**
  * Branch name used in every attached repo. Set once worktrees exist.
  */
 branch: string | null, parent_session_id: string | null, 

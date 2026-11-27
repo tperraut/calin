@@ -11,4 +11,9 @@ id: string, text: string,
 /**
  * Suggested answers. The user may still answer in free text.
  */
-options: Array<string>, };
+options: Array<string>, 
+/**
+ * True when a workflow gate asks: the answer must be `approve` or
+ * `reject` (the two `options`), with an optional comment.
+ */
+gate: boolean, };

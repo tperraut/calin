@@ -2,6 +2,10 @@
 
 export type AnswerQuestionRequest = { 
 /**
- * Must not be blank.
+ * Must not be blank. For a gate: `approve` or `reject`.
  */
-answer: string, };
+answer: string, 
+/**
+ * For a gate: an optional note that goes with the decision.
+ */
+comment?: string, };

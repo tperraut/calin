@@ -17,4 +17,10 @@ scan_roots: Array<string>,
  * Where a declared repo with no local clone is cloned to. The server
  * fills in its default (`<data dir>/repos`) when this is absent.
  */
-clone_root: string | null, };
+clone_root: string | null, 
+/**
+ * How many root sessions may be preparing or running at once. Others wait
+ * as `queued`, oldest first. The server fills in its default (4) when
+ * this is absent. Child sessions do not count: they have their own limit.
+ */
+max_parallel: number | null, };

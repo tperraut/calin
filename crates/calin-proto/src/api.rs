@@ -11,6 +11,7 @@
 //! | POST | `/repos/{id}/clone` | | `202`; the repo reports `cloning` until it is `available` |
 //! | DELETE | `/repos/{id}` | | `204`; removes the registry entry only |
 //! | GET | `/repo-sets` | | `Vec<RepoSet>`, in the home repo's order |
+//! | GET | `/workflows` | | `Vec<WorkflowInfo>`: `quick` first, then by id |
 //! | GET | `/sessions` | | `Vec<Session>`, newest first |
 //! | POST | `/sessions` | [`CreateSessionRequest`] | `201` [`SessionDetail`] |
 //! | GET | `/sessions/{id}` | | [`SessionDetail`] |
@@ -21,6 +22,7 @@
 //! | POST | `/sessions/{id}/questions/{question_id}` | [`AnswerQuestionRequest`] | `202`, empty body |
 //! | GET | `/sessions/{id}/graph?at=` | | [`Graph`] of the session's whole tree |
 //! | GET | `/sessions/{id}/timeline` | | [`Timeline`] of the session's whole tree |
+//! | GET | `/sessions/{id}/workflow` | | [`WorkflowRun`]; 404 when the session runs no workflow |
 //! | POST | `/sessions/{id}/repos` | [`AttachRepoRequest`] | `201` [`SessionRepo`] |
 //! | POST | `/sessions/{id}/ship` | [`ShipRequest`] | `202`, empty body |
 //! | POST | `/sessions/{id}/pull-requests/refresh` | | `202`, empty body |
@@ -130,6 +132,21 @@
 //!   `at` (Unix milliseconds) asks for the graph as it was at that moment:
 //!   only what had happened by then, with each agent's and session's status
 //!   as of then. Without `at` it is the present.
+//! - **Workflows** come from `<home repo>/.calin/workflows/*.yaml`, plus the
+//!   built-in `quick`. The file format, the node types and how a run moves a
+//!   session are specified in `docs/specs/2026-11-27-workflows.md`; section 6
+//!   of that document is part of this contract. A file that does not validate
+//!   is listed with its `problem` and no `graph`, and naming it in
+//!   `CreateSessionRequest::workflow` is a 400, as is an unknown id. A child
+//!   session never runs a workflow of its own.
+//! - **A gate** is a `question_asked` whose question has `gate: true` and the
+//!   options `approve` and `reject`. Any other answer is a 400.
+//! - **The queue**: at most `Settings::max_parallel` root sessions are
+//!   `preparing` or `running` at a time. A new session beyond that stays
+//!   `queued` and starts, oldest first, when a slot frees. A session that is
+//!   `waiting`, `review`, `shipping` or settled holds no slot; one that leaves
+//!   `review` or `waiting` to run again takes a slot or waits for one as
+//!   `queued`. Stopping a queued session cancels it.
 //! - **Registering a repo**: the path must be the root of a git work tree
 //!   (400 otherwise); a name already in use is a 409. A repo attached to a
 //!   session that is not `done`, `failed` or `cancelled` cannot be deleted (409).
@@ -176,6 +193,10 @@ pub struct CreateSessionRequest {
     #[serde(default)]
     #[ts(optional)]
     pub permission_mode: Option<PermissionMode>,
+    /// Workflow id. The built-in `quick` when absent.
+    #[serde(default)]
+    #[ts(optional)]
+    pub workflow: Option<String>,
     /// Repos to attach, in order. The first one is the primary repo: the
     /// agent's working directory. With none, the agent works in an empty
     /// folder inside the session's own directory.

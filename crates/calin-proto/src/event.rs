@@ -2,8 +2,9 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 use crate::{
-    Agent, AgentMessage, AgentStatus, DecisionSource, FileOp, PermissionDecision,
-    PermissionRequest, PullRequest, Question, SessionRepo, SessionStatus,
+    Agent, AgentMessage, AgentStatus, DecisionSource, FileOp, NodePhase, PermissionDecision,
+    PermissionRequest, PullRequest, Question, SessionRepo, SessionStatus, WorkflowGraph,
+    WorkflowStatus,
 };
 
 /// One entry in a session's append-only log.
@@ -133,6 +134,25 @@ pub enum EventBody {
         question_id: String,
         answer: String,
         by: DecisionSource,
+    },
+    /// A workflow run began in this session.
+    WorkflowStarted {
+        workflow_id: String,
+        name: String,
+        graph: WorkflowGraph,
+        budget_usd: Option<f64>,
+    },
+    /// A workflow node started, or finished through `port`.
+    WorkflowNode {
+        node_id: String,
+        phase: NodePhase,
+        port: Option<String>,
+        outcome: Option<String>,
+    },
+    /// The workflow run ended. `status` is never `running`.
+    WorkflowFinished {
+        status: WorkflowStatus,
+        reason: Option<String>,
     },
     /// Something went wrong that the user should see in the transcript.
     Error {
