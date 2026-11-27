@@ -98,9 +98,44 @@ Known gaps carried forward from M2:
   the session briefing tells it, and each shell command there still waits for approval in `ask`
   and `accept_edits`.
 
+## M3: Orchestration graph (done 2026-11-27)
+
+- [x] Contract: messages, questions, child sessions, graph and timeline
+- [x] Subagents are agents of their own: spawned, attributed and closed, including the ones the
+      CLI runs in the background
+- [x] Child sessions through the tool endpoint (`dispatch`, `report`), notes (`send_message`),
+      questions (`ask_user`); a child forks from its parent's commit and reports back; stop cascades
+- [x] Graph (with "as of" a moment) and timeline for a whole session tree, from index projections
+- [x] Web: SVG graph with a stable tree layout, timeline, scrubber and replay, question bar,
+      subagent grouping and agent filter in the transcript, child sessions nested in the list
+- [x] File changes made through the shell are recorded at turn end
+- [x] `make e2e` covers the graph and timeline against the real server (33 checks)
+- [x] On the real CLI: a lead dispatched a child, the child worked and reported, the lead merged
+      the child's branch
+
+Known gaps carried forward from M3:
+
+- The mock runner cannot dispatch, send notes or ask, so `make e2e` covers subagents but not
+  child sessions, notes or questions. Those are covered by core tests and one real run.
+- On a busy session the note, report and change edges are wide arcs that tangle beside the tree.
+- A child that is stopped, or failed by a server restart, sends no report: its parent is not told.
+- Nothing has run on a real phone; the graph's frame rates were measured in a headless browser.
+- A stopped or failed turn is not scanned for shell-made changes.
+- Timeline marks and arrow hit areas are smaller than 44 px.
+
+## M4: Workflows (in progress)
+
+- [x] Spec: `docs/specs/2026-11-27-workflows.md`
+- [x] `calin-workflow`: parsing, validation, templates and the engine, as a pure library
+- [ ] Contract, then core and server: workflows from the home repo, a run inside a session,
+      checks, gates, parallel branches, budget
+- [ ] Web: workflow select, the Workflow view with the run overlaid
+- [ ] ACP runner for one more agent
+- [ ] Queue and parallel limit
+
 ## Later
 
-M3 graph · M4 workflows · M5 sign-in, server install, PWA, desktop · M6 integrations
+M5 sign-in, server install, PWA, desktop · M6 integrations
 
 ## Decisions since the spec
 

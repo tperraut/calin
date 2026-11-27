@@ -192,6 +192,36 @@ try {
   ).catch(() => false);
   check("transcript and diff are visible together on a desktop", sideBySide);
   await desktop.shot("changes");
+
+  // ---- M3: the session graph and timeline, from the real server's data.
+  await page.getByRole("tab", { name: /^graph/i }).first().click();
+  await page.waitForSelector('[aria-label="Session graph"]', { timeout: 15000 });
+  await page.waitForFunction(
+    () => /explorer/i.test(document.querySelector('[aria-label="Session graph"]')?.textContent ?? ""),
+    null,
+    { timeout: 15000 },
+  );
+  // The graph is SVG, so read its text content rather than innerText.
+  const graphText = await page.locator('[aria-label="Session graph"]').first().evaluate((el) => el.textContent ?? "");
+  check("the graph shows you, the lead and its subagent", /you/i.test(graphText) && /lead/i.test(graphText) && /explorer/i.test(graphText));
+  check("the graph shows the repos", graphText.includes("alpha-svc") && graphText.includes("beta-web"));
+  const graph = (await api("GET", `/sessions/${sessionId}/graph`)).body;
+  check(
+    "the server reports who changed which repo",
+    graph.edges.some((e) => e.kind === "changed") && graph.edges.some((e) => e.kind === "spawned"),
+    JSON.stringify(graph.edges.map((e) => [e.kind, e.count])),
+  );
+  await page.waitForTimeout(600);
+  await desktop.shot("graph");
+  await page.getByRole("group", { name: "View" }).getByRole("button", { name: "Timeline" }).click().catch(() =>
+    page.getByRole("button", { name: "Timeline" }).first().click(),
+  );
+  await page.waitForSelector('[aria-label="Timeline"]', { timeout: 15000 });
+  await page.waitForTimeout(600);
+  // Lane labels are HTML beside the drawing, so look at the page text.
+  const timelineText = await page.evaluate(() => document.body.innerText);
+  check("the timeline has a lane per agent", /lead · /i.test(timelineText) && /Waiting for you/.test(timelineText));
+  await desktop.shot("timeline");
   check("the desktop console is clean", desktop.errors.length === 0, JSON.stringify(desktop.errors).slice(0, 300));
 
   // ---- M2: a home repo that declares the others, attach mid-session, ship.
