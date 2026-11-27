@@ -72,7 +72,9 @@ impl WorkflowCatalog {
         state.loaded.clear();
     }
 
-    /// `quick` first, then the home repo's workflows by id.
+    /// `quick` first, then the home repo's workflows by id. No two share an
+    /// id: a file named `quick.yaml` or `quick.yml` is listed as invalid
+    /// under its path, `.calin/workflows/quick.yaml`.
     pub(crate) async fn list(&self) -> Vec<WorkflowInfo> {
         let mut all = vec![info(&calin_workflow::quick(), true)];
         all.extend(self.current().await.iter().map(|loaded| match loaded {
@@ -182,6 +184,17 @@ fn load(dir: &Path, stamps: &[Stamp]) -> Vec<Loaded> {
         let Some(id) = file_id(&stamp.name) else {
             continue;
         };
+        // Listed under its path, which holds a `/` that no id from a file
+        // name can: it never stands beside the built-in as a second `quick`.
+        if id == QUICK {
+            loaded.push(Loaded::Invalid {
+                id: format!("{WORKFLOWS_DIR}/{}", stamp.name),
+                problem: format!(
+                    "the id `{QUICK}` is reserved for the built-in workflow; rename the file"
+                ),
+            });
+            continue;
+        }
         // `a.yaml` and `a.yml` would be one id: neither can be meant.
         if let Some((_, other)) = files.iter().find(|(known, _)| *known == id) {
             let problem = format!(
@@ -478,17 +491,55 @@ edges:
         ])
         .await;
         let list = catalog.list().await;
-        assert_eq!(ids(&list), ["quick", "Not An Id", "quick", "twice"]);
+        assert_eq!(
+            ids(&list),
+            ["quick", ".calin/workflows/quick.yaml", "Not An Id", "twice"]
+        );
         assert!(list[0].builtin && list[0].graph.is_some());
         for unusable in &list[1..] {
             assert!(!unusable.builtin);
             assert!(unusable.graph.is_none(), "{}", unusable.id);
             assert!(unusable.problem.is_some(), "{}", unusable.id);
         }
+        assert_eq!(
+            list[1].problem.as_deref(),
+            Some("the id `quick` is reserved for the built-in workflow; rename the file")
+        );
         let twice = list[3].problem.as_deref().unwrap();
         assert!(twice.contains("twice.yaml") && twice.contains("twice.yml"));
         assert!(catalog.resolve(Some("twice")).await.is_err());
-        // The name always means the built-in one.
+        // The name always means the built-in one, and the file is never picked.
         assert!(catalog.resolve(Some("quick")).await.unwrap().is_none());
+        let refused = catalog.resolve(Some(".calin/workflows/quick.yaml")).await;
+        assert!(matches!(refused, Err(Error::Invalid(_))), "{refused:?}");
+    }
+
+    #[tokio::test]
+    async fn no_two_listed_workflows_ever_share_an_id() {
+        let (_dir, _home, catalog) = super::tests::catalog(&[
+            ("quick.yaml", VALID),
+            ("quick.yml", VALID),
+            // Its id would be `quick.yaml` if the reserved file were listed so.
+            ("quick.yaml.yaml", VALID),
+            ("Quick.yaml", VALID),
+            ("same.yaml", VALID),
+            ("same.yml", VALID),
+            ("with spaces.yaml", VALID),
+            ("UPPER.yml", VALID),
+            ("plain.yaml", VALID),
+        ])
+        .await;
+        let list = catalog.list().await;
+        let all = ids(&list);
+        let unique: std::collections::HashSet<&str> = all.iter().copied().collect();
+        assert_eq!(unique.len(), all.len(), "{all:?}");
+        assert_eq!(all.iter().filter(|id| **id == "quick").count(), 1);
+        assert!(all.contains(&".calin/workflows/quick.yaml"), "{all:?}");
+        assert!(all.contains(&".calin/workflows/quick.yml"), "{all:?}");
+        // Only the built-in and real ids can be picked.
+        for id in [".calin/workflows/quick.yaml", ".calin/workflows/quick.yml"] {
+            assert!(catalog.resolve(Some(id)).await.is_err(), "{id}");
+        }
+        assert!(catalog.resolve(Some("plain")).await.unwrap().is_some());
     }
 }

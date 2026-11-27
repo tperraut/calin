@@ -30,7 +30,7 @@ use super::unreported::{self, MAX_CHANGES_PER_TURN, Tracker};
 use super::{
     ChildEnd, Command, Dispatched, DispatchedRepo, Inner, NoteOutcome, NoteTarget, Reply,
     SessionManager, agent_ended, closed, expired, is_closed, no_attaching, no_longer_active,
-    no_shipping, no_turn, now_ms, ships, takes_messages, takes_repos, unanswered,
+    no_shipping, no_turn, now_ms, ships, status_name, takes_messages, takes_repos, unanswered,
 };
 use crate::briefing::{self, ChildOf, MAX_RUNNING_CHILDREN, ReportedBranch};
 use crate::error::{Error, Result};
@@ -43,7 +43,7 @@ use crate::workspace::{locate, primary, working_directory};
 /// How long a stopped agent, or a git command of a stopped preparation, may
 /// take to end before the session is cancelled without it.
 const STOP_GRACE: Duration = Duration::from_secs(5);
-const LEAD_ROLE: &str = "lead";
+pub(super) const LEAD_ROLE: &str = "lead";
 /// The reason of `waiting` while a permission request is open.
 const WAITING_FOR_PERMISSION: &str = "permission";
 /// The reason of `waiting` once an agent asked the user a question.
@@ -552,6 +552,13 @@ impl Driver {
         // have exited while the user was still thinking.
         let open = self.inner.store.open_questions(Some(&self.session_id));
         self.question = open.await?.into_iter().next();
+        // Missing them is better than not starting at all.
+        match self.unheard_reports().await {
+            Ok(notes) => self.notes = notes,
+            Err(err) => {
+                tracing::warn!(session = %self.session_id, %err, "could not look for reports the agent never got");
+            }
+        }
         Ok(())
     }
 
@@ -629,12 +636,6 @@ impl Driver {
                 tracing::error!(session = %self.session_id, %err, "could not check the workflow's budget");
                 Halt
             }),
-            Command::ChildStopped { session_id } => {
-                self.child_stopped(&session_id).await.map_err(|err| {
-                    tracing::error!(session = %self.session_id, %err, "could not record a stopped child session");
-                    Halt
-                })
-            }
             Command::Message { text, reply } => {
                 let result = self.message(text).await;
                 self.answer(reply, result)
@@ -643,8 +644,8 @@ impl Driver {
                 let result = self.interrupt().await;
                 self.answer(reply, result)
             }
-            Command::Stop { reply } => {
-                let result = self.stop().await;
+            Command::Stop { cascade, reply } => {
+                let result = self.stop(cascade).await;
                 self.answer(reply, result)
             }
             Command::Permission {
@@ -1466,8 +1467,12 @@ impl Driver {
         if self.status == SessionStatus::Review {
             return Ok(());
         }
+        let owes_report = !self.status.is_settled();
         self.set_status(SessionStatus::Review, None).await?;
-        self.send_report(None).await
+        if owes_report {
+            self.send_report(Ending::Rested).await?;
+        }
+        Ok(())
     }
 
     /// True while the user owes the session an answer.
@@ -1500,13 +1505,19 @@ impl Driver {
         self.notes.clear();
     }
 
-    async fn agent_exited(&mut self) -> Result<()> {
-        // An agent that exits mid-turn ends that turn: what it changed is
-        // looked for once its status says so.
-        let tracker = match unreported::tracker(&self.inner.trackers, &self.session_id) {
+    /// The tracker of the turn in progress, locked, taken before the agent
+    /// is dropped: a turn that ends without its end (the agent exits, fails
+    /// or is stopped) still has what it changed looked for, once the
+    /// agent's status says how it ended. `None` between turns.
+    async fn turn_tracker(&self) -> Option<tokio::sync::OwnedMutexGuard<Tracker>> {
+        match unreported::tracker(&self.inner.trackers, &self.session_id) {
             Some(tracker) if self.in_turn => Some(tracker.lock_owned().await),
             _ => None,
-        };
+        }
+    }
+
+    async fn agent_exited(&mut self) -> Result<()> {
+        let tracker = self.turn_tracker().await;
         self.drop_agent();
         if self.in_turn {
             let interrupted = self.interrupted;
@@ -1557,10 +1568,14 @@ impl Driver {
         Ok(())
     }
 
-    async fn stop(&mut self) -> Result<()> {
+    /// Ends the agent and cancels the session. A child that had not come
+    /// to rest since its last report tells its parent it was stopped,
+    /// unless the parent is being stopped too (`cascade`).
+    async fn stop(&mut self, cascade: bool) -> Result<()> {
         if is_closed(self.status) {
             return Err(closed(self.status));
         }
+        let owes_report = !self.status.is_settled();
         // The run ends with the session (workflows spec, section 6).
         self.abort_run(Abort::Stopped).await?;
         self.workflow = None;
@@ -1645,6 +1660,7 @@ impl Driver {
                 }
             }
         }
+        let tracker = self.turn_tracker().await;
         self.drop_agent();
         self.in_turn = false;
         self.interrupted = false;
@@ -1652,14 +1668,14 @@ impl Driver {
         self.held.clear();
         self.turn_items.clear();
         self.close_subagents(AgentStatus::Stopped).await?;
-        self.set_agent_status(AgentStatus::Stopped).await?;
+        let ended = self.set_agent_status(AgentStatus::Stopped).await?;
+        // Before the session's last status: the changes belong to the turn.
+        if let Some(tracker) = tracker {
+            self.report_unreported_with(tracker, ended).await?;
+        }
         self.set_status(SessionStatus::Cancelled, None).await?;
-        // A stopped child never reports: whoever waits for it is told.
-        if let Some(dispatch) = &self.setup.dispatch {
-            let stopped = Command::ChildStopped {
-                session_id: self.session_id.clone(),
-            };
-            self.manager().post(&dispatch.parent_session_id, stopped);
+        if owes_report && !cascade {
+            self.send_report(Ending::Stopped).await?;
         }
         Ok(())
     }
@@ -1672,6 +1688,8 @@ impl Driver {
             return self.lead_lost(message).await;
         }
         self.workflow = None;
+        let owes_report = !self.status.is_settled();
+        let tracker = self.turn_tracker().await;
         self.drop_agent();
         self.abort_attaching();
         self.abort_shipping();
@@ -1692,10 +1710,16 @@ impl Driver {
         }
         self.append(error).await?;
         self.close_subagents(AgentStatus::Failed).await?;
-        self.set_agent_status(AgentStatus::Failed).await?;
+        let ended = self.set_agent_status(AgentStatus::Failed).await?;
+        if let Some(tracker) = tracker {
+            self.report_unreported_with(tracker, ended).await?;
+        }
         self.set_status(SessionStatus::Failed, Some(message.clone()))
             .await?;
-        self.send_report(Some(&message)).await
+        if owes_report {
+            self.send_report(Ending::Failed(&message)).await?;
+        }
+        Ok(())
     }
 
     async fn permission_requested(&mut self, ask: PermissionAsk) -> Result<()> {
@@ -2365,6 +2389,8 @@ impl Driver {
             .append(EventDraft::new(received).parent(Some(cause)))
             .await?;
         if is_closed(self.status) {
+            // Nothing starts for it; the agent gets it if the user goes on.
+            self.notes.push(text);
             return Ok(());
         }
         if let Some(ended) = ended
@@ -2395,29 +2421,35 @@ impl Driver {
         Ok(())
     }
 
-    /// A child session came to rest: its report goes to the agent that
-    /// dispatched it (the "Child sessions" semantics in
-    /// `calin-proto/src/api.rs`). `failure` is why the session failed, when it did.
-    async fn send_report(&mut self, failure: Option<&str>) -> Result<()> {
+    /// A child session came to rest, failed or was stopped for the first
+    /// time since it was dispatched or last reported: its report goes to the
+    /// agent that dispatched it (the "Child sessions" semantics in
+    /// `calin-proto/src/api.rs`). Exactly one per such ending.
+    async fn send_report(&mut self, ending: Ending<'_>) -> Result<()> {
         let Some(dispatch) = self.setup.dispatch.clone() else {
             return Ok(());
         };
-        let mut body = self
-            .report
-            .take()
-            .or_else(|| self.last_text.take())
-            .unwrap_or_default();
+        let said = self.report.take().or_else(|| self.last_text.take());
         self.last_text = None;
-        if let Some(reason) = failure {
-            if !body.is_empty() {
-                body.push_str("\n\n");
-            }
-            body.push_str(&format!("The session failed: {reason}"));
-        }
-        if body.is_empty() {
-            body = NO_REPORT.to_owned();
-        }
-        let branches = self.reported_branches().await;
+        let (body, status, ended) = match ending {
+            Ending::Rested => (
+                said.filter(|said| !said.is_empty())
+                    .unwrap_or_else(|| NO_REPORT.to_owned()),
+                "review",
+                ChildEnd::Review,
+            ),
+            Ending::Failed(reason) => (
+                briefing::child_failed_report(reason, said.as_deref()),
+                "failed",
+                ChildEnd::Failed,
+            ),
+            Ending::Stopped => (
+                briefing::child_stopped_report(said.as_deref()),
+                "cancelled",
+                ChildEnd::Failed,
+            ),
+        };
+        let branches = reported_branches(&self.repos).await;
         // A child that failed before its agent started still reports, as the
         // agent it would have had.
         let from = match &self.lead {
@@ -2435,10 +2467,6 @@ impl Driver {
             in_reply_to: Some(dispatch.message_id),
             ts: now_ms(),
         };
-        let status = match failure {
-            Some(_) => "failed",
-            None => "review",
-        };
         let text = briefing::report_text(&self.title, status, &message.body, &branches);
         let sent = EventBody::MessageSent {
             message: message.clone(),
@@ -2449,38 +2477,65 @@ impl Driver {
             message,
             cause,
             text,
-            ended: Some(match failure {
-                Some(_) => ChildEnd::Failed,
-                None => ChildEnd::Review,
-            }),
+            ended: Some(ended),
         };
         self.manager().post(&dispatch.parent_session_id, delivery);
         Ok(())
     }
 
-    /// The session's branches as a report describes them: where each stands
-    /// against the commit it started from.
-    async fn reported_branches(&self) -> Vec<ReportedBranch> {
-        let mut branches = Vec::new();
-        for repo in &self.repos {
-            let (Some(branch), Some(base)) = (&repo.branch, &repo.base_ref) else {
+    /// Reports that reached this session after its lead agent was last
+    /// handed an input, so that no agent ever read them: they arrived while
+    /// the session was over, or before a restart cut the turn they waited
+    /// for (`report_restart` in `manager.rs`). The log is the only place
+    /// they are kept, so a new driver looks there; they go with the agent's
+    /// next input, as notes.
+    async fn unheard_reports(&self) -> Result<Vec<String>> {
+        let sessions = self.inner.store.sessions().await?;
+        let parent = |session: &calin_proto::Session| {
+            session.parent_session_id.as_deref() == Some(self.session_id.as_str())
+        };
+        // Only a session that dispatched has reports; the log is read only then.
+        if !sessions.iter().any(parent) {
+            return Ok(Vec::new());
+        }
+        let events = self
+            .inner
+            .store
+            .subscribe(&self.session_id, 0)
+            .await?
+            .backlog;
+        let lead = self.lead.as_ref().map(|lead| lead.id.as_str());
+        // A turn begins with the lead's `running` (or its spawn): what it was
+        // handed is on record before that.
+        let handed = events.iter().rposition(|event| match &event.body {
+            EventBody::AgentStatus {
+                status: AgentStatus::Running,
+            } => lead.is_some() && event.agent_id.as_deref() == lead,
+            EventBody::AgentSpawned { agent } => lead == Some(agent.id.as_str()),
+            _ => false,
+        });
+        let mut notes = Vec::new();
+        for event in &events[handed.map_or(0, |at| at + 1)..] {
+            let EventBody::MessageReceived { message } = &event.body else {
                 continue;
             };
-            let (dir, base, name) = (PathBuf::from(&repo.path), base.clone(), branch.clone());
-            // A count git cannot give is left out; the report still goes.
-            let counted = blocking(move || {
-                let ahead = calin_git::commits_ahead(&dir, &base, &name).ok();
-                Ok((ahead, calin_git::is_dirty(&dir).unwrap_or(false)))
-            });
-            let (ahead, dirty) = counted.await.unwrap_or((None, false));
-            branches.push(ReportedBranch {
-                repo: repo.name.clone(),
-                branch: branch.clone(),
-                ahead,
-                dirty,
-            });
+            if message.kind != MessageKind::Report {
+                continue;
+            }
+            let Ok(child) = self.inner.store.session(&message.from_session_id).await else {
+                continue;
+            };
+            let branches = reported_branches(&child.repos).await;
+            let status = status_name(child.session.status);
+            let title = &child.session.title;
+            notes.push(briefing::report_text(
+                title,
+                &status,
+                &message.body,
+                &branches,
+            ));
         }
-        branches
+        Ok(notes)
     }
 
     /// Puts the agent's question to the user (the "Questions" semantics in
@@ -2727,6 +2782,8 @@ impl Driver {
                 .map(|repo| (repo.clone(), known(repo)))
                 .collect(),
             issue: self.issue.clone(),
+            commit_timeout: self.inner.config.commit_timeout,
+            push_timeout: self.inner.config.push_timeout,
         };
         let (results, receiver) = mpsc::channel(8);
         let cancel = Arc::new(AtomicBool::new(false));
@@ -2913,6 +2970,41 @@ impl Driver {
 }
 
 /// A draft attributed to `agent_id`, when there is one.
+/// How a child session came to an end that its parent is told about.
+enum Ending<'a> {
+    /// It came to rest in `review`.
+    Rested,
+    /// It failed, for this reason.
+    Failed(&'a str),
+    /// It was stopped before it came to rest.
+    Stopped,
+}
+
+/// A session's branches as a report describes them: where each stands
+/// against the commit it started from.
+async fn reported_branches(repos: &[SessionRepo]) -> Vec<ReportedBranch> {
+    let mut branches = Vec::new();
+    for repo in repos {
+        let (Some(branch), Some(base)) = (&repo.branch, &repo.base_ref) else {
+            continue;
+        };
+        let (dir, base, name) = (PathBuf::from(&repo.path), base.clone(), branch.clone());
+        // A count git cannot give is left out; the report still goes.
+        let counted = blocking(move || {
+            let ahead = calin_git::commits_ahead(&dir, &base, &name).ok();
+            Ok((ahead, calin_git::is_dirty(&dir).unwrap_or(false)))
+        });
+        let (ahead, dirty) = counted.await.unwrap_or((None, false));
+        branches.push(ReportedBranch {
+            repo: repo.name.clone(),
+            branch: branch.clone(),
+            ahead,
+            dirty,
+        });
+    }
+    branches
+}
+
 fn as_agent(agent_id: Option<String>, body: EventBody) -> EventDraft {
     let mut draft = EventDraft::new(body);
     draft.agent_id = agent_id;

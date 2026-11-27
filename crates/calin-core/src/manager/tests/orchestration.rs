@@ -931,7 +931,7 @@ async fn a_failed_child_reports_and_a_busy_parent_gets_it_after_its_turn() {
     let body = &sent(&child_events)[0].1.body;
     assert_eq!(
         body,
-        "Half of it works.\n\nThe session failed: the agent crashed"
+        "This child session failed: the agent crashed.\n\nBefore that, it said:\n\nHalf of it works."
     );
 
     // The parent is in the middle of its turn: the report is on record,
@@ -945,7 +945,7 @@ async fn a_failed_child_reports_and_a_busy_parent_gets_it_after_its_turn() {
     emit(&root.io, RunnerOutput::TurnEnded).await;
     let handed = input(&mut root).await;
     assert!(handed.starts_with("[Calin] Report from child session \"Risky\" (failed)\n\n"));
-    assert!(handed.contains("The session failed: the agent crashed"));
+    assert!(handed.contains("This child session failed: the agent crashed."));
     assert!(handed.contains("no commits ahead of its base, so there is nothing to merge"));
     // One turn ended and the next began, without the session leaving `running`.
     let root_events = until_label(&manager, &root_id, root_before, "agent_status:running").await;
@@ -1484,6 +1484,161 @@ async fn stopping_a_session_stops_its_running_children_first_and_interrupt_does_
         manager.stop(&root_id).await,
         Err(Error::Conflict(_))
     ));
+}
+
+#[tokio::test]
+async fn a_child_the_user_stops_tells_its_parent_once_and_one_at_rest_says_nothing_more() {
+    let mut tree = tree().await;
+    let manager = tree.manager.clone();
+    let root_id = tree.root.id.clone();
+    let mut child = tree.dispatch("Stoppable").await;
+    let rested = tree.dispatch("Rested").await;
+    let mut root = tree.root;
+    end_turn(&manager, &root).await;
+    until_label(&manager, &root_id, 0, "session_status:review").await;
+    until_label(&manager, &child.id, 0, "agent_spawned").await;
+    until_label(&manager, &rested.id, 0, "agent_spawned").await;
+    let dir = repo_path(&manager, &child.id, "api").await;
+    commit(&dir, "half.md", "half of it");
+    let branch = git(&dir, &["rev-parse", "--abbrev-ref", "HEAD"]);
+
+    // Stopped by the user in the middle of its turn: the parent is told
+    // what happened, with where the partial work is.
+    let root_before = head(&manager, &root_id).await;
+    let child_id = child.id.clone();
+    let (stopped, ()) = tokio::join!(manager.stop(&child_id), exit_on_stop(&mut child));
+    stopped.unwrap();
+    let handed = input(&mut root).await;
+    assert!(
+        handed.starts_with(
+            "[Calin] Report from child session \"Stoppable\" (cancelled)\n\n\
+             This child session was stopped before it finished. It did not report.\n"
+        ),
+        "{handed}"
+    );
+    assert!(
+        handed.contains(&format!(
+            "- api: branch `{branch}`, 1 commit ahead of its base."
+        )),
+        "{handed}"
+    );
+    let child_events = all_events(&manager, &child_id).await;
+    let labels = labels(&child_events);
+    assert_eq!(
+        labels[labels.len() - 2..],
+        ["session_status:cancelled", "message_sent:report"]
+    );
+    assert_eq!(sent(&child_events).len(), 1);
+    let root_events = until_label(&manager, &root_id, root_before, "agent_status:running").await;
+    assert_eq!(
+        super::labels(&root_events),
+        [
+            "message_received:report",
+            "session_status:running",
+            "agent_status:running"
+        ]
+    );
+    end_turn(&manager, &root).await;
+
+    // A child that already reported from its rest says nothing more when
+    // it is stopped there.
+    let mut rested = rested;
+    emit(&rested.io, RunnerOutput::TurnEnded).await;
+    let _ = input(&mut root).await;
+    let turn = head(&manager, &root_id).await;
+    end_turn(&manager, &root).await;
+    until_label(&manager, &root_id, turn, "session_status:review").await;
+    let root_before = head(&manager, &root_id).await;
+    let rested_before = head(&manager, &rested.id).await;
+    let rested_id = rested.id.clone();
+    let (stopped, ()) = tokio::join!(manager.stop(&rested_id), exit_on_stop(&mut rested));
+    stopped.unwrap();
+    let after = all_events(&manager, &rested.id).await;
+    assert_eq!(
+        super::labels(&after[rested_before as usize..]),
+        ["agent_status:stopped", "session_status:cancelled"]
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(head(&manager, &root_id).await, root_before);
+    nothing_for(&mut root);
+    let everything = all_events(&manager, &root_id).await;
+    assert_eq!(received(&everything).len(), 2);
+}
+
+#[tokio::test]
+async fn a_child_a_restart_fails_reports_and_its_parent_gets_it_when_continued() {
+    let dir = TempDir::new().unwrap();
+    let (manager, mut starts) = manager_in(&dir, false).await;
+    manager.set_tool_endpoint(TOOLS);
+    let clones = TempDir::new().unwrap();
+    let api = registered(&manager, clones.path(), "api").await;
+    let mut wanted = request("start", Some("puppet"));
+    wanted.repos = vec![attach(&api, None)];
+    let root_id = manager.create_session(wanted).await.unwrap().session.id;
+    let root = play(&mut starts).await;
+    let dispatched = manager.agent_dispatch(&root.agent, "Long job", "Do it.", None);
+    let child_id = within(dispatched).await.unwrap().session.id;
+    let child = play(&mut starts).await;
+    until_label(&manager, &child_id, 0, "agent_spawned").await;
+    let branch = manager.get(&child_id).await.unwrap().repos[0]
+        .branch
+        .clone()
+        .unwrap();
+    // The parent waits in review for the report; the child is at work.
+    end_turn(&manager, &root).await;
+    until_label(&manager, &root_id, 0, "session_status:review").await;
+    let root_before = head(&manager, &root_id).await;
+    let child_before = head(&manager, &child_id).await;
+    manager.store().close().await;
+    drop((manager, starts, root, child));
+
+    let (manager, mut starts) = manager_in(&dir, false).await;
+    let child_events = all_events(&manager, &child_id).await;
+    let tail = &child_events[child_before as usize..];
+    assert_eq!(
+        labels(tail),
+        [
+            "agent_status:failed",
+            "session_status:failed",
+            "message_sent:report"
+        ]
+    );
+    let (sent_event, report) = sent(tail)[0];
+    assert_eq!(sent_event.parent_id.as_ref(), Some(&tail[1].id));
+    assert_eq!(
+        report.body,
+        "This child session failed: server restarted. It did not report."
+    );
+    assert_eq!(report.kind, MessageKind::Report);
+    assert_eq!(report.to_session_id, root_id);
+    // The parent was not cut short; the report is on record and waits.
+    let root_events = all_events(&manager, &root_id).await;
+    let root_tail = &root_events[root_before as usize..];
+    assert_eq!(labels(root_tail), ["message_received:report"]);
+    assert_eq!(received(root_tail)[0].1, report);
+    assert_eq!(root_tail[0].parent_id.as_ref(), Some(&sent_event.id));
+    assert_eq!(status(&manager, &root_id).await, SessionStatus::Review);
+    assert!(starts.try_recv().is_err());
+
+    // Continued, its agent is handed the report before the message, once.
+    manager.send_message(&root_id, "What now?").await.unwrap();
+    let mut root = play(&mut starts).await;
+    let prompt = root.params.prompt.clone();
+    assert!(
+        prompt.starts_with(
+            "[Calin] Report from child session \"Long job\" (failed)\n\n\
+             This child session failed: server restarted. It did not report.\n"
+        ),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains(&format!("- api: branch `{branch}`, no commits ahead")),
+        "{prompt}"
+    );
+    assert!(prompt.ends_with("\n\nWhat now?"), "{prompt}");
+    end_turn(&manager, &root).await;
+    manager.send_message(&root_id, "And then?").await.unwrap();
+    assert_eq!(input(&mut root).await, "And then?");
 }
 
 #[tokio::test]

@@ -2,12 +2,20 @@
 
 use std::ffi::OsStr;
 use std::fs;
-use std::io::Write as _;
+use std::io::{Read, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::mpsc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
+use crate::setup::{kill, kill_group};
+
+/// How often a time-limited command is checked for its end.
+const POLL: Duration = Duration::from_millis(10);
+/// After it is gone, how long its output may still trickle in.
+const DRAIN: Duration = Duration::from_millis(500);
 
 /// Set by git for hooks and `rebase -x`. Inherited, they would point every
 /// command at the repository the server was started from.
@@ -110,6 +118,15 @@ impl Git {
         self
     }
 
+    /// An argument that errors and logs show as `shown`: the user's text
+    /// (a commit message) is not a command line to repeat.
+    pub(crate) fn arg_shown_as(mut self, arg: impl AsRef<OsStr>, shown: &str) -> Self {
+        self.command.push(' ');
+        self.command.push_str(shown);
+        self.cmd.arg(arg);
+        self
+    }
+
     pub(crate) fn args<I, S>(mut self, args: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -168,6 +185,67 @@ impl Git {
         Ok(Done {
             status: output.status,
             stdout: output.stdout,
+            stderr,
+            command,
+        })
+    }
+
+    /// [`Self::exec`] for a command that may run hooks or wait on a remote:
+    /// it gets no input at all, runs in a process group of its own, and the
+    /// whole group is killed at `deadline`. `limit` is what the timeout
+    /// error says the command was given.
+    pub(crate) fn exec_until(mut self, deadline: Instant, limit: Duration) -> Result<Done> {
+        let command = self.command.clone();
+        let spawn_error = |source| Error::Io {
+            context: format!("running `{command}`"),
+            source,
+        };
+        // Nothing to feed: a hook that reads its input sees the end of it.
+        self.cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            self.cmd.process_group(0);
+        }
+        let mut child = self.cmd.spawn().map_err(spawn_error)?;
+        let stdout = collect(child.stdout.take());
+        let stderr = collect(child.stderr.take());
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {}
+                Err(err) => {
+                    kill(&mut child);
+                    return Err(spawn_error(err));
+                }
+            }
+            if Instant::now() >= deadline {
+                kill(&mut child);
+                return Err(Error::Git {
+                    command,
+                    stderr: format!("timed out after {}", how_long(limit)),
+                });
+            }
+            thread::sleep(POLL);
+        };
+        // A hook may have left something running that holds the pipes.
+        kill_group(&child);
+        let stdout = stdout.recv_timeout(DRAIN).unwrap_or_default();
+        let stderr = String::from_utf8_lossy(&stderr.recv_timeout(DRAIN).unwrap_or_default())
+            .trim()
+            .to_owned();
+        if !status.success() && stderr.contains("not a git repository") {
+            return Err(Error::NotARepository {
+                path: self.dir,
+                reason: "no git repository here".into(),
+            });
+        }
+        Ok(Done {
+            status,
+            stdout,
             stderr,
             command,
         })
@@ -232,6 +310,31 @@ impl Done {
                 self.stderr
             },
         }
+    }
+}
+
+/// Reads a stream to its end on a thread of its own and hands over the bytes.
+fn collect(stream: Option<impl Read + Send + 'static>) -> mpsc::Receiver<Vec<u8>> {
+    let (done, bytes) = mpsc::channel();
+    if let Some(mut stream) = stream {
+        thread::spawn(move || {
+            let mut read = Vec::new();
+            // What was read before an error is still what git said.
+            let _ = stream.read_to_end(&mut read);
+            // Nobody listens once the drain was given up.
+            let _ = done.send(read);
+        });
+    }
+    bytes
+}
+
+/// A limit as an error message says it: whole seconds, or milliseconds
+/// for the short ones tests use.
+fn how_long(limit: Duration) -> String {
+    if limit >= Duration::from_secs(1) && limit.subsec_millis() == 0 {
+        format!("{} seconds", limit.as_secs())
+    } else {
+        format!("{} ms", limit.as_millis())
     }
 }
 

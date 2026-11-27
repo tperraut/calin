@@ -7,7 +7,9 @@ use calin_proto::{
     WorkflowStatus,
 };
 
-use super::orchestration::{Played, all_events, input, nothing_for, play, say, status};
+use super::orchestration::{
+    Played, all_events, input, nothing_for, play, received, say, sent, status,
+};
 use super::*;
 
 /// The spec's example, adapted: the review is a turn of the lead, the check
@@ -1264,7 +1266,7 @@ async fn a_fresh_agent_that_fails_takes_the_failed_port() {
         finished(&events, "review"),
         (
             &Some("failed".to_owned()),
-            &Some("the child session failed".to_owned())
+            &Some("This child session failed: out of memory.".to_owned())
         )
     );
     assert_eq!(
@@ -1431,8 +1433,8 @@ async fn a_parallel_node_fails_when_one_child_fails_or_is_stopped() {
     let lost = lead.prompt(&mut flow.starts).await;
     assert!(
         lost.ends_with(
-            "A branch failed:\n## docs\n\nDocs written.\n\n## tests\n\nThe child session was \
-             stopped before it reported."
+            "A branch failed:\n## docs\n\nDocs written.\n\n## tests\n\nThis child session was \
+             stopped before it finished. It did not report."
         ),
         "{lost}"
     );
@@ -1443,11 +1445,192 @@ async fn a_parallel_node_fails_when_one_child_fails_or_is_stopped() {
         finished(&events, "split"),
         (
             &Some("failed".to_owned()),
-            &Some("failed: tests".to_owned())
+            &Some(
+                "failed: tests: This child session was stopped before it finished. It did not \
+                 report."
+                    .to_owned()
+            )
         )
     );
     // `failed` was wired, and what it led to ended well.
     assert_eq!(finish_reason(&events), (WorkflowStatus::Success, None));
+}
+
+#[tokio::test]
+async fn a_fresh_agent_that_is_stopped_takes_the_failed_port_with_what_happened() {
+    let mut flow = flow(&[("fresh", FRESH)]).await;
+    let id = flow.session("fresh", "Add a flag", &[]).await;
+    let mut lead = Lead::default();
+    lead.prompt(&mut flow.starts).await;
+    lead.answer("Added.").await;
+    let mut child = play(&mut flow.starts).await;
+    let child_id = child.id.clone();
+    let stopping = flow.manager.stop(&child_id);
+    let obeying = super::orchestration::exit_on_stop(&mut child);
+    let (stopped, ()) = tokio::join!(stopping, obeying);
+    stopped.unwrap();
+
+    let events = flow.reviewed(&id).await;
+    let line = "This child session was stopped before it finished. It did not report.";
+    assert_eq!(
+        finished(&events, "review"),
+        (&Some("failed".to_owned()), &Some(line.to_owned()))
+    );
+    let reason = "node `review` left through `failed`, which has no outgoing edge";
+    assert_eq!(
+        finish_reason(&events),
+        (WorkflowStatus::Failed, Some(reason.to_owned()))
+    );
+    // One report on each side, and the lead gets no turn for it.
+    let child_events = all_events(&flow.manager, &child_id).await;
+    assert_eq!(sent(&child_events).len(), 1);
+    assert_eq!(sent(&child_events)[0].1.body, line);
+    assert_eq!(received(&events).len(), 1);
+    nothing_for(lead.played());
+}
+
+/// Ends the process: the store is closed and everything else dropped. The
+/// next manager on the same directory recovers what it finds.
+async fn restart(flow: Flow) -> Flow {
+    let Flow {
+        manager,
+        starts,
+        dir,
+        clones,
+        home,
+    } = flow;
+    manager.store().close().await;
+    drop((manager, starts));
+    let (manager, starts) = manager_in(&dir, false).await;
+    Flow {
+        manager,
+        starts,
+        dir,
+        clones,
+        home,
+    }
+}
+
+/// The report a child the restart failed sends.
+const RESTARTED: &str = "This child session failed: server restarted. It did not report.";
+
+/// The child's own end after a restart: failed, then its report.
+async fn restarted_child(manager: &SessionManager, id: &str) {
+    let events = all_events(manager, id).await;
+    let labels = labels(&events);
+    assert_eq!(
+        labels[labels.len() - 2..],
+        ["session_status:failed", "message_sent:report"]
+    );
+    let reports = sent(&events);
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].1.body, RESTARTED);
+}
+
+#[tokio::test]
+async fn a_fresh_agent_cut_short_by_a_restart_reports_and_the_lead_hears_of_it_later() {
+    let mut flow = flow(&[("fresh", FRESH)]).await;
+    let id = flow.session("fresh", "Add a flag", &[]).await;
+    let mut lead = Lead::default();
+    lead.prompt(&mut flow.starts).await;
+    lead.answer("Added.").await;
+    let child = play(&mut flow.starts).await;
+    events_until(&flow.manager, &child.id, 0, |event| {
+        label(event) == "agent_spawned"
+    })
+    .await;
+    let before = flow.manager.get(&id).await.unwrap().session.head_seq;
+    // The old agents go with the old process, after its store closed.
+    let mut flow = restart(flow).await;
+    drop(lead);
+
+    restarted_child(&flow.manager, &child.id).await;
+    let events = events_until(&flow.manager, &id, before, is_status(SessionStatus::Failed)).await;
+    // The report is on record first; the run is not resumed, so the node
+    // ends where the restart cut it.
+    assert_eq!(
+        labels(&events),
+        [
+            "message_received:report",
+            "workflow_node:review:finished",
+            "workflow_finished:failed",
+            "agent_status:failed",
+            "session_status:failed",
+        ]
+    );
+    assert_eq!(received(&events)[0].1.body, RESTARTED);
+    let run = flow.run(&id).await;
+    assert_eq!(
+        node(&run, "review").outcome.as_deref(),
+        Some("stopped: server restarted")
+    );
+
+    // Continued, the lead is told before anything else, and only once.
+    flow.manager.send_message(&id, "go on").await.unwrap();
+    let mut lead = Lead::default();
+    let prompt = lead.prompt(&mut flow.starts).await;
+    assert_eq!(
+        prompt,
+        format!("[Calin] Report from child session \"review\" (failed)\n\n{RESTARTED}\n\n\ngo on")
+    );
+    lead.answer("Went on.").await;
+    flow.reviewed(&id).await;
+    flow.manager.send_message(&id, "more").await.unwrap();
+    assert_eq!(lead.prompt(&mut flow.starts).await, "more");
+}
+
+#[tokio::test]
+async fn a_parallel_branch_cut_short_by_a_restart_reports_and_the_lead_hears_of_both() {
+    let mut flow = flow(&[("parallel", PARALLEL)]).await;
+    let api = flow.repo("api").await;
+    let id = flow.session("parallel", "the flag", &[&api]).await;
+    let (docs, tests) = children(&mut flow.starts).await;
+    report(&tests, "Tests written.").await;
+    events_until(&flow.manager, &id, 0, |event| {
+        label(event) == "message_received:report"
+    })
+    .await;
+    events_until(&flow.manager, &docs.id, 0, |event| {
+        label(event) == "agent_spawned"
+    })
+    .await;
+    let before = flow.manager.get(&id).await.unwrap().session.head_seq;
+    let mut flow = restart(flow).await;
+
+    // The branch that had reported is left as it was.
+    restarted_child(&flow.manager, &docs.id).await;
+    assert_eq!(
+        status(&flow.manager, &tests.id).await,
+        SessionStatus::Review
+    );
+    let events = events_until(&flow.manager, &id, before, is_status(SessionStatus::Failed)).await;
+    assert_eq!(
+        labels(&events),
+        [
+            "message_received:report",
+            "workflow_node:split:finished",
+            "workflow_finished:failed",
+            "session_status:failed",
+        ]
+    );
+
+    // No lead ever ran: when one starts, it hears of both branches.
+    flow.manager.send_message(&id, "go on").await.unwrap();
+    let mut lead = Lead::default();
+    let prompt = lead.prompt(&mut flow.starts).await;
+    assert!(
+        prompt.starts_with(
+            "[Calin] Report from child session \"split: tests\" (review)\n\nTests written.\n"
+        ),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains(&format!(
+            "[Calin] Report from child session \"split: docs\" (failed)\n\n{RESTARTED}\n"
+        )),
+        "{prompt}"
+    );
+    assert!(prompt.ends_with("the flag\n\ngo on"), "{prompt}");
 }
 
 const TWO_STEPS: &str = r#"

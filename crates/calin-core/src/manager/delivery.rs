@@ -7,7 +7,7 @@
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use calin_git::{CommitOutcome, GitHub, PullRequestInfo};
 use calin_proto::{
@@ -54,6 +54,9 @@ pub(super) struct ShipPlan {
     pub repos: Vec<(SessionRepo, Option<PullRequest>)>,
     /// The issue the session started from: its repo's pull request closes it.
     pub issue: Option<IssueRef>,
+    /// How long a commit and a push may each take before they are killed.
+    pub commit_timeout: Duration,
+    pub push_timeout: Duration,
 }
 
 /// A step of a ship, for the driver to record.
@@ -304,7 +307,8 @@ fn deliver(plan: &ShipPlan, repo: &SessionRepo) -> Result<Option<Pushed>, Failur
             });
         }
         let message = commit_message(&plan.title, &plan.session_id);
-        let outcome = calin_git::commit_all(dir, &message).map_err(at("commit"))?;
+        let outcome =
+            calin_git::commit_all(dir, &message, plan.commit_timeout).map_err(at("commit"))?;
         committed = matches!(outcome, CommitOutcome::Committed(_));
     }
     // What differed may have been nothing a commit records.
@@ -331,7 +335,7 @@ fn deliver(plan: &ShipPlan, repo: &SessionRepo) -> Result<Option<Pushed>, Failur
         });
     };
     let new_commits = calin_git::has_unpushed_commits(dir, REMOTE, branch).map_err(at("push"))?;
-    calin_git::push_branch(dir, REMOTE, branch).map_err(at("push"))?;
+    calin_git::push_branch(dir, REMOTE, branch, plan.push_timeout).map_err(at("push"))?;
 
     let open = plan
         .github

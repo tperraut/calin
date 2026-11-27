@@ -681,6 +681,86 @@ async fn a_repo_that_fails_is_reported_with_its_step_and_the_others_carry_on() {
 }
 
 #[tokio::test]
+async fn a_commit_or_a_push_that_hangs_times_out_and_the_others_carry_on() {
+    let gh = FakeGh::new();
+    let home = TempDir::new().unwrap();
+    let limit = Duration::from_millis(500);
+    let config = ManagerConfig {
+        commit_timeout: limit,
+        push_timeout: limit,
+        ..shipping_config(&gh, NEVER)
+    };
+    let (manager, starts) = manager_with(&home, false, config).await;
+    let d = Delivery {
+        manager,
+        starts,
+        gh,
+        home,
+        clones: TempDir::new().unwrap(),
+        remotes: TempDir::new().unwrap(),
+    };
+    let api = d.repo("api").await;
+    let web = d.repo("web").await;
+    let docs = d.repo("docs").await;
+    // web's commit hook waits for ever; docs' remote never answers.
+    let hooks = d.clones.path().join("hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    write_executable(&hooks.join("pre-commit"), "#!/bin/sh\nexec sleep 30\n");
+    let hooks = hooks.to_str().unwrap();
+    git(Path::new(&web.path), &["config", "core.hooksPath", hooks]);
+    let silent = d.clones.path().join("silent-receive-pack");
+    write_executable(&silent, "#!/bin/sh\nexec sleep 30\n");
+    let receivepack = silent.to_str().unwrap();
+    let docs_clone = Path::new(&docs.path);
+    git(
+        docs_clone,
+        &["config", "remote.origin.receivepack", receivepack],
+    );
+    let detail = d
+        .reviewed(vec![
+            attach(&api, None),
+            attach(&web, None),
+            attach(&docs, None),
+        ])
+        .await;
+    let id = detail.session.id.clone();
+    let branch = detail.session.branch.clone().unwrap();
+    for at in &detail.repos[1..] {
+        write_file(Path::new(&at.path), "change.txt", "changed\n");
+    }
+
+    let started = std::time::Instant::now();
+    let events = d
+        .ship(&id, titled("Add the thing", "Body."), is_shipping())
+        .await;
+    assert!(started.elapsed() < Duration::from_secs(10));
+    let labels = labels(&events);
+    assert_eq!(labels.len(), 4, "{labels:?}");
+    assert_eq!(labels[0], opened("api", 1));
+    assert!(
+        labels[1].starts_with("error:could not ship web: commit failed: ")
+            && labels[1].ends_with("timed out after 500 ms"),
+        "{}",
+        labels[1]
+    );
+    assert!(
+        labels[2].starts_with("error:could not ship docs: push failed: `git push")
+            && labels[2].ends_with("timed out after 500 ms"),
+        "{}",
+        labels[2]
+    );
+    assert_eq!(labels[3], "session_status:shipping");
+    assert!(d.remote_tip("api", &branch).is_some());
+    assert!(d.remote_tip("docs", &branch).is_none());
+    // docs' commit was made before its push hung; web's was not.
+    assert_eq!(
+        subjects(&detail.repos[2].path),
+        ["Add the thing", "initial"]
+    );
+    assert_eq!(subjects(&detail.repos[1].path), ["initial"]);
+}
+
+#[tokio::test]
 async fn with_nothing_to_ship_the_session_stays_in_review() {
     let mut d = delivery().await;
     let api = d.repo("api").await;

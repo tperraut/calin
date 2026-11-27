@@ -2,6 +2,7 @@
 //! the session's branch. Nothing here amends, forces or touches another branch.
 
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use crate::cmd::{Git, no_ssh_prompt, require_commit, resolve_commit, work_dir};
 use crate::error::{Error, Result};
@@ -26,29 +27,36 @@ pub enum CommitOutcome {
 /// The commit is made with the machine's git identity and runs the repo's
 /// hooks, like a commit made by hand. It is never an amend.
 ///
+/// Every git command it runs gets no input and nothing to ask on, and all
+/// of them together get `limit`: at the limit the one running is killed with
+/// whatever it started (a hook included), and the error says so.
+///
 /// [`Error::Conflict`] when git has no name or email to commit with; the
 /// changes are staged then, and nothing else happened. [`Error::Git`] with
-/// git's own words when the commit fails, for example in a hook.
-pub fn commit_all(worktree: &Path, message: &str) -> Result<CommitOutcome> {
+/// git's own words when the commit fails, for example in a hook, or when it
+/// timed out.
+pub fn commit_all(worktree: &Path, message: &str, limit: Duration) -> Result<CommitOutcome> {
     let dir = work_dir(worktree)?;
     if message.trim().is_empty() {
         return Err(Error::Conflict("a commit needs a message".to_owned()));
     }
-    Git::write(&dir).args(["add", "--all"]).run()?;
+    let deadline = Instant::now() + limit;
+    let run = |git: Git| git.exec_until(deadline, limit);
+    let added = run(Git::write(&dir).args(["add", "--all"]))?;
+    if !added.status.success() {
+        return Err(added.into_error());
+    }
     // Status 1 says the index differs from `HEAD`.
-    let staged = Git::read(&dir)
-        .args(["diff", "--cached", "--quiet"])
-        .exec()?;
+    let staged = run(Git::read(&dir).args(["diff", "--cached", "--quiet"]))?;
     match staged.status.code() {
         Some(0) => return Ok(CommitOutcome::NothingToCommit),
         Some(1) => {}
         _ => return Err(staged.into_error()),
     }
     for who in ["GIT_AUTHOR_IDENT", "GIT_COMMITTER_IDENT"] {
-        let known = Git::read(&dir)
+        let known = run(Git::read(&dir)
             .args(CONFIGURED_IDENTITY_ONLY)
-            .args(["var", who])
-            .exec()?;
+            .args(["var", who]))?;
         if !known.status.success() {
             return Err(Error::Conflict(
                 "git has no identity to commit with: set one with `git config --global \
@@ -57,12 +65,15 @@ pub fn commit_all(worktree: &Path, message: &str) -> Result<CommitOutcome> {
             ));
         }
     }
-    // The message goes through stdin: it is the user's text, whatever it holds.
-    Git::write(&dir)
+    // One argument, whatever the message holds; stdin stays closed so that
+    // a hook reading it ends at once instead of waiting.
+    let committed = run(Git::write(&dir)
         .args(CONFIGURED_IDENTITY_ONLY)
-        .args(["commit", "--quiet", "--file=-"])
-        .stdin(message.as_bytes().to_vec())
-        .run()?;
+        .args(["commit", "--quiet"])
+        .arg_shown_as(format!("--message={message}"), "--message=<message>"))?;
+    if !committed.status.success() {
+        return Err(committed.into_error());
+    }
     let head = resolve_commit(&dir, "HEAD")?
         .ok_or_else(|| Error::NotFound("the commit that was just made".to_owned()))?;
     Ok(CommitOutcome::Committed(head))
@@ -71,13 +82,15 @@ pub fn commit_all(worktree: &Path, message: &str) -> Result<CommitOutcome> {
 /// Pushes `branch` to the branch of the same name on `remote` and makes that
 /// its upstream. Never forced: a remote branch with commits the local one
 /// lacks rejects the push, which is an [`Error::Git`] with git's message.
-/// Nothing is ever asked on a terminal.
+/// Nothing is ever asked on a terminal, the push gets no input, and it is
+/// killed with whatever it started (a hook, ssh) once it has run for
+/// `limit`: an [`Error::Git`] that says it timed out.
 ///
 /// Refused before anything runs, with [`Error::Conflict`], when `branch` is
 /// the repo's default branch ([`default_branch`]): a session delivers through
 /// a pull request, never by pushing to the branch it would be merged into.
 /// [`Error::NotFound`] when there is no such remote or no such branch.
-pub fn push_branch(worktree: &Path, remote: &str, branch: &str) -> Result<()> {
+pub fn push_branch(worktree: &Path, remote: &str, branch: &str, limit: Duration) -> Result<()> {
     let dir = work_dir(worktree)?;
     if !has_remote(&dir, remote)? {
         return Err(Error::NotFound(format!("remote {remote}")));
@@ -91,10 +104,13 @@ pub fn push_branch(worktree: &Path, remote: &str, branch: &str) -> Result<()> {
     require_commit(&dir, &full_ref)?;
     // Both sides spelled out: a refspec that cannot start with `+` (which
     // would force) and cannot be read as an option or a tag.
-    no_ssh_prompt(Git::write(&dir))
+    let pushed = no_ssh_prompt(Git::write(&dir))
         .args(["push", "--set-upstream", remote])
         .arg(format!("{full_ref}:{full_ref}"))
-        .run()?;
+        .exec_until(Instant::now() + limit, limit)?;
+    if !pushed.status.success() {
+        return Err(pushed.into_error());
+    }
     Ok(())
 }
 
@@ -192,10 +208,16 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::testing::{Sandbox, commit_all as commit, git, git_ok, without_identity, write};
+    use crate::testing::{
+        Sandbox, commit_all as commit, git, git_ok, without_identity, write, write_executable,
+    };
     use crate::worktree::create_worktree;
 
     const BRANCH: &str = "calin/feature-abc123";
+    /// Long enough for any git command a test runs that is meant to finish.
+    const LIMIT: Duration = Duration::from_secs(30);
+    /// What a test gives a command that is meant to hang.
+    const SHORT: Duration = Duration::from_millis(400);
 
     /// A bare repository, a clone of it, and a worktree of the clone on [`BRANCH`].
     struct Delivery {
@@ -251,7 +273,8 @@ mod tests {
         assert!(is_dirty(&d.worktree).unwrap());
 
         let message = "Add the thing\n\nCalin-Session: 01ABC\n";
-        let CommitOutcome::Committed(commit) = commit_all(&d.worktree, message).unwrap() else {
+        let CommitOutcome::Committed(commit) = commit_all(&d.worktree, message, LIMIT).unwrap()
+        else {
             panic!("expected a commit");
         };
         assert_eq!(git(&d.worktree, &["rev-parse", "HEAD"]), commit);
@@ -281,7 +304,7 @@ mod tests {
         let d = delivery();
         let head = git(&d.worktree, &["rev-parse", "HEAD"]);
         assert_eq!(
-            commit_all(&d.worktree, "nothing").unwrap(),
+            commit_all(&d.worktree, "nothing", LIMIT).unwrap(),
             CommitOutcome::NothingToCommit
         );
 
@@ -293,7 +316,7 @@ mod tests {
         write(&d.worktree, "run.log", "noise\n");
         assert!(!is_dirty(&d.worktree).unwrap());
         assert_eq!(
-            commit_all(&d.worktree, "nothing").unwrap(),
+            commit_all(&d.worktree, "nothing", LIMIT).unwrap(),
             CommitOutcome::NothingToCommit
         );
         assert_eq!(git(&d.worktree, &["rev-parse", "HEAD"]), head_after);
@@ -302,7 +325,7 @@ mod tests {
         // A blank message is refused before anything is staged.
         write(&d.worktree, "a.txt", "a\n");
         assert!(matches!(
-            commit_all(&d.worktree, " \n"),
+            commit_all(&d.worktree, " \n", LIMIT),
             Err(Error::Conflict(_))
         ));
         assert_eq!(git(&d.worktree, &["diff", "--cached", "--name-only"]), "");
@@ -313,7 +336,7 @@ mod tests {
         let d = delivery();
         let head = git(&d.worktree, &["rev-parse", "HEAD"]);
         write(&d.worktree, "a.txt", "a\n");
-        let err = without_identity(|| commit_all(&d.worktree, "no author")).unwrap_err();
+        let err = without_identity(|| commit_all(&d.worktree, "no author", LIMIT)).unwrap_err();
         let Error::Conflict(message) = &err else {
             panic!("expected a conflict, got {err:?}");
         };
@@ -324,7 +347,7 @@ mod tests {
         git(&d.worktree, &["reset", "-q"]);
         std::fs::remove_file(d.worktree.join("a.txt")).unwrap();
         assert_eq!(
-            without_identity(|| commit_all(&d.worktree, "clean")).unwrap(),
+            without_identity(|| commit_all(&d.worktree, "clean", LIMIT)).unwrap(),
             CommitOutcome::NothingToCommit
         );
     }
@@ -338,7 +361,7 @@ mod tests {
         write(&d.worktree, "a.txt", "a\n");
         let first = commit(&d.worktree, "first");
 
-        push_branch(&d.worktree, "origin", BRANCH).unwrap();
+        push_branch(&d.worktree, "origin", BRANCH, LIMIT).unwrap();
         assert_eq!(remote_tip(&d.remote, BRANCH), Some(first.clone()));
         assert_eq!(remote_tip(&d.remote, "main"), Some(base));
         assert_eq!(
@@ -351,14 +374,14 @@ mod tests {
         write(&d.worktree, "b.txt", "b\n");
         let second = commit(&d.worktree, "second");
         assert!(has_unpushed_commits(&d.worktree, "origin", BRANCH).unwrap());
-        push_branch(&d.worktree, "origin", BRANCH).unwrap();
-        push_branch(&d.worktree, "origin", BRANCH).unwrap();
+        push_branch(&d.worktree, "origin", BRANCH, LIMIT).unwrap();
+        push_branch(&d.worktree, "origin", BRANCH, LIMIT).unwrap();
         assert_eq!(remote_tip(&d.remote, BRANCH), Some(second));
 
         // A file URL works like a path.
         let url = format!("file://{}", d.remote.display());
         git(&d.worktree, &["remote", "add", "mirror", &url]);
-        push_branch(&d.worktree, "mirror", BRANCH).unwrap();
+        push_branch(&d.worktree, "mirror", BRANCH, LIMIT).unwrap();
     }
 
     #[test]
@@ -371,7 +394,7 @@ mod tests {
         write(&d.clone, "a.txt", "a\n");
         commit(&d.clone, "on main");
         let before = remote_tip(&d.remote, "main");
-        let err = push_branch(&d.clone, "origin", "main").unwrap_err();
+        let err = push_branch(&d.clone, "origin", "main", LIMIT).unwrap_err();
         assert!(
             matches!(&err, Error::Conflict(m) if m.contains("default branch")),
             "{err:?}"
@@ -386,12 +409,12 @@ mod tests {
             Some("main")
         );
         assert!(matches!(
-            push_branch(&d.worktree, "origin", "main"),
+            push_branch(&d.worktree, "origin", "main", LIMIT),
             Err(Error::Conflict(_))
         ));
         assert_eq!(remote_tip(&d.remote, "main"), before);
         // The session's branch still goes through.
-        push_branch(&d.worktree, "origin", BRANCH).unwrap();
+        push_branch(&d.worktree, "origin", BRANCH, LIMIT).unwrap();
         assert!(remote_tip(&d.remote, BRANCH).is_some());
     }
 
@@ -400,7 +423,7 @@ mod tests {
         let d = delivery();
         write(&d.worktree, "a.txt", "a\n");
         commit(&d.worktree, "first");
-        push_branch(&d.worktree, "origin", BRANCH).unwrap();
+        push_branch(&d.worktree, "origin", BRANCH, LIMIT).unwrap();
 
         // Someone else pushes to the same branch.
         let other = d.sandbox.path().join("other");
@@ -415,7 +438,7 @@ mod tests {
 
         write(&d.worktree, "b.txt", "b\n");
         let ours = commit(&d.worktree, "ours");
-        let err = push_branch(&d.worktree, "origin", BRANCH).unwrap_err();
+        let err = push_branch(&d.worktree, "origin", BRANCH, LIMIT).unwrap_err();
         let Error::Git { stderr, .. } = &err else {
             panic!("expected git's error, got {err:?}");
         };
@@ -433,23 +456,23 @@ mod tests {
         assert!(!has_remote(&repo, "origin").unwrap());
         assert!(!has_remote(&repo, "--upload-pack=x").unwrap());
         assert!(matches!(
-            push_branch(&repo, "origin", BRANCH),
+            push_branch(&repo, "origin", BRANCH, LIMIT),
             Err(Error::NotFound(what)) if what.contains("origin")
         ));
 
         let d = delivery();
         assert!(matches!(
-            push_branch(&d.worktree, "origin", "calin/never-made"),
+            push_branch(&d.worktree, "origin", "calin/never-made", LIMIT),
             Err(Error::NotFound(_))
         ));
         assert!(matches!(
-            push_branch(&d.worktree, "upstream", BRANCH),
+            push_branch(&d.worktree, "upstream", BRANCH, LIMIT),
             Err(Error::NotFound(_))
         ));
         for odd in ["", "-f", "+calin/x", "a:b"] {
             assert!(
                 matches!(
-                    push_branch(&d.worktree, "origin", odd),
+                    push_branch(&d.worktree, "origin", odd, LIMIT),
                     Err(Error::Git { .. })
                 ),
                 "{odd:?}"
@@ -459,5 +482,147 @@ mod tests {
         // A detached worktree has no branch to speak of.
         git(&d.worktree, &["checkout", "-q", "--detach"]);
         assert_eq!(current_branch(&d.worktree).unwrap(), None);
+    }
+
+    /// True once process `pid` is gone, or is a zombie nobody waits for
+    /// any more; looks for up to two seconds.
+    #[cfg(target_os = "linux")]
+    fn gone(pid: &str) -> bool {
+        let until = Instant::now() + Duration::from_secs(2);
+        loop {
+            match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                Err(_) => return true,
+                // The state follows the command name, which ends with `)`.
+                Ok(stat)
+                    if stat
+                        .rsplit(')')
+                        .next()
+                        .is_some_and(|rest| rest.trim_start().starts_with('Z')) =>
+                {
+                    return true;
+                }
+                Ok(_) => {}
+            }
+            if Instant::now() >= until {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// A hook of the clone, which its worktrees share.
+    fn hook(d: &Delivery, name: &str, script: &str) {
+        let hooks = d.clone.join(".git/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        write_executable(&hooks.join(name), script);
+    }
+
+    #[test]
+    fn a_hook_that_reads_its_input_finds_none_and_does_not_hold_the_commit() {
+        let d = delivery();
+        // `cat` ends at once on a closed input; the commit goes through.
+        hook(&d, "pre-commit", "#!/bin/sh\ncat\n");
+        write(&d.worktree, "a.txt", "a\n");
+        let started = Instant::now();
+        let outcome = commit_all(&d.worktree, "with cat", LIMIT).unwrap();
+        assert!(
+            matches!(outcome, CommitOutcome::Committed(_)),
+            "{outcome:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        // One that needs an answer gets none, and fails at once.
+        hook(
+            &d,
+            "pre-commit",
+            "#!/bin/sh\nread answer || { echo nobody answered >&2; exit 1; }\n",
+        );
+        write(&d.worktree, "b.txt", "b\n");
+        let started = Instant::now();
+        let err = commit_all(&d.worktree, "asks", LIMIT).unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let Error::Git { command, stderr } = &err else {
+            panic!("expected git's error, got {err:?}");
+        };
+        assert!(stderr.contains("nobody answered"), "{stderr}");
+        // The message is the user's text: errors do not repeat it.
+        assert_eq!(
+            command,
+            "git -c user.useConfigOnly=true commit --quiet --message=<message>"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_commit_whose_hook_hangs_is_killed_with_the_hook_at_the_limit() {
+        let d = delivery();
+        let head = git(&d.worktree, &["rev-parse", "HEAD"]);
+        let pid_file = d.sandbox.path().join("hook.pid");
+        let script = format!(
+            "#!/bin/sh\necho $$ > '{}'\nexec sleep 30\n",
+            pid_file.display()
+        );
+        hook(&d, "pre-commit", &script);
+        write(&d.worktree, "a.txt", "a\n");
+        let started = Instant::now();
+        let err = commit_all(&d.worktree, "hangs", SHORT).unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        let Error::Git { command, stderr } = &err else {
+            panic!("expected a timeout, got {err:?}");
+        };
+        assert!(command.contains("commit"), "{command}");
+        assert_eq!(stderr, "timed out after 400 ms");
+        assert!(err.to_string().contains("commit"), "{err}");
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        assert!(gone(pid.trim()), "the hook {} still runs", pid.trim());
+        assert_eq!(git(&d.worktree, &["rev-parse", "HEAD"]), head);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_push_to_a_remote_that_never_answers_is_killed_at_the_limit() {
+        let d = delivery();
+        write(&d.worktree, "a.txt", "a\n");
+        commit(&d.worktree, "first");
+        // The local transport runs this in place of `git-receive-pack`.
+        let pid_file = d.sandbox.path().join("remote.pid");
+        let silent = d.sandbox.path().join("silent-receive-pack");
+        let script = format!(
+            "#!/bin/sh\necho $$ > '{}'\nexec sleep 30\n",
+            pid_file.display()
+        );
+        write_executable(&silent, &script);
+        git(
+            &d.clone,
+            &[
+                "config",
+                "remote.origin.receivepack",
+                silent.to_str().unwrap(),
+            ],
+        );
+
+        let started = Instant::now();
+        let err = push_branch(&d.worktree, "origin", BRANCH, SHORT).unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        let Error::Git { command, stderr } = &err else {
+            panic!("expected a timeout, got {err:?}");
+        };
+        assert!(command.starts_with("git push"), "{command}");
+        assert_eq!(stderr, "timed out after 400 ms");
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        assert!(
+            gone(pid.trim()),
+            "the remote side {} still runs",
+            pid.trim()
+        );
+        assert_eq!(remote_tip(&d.remote, BRANCH), None);
     }
 }

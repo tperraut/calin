@@ -24,9 +24,9 @@ use calin_agents::{Runner, RunnerRegistry};
 use calin_git::GitHub;
 use calin_proto::{
     AgentMessage, AgentStatus, AttachRepoRequest, CreateSessionRequest, DecisionSource, EventBody,
-    Graph, IssueRef, NodePhase, NodeRunState, PermissionDecision, RegisterRepoRequest, Repo,
-    RepoMode, RepoSet, RunnerLimits, Session, SessionDetail, SessionRepo, SessionStatus, Settings,
-    ShipRequest, Timeline, Usage, UsageBy, WorkflowInfo, WorkflowRun, WorkflowStatus,
+    Graph, IssueRef, MessageKind, NodePhase, NodeRunState, PermissionDecision, RegisterRepoRequest,
+    Repo, RepoMode, RepoSet, RunnerLimits, Session, SessionDetail, SessionRepo, SessionStatus,
+    Settings, ShipRequest, Timeline, Usage, UsageBy, WorkflowInfo, WorkflowRun, WorkflowStatus,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -63,6 +63,12 @@ const PULL_REQUEST_POLL: Duration = Duration::from_secs(60);
 const GITHUB_STATUS_TTL: Duration = Duration::from_secs(60);
 /// How often issue and pull request triggers ask GitHub (integrations spec, section 3).
 const TRIGGER_POLL: Duration = Duration::from_secs(5 * 60);
+/// How long a commit Calin makes may take, its hooks included: a hook that
+/// waits for something nobody will give must not hold up a ship for good.
+const COMMIT_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long a push may take: a large first push over a slow link, but not
+/// a remote that never answers.
+const PUSH_TIMEOUT: Duration = Duration::from_secs(300);
 
 const RESTART_REASON: &str = "server restarted";
 /// Recorded with a request that nobody answered while it could be answered.
@@ -106,6 +112,11 @@ pub struct ManagerConfig {
     /// Runs automations in the background. Tests turn it off and drive
     /// them with [`SessionManager::automations_tick`].
     pub automations: bool,
+    /// How long a commit Calin makes (when shipping, or at a workflow's
+    /// `commit` node) may take before git and its hooks are killed.
+    pub commit_timeout: Duration,
+    /// How long a push may take before git and what it started are killed.
+    pub push_timeout: Duration,
 }
 
 impl Default for ManagerConfig {
@@ -119,6 +130,8 @@ impl Default for ManagerConfig {
             time_zone: TimeZone::system(),
             trigger_poll: TRIGGER_POLL,
             automations: true,
+            commit_timeout: COMMIT_TIMEOUT,
+            push_timeout: PUSH_TIMEOUT,
         }
     }
 }
@@ -265,6 +278,9 @@ enum Command {
         reply: Reply,
     },
     Stop {
+        /// Stopped because an ancestor is: its report would go to an agent
+        /// that is going away, so none is sent.
+        cascade: bool,
         reply: Reply,
     },
     Permission {
@@ -344,14 +360,10 @@ enum Command {
     /// A child session's agents cost more than they did: a workflow run of
     /// this session has a budget to check. Nobody waits for this.
     Spent,
-    /// A child session was stopped, so it will never report. Nobody waits
-    /// for this.
-    ChildStopped {
-        session_id: String,
-    },
 }
 
-/// How a child session ended when it reported.
+/// How a child session ended when it reported. A child that was stopped
+/// before it reported counts as failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ChildEnd {
     Review,
@@ -379,7 +391,7 @@ impl Command {
             }
             Self::Message { reply, .. }
             | Self::Interrupt { reply }
-            | Self::Stop { reply }
+            | Self::Stop { reply, .. }
             | Self::Ship { reply, .. }
             | Self::Poll { reply }
             | Self::Report { reply, .. }
@@ -388,7 +400,7 @@ impl Command {
                 let _ = reply.send(Err(err));
             }
             // Nobody waits for these.
-            Self::Deliver { .. } | Self::Spent | Self::ChildStopped { .. } => {}
+            Self::Deliver { .. } | Self::Spent => {}
         }
     }
 }
@@ -791,23 +803,24 @@ impl SessionManager {
         if is_closed(status) {
             return Err(closed(status));
         }
-        // Deepest first, so that no child reports to a parent being stopped
-        // and starts a turn there.
+        // Deepest first, so that no child is left running under a parent
+        // that is gone. They send no report: everyone they would report to
+        // is being stopped too. The session itself reports to its own parent.
         for descendant in self.descendants(session_id).await?.into_iter().rev() {
             if descendant.status.is_settled() {
                 continue;
             }
-            match self.stop_one(&descendant.id).await {
+            match self.stop_one(&descendant.id, true).await {
                 // It ended on its own meanwhile.
                 Ok(()) | Err(Error::Conflict(_)) => {}
                 Err(err) => return Err(err),
             }
         }
-        self.stop_one(session_id).await
+        self.stop_one(session_id, false).await
     }
 
-    async fn stop_one(&self, session_id: &str) -> Result<()> {
-        self.command(session_id, |reply| Command::Stop { reply })
+    async fn stop_one(&self, session_id: &str, cascade: bool) -> Result<()> {
+        self.command(session_id, |reply| Command::Stop { cascade, reply })
             .await
     }
 
@@ -1286,7 +1299,8 @@ impl SessionManager {
                     status: SessionStatus::Failed,
                     reason: Some(RESTART_REASON.to_owned()),
                 };
-                store.append(&session.id, EventDraft::new(failed)).await?;
+                let failed = store.append(&session.id, EventDraft::new(failed)).await?;
+                report_restart(store, &session.id, &failed.id).await?;
                 Ok::<(), Error>(())
             }
             .await;
@@ -1302,6 +1316,50 @@ impl SessionManager {
         }
         Ok(())
     }
+}
+
+/// A child session the restart failed tells the agent that dispatched it,
+/// as its report would have (the "Child sessions" semantics in
+/// `calin-proto/src/api.rs`). Nobody runs to hand it over now: the parent's
+/// driver finds it in the log and hands it to its agent with the next input
+/// (`Driver::unheard_reports`). Children are recovered before their parents
+/// (newest first), so the report precedes the parent's own closing events.
+async fn report_restart(store: &Store, session_id: &str, failed: &str) -> Result<()> {
+    let Some(dispatch) = store.setup(session_id).await?.dispatch else {
+        return Ok(());
+    };
+    let agents = store.session(session_id).await?.agents;
+    let lead = agents
+        .into_iter()
+        .rev()
+        .find(|agent| agent.role == driver::LEAD_ROLE);
+    let from = lead.map_or_else(|| dispatch.lead_agent_id.clone(), |agent| agent.id);
+    let message = AgentMessage {
+        id: ulid::Ulid::generate().to_string(),
+        kind: MessageKind::Report,
+        from_session_id: session_id.to_owned(),
+        from_agent_id: Some(from.clone()),
+        to_session_id: dispatch.parent_session_id.clone(),
+        to_agent_id: Some(dispatch.agent_id),
+        body: briefing::child_failed_report(RESTART_REASON, None),
+        in_reply_to: Some(dispatch.message_id),
+        ts: now_ms(),
+    };
+    let sent = EventBody::MessageSent {
+        message: message.clone(),
+    };
+    let sent = EventDraft::new(sent)
+        .agent(from)
+        .parent(Some(failed.to_owned()));
+    let sent = store.append(session_id, sent).await?;
+    let received = EventDraft::new(EventBody::MessageReceived { message });
+    store
+        .append(
+            &dispatch.parent_session_id,
+            received.parent(Some(sent.id.clone())),
+        )
+        .await?;
+    Ok(())
 }
 
 /// Looks at the pull requests of every `shipping` session, at once and then

@@ -27,8 +27,6 @@ const APPROVE: &str = "approve";
 const REJECT: &str = "reject";
 /// What a node that was cut short says, and the run with it.
 const STOPPED: &str = "the session was stopped";
-/// The report of a child that was stopped before it sent one.
-const CHILD_STOPPED: &str = "The child session was stopped before it reported.";
 
 /// A workflow run in progress.
 pub(super) struct Run {
@@ -551,6 +549,7 @@ impl Driver {
     /// and the node it worked on leaves through `failed` (spec section 3).
     /// The session goes on; the next lead turn starts the agent again.
     pub(super) async fn lead_lost(&mut self, message: String) -> Result<()> {
+        let tracker = self.turn_tracker().await;
         self.drop_agent();
         self.abort_attaching();
         self.in_turn = false;
@@ -571,7 +570,10 @@ impl Driver {
         }
         self.append(error).await?;
         self.close_subagents(AgentStatus::Failed).await?;
-        self.set_agent_status(AgentStatus::Failed).await?;
+        let ended = self.set_agent_status(AgentStatus::Failed).await?;
+        if let Some(tracker) = tracker {
+            self.report_unreported_with(tracker, ended).await?;
+        }
         if let Some(run) = &mut self.run
             && let Wait::Lead { node, captured, .. } = &mut run.wait
         {
@@ -655,9 +657,11 @@ impl Driver {
         }
     }
 
-    /// A child session a node dispatched reported, or was stopped (`ended`
-    /// is then `Failed` and `body` says so). Once every child of the node
-    /// has, the node is over.
+    /// A child session a node dispatched reported: it rested, failed or was
+    /// stopped (`ended` is `Failed` for both, and `body` says which). Once
+    /// every child of the node has, the node is over; a child that failed
+    /// makes it leave through `failed`, with what the child's report says
+    /// first as the outcome.
     pub(super) async fn child_ended(
         &mut self,
         session_id: &str,
@@ -715,7 +719,9 @@ impl Driver {
         let failed = reports
             .iter()
             .filter(|(_, _, ended)| *ended == ChildEnd::Failed);
-        let failed: Vec<String> = failed.map(|(label, _, _)| label.clone()).collect();
+        let failed: Vec<String> = failed
+            .map(|(label, body, _)| format!("{label}: {}", excerpt(body)))
+            .collect();
         let done = if parallel {
             let sections = reports
                 .iter()
@@ -723,7 +729,7 @@ impl Driver {
             let summary = sections.collect::<Vec<_>>().join("\n\n");
             match failed.is_empty() {
                 true => Done::new(&node, "done", format!("{} branches done", reports.len())),
-                false => Done::new(&node, "failed", format!("failed: {}", failed.join(", "))),
+                false => Done::new(&node, "failed", format!("failed: {}", failed.join("; "))),
             }
             .with("summary", summary)
         } else {
@@ -731,9 +737,7 @@ impl Driver {
             let summary = summary.unwrap_or_default();
             match failed.is_empty() {
                 true => agent_result(&node, &verdicts, summary),
-                false => {
-                    Done::new(&node, "failed", "the child session failed").with("summary", summary)
-                }
+                false => Done::new(&node, "failed", excerpt(&summary)).with("summary", summary),
             }
         };
         if let Some(run) = &mut self.run {
@@ -741,12 +745,6 @@ impl Driver {
             run.done = Some(done);
         }
         Ok(())
-    }
-
-    /// A child session was stopped: it will never report.
-    pub(super) async fn child_stopped(&mut self, session_id: &str) -> Result<()> {
-        self.child_ended(session_id, CHILD_STOPPED.to_owned(), ChildEnd::Failed)
-            .await
     }
 
     /// A `check` node: its commands run one after the other, off the runtime.
@@ -844,11 +842,12 @@ impl Driver {
             .map(|repo| (repo.name.clone(), PathBuf::from(&repo.path)))
             .collect();
         let (results, work) = mpsc::channel(1);
+        let limit = self.inner.config.commit_timeout;
         tokio::spawn(async move {
             let committed = blocking(move || {
                 let mut committed = Vec::new();
                 for (name, dir) in dirs {
-                    match calin_git::commit_all(&dir, &message) {
+                    match calin_git::commit_all(&dir, &message, limit) {
                         Ok(calin_git::CommitOutcome::Committed(_)) => committed.push(name),
                         Ok(calin_git::CommitOutcome::NothingToCommit) => {}
                         Err(err) => return Ok(Err(format!("{name}: {err}"))),

@@ -12,6 +12,8 @@ struct Shell {
     id: String,
     io: AgentIo,
     lead: String,
+    /// The agents started later, when the session is continued.
+    starts: Starts,
 }
 
 /// A clone `name` with `files` committed on top of its first commit.
@@ -57,6 +59,7 @@ where
         id,
         io,
         lead,
+        starts,
     }
 }
 
@@ -501,4 +504,119 @@ async fn the_mock_agents_edit_is_reported_once_per_turn() {
     manager.send_message(&id, "Another").await.unwrap();
     let second = events_until(&manager, &id, head, is_status(SessionStatus::Review)).await;
     assert_eq!(changes(&second), [note]);
+}
+
+impl Shell {
+    /// Continues a session that is over: the agent starts again and its
+    /// turn ends at once. Returns what that turn appended.
+    async fn continue_quietly(&mut self) -> Vec<Event> {
+        self.manager.send_message(&self.id, "go on").await.unwrap();
+        let (_params, io) = within(self.starts.recv()).await.unwrap();
+        self.io = io;
+        self.end_turn().await
+    }
+}
+
+/// The one `file_changed` among `events`, which must follow the event
+/// labelled `ended` and be caused by it.
+fn changed_after(events: &[Event], ended: &str, lead: &str) -> Event {
+    let changed: Vec<&Event> = events
+        .iter()
+        .filter(|event| matches!(event.body, EventBody::FileChanged { .. }))
+        .collect();
+    let [changed] = changed.as_slice() else {
+        panic!("expected one file_changed, got {:?}", labels(events));
+    };
+    let ended = events
+        .iter()
+        .find(|event| label(event) == ended)
+        .unwrap_or_else(|| panic!("no {ended} in {:?}", labels(events)));
+    assert_eq!(changed.parent_id.as_ref(), Some(&ended.id));
+    assert_eq!(changed.agent_id.as_deref(), Some(lead));
+    assert_eq!(ended.agent_id.as_deref(), Some(lead));
+    (*changed).clone()
+}
+
+#[tokio::test]
+async fn an_interrupted_turn_has_its_shell_changes_found() {
+    let mut s = shell(&[]).await;
+    let api = s.repo("api").await;
+    write_file(Path::new(&api.path), "half.txt", "half done\n");
+    let after = s.head().await;
+    s.manager.interrupt(&s.id).await.unwrap();
+    assert_eq!(
+        within(s.io.inputs.recv()).await,
+        Some(RunnerInput::Interrupt)
+    );
+    emit(&s.io, RunnerOutput::TurnEnded).await;
+    let events = events_until(&s.manager, &s.id, after, is_status(SessionStatus::Review)).await;
+    changed_after(&events, "agent_status:idle", &s.lead);
+    assert_eq!(changes(&events), [change(&api, "half.txt", FileOp::Create)]);
+
+    // Nothing changed since: the next turn finds nothing.
+    s.next_turn().await;
+    assert!(changes(&s.end_turn().await).is_empty());
+}
+
+#[tokio::test]
+async fn a_stopped_turn_has_its_shell_changes_found_before_the_session_is_cancelled() {
+    let mut s = shell(&[]).await;
+    let api = s.repo("api").await;
+    write_file(Path::new(&api.path), "half.txt", "half done\n");
+    let after = s.head().await;
+    let stopping = s.manager.stop(&s.id);
+    let obeying = async {
+        assert_eq!(within(s.io.inputs.recv()).await, Some(RunnerInput::Stop));
+        emit(&s.io, RunnerOutput::Exited(Exit::Ok)).await;
+    };
+    let (stopped, ()) = tokio::join!(stopping, obeying);
+    stopped.unwrap();
+    let events = events_until(
+        &s.manager,
+        &s.id,
+        after,
+        is_status(SessionStatus::Cancelled),
+    )
+    .await;
+    let labels = labels(&events);
+    assert_eq!(
+        labels[labels.len() - 3..],
+        [
+            "agent_status:stopped",
+            "file_changed:create",
+            "session_status:cancelled"
+        ]
+    );
+    changed_after(&events, "agent_status:stopped", &s.lead);
+    assert_eq!(changes(&events), [change(&api, "half.txt", FileOp::Create)]);
+
+    // Continued, with nothing changed: nothing is said twice.
+    assert!(changes(&s.continue_quietly().await).is_empty());
+}
+
+#[tokio::test]
+async fn a_turn_whose_agent_fails_has_its_shell_changes_found() {
+    let mut s = shell(&[("src/lib.rs", "fn a() {}\n")]).await;
+    let api = s.repo("api").await;
+    write_file(Path::new(&api.path), "src/lib.rs", "fn a() { b() }\n");
+    let after = s.head().await;
+    let died = RunnerOutput::Exited(Exit::Error("the agent crashed".to_owned()));
+    emit(&s.io, died).await;
+    let events = events_until(&s.manager, &s.id, after, is_status(SessionStatus::Failed)).await;
+    let labels = labels(&events);
+    assert_eq!(
+        labels[labels.len() - 4..],
+        [
+            "error:the agent crashed",
+            "agent_status:failed",
+            "file_changed:edit",
+            "session_status:failed"
+        ]
+    );
+    changed_after(&events, "agent_status:failed", &s.lead);
+    assert_eq!(changes(&events), [change(&api, "src/lib.rs", FileOp::Edit)]);
+
+    assert!(changes(&s.continue_quietly().await).is_empty());
+    let all = s.manager.store().subscribe(&s.id, 0).await.unwrap().backlog;
+    assert_eq!(changes(&all).len(), 1);
 }

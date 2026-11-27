@@ -190,6 +190,26 @@ pub(crate) fn report_text(
     text
 }
 
+/// The body of the report of a child that failed: what happened first, on
+/// a line of its own (a workflow node's outcome is that line), then what
+/// the child said before, when it said anything.
+pub(crate) fn child_failed_report(reason: &str, said: Option<&str>) -> String {
+    let reason = reason.trim().trim_end_matches('.');
+    ended_report(&format!("This child session failed: {reason}."), said)
+}
+
+/// The body of the report of a child that was stopped before it rested.
+pub(crate) fn child_stopped_report(said: Option<&str>) -> String {
+    ended_report("This child session was stopped before it finished.", said)
+}
+
+fn ended_report(what: &str, said: Option<&str>) -> String {
+    match said.map(str::trim).filter(|said| !said.is_empty()) {
+        Some(said) => format!("{what}\n\nBefore that, it said:\n\n{said}"),
+        None => format!("{what} It did not report."),
+    }
+}
+
 /// A note from a child session, as the agent that dispatched it receives it.
 pub(crate) fn note_from_child(title: &str, session_id: &str, body: &str) -> String {
     format!("[Calin] Note from child session \"{title}\" (id {session_id})\n\n{body}")
