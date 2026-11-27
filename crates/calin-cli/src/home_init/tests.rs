@@ -33,6 +33,10 @@ fn git(dir: &Path, args: &[&str]) -> String {
             "commit.gpgsign=false",
             "-c",
             "init.defaultBranch=main",
+            // A commit may start maintenance in the background, whose lock
+            // file would show up in a snapshot taken after it.
+            "-c",
+            "maintenance.auto=false",
         ])
         .arg("-C")
         .arg(dir)
