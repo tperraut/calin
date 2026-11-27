@@ -9,6 +9,13 @@
 //! | GET | `/tokens` | | `Vec<DeviceTokenInfo>`, newest first |
 //! | POST | `/tokens` | [`CreateDeviceTokenRequest`] | `201` [`CreatedDeviceToken`] |
 //! | DELETE | `/tokens/{id}` | | `204` |
+//! | GET | `/push/key` | | [`PushKey`] |
+//! | GET | `/push/subscriptions` | | `Vec<PushSubscriptionInfo>`, newest first |
+//! | POST | `/push/subscriptions` | [`PushSubscriptionRequest`] | `201` [`PushSubscriptionInfo`] |
+//! | DELETE | `/push/subscriptions/{id}` | | `204` |
+//! | GET | `/push/preferences` | | [`PushPreferences`] |
+//! | PUT | `/push/preferences` | [`PushPreferences`] | [`PushPreferences`] |
+//! | POST | `/push/test` | | `202`; sends a test notification to the caller's devices |
 //! | GET | `/settings` | | [`Settings`] |
 //! | PUT | `/settings` | [`Settings`] | [`Settings`], as stored |
 //! | GET | `/repos` | | `Vec<Repo>`: the home repo first, then by name |
@@ -166,6 +173,13 @@
 //!   straight from loopback with no forwarding header, in both modes. The
 //!   session and token routes act on the caller's own identity only; an id
 //!   that belongs to someone else is a 404. In local mode they are a 409.
+//! - **Push** follows section 6 of the remote access spec, which is part of
+//!   this contract. The routes exist in public mode only (409 in local mode).
+//!   Subscribing with an endpoint that is already registered for the caller
+//!   replaces it and returns the same `id`. An endpoint that is not `https`,
+//!   or keys that do not decode to the right lengths, are a 400. Subscriptions
+//!   and preferences belong to the caller's identity; another identity's id is
+//!   a 404. A subscription the push service reports as gone is removed.
 //! - **Registering a repo**: the path must be the root of a git work tree
 //!   (400 otherwise); a name already in use is a 409. A repo attached to a
 //!   session that is not `done`, `failed` or `cancelled` cannot be deleted (409).
