@@ -29,12 +29,18 @@ export function dayKey(ts: number): string {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
 }
 
-/** Noon of a `YYYY-MM-DD` day in local time; noon stays inside the day across a clock change. */
-export function dayNoon(key: string): number | undefined {
+/**
+ * Midnight UTC of a `YYYY-MM-DD` day. A key is a calendar date in the server's
+ * zone, not an instant: read and written in UTC, no zone can shift it a day.
+ */
+export function dayUtc(key: string): number | undefined {
   const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(key);
   if (!match) return undefined;
-  return new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]), 12).getTime();
+  return Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
 }
+
+/** The `YYYY-MM-DD` key of a `dayUtc` value. */
+const utcKey = (ms: number): string => new Date(ms).toISOString().slice(0, 10);
 
 const ZERO: UsageTotals = { cost_usd: 0, tokens_in: 0, tokens_out: 0, sessions: 0 };
 
@@ -45,22 +51,30 @@ const ZERO: UsageTotals = { cost_usd: 0, tokens_in: 0, tokens_out: 0, sessions: 
  */
 export function fillDays(rows: readonly UsageRow[]): UsageRow[] {
   const known = rows
-    .filter((row) => dayNoon(row.key) !== undefined)
+    .filter((row) => dayUtc(row.key) !== undefined)
     .toSorted((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
   const first = known.at(0);
   const last = known.at(-1);
   if (!first || !last) return [];
   const byKey = new Map(known.map((row) => [row.key, row]));
   const days: UsageRow[] = [];
-  const cursor = new Date(dayNoon(first.key) ?? 0);
+  let cursor = dayUtc(first.key) ?? 0;
   // Bounded by the server's 366 days, and by the last key in any case.
   for (let guard = 0; guard < 400; guard += 1) {
-    const key = dayKey(cursor.getTime());
+    const key = utcKey(cursor);
     days.push(byKey.get(key) ?? { key, label: key, totals: ZERO });
     if (key >= last.key) break;
-    cursor.setDate(cursor.getDate() + 1);
+    cursor += 86_400_000;
   }
   return days;
+}
+
+/**
+ * The key of the day to mark as today: the server's last day when the range
+ * asked for ends now, since the server buckets days in its own zone. None otherwise.
+ */
+export function todayKey(days: readonly UsageRow[], endsNow: boolean): string | undefined {
+  return endsNow ? days.at(-1)?.key : undefined;
 }
 
 /** A value axis: its top and its ticks from 0 up, evenly spaced. */
@@ -109,15 +123,15 @@ export function axisCost(value: number, step: number): string {
   return `$${value.toFixed(needed === 0 ? 0 : Math.max(2, needed))}`;
 }
 
-/** "Tue 24 Nov" style: the date of a day key in the viewer's locale. */
+/** "24 Nov" style: the calendar date of a day key in the viewer's locale, whatever their zone. */
 export function dayLabel(key: string, style: "short" | "long" = "short"): string {
-  const noon = dayNoon(key);
-  if (noon === undefined) return key;
-  return new Date(noon).toLocaleDateString(
+  const day = dayUtc(key);
+  if (day === undefined) return key;
+  return new Date(day).toLocaleDateString(
     undefined,
     style === "long"
-      ? { weekday: "long", day: "numeric", month: "long", year: "numeric" }
-      : { day: "numeric", month: "short" },
+      ? { weekday: "long", day: "numeric", month: "long", year: "numeric", timeZone: "UTC" }
+      : { day: "numeric", month: "short", timeZone: "UTC" },
   );
 }
 

@@ -17,10 +17,10 @@ import type { UsageRow } from "../gen/UsageRow";
 import { errorMessage } from "../lib/errors";
 import { compactCount, formatCost } from "../lib/format";
 import {
-  dayKey,
   fillDays,
   rangeBounds,
   rangeFromQuery,
+  todayKey,
   USAGE_RANGES,
   type UsageRange,
 } from "../lib/usage";
@@ -34,7 +34,7 @@ type Breakdowns = { day: Usage; session: Usage; repo: Usage; model: Usage };
 
 type Load =
   | { status: "loading" }
-  | { status: "ready"; data: Breakdowns }
+  | { status: "ready"; data: Breakdowns; endsNow: boolean }
   | { status: "error"; message: string };
 
 const numberFormat = new Intl.NumberFormat();
@@ -124,11 +124,15 @@ export default function UsagePage() {
       asked += 1;
       const mine = asked;
       setLoad({ status: "loading" });
-      const bounds = rangeBounds(days, Date.now());
+      const now = Date.now();
+      const bounds = rangeBounds(days, now);
+      // Every range offered ends now; one that does not has no today to mark.
+      const endsNow = bounds.to >= now;
       const ask = (by: Usage["by"]) => app.usage({ ...bounds, by });
       Promise.all([ask("day"), ask("session"), ask("repo"), ask("model")]).then(
         ([day, session, repo, model]) => {
-          if (mine === asked) setLoad({ status: "ready", data: { day, session, repo, model } });
+          if (mine === asked)
+            setLoad({ status: "ready", data: { day, session, repo, model }, endsNow });
         },
         (error: unknown) => {
           if (mine === asked) setLoad({ status: "error", message: errorMessage(error) });
@@ -146,6 +150,10 @@ export default function UsagePage() {
     return current.status === "error" ? current.message : undefined;
   };
   const days = createMemo(() => fillDays(data()?.day.rows ?? []));
+  const today = (): string | undefined => {
+    const current = load();
+    return todayKey(days(), current.status === "ready" && current.endsNow);
+  };
   const empty = (): boolean => {
     const totals = data()?.day.totals;
     return (
@@ -236,7 +244,7 @@ export default function UsagePage() {
                 >
                   <section class="flex flex-col gap-2">
                     <h2 class="font-semibold">By day</h2>
-                    <DayChart days={days()} today={dayKey(Date.now())} />
+                    <DayChart days={days()} today={today()} />
                   </section>
 
                   <section class="flex flex-col gap-2">

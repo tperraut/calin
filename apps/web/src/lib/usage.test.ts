@@ -1,9 +1,10 @@
-import { describe, expect, it } from "vite-plus/test";
+import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import { makeWindow, row } from "../test/integrations";
 import {
   axisCost,
   barHeight,
   dayKey,
+  dayLabel,
   fillDays,
   meterState,
   niceScale,
@@ -13,6 +14,7 @@ import {
   refusalText,
   reportedText,
   resetText,
+  todayKey,
   windowName,
   windowSummary,
 } from "./usage";
@@ -85,6 +87,13 @@ describe("days", () => {
     expect(days.at(-1)?.key).toBe("2026-11-02");
   });
 
+  it("marks the server's last day as today when the range ends now, and none otherwise", () => {
+    const days = fillDays([row("2026-11-26", 1), row("2026-11-28", 2)]);
+    expect(todayKey(days, true)).toBe("2026-11-28");
+    expect(todayKey(days, false)).toBeUndefined();
+    expect(todayKey([], true)).toBeUndefined();
+  });
+
   it("asks for the last n days, today included, from local midnight", () => {
     const now = at(27, 15, 30);
     const { from, to } = rangeBounds(7, now);
@@ -150,5 +159,56 @@ describe("limit windows", () => {
     expect(meterState(makeWindow("a", { used: 0.1, refused: true })).label).toBe(
       "Refusing requests",
     );
+  });
+});
+
+describe("day labels across time zones", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  // Node applies a change of TZ at once: the zones below are a day apart at midnight UTC.
+  const zones = [
+    "UTC",
+    "Pacific/Pago_Pago",
+    "Pacific/Kiritimati",
+    "America/Los_Angeles",
+    "Asia/Tokyo",
+  ];
+
+  it("reads a key as the same calendar date in every viewer zone", () => {
+    const labels = zones.map((one) => {
+      vi.stubEnv("TZ", one);
+      return [dayLabel("2026-11-27"), dayLabel("2026-11-27", "long")];
+    });
+    vi.stubEnv("TZ", "Pacific/Pago_Pago");
+    // A sanity check that the zone did change: a naive reading lands on the 26th there.
+    expect(new Date("2026-11-27").getDate()).toBe(26);
+    for (const [short, long] of labels) {
+      expect(short).toBe(labels[0]?.[0]);
+      expect(long).toBe(labels[0]?.[1]);
+      expect(short).toMatch(/27/);
+      expect(long).toMatch(/Friday/);
+      expect(long).toMatch(/November/);
+    }
+  });
+
+  it("fills days the same way in every viewer zone, across a clock change", () => {
+    for (const one of zones) {
+      vi.stubEnv("TZ", one);
+      const days = fillDays([row("2026-10-24", 1), row("2026-11-02", 1)]);
+      expect(days.map((day) => day.key)).toEqual([
+        "2026-10-24",
+        "2026-10-25",
+        "2026-10-26",
+        "2026-10-27",
+        "2026-10-28",
+        "2026-10-29",
+        "2026-10-30",
+        "2026-10-31",
+        "2026-11-01",
+        "2026-11-02",
+      ]);
+    }
   });
 });

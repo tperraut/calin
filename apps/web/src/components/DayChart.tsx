@@ -35,13 +35,14 @@ export function dayText(row: UsageRow, today: boolean): string {
  * focusable (arrow keys move between days) and names its day, cost and
  * tokens; the same numbers are in a table for screen readers.
  */
-export function DayChart(props: { days: readonly UsageRow[]; today: string }) {
+export function DayChart(props: { days: readonly UsageRow[]; today: string | undefined }) {
   const scale = createMemo(() =>
     niceScale(Math.max(0, ...props.days.map((d) => d.totals.cost_usd))),
   );
   const count = (): number => props.days.length;
   const slot = (): number => 100 / Math.max(1, count());
-  const todayIndex = (): number => props.days.findIndex((day) => day.key === props.today);
+  const todayIndex = (): number =>
+    props.today === undefined ? -1 : props.days.findIndex((day) => day.key === props.today);
   const step = (): number => labelStep(count());
   const labelled = (index: number): boolean => {
     const anchor = todayIndex() >= 0 ? todayIndex() : count() - 1;
@@ -270,6 +271,9 @@ export function DayChart(props: { days: readonly UsageRow[]; today: string }) {
           </svg>
         </div>
       </div>
+      <p class="text-xs text-muted" data-part="day-zone">
+        Days are the server's local days.
+      </p>
       <table class="sr-only" data-part="day-table">
         <caption>Cost by day</caption>
         <thead>
@@ -286,7 +290,7 @@ export function DayChart(props: { days: readonly UsageRow[]; today: string }) {
               <tr>
                 <th scope="row">
                   {dayLabel(day().key, "long")}
-                  {day().key === props.today ? " (today)" : ""}
+                  {props.today !== undefined && day().key === props.today ? " (today)" : ""}
                 </th>
                 <td>{formatCost(day().totals.cost_usd)}</td>
                 <td>{day().totals.tokens_in}</td>

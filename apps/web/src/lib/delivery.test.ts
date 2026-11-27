@@ -78,7 +78,7 @@ describe("shipPlan", () => {
     },
   );
 
-  it("names what is skipped and why: no changes, edited in place, read-only", () => {
+  it("names what is skipped and why: no changes, edited in place, read only", () => {
     const plan = shipPlan(
       repos,
       // The changes of a repo that is not a worktree never ship, whatever they are.
@@ -92,7 +92,7 @@ describe("shipPlan", () => {
       ["notes", "live"],
     ]);
     expect(skippedLine(plan)).toBe(
-      "Skipped: web (no changes), docs (read-only), notes (edited in place)",
+      "Skipped: web (no changes), docs (read only), notes (edited in place)",
     );
   });
 

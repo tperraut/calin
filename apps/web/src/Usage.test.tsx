@@ -1,6 +1,7 @@
 import { flush } from "solid-js";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import { App } from "./App";
+import { DayChart } from "./components/DayChart";
 import { HttpError, type Api, type UsageQuery } from "./api/http";
 import type { Health } from "./gen/Health";
 import type { RunnerLimits } from "./gen/RunnerLimits";
@@ -122,6 +123,30 @@ describe("Usage page", () => {
       "$0.00",
       "$120.00",
     ]);
+  });
+
+  it("marks the server's last day as today, whatever the viewer's date", async () => {
+    // A server a day ahead of the viewer: its last day is tomorrow here.
+    const { main } = await open("/usage", {
+      getUsage: answers([row(daysAgo(0), 1), row(daysAgo(-1), 3)]),
+    });
+    const hits = bars(main());
+    expect(hits).toHaveLength(2);
+    expect(hits.at(-1)?.getAttribute("aria-label")).toContain("(today): $3.00");
+    expect(hits.at(0)?.getAttribute("aria-label")).not.toContain("(today)");
+    expect(main().querySelectorAll("[data-today]")).toHaveLength(1);
+    expect(find(main(), '[data-part="day-zone"]').textContent).toContain(
+      "Days are the server's local days.",
+    );
+  });
+
+  it("marks no day as today when the range does not end now", () => {
+    const host = mount(() => (
+      <DayChart days={[row("2026-11-26", 1), row("2026-11-27", 2)]} today={undefined} />
+    ));
+    expect(host.querySelectorAll("[data-today]")).toHaveLength(0);
+    expect(host.textContent).not.toContain("Today");
+    expect(host.textContent).not.toContain("(today)");
   });
 
   it("moves between bars with the arrow keys and says the focused day", async () => {

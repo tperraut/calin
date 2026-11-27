@@ -4,11 +4,10 @@ import type { Repo } from "../gen/Repo";
 import type { RepoSet } from "../gen/RepoSet";
 import { errorMessage } from "../lib/errors";
 import { createMediaQuery, WIDE_QUERY } from "../lib/media";
-import type { ComposerRepoMode, RepoChoice } from "../lib/prefs";
-import { defaultRepoMode, repoModeLabel } from "../lib/status";
+import type { RepoMode } from "../gen/RepoMode";
+import type { RepoChoice } from "../lib/prefs";
+import { defaultRepoMode, repoModeLabel, repoModes } from "../lib/status";
 import type { RepoRegistry } from "../state/app";
-
-const composerModes: readonly ComposerRepoMode[] = ["write", "live"];
 
 /** From this many repos on, the list gets a filter box. */
 const FILTER_FROM = 9;
@@ -107,7 +106,7 @@ function RepoRow(props: {
   choice: RepoChoice | undefined;
   primary: boolean;
   onToggle: (chosen: boolean) => void;
-  onMode: (mode: ComposerRepoMode) => void;
+  onMode: (mode: RepoMode) => void;
   onMakePrimary: () => void;
   onRemove: () => Promise<void>;
   onClone: () => Promise<void>;
@@ -235,17 +234,14 @@ function RepoRow(props: {
             <select
               id={modeId}
               class="field h-11 w-auto min-w-0 px-2"
+              value={choice().mode}
               onChange={(event) => {
-                const picked = composerModes.find((mode) => mode === event.currentTarget.value);
+                const picked = repoModes.find((mode) => mode === event.currentTarget.value);
                 if (picked) props.onMode(picked);
               }}
             >
-              <For each={composerModes}>
-                {(mode) => (
-                  <option value={mode} selected={mode === choice().mode}>
-                    {repoModeLabel(mode)}
-                  </option>
-                )}
+              <For each={repoModes}>
+                {(mode) => <option value={mode}>{repoModeLabel(mode)}</option>}
               </For>
             </select>
             <Show when={!props.primary}>
@@ -362,7 +358,7 @@ export function RepoPicker(props: {
     else change([...without(repo.id), { repoId: repo.id, mode: defaultRepoMode(repo) }]);
   }
 
-  function setMode(id: string, mode: ComposerRepoMode): void {
+  function setMode(id: string, mode: RepoMode): void {
     change(props.choices.map((choice) => (choice.repoId === id ? { ...choice, mode } : choice)));
   }
 
@@ -570,6 +566,12 @@ export function RepoPicker(props: {
                 )}
               </Show>
             </p>
+            <Show when={primaryName() !== undefined && props.choices.at(0)?.mode === "read"}>
+              <p data-part="read-only-primary" class="text-xs text-muted">
+                The agent starts in a read-only repo and will have to ask before changing anything
+                there.
+              </p>
+            </Show>
           </Match>
         </Switch>
         <Show when={registering()}>

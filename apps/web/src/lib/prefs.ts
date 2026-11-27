@@ -1,11 +1,8 @@
 import type { PermissionMode } from "../gen/PermissionMode";
 import type { RepoMode } from "../gen/RepoMode";
-import { permissionModes } from "./status";
+import { permissionModes, repoModes } from "./status";
 
-/** The two ways the composer attaches a repo; `read` is not offered there. */
-export type ComposerRepoMode = Extract<RepoMode, "write" | "live">;
-
-export type RepoChoice = { repoId: string; mode: ComposerRepoMode };
+export type RepoChoice = { repoId: string; mode: RepoMode };
 
 /** What the composer starts from: the choices of the last session started in this browser. */
 export type ComposerPrefs = {
@@ -54,7 +51,8 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
 
 function repoChoice(value: unknown): RepoChoice | undefined {
   if (!isRecord(value) || typeof value.repoId !== "string") return undefined;
-  return { repoId: value.repoId, mode: value.mode === "live" ? "live" : "write" };
+  const mode = repoModes.find((one) => one === value.mode) ?? "write";
+  return { repoId: value.repoId, mode };
 }
 
 /** Whatever is stored is checked field by field: it may come from another build. */

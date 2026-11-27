@@ -96,7 +96,8 @@ function AutomationEditor(props: {
   const [choices, setChoices] = createSignal<readonly RepoChoice[]>(
     (stored?.session.repos ?? []).map((repo) => ({
       repoId: repo.repo_id,
-      mode: repo.mode === "live" ? "live" : "write",
+      // Absent means a worktree (repo.rs); every other mode is kept as it was saved.
+      mode: repo.mode ?? "write",
     })),
   );
   const [workflow, setWorkflow] = createSignal<string | undefined>(

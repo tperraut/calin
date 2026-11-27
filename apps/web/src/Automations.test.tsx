@@ -230,6 +230,54 @@ describe("Automation editor", () => {
     expect(body?.trigger).toEqual({ kind: "pull_request", repo_id: "notes" });
   });
 
+  it.each(["write", "read", "live"] as const)(
+    "saves a session repo attached as %s back as it was loaded",
+    async (mode) => {
+      const stored = makeAutomation("a5", {
+        name: "Keep modes",
+        session: {
+          ...schedule.session,
+          repos: [
+            { repo_id: "api", mode },
+            { repo_id: "web", mode: "read" },
+            { repo_id: "notes", mode: "live" },
+          ],
+        },
+      });
+      const putAutomation = vi.fn((_id: string, body: AutomationRequest) =>
+        Promise.resolve({ ...stored, ...body }),
+      );
+      const { main } = await open("/automations/a5", {
+        getAutomation: () => Promise.resolve(stored),
+        putAutomation,
+      });
+      await click(findByText(main(), "button", "Save"));
+      await settle();
+      expect(putAutomation.mock.calls).toEqual([
+        [
+          "a5",
+          {
+            name: "Keep modes",
+            enabled: true,
+            trigger: stored.trigger,
+            session: {
+              prompt: "Check {{date}}",
+              workflow: null,
+              repos: [
+                { repo_id: "api", mode },
+                { repo_id: "web", mode: "read" },
+                { repo_id: "notes", mode: "live" },
+              ],
+              runner: null,
+              model: null,
+              permission_mode: "accept_edits",
+            },
+          },
+        ],
+      ]);
+    },
+  );
+
   it("lists the placeholders of the chosen trigger, and does not offer Ask, saying why", async () => {
     const { main } = await open("/automations/new");
     const note = () => text(find(main(), '[data-part="placeholders"]'));

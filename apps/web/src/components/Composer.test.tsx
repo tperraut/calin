@@ -142,6 +142,7 @@ describe("Composer", () => {
     const mode = find<HTMLSelectElement>(repoRow("docs"), "select");
     expect([...mode.options].map((option) => option.textContent)).toEqual([
       "Worktree",
+      "Read only",
       "Edit in place",
     ]);
     expect(mode.value).toBe("write");
@@ -152,6 +153,71 @@ describe("Composer", () => {
       { repo_id: "api", mode: "write" },
       { repo_id: "docs", mode: "live" },
     ]);
+  });
+
+  it.each(["write", "read", "live"] as const)("sends a repo attached as %s", async (mode) => {
+    const { repoRow, pick, start } = setup();
+    await pick("api");
+    await pick("docs");
+    choose(find<HTMLSelectElement>(repoRow("docs"), "select"), mode);
+    expect(find<HTMLSelectElement>(repoRow("docs"), "select").value).toBe(mode);
+    expect((await start()).repos).toEqual([
+      { repo_id: "api", mode: "write" },
+      { repo_id: "docs", mode },
+    ]);
+  });
+
+  it("says calmly when the primary repo is read only, and stops once it is not", async () => {
+    const { host, repoRow, pick, start } = setup();
+    const note = () => host.querySelector('[data-part="read-only-primary"]');
+    await pick("api");
+    await pick("docs");
+    expect(note()).toBeNull();
+    choose(find<HTMLSelectElement>(repoRow("docs"), "select"), "read");
+    // Only the primary repo is the agent's working directory.
+    expect(note()).toBeNull();
+    choose(find<HTMLSelectElement>(repoRow("api"), "select"), "read");
+    expect(note()?.textContent?.replace(/\s+/g, " ").trim()).toBe(
+      "The agent starts in a read-only repo and will have to ask before changing anything there.",
+    );
+    choose(find<HTMLSelectElement>(repoRow("api"), "select"), "write");
+    expect(note()).toBeNull();
+    choose(find<HTMLSelectElement>(repoRow("api"), "select"), "read");
+    expect(note()).not.toBeNull();
+    // A read-only primary is allowed: the session starts with it.
+    expect((await start()).repos).toEqual([
+      { repo_id: "api", mode: "read" },
+      { repo_id: "docs", mode: "read" },
+    ]);
+    await click(findByText(repoRow("docs"), "button", "Make primary"));
+    expect(note()).not.toBeNull();
+    choose(find<HTMLSelectElement>(repoRow("docs"), "select"), "live");
+    expect(note()).toBeNull();
+  });
+
+  it("restores a remembered read-only repo as read only", async () => {
+    localStorage.setItem(
+      "calin.composer.v2",
+      JSON.stringify({
+        repos: [
+          { repoId: "web", mode: "live" },
+          { repoId: "docs", mode: "read" },
+          { repoId: "api", mode: "bogus" },
+        ],
+        permissionMode: "ask",
+      }),
+    );
+    const { repoRow, start } = setup();
+    expect(find<HTMLSelectElement>(repoRow("docs"), "select").value).toBe("read");
+    expect((await start()).repos).toEqual([
+      { repo_id: "web", mode: "live" },
+      { repo_id: "docs", mode: "read" },
+      { repo_id: "api", mode: "write" },
+    ]);
+    unmountAll();
+
+    const second = setup();
+    expect(find<HTMLSelectElement>(second.repoRow("docs"), "select").value).toBe("read");
   });
 
   it("drops a repo that is unticked", async () => {

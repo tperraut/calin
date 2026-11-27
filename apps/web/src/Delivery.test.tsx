@@ -242,7 +242,7 @@ describe("shipping from review", () => {
       "web: 1 file, +5 −0 → new pull request",
     ]);
     expect(find(shown, '[data-part="skipped"]').textContent).toBe(
-      "Skipped: docs (read-only), notes (edited in place), tools (no changes)",
+      "Skipped: docs (read only), notes (edited in place), tools (no changes)",
     );
     // Not a dry run: nothing says so.
     expect(shown.querySelector('[data-part="dry-run"]')).toBeNull();

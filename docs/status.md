@@ -181,9 +181,39 @@ Known gaps carried forward from M5:
   local to the tool endpoint's loopback check. Caddy's defaults are safe; the README says so.
 - The manifest has one theme color, so the installed app's splash screen is light in both themes.
 
-## Later
+## M6: Usage, issues and automations (done 2026-11-28, except GitHub for real)
 
-M6 integrations
+- [x] Spec: `docs/specs/2026-11-28-integrations.md`
+- [x] Usage by day, session, repo, runner and model, from a rebuildable projection; the agent
+      plan's limit windows, reported by the runner and shown with their reset times
+- [x] GitHub issues through `gh`; a session started from an issue carries its text and its pull
+      request closes it
+- [x] Automations: a cron schedule, or new issues and pull requests; a baseline on enable, one
+      active session at a time, switched off after three failures
+- [x] Web: Usage page, issues in the new-session form, Automations pages, a summary line on the
+      home page
+- [x] `make e2e` covers usage, a session from an issue and an automation run (48 + 14 checks)
+- [ ] Issues, issue and pull request triggers against real GitHub. Everything ran against a
+      stand-in for `gh` and built-in sample issues.
+
+Known gaps carried forward from M6:
+
+- The usage range starts at the browser's local midnight while days are the server's, so the
+  first day can be partial when the two time zones differ.
+- A 400 from saving an automation names no field; the web app guesses which one from the wording.
+- Cron: five fields only, no `@daily`, seconds or `L W # ?`.
+- A repo set always adds its repos as worktrees.
+- Cost is what the agent CLI reports; on a subscription it is an estimate, and the page says so.
+
+## What is left
+
+Everything in the original plan is on `main` except:
+
+- the desktop app (M5), which needs system packages installed with root;
+- a second agent runner through ACP (M4), which needs a choice of agent CLI;
+- checks against the real world: pull requests and issues on GitHub, sign-in with a real
+  provider and domain, an install on a real server, the app and notifications on a real phone;
+- the polish items listed under each milestone above.
 
 ## Decisions since the spec
 

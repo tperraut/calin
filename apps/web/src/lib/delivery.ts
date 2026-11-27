@@ -163,10 +163,10 @@ export const stepLine = (step: ShipStep): string =>
 const skipWords: Record<SkipReason, string> = {
   no_changes: "no changes",
   live: "edited in place",
-  read: "read-only",
+  read: "read only",
 };
 
-/** "Skipped: docs (read-only), notes (edited in place)"; empty when every repo ships. */
+/** "Skipped: docs (read only), notes (edited in place)"; empty when every repo ships. */
 export function skippedLine(plan: ShipPlan): string {
   if (plan.skipped.length === 0) return "";
   const each = plan.skipped.map(({ repo, reason }) => `${repo.name} (${skipWords[reason]})`);
