@@ -16,7 +16,8 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 const SWITCH: &str = "CALIN_UNSAFE_DEV_ALLOW_HTTP_LOOPBACK";
 
 /// `calin serve` on a free loopback port with `home` as its data directory
-/// and nothing of this machine's environment but `PATH`.
+/// and nothing of this machine's environment but `PATH` (and, under
+/// coverage, where the profile goes).
 fn calin(home: &Path, vars: &[(&str, &str)]) -> Command {
     calin_on("127.0.0.1:0", home, vars)
 }
@@ -31,6 +32,9 @@ fn calin_on(bind: &str, home: &Path, vars: &[(&str, &str)]) -> Command {
         .env("HOME", home)
         .env("CALIN_DRY_RUN", "1")
         .envs(vars.iter().copied())
+        // Under `cargo llvm-cov` the binary is instrumented: without this its
+        // coverage is lost and a profile file lands in the working directory.
+        .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|file| ("LLVM_PROFILE_FILE", file)))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -144,6 +148,20 @@ fn local_mode_serves_without_sign_in_and_keeps_no_auth_file() {
     serving.stop();
     assert!(!home.path().join("auth.json").exists());
     assert!(!home.path().join("auth.json.tmp").exists());
+}
+
+#[test]
+fn a_log_filter_that_does_not_parse_is_ignored_with_a_warning() {
+    let home = TempDir::new().unwrap();
+    let serving = Serving::start(home.path(), &[("CALIN_LOG", "calin=nonsense")]);
+    assert_eq!(serving.get("/api/v1/health", &[]).0, 200);
+    let log = serving.stop();
+    assert!(
+        log.contains("ignoring CALIN_LOG=calin=nonsense; using info"),
+        "{log}"
+    );
+    // The default level still applies.
+    assert!(log.contains("server started"), "{log}");
 }
 
 #[test]
