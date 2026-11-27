@@ -408,6 +408,19 @@ describe("Transcript: a permission request inside its tool call's card", () => {
     expect(resolve).toHaveBeenCalledTimes(1);
   });
 
+  it("says a held call waits for the reader, and that a call whose request lapsed never ran", () => {
+    const { card, setEntries } = setup([asked({ state: "pending" })]);
+    const badge = () => find(card(), "summary").textContent;
+    // Held by its request: not running yet.
+    expect(badge()).toContain("Waiting for you");
+    expect(badge()).not.toContain("Running");
+    // The session was stopped before anyone answered: the call failed without running.
+    setEntries([call("failed", [asked({ state: "lapsed", message: "The turn ended." })])]);
+    flush();
+    expect(badge()).toContain("Not run");
+    expect(badge()).not.toContain("Failed");
+  });
+
   it("denies from the card, and shows the server's reason when an answer is refused", async () => {
     const { card, resolve } = setup([asked({ state: "pending" })], {
       resolve: () => Promise.reject(conflict("the request was already answered")),

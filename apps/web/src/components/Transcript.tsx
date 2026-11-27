@@ -276,6 +276,16 @@ function ToolCard(props: {
   // Input and output are built only once the card is open: a long transcript
   // holds hundreds of these and most are never looked at.
   const [open, setOpen] = createSignal(false);
+  // A call held by its permission request is not running: it waits for the reader. One
+  // whose request lapsed unanswered and then failed never ran: the failure is the stop's.
+  const heldLook = (): Look | undefined => {
+    const states = props.permissions.map((asked) => asked.outcome.state);
+    if (states.includes("pending")) return permissionLook({ state: "pending" });
+    if (props.status === "failed" && states.includes("lapsed")) {
+      return { label: "Not run", tone: "neutral" };
+    }
+    return undefined;
+  };
   return (
     <div class="rounded-md border border-line bg-surface">
       <details class="group" onToggle={(event) => setOpen(event.currentTarget.open)}>
@@ -285,12 +295,11 @@ function ToolCard(props: {
             {props.content.tool_kind}
           </span>
           <span class="min-w-0 flex-1 truncate font-mono text-sm">{props.content.title}</span>
-          {/* A call held by its permission request is not running yet: it waits for the reader. */}
           <Show
-            when={props.permissions.some((asked) => asked.outcome.state === "pending")}
+            when={heldLook()}
             fallback={<ItemStatusBadge status={props.status} interrupted={props.interrupted} />}
           >
-            <Badge look={permissionLook({ state: "pending" })} pulse />
+            {(look) => <Badge look={look()} pulse={look().tone === "attention"} />}
           </Show>
         </summary>
         <Show when={open()}>
