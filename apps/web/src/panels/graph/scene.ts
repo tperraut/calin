@@ -1,6 +1,7 @@
 import {
-  curveRoute,
   fitView,
+  polyLength,
+  polyPoint,
   routePath,
   routePoint,
   translate,
@@ -8,7 +9,8 @@ import {
   type Box,
   type Route,
 } from "./geometry";
-import type { LayoutMode, Size } from "./layout";
+import type { LayoutMode, Point, Size } from "./layout";
+import { resolvePoints, type LabelAt, type RoutePoint } from "./routing";
 
 /** A node as the scene needs it: where it goes and how big it is. */
 export type SceneNodeInput = {
@@ -26,9 +28,10 @@ export type SceneEdgeInput = {
   from: string;
   to: string;
   route: "tree" | "curve";
-  lane: number;
-  /** For a curve: end on the top edge of the target (a repo band under the tree). */
-  intoTop: boolean;
+  /** For a curve: its corners, from `routeOverlay`. Without them it is drawn straight. */
+  points?: readonly RoutePoint[];
+  /** For a curve: where its count sits. */
+  label?: LabelAt;
 };
 
 export type SceneLayout = {
@@ -37,6 +40,8 @@ export type SceneLayout = {
   edges: readonly SceneEdgeInput[];
   width: number;
   height: number;
+  /** The width the first view makes readable, when it is less than `width` (a gutter may run off to the right). */
+  homeWidth?: number;
 };
 
 export type ViewTransform = { x: number; y: number; k: number };
@@ -59,6 +64,10 @@ export type EdgePart = keyof EdgeElements;
 
 type SceneEdge = SceneEdgeInput & {
   current?: Route;
+  /** For a curve on its way to new lanes: where its corners were when the tween started. */
+  start?: readonly Point[];
+  /** The path data last written: an unchanged path is not written again. */
+  written?: string;
   moving: boolean;
   shown: boolean;
   els?: EdgeElements;
@@ -114,6 +123,9 @@ export function createScene(options: SceneOptions) {
   const pendingEdgeEls = new Map<string, EdgeElements>();
   let mode: LayoutMode = "indented";
   let content: Size = { w: 0, h: 0 };
+  let homeWidth = 0;
+  /** How far the running tween is, eased: 1 when none runs. */
+  let progress = 1;
   let viewport: Size = { w: 0, h: 0 };
   const view: ViewTransform = { x: 0, y: 0, k: 1 };
   let viewEl: SVGGElement | undefined;
@@ -133,13 +145,43 @@ export function createScene(options: SceneOptions) {
 
   const box = (node: SceneNode): Box => node;
 
+  const at = (id: string): SceneNode | undefined => nodes.get(id);
+
+  /** A curve's corners now: those tied to a node follow it; the others move from where they were. */
+  function cornersOf(edge: SceneEdge, from: SceneNode, to: SceneNode): Point[] {
+    if (!edge.points || edge.points.length < 2) {
+      return [
+        { x: from.x + from.w, y: from.y + from.h / 2 },
+        { x: to.x + to.w, y: to.y + to.h / 2 },
+      ];
+    }
+    const target = resolvePoints(edge.points, at);
+    const start = edge.start;
+    if (!start || progress >= 1 || start.length !== target.length) return target;
+    return target.map((point, index) => {
+      const was = start[index];
+      const source = edge.points?.[index];
+      return {
+        x: source?.xn === undefined ? was.x + (point.x - was.x) * progress : point.x,
+        y: source?.yn === undefined ? was.y + (point.y - was.y) * progress : point.y,
+      };
+    });
+  }
+
   function routeOf(edge: SceneEdge): Route | undefined {
     const from = nodes.get(edge.from);
     const to = nodes.get(edge.to);
     if (!from || !to) return undefined;
     return edge.route === "tree"
       ? treeRoute(mode, box(from), box(to))
-      : curveRoute(box(from), box(to), edge.lane, edge.intoTop);
+      : { kind: "poly", points: cornersOf(edge, from, to) };
+  }
+
+  /** Where an edge's count sits. */
+  function labelPoint(edge: SceneEdge, route: Route): Point {
+    if (route.kind !== "poly" || !edge.label) return routePoint(route, 0.5);
+    if ("distance" in edge.label) return polyPoint(route.points, edge.label.distance);
+    return polyPoint(route.points, edge.label.fraction * polyLength(route.points));
   }
 
   function writeNode(node: SceneNode): void {
@@ -151,16 +193,28 @@ export function createScene(options: SceneOptions) {
     edge.current = route;
     if (!route || !edge.els) return;
     const d = routePath(route);
+    if (d === edge.written) return;
+    edge.written = d;
     edge.els.path?.setAttribute("d", d);
     edge.els.hit?.setAttribute("d", d);
     if (edge.els.label) {
-      const middle = routePoint(route, 0.5);
+      const middle = labelPoint(edge, route);
       edge.els.label.setAttribute("transform", translate(middle.x, middle.y));
     }
   }
 
   /** The corners of a route's bounding box: its ends and, for a curve, its control points. */
   function reach(route: Route): { x0: number; y0: number; x1: number; y1: number } {
+    if (route.kind === "poly") {
+      const box = { x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity };
+      for (const point of route.points) {
+        box.x0 = Math.min(box.x0, point.x);
+        box.y0 = Math.min(box.y0, point.y);
+        box.x1 = Math.max(box.x1, point.x);
+        box.y1 = Math.max(box.y1, point.y);
+      }
+      return box;
+    }
     const xs =
       route.kind === "cubic" ? [route.x0, route.c1x, route.c2x, route.x1] : [route.x0, route.x1];
     const ys =
@@ -248,6 +302,7 @@ export function createScene(options: SceneOptions) {
     if (tweenStart !== undefined) {
       const t = Math.min(1, (time - tweenStart) / TWEEN_MS);
       const eased = ease(t);
+      progress = eased;
       const held = anchor === undefined ? undefined : nodes.get(anchor);
       const heldAt = held ? { x: held.x, y: held.y } : undefined;
       for (const node of nodes.values()) {
@@ -270,6 +325,7 @@ export function createScene(options: SceneOptions) {
       }
       if (t >= 1) {
         tweenStart = undefined;
+        progress = 1;
         // What was only drawn because it was moving may now rest outside.
         cull(true);
       }
@@ -307,7 +363,8 @@ export function createScene(options: SceneOptions) {
     homed = true;
     // Readable first, and from the top-left corner: a tree that grows downwards
     // then moves nothing that is already on screen.
-    const k = Math.min(1, Math.max(HOME_MIN_ZOOM, (viewport.w - 2 * PADDING) / content.w));
+    const wide = homeWidth > 0 ? Math.min(content.w, homeWidth) : content.w;
+    const k = Math.min(1, Math.max(HOME_MIN_ZOOM, (viewport.w - 2 * PADDING) / wide));
     Object.assign(view, { x: PADDING, y: HOME_TOP, k });
     touchView();
   }
@@ -333,8 +390,11 @@ export function createScene(options: SceneOptions) {
       const edge = edges.get(id);
       const elements = edge ? (edge.els ??= {}) : (pendingEdgeEls.get(id) ?? {});
       Object.assign(elements, { [part]: element });
-      if (edge) writeEdge(edge);
-      else pendingEdgeEls.set(id, elements);
+      if (edge) {
+        // A new element has no path yet, whatever was written to the others.
+        edge.written = undefined;
+        writeEdge(edge);
+      } else pendingEdgeEls.set(id, elements);
     },
     pulseRef(id: string, element: SVGCircleElement): void {
       const pulse = pulses.get(id);
@@ -351,6 +411,7 @@ export function createScene(options: SceneOptions) {
       const tween = animate && !options.reducedMotion() && nodes.size > 0;
       mode = layout.mode;
       content = { w: layout.width, h: layout.height };
+      homeWidth = layout.homeWidth ?? 0;
       const wanted = new Set(layout.nodes.map((node) => node.id));
       for (const id of nodes.keys()) if (!wanted.has(id)) nodes.delete(id);
       let anyMoving = false;
@@ -397,6 +458,8 @@ export function createScene(options: SceneOptions) {
       for (const id of edges.keys()) if (!wantedEdges.has(id)) edges.delete(id);
       for (const input of layout.edges) {
         const existing = edges.get(input.id);
+        // Where a curve is drawn now, mid-tween included: its new lanes start from there.
+        const shown = existing?.current?.kind === "poly" ? existing.current.points : undefined;
         const edge: SceneEdge = existing
           ? Object.assign(existing, input)
           : { ...input, moving: false, shown: true, els: pendingEdgeEls.get(input.id) };
@@ -404,8 +467,24 @@ export function createScene(options: SceneOptions) {
         edges.set(input.id, edge);
         const ends = [nodes.get(edge.from), nodes.get(edge.to)];
         edge.moving = ends.some((end) => end?.moving === true);
-        writeEdge(edge);
+        edge.start = undefined;
+        if (tween && shown && edge.points) {
+          const target = resolvePoints(edge.points, (id) => {
+            const node = nodes.get(id);
+            return node ? { x: node.tx, y: node.ty } : undefined;
+          });
+          const lanesMoved =
+            shown.length !== target.length ||
+            target.some((point, index) => point.x !== shown[index].x || point.y !== shown[index].y);
+          if (lanesMoved) {
+            edge.start = shown;
+            edge.moving = true;
+          }
+        }
+        anyMoving ||= edge.moving;
       }
+      progress = anyMoving ? 0 : 1;
+      for (const edge of edges.values()) writeEdge(edge);
       cull(true);
       if (anyMoving) {
         tweenStart = now();

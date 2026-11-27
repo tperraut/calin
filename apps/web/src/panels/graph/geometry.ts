@@ -5,8 +5,10 @@ export type Box = Point & Size;
 /**
  * How an edge runs. `elbow`: down from under the parent, then across to the
  * child (the tree lines of the indented layout). `cubic`: one Bézier curve.
+ * `poly`: straight runs with rounded corners (the lanes of `routing.ts`).
  */
 export type Route =
+  | { readonly kind: "poly"; points: readonly Point[] }
   | { readonly kind: "elbow"; x0: number; y0: number; x1: number; y1: number }
   | {
       readonly kind: "cubic";
@@ -45,46 +47,9 @@ export function treeRoute(mode: LayoutMode, parent: Box, child: Box): Route {
   return { kind: "cubic", x0, y0, c1x: x0 + reach, c1y: y0, c2x: x1 - reach, c2y: y1, x1, y1 };
 }
 
-/**
- * A curve drawn over the tree, from the side of one card to another. `lane`
- * (0, 1, 2…) tells apart several edges between the same two cards: each bulges
- * a little further and attaches a little lower. `intoTop` ends on the top edge
- * of the target, for a band that lies under the tree.
- */
-export function curveRoute(from: Box, to: Box, lane: number, intoTop: boolean): Route {
-  const shift = 5 + lane * 4;
-  // Leaving above the middle and arriving below it keeps A→B apart from B→A.
-  const y0 = from.y + from.h / 2 - shift;
-  if (intoTop && to.y >= from.y + from.h) {
-    const x0 = from.x + from.w;
-    const x1 = to.x + to.w / 2 + (lane - 1) * 10;
-    const y1 = to.y;
-    const reach = 28 + lane * 10 + Math.min(80, Math.abs(x1 - x0) / 4);
-    const drop = Math.max(24, Math.min(120, (y1 - y0) / 2));
-    return { kind: "cubic", x0, y0, c1x: x0 + reach, c1y: y0, c2x: x1, c2y: y1 - drop, x1, y1 };
-  }
-  const y1 = to.y + to.h / 2 + shift;
-  if (to.x >= from.x + from.w + 8) {
-    const x0 = from.x + from.w;
-    const x1 = to.x;
-    const reach = Math.max(20, (x1 - x0) / 2);
-    return { kind: "cubic", x0, y0, c1x: x0 + reach, c1y: y0, c2x: x1 - reach, c2y: y1, x1, y1 };
-  }
-  if (to.x + to.w <= from.x - 8) {
-    const x0 = from.x;
-    const x1 = to.x + to.w;
-    const reach = Math.max(20, (x0 - x1) / 2);
-    return { kind: "cubic", x0, y0, c1x: x0 - reach, c1y: y0, c2x: x1 + reach, c2y: y1, x1, y1 };
-  }
-  // The cards overlap sideways (one above the other): out and back in on the right, bulging outwards.
-  const x0 = from.x + from.w;
-  const x1 = to.x + to.w;
-  const out = Math.max(x0, x1) + 24 + lane * 12 + Math.min(72, Math.abs(y1 - y0) / 6);
-  return { kind: "cubic", x0, y0, c1x: out, c1y: y0, c2x: out, c2y: y1, x1, y1 };
-}
-
 /** SVG path data for a route. */
 export function routePath(route: Route): string {
+  if (route.kind === "poly") return polyPath(route.points);
   if (route.kind === "elbow") {
     const { x0, y0, x1, y1 } = route;
     const r = Math.max(0, Math.min(CORNER, Math.abs(y1 - y0), Math.abs(x1 - x0)));
@@ -104,6 +69,7 @@ export function routePath(route: Route): string {
 /** The point at `t` (0 to 1) along a route: where a pulse is, where a count sits. */
 export function routePoint(route: Route, t: number): Point {
   const at = Math.min(1, Math.max(0, t));
+  if (route.kind === "poly") return polyPoint(route.points, at * polyLength(route.points));
   if (route.kind === "elbow") {
     const down = Math.abs(route.y1 - route.y0);
     const across = Math.abs(route.x1 - route.x0);
@@ -122,6 +88,60 @@ export function routePoint(route: Route, t: number): Point {
     x: a * route.x0 + b * route.c1x + c * route.c2x + d * route.x1,
     y: a * route.y0 + b * route.c1y + c * route.c2y + d * route.y1,
   };
+}
+
+/** Straight runs through `points`, each corner rounded as far as its two runs allow. */
+export function polyPath(points: readonly Point[]): string {
+  if (points.length === 0) return "";
+  let d = `M${round(points[0].x)},${round(points[0].y)}`;
+  for (let index = 1; index < points.length - 1; index += 1) {
+    const before = points[index - 1];
+    const at = points[index];
+    const after = points[index + 1];
+    const inLength = Math.hypot(at.x - before.x, at.y - before.y);
+    const outLength = Math.hypot(after.x - at.x, after.y - at.y);
+    const r = Math.min(CORNER, inLength / 2, outLength / 2);
+    if (r < 0.5) {
+      d += `L${round(at.x)},${round(at.y)}`;
+      continue;
+    }
+    const ax = at.x - ((at.x - before.x) / inLength) * r;
+    const ay = at.y - ((at.y - before.y) / inLength) * r;
+    const bx = at.x + ((after.x - at.x) / outLength) * r;
+    const by = at.y + ((after.y - at.y) / outLength) * r;
+    d += `L${round(ax)},${round(ay)}Q${round(at.x)},${round(at.y)},${round(bx)},${round(by)}`;
+  }
+  const last = points[points.length - 1];
+  if (points.length > 1) d += `L${round(last.x)},${round(last.y)}`;
+  return d;
+}
+
+export function polyLength(points: readonly Point[]): number {
+  let length = 0;
+  for (let index = 1; index < points.length; index += 1) {
+    length += Math.hypot(
+      points[index].x - points[index - 1].x,
+      points[index].y - points[index - 1].y,
+    );
+  }
+  return length;
+}
+
+/** The point `distance` along `points` from the first (from the last when negative). */
+export function polyPoint(points: readonly Point[], distance: number): Point {
+  if (points.length === 0) return { x: 0, y: 0 };
+  const total = polyLength(points);
+  let left = Math.min(total, Math.max(0, distance < 0 ? total + distance : distance));
+  for (let index = 1; index < points.length; index += 1) {
+    const a = points[index - 1];
+    const b = points[index];
+    const length = Math.hypot(b.x - a.x, b.y - a.y);
+    if (left <= length && length > 0) {
+      return { x: a.x + ((b.x - a.x) * left) / length, y: a.y + ((b.y - a.y) * left) / length };
+    }
+    left -= length;
+  }
+  return points[points.length - 1];
 }
 
 export const translate = (x: number, y: number): string => `translate(${round(x)},${round(y)})`;

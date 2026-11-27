@@ -15,6 +15,7 @@ import { layoutGraph, NODE_SIZE, sizeOf, type Layout, type LayoutMode } from "./
 import {
   clip,
   describeGraph,
+  edgeEmphasis,
   edgeKindWords,
   edgeSentence,
   graphModel,
@@ -24,6 +25,7 @@ import {
   type NodeView,
   type OutlineItem,
 } from "./model";
+import { routeOverlay, type RouteBox, type Routing } from "./routing";
 import { createScene, type Scene, type SceneLayout } from "./scene";
 
 /** What the reader picked in the graph. */
@@ -61,6 +63,25 @@ function StatusMark(props: { tone: Tone; x: number; y: number }) {
 }
 
 const edgeKinds = ["spawned", "dispatched", "message", "report", "changed"] as const;
+
+/**
+ * How strongly an edge's arrowhead is drawn, with its line: `quiet` while
+ * many edges share the drawing, `faint` while another node's or edge's are
+ * brought out. The tree's own edges are never faded.
+ */
+const markerTones = { full: 1, quiet: 0.6, faint: 0.22 } as const;
+type MarkerTone = keyof typeof markerTones;
+const markerToneNames = Object.keys(markerTones) as MarkerTone[];
+/** Lighter arrowheads are smaller too: where many lines meet one card they overlap less. */
+const markerScale: Readonly<Record<MarkerTone, number>> = { full: 1, quiet: 0.8, faint: 0.8 };
+const markerSpecs: readonly { kind: EdgeKind; which: MarkerTone }[] = edgeKinds.flatMap((kind) =>
+  markerToneNames.map((which) => ({ kind, which })),
+);
+
+/** With more edges over the tree than this, they are drawn thinner and lighter until asked for. */
+export const QUIET_ABOVE = 5;
+/** How much of the gutter right of the tree the first view keeps readable. */
+const HOME_GUTTER = 64;
 
 /**
  * What an edge ends with, one shape per kind, so the kinds are told apart
@@ -160,25 +181,39 @@ function Outline(props: { items: readonly OutlineItem[] }) {
   );
 }
 
-function sceneLayout(layout: Layout, model: GraphModel): SceneLayout {
+/** Where every card is, for the router. */
+function boxesOf(layout: Layout, model: GraphModel): Map<string, RouteBox> {
+  const boxes = new Map<string, RouteBox>();
+  for (const node of model.nodes) {
+    const at = layout.positions.get(node.id);
+    if (at) boxes.set(node.id, { ...at, ...sizeOf(node.node), kind: node.node.kind });
+  }
+  return boxes;
+}
+
+function sceneLayout(layout: Layout, model: GraphModel, routing: Routing): SceneLayout {
+  const width = Math.max(layout.width, routing.right);
   return {
     mode: layout.mode,
-    width: layout.width,
+    width,
     height: layout.height,
+    homeWidth: Math.min(width, layout.width + HOME_GUTTER),
     nodes: model.nodes.flatMap((node) => {
       const at = layout.positions.get(node.id);
       if (!at) return [];
       return [{ id: node.id, ...at, ...sizeOf(node.node), origin: layout.parent.get(node.id) }];
     }),
-    edges: model.edges.map((edge) => ({
-      id: edge.id,
-      from: edge.from,
-      to: edge.to,
-      route: edge.route,
-      lane: edge.lane,
-      // Under the tree, a repo is reached from above.
-      intoTop: layout.mode === "indented" && model.nodeById.get(edge.to)?.node.kind === "repo",
-    })),
+    edges: model.edges.map((edge) => {
+      const routed = edge.route === "curve" ? routing.routes.get(edge.id) : undefined;
+      return {
+        id: edge.id,
+        from: edge.from,
+        to: edge.to,
+        route: edge.route,
+        points: routed?.points,
+        label: routed?.label,
+      };
+    }),
   };
 }
 
@@ -214,6 +249,22 @@ export function GraphView(props: {
   const layout = createMemo<Layout>((previous) =>
     layoutGraph(props.graph.nodes, previous?.positions, props.mode),
   );
+  // Fit starts the lanes over, packed; until then an edge keeps the lane it was given.
+  const [packs, setPacks] = createSignal(0);
+  const routing = createMemo<{ result: Routing; pack: number; mode: LayoutMode }>((previous) => {
+    const current = layout();
+    const pack = packs();
+    const keep =
+      previous && previous.pack === pack && previous.mode === current.mode
+        ? previous.result.memory
+        : undefined;
+    const overlay = model().edges.filter((edge) => edge.route === "curve");
+    return {
+      result: routeOverlay(current.mode, boxesOf(current, model()), overlay, keep),
+      pack,
+      mode: current.mode,
+    };
+  });
   const outline = createMemo(() => describeGraph(model(), layout()));
   // The one tab stop among the nodes; arrows move it along the tree.
   const [focusId, setFocusId] = createSignal<string>();
@@ -222,15 +273,28 @@ export function GraphView(props: {
     return wanted !== undefined && layout().positions.has(wanted) ? wanted : layout().order.at(0);
   };
 
+  // The node whose edges are brought out: the one picked, else the one holding the focus.
+  const [focused, setFocused] = createSignal<string>();
+  const emphasis = createMemo(() => edgeEmphasis(model(), props.selection, focused()));
+  const quiet = createMemo(
+    () => model().edges.filter((edge) => edge.route === "curve").length > QUIET_ABOVE,
+  );
+
   const nodeEls = new Map<string, SVGGElement>();
   const counts = new Map<string, number>();
   let seenGraph = false;
+  let packed = 0;
   let canvas: SVGSVGElement | undefined;
 
   createEffect(
-    () => ({ layout: layout(), model: model() }),
+    () => ({ layout: layout(), model: model(), routing: routing() }),
     (next) => {
-      scene.setLayout(sceneLayout(next.layout, next.model), seenGraph);
+      scene.setLayout(sceneLayout(next.layout, next.model, next.routing.result), seenGraph);
+      // A packing asked for by Fit: show the drawing whole again once the lanes have moved in.
+      if (next.routing.pack !== packed) {
+        packed = next.routing.pack;
+        scene.fit();
+      }
       // One pulse per edge whose count went up since the last graph; none for the first one.
       for (const edge of next.model.edges) {
         if (!edge.edge) continue;
@@ -338,7 +402,7 @@ export function GraphView(props: {
         scene.zoomBy(1 / ZOOM_STEP);
         break;
       case "0":
-        scene.fit();
+        fit();
         break;
       case "Escape":
         if (props.selection === undefined) return;
@@ -379,6 +443,12 @@ export function GraphView(props: {
     event.preventDefault();
   }
 
+  /** Shows the whole drawing, with the lanes packed again. */
+  function fit(): void {
+    setPacks((count) => count + 1);
+    scene.fit();
+  }
+
   onSettled(() => {
     props.onScene?.(scene);
     const element = canvas;
@@ -411,8 +481,16 @@ export function GraphView(props: {
     props.selection?.kind === "node" ? props.selection.id : undefined;
   const selectedEdge = (): string | undefined =>
     props.selection?.kind === "edge" ? props.selection.id : undefined;
+  const hot = (edge: EdgeView): boolean => emphasis().hot.has(edge.id);
+  const tone = (edge: EdgeView): MarkerTone => {
+    if (edge.route === "tree" || hot(edge)) return "full";
+    if (emphasis().active) return "faint";
+    return quiet() ? "quiet" : "full";
+  };
+  const markerId = (kind: EdgeKind, which: MarkerTone): string =>
+    which === "full" ? `${markerBase}-${kind}` : `${markerBase}-${kind}-${which}`;
   const marker = (edge: EdgeView): string | undefined =>
-    edge.kind === "link" ? undefined : `url(#${markerBase}-${edge.kind})`;
+    edge.kind === "link" ? undefined : `url(#${markerId(edge.kind, tone(edge))})`;
 
   return (
     <div class="relative min-h-0 min-w-0 flex-1">
@@ -433,41 +511,51 @@ export function GraphView(props: {
         }}
       >
         <defs>
-          <For each={edgeKinds}>
-            {(kind) => (
-              <marker
-                id={`${markerBase}-${kind}`}
-                viewBox="0 0 8 8"
-                refX={arrowheads[kind].refX}
-                refY="4"
-                markerWidth={arrowheads[kind].size}
-                markerHeight={arrowheads[kind].size}
-                markerUnits="userSpaceOnUse"
-                orient="auto"
-              >
-                <path
-                  d={arrowheads[kind].d}
-                  stroke-width="1.5"
-                  stroke-linejoin="round"
-                  stroke-linecap="round"
-                  style={
-                    arrowheads[kind].open
-                      ? { fill: "none", stroke: arrowheads[kind].color }
-                      : { fill: arrowheads[kind].color }
-                  }
-                />
-              </marker>
-            )}
+          <For each={markerSpecs}>
+            {(spec) => {
+              const { kind, which } = spec;
+              return (
+                <marker
+                  id={markerId(kind, which)}
+                  viewBox="0 0 8 8"
+                  refX={arrowheads[kind].refX}
+                  refY="4"
+                  markerWidth={arrowheads[kind].size * markerScale[which]}
+                  markerHeight={arrowheads[kind].size * markerScale[which]}
+                  markerUnits="userSpaceOnUse"
+                  orient="auto"
+                >
+                  <path
+                    d={arrowheads[kind].d}
+                    stroke-width="1.5"
+                    stroke-linejoin="round"
+                    stroke-linecap="round"
+                    opacity={which === "full" ? undefined : markerTones[which]}
+                    style={
+                      arrowheads[kind].open
+                        ? { fill: "none", stroke: arrowheads[kind].color }
+                        : { fill: arrowheads[kind].color }
+                    }
+                  />
+                </marker>
+              );
+            }}
           </For>
         </defs>
         <g ref={(element) => scene.mount(element)}>
-          <g>
+          <g
+            class="gedges"
+            data-quiet={quiet() ? "" : undefined}
+            data-focus={emphasis().active ? "" : undefined}
+          >
             <For each={model().edges} keyed={(edge) => edge.id}>
               {(edge) => (
                 <g
                   class="gedge"
                   data-edge={edge().id}
                   data-kind={edge().kind}
+                  data-route={edge().route}
+                  data-hot={hot(edge()) ? "" : undefined}
                   data-selected={selectedEdge() === edge().id ? "" : undefined}
                 >
                   <path
@@ -514,7 +602,11 @@ export function GraphView(props: {
                   tabindex={tabStop() === node().id ? 0 : -1}
                   aria-label={nodeSentence(node())}
                   aria-pressed={selectedNode() === node().id ? "true" : "false"}
-                  onFocus={() => setFocusId(node().id)}
+                  onFocus={() => {
+                    setFocusId(node().id);
+                    setFocused(node().id);
+                  }}
+                  onBlur={() => setFocused(undefined)}
                   onClick={(event) => {
                     event.stopPropagation();
                     if (tapped()) props.onSelect({ kind: "node", id: node().id });
@@ -557,7 +649,7 @@ export function GraphView(props: {
           type="button"
           class="btn bg-surface px-2.5"
           title="Show the whole graph (0)"
-          onClick={() => scene.fit()}
+          onClick={() => fit()}
         >
           Fit
         </button>
@@ -603,6 +695,9 @@ export function GraphView(props: {
                 />
               </svg>
               Agent of the open session
+            </li>
+            <li class="max-w-56 text-muted">
+              Pick a card to bring out its notes, reports and changed files.
             </li>
           </ul>
         </div>

@@ -141,13 +141,46 @@ describe("GraphPanel: the graph", () => {
     expect(count("message:agent:a2:agent:a1")).toBe("2");
     expect(count("changed:agent:a2:repo:api")).toBe("4");
     expect(count("message:agent:a1:agent:a2")).toBeUndefined();
-    // Spawned and dispatched edges follow the tree; the others are curves over it.
+    // Spawned and dispatched edges follow the tree; the others run in lanes over it,
+    // straight runs with rounded corners.
     expect(
       find(host, '[data-edge="dispatched:agent:a1:agent:a2"] .gline').getAttribute("d"),
     ).toMatch(/^M[\d.]+,[\d.]+V/);
-    expect(find(host, '[data-edge="report:agent:a2:agent:a1"] .gline').getAttribute("d")).toMatch(
-      /C/,
+    const report = find(host, '[data-edge="report:agent:a2:agent:a1"] .gline').getAttribute("d");
+    expect(report).toMatch(/^M[\d.]+,[\d.]+L[\d.]+,[\d.]+Q/);
+    expect(report).not.toMatch(/C/);
+  });
+
+  it("draws many edges over the tree lightly, and brings out those of the picked card or edge", async () => {
+    const { host } = await open();
+    const layer = find(host, "g.gedges");
+    const hot = (): string[] =>
+      [...host.querySelectorAll("[data-edge][data-hot]")].map(
+        (one) => one.getAttribute("data-edge") ?? "",
+      );
+    // Six edges over the tree: more than a handful, so they start quiet.
+    expect(layer.hasAttribute("data-quiet")).toBe(true);
+    expect(layer.hasAttribute("data-focus")).toBe(false);
+    expect(hot()).toEqual([]);
+    await tap(node(host, "agent:a2"));
+    expect(layer.hasAttribute("data-focus")).toBe(true);
+    expect(hot().toSorted()).toEqual(
+      [
+        "changed:agent:a2:repo:api",
+        "dispatched:agent:a1:agent:a2",
+        "message:agent:a1:agent:a2",
+        "message:agent:a2:agent:a1",
+        "report:agent:a2:agent:a1",
+      ].toSorted(),
     );
+    // The others fade, arrowheads included: not by color alone.
+    const marker = (id: string): string =>
+      find(host, `[data-edge="${id}"] .gline`).getAttribute("marker-end") ?? "";
+    expect(marker("changed:agent:sub3:repo:web")).toMatch(/-changed-faint\)$/);
+    expect(marker("changed:agent:a2:repo:api")).toMatch(/-changed\)$/);
+    await tap(find(host, '[data-edge="changed:agent:sub3:repo:web"] .ghit'));
+    expect(hot()).toEqual(["changed:agent:sub3:repo:web"]);
+    expect(marker("changed:agent:a2:repo:api")).toMatch(/-changed-faint\)$/);
   });
 
   it("keeps a text alternative in sync: who is under whom, the repos, a sentence per edge", async () => {

@@ -42,7 +42,22 @@ const layout = (nodes: SceneLayout["nodes"], edges: SceneLayout["edges"] = []): 
   width: 400,
   height: 400,
 });
-const treeEdge = { id: "e1", from: "a", to: "b", route: "tree", lane: 0, intoTop: false } as const;
+const treeEdge = { id: "e1", from: "a", to: "b", route: "tree" } as const;
+/** An edge over the tree, out of `a`'s right side, along the lane at `x`, into `b`'s right side. */
+const laneEdge = (x: number) =>
+  ({
+    id: "o1",
+    from: "a",
+    to: "b",
+    route: "curve",
+    points: [
+      { x: 100, xn: "a", y: 20, yn: "a" },
+      { x, y: 20, yn: "a" },
+      { x, y: 20, yn: "b" },
+      { x: 100, xn: "b", y: 20, yn: "b" },
+    ],
+    label: { distance: 10 },
+  }) as const;
 
 describe("scene", () => {
   it("writes a node's place straight to its element, and runs no frame when nothing moves", () => {
@@ -115,6 +130,63 @@ describe("scene", () => {
     expect(pulses).toHaveBeenCalledTimes(2);
   });
 
+  it("draws an edge over the tree along its lane, and moves it to a new lane over the tween", () => {
+    const { scene, frame } = setup();
+    const line = path();
+    const count = g();
+    scene.edgeRef("o1", "path", line);
+    scene.edgeRef("o1", "label", count);
+    scene.setLayout(layout([node("a", 0, 0), node("b", 0, 64)], [laneEdge(130)]), false);
+    expect(line.getAttribute("d")).toBe("M100,20L124,20Q130,20,130,26L130,78Q130,84,124,84L100,84");
+    // The count sits on the line, a set distance from where it leaves its card.
+    expect(count.getAttribute("transform")).toBe("translate(110,20)");
+    // The lanes were packed again: the line slides over, it does not jump.
+    scene.setLayout(layout([node("a", 0, 0), node("b", 0, 64)], [laneEdge(110)]), true);
+    expect(line.getAttribute("d")).toMatch(/^M100,20L124,20Q130,20/);
+    frame(TWEEN_MS / 2);
+    const middle = Number(/L([\d.]+),20Q/.exec(line.getAttribute("d") ?? "")?.[1]);
+    expect(middle).toBeGreaterThan(104);
+    expect(middle).toBeLessThan(124);
+    frame(TWEEN_MS);
+    expect(line.getAttribute("d")).toBe("M100,20L105,20Q110,20,110,25L110,79Q110,84,105,84L100,84");
+    expect(scene.busy()).toBe(false);
+  });
+
+  it("follows its cards with the corners tied to them, and snaps when motion is to be reduced", () => {
+    const moving = setup();
+    const line = path();
+    moving.scene.edgeRef("o1", "path", line);
+    moving.scene.setLayout(layout([node("a", 0, 0), node("b", 0, 64)], [laneEdge(130)]), false);
+    moving.scene.setLayout(layout([node("a", 0, 0), node("b", 0, 128)], [laneEdge(130)]), true);
+    moving.frame(TWEEN_MS / 2);
+    const end = Number(/L100,([\d.]+)$/.exec(line.getAttribute("d") ?? "")?.[1]);
+    expect(end).toBeGreaterThan(84);
+    expect(end).toBeLessThan(148);
+    expect(moving.scene.position("b")?.y).toBeCloseTo(end - 20);
+
+    const calm = setup(true);
+    const still = path();
+    calm.scene.edgeRef("o1", "path", still);
+    calm.scene.setLayout(layout([node("a", 0, 0), node("b", 0, 64)], [laneEdge(130)]), false);
+    calm.scene.setLayout(layout([node("a", 0, 0), node("b", 0, 128)], [laneEdge(110)]), true);
+    expect(still.getAttribute("d")).toBe(
+      "M100,20L105,20Q110,20,110,25L110,143Q110,148,105,148L100,148",
+    );
+    expect(calm.pending()).toBe(0);
+  });
+
+  it("sends a pulse along an edge's lanes, corner by corner", () => {
+    const { scene, frame } = setup();
+    scene.setLayout(layout([node("a", 0, 0), node("b", 0, 64)], [laneEdge(130)]), false);
+    scene.pulse("o1");
+    const dot = circle();
+    scene.pulseRef("pulse-1", dot);
+    expect(dot.getAttribute("transform")).toBe("translate(100,20)");
+    // Halfway along: down the lane, level between the two cards.
+    frame(PULSE_MS / 2);
+    expect(dot.getAttribute("transform")).toBe("translate(130,52)");
+  });
+
   it("pans, zooms about a point, fits, and drops the text when zoomed far out", () => {
     const { scene, frame } = setup();
     const view = g();
@@ -160,8 +232,6 @@ describe("scene", () => {
       from: "far",
       to: "far2",
       route: "tree",
-      lane: 0,
-      intoTop: false,
     } as const;
     // Before the pane is measured nothing is hidden.
     scene.setLayout(

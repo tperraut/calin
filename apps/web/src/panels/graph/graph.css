@@ -184,9 +184,60 @@
   stroke-width: 1.25;
 }
 
-.gedge[data-selected] .gline {
+/*
+ * Edges over the tree run in lanes (routing.ts). With more than a handful they
+ * are drawn thinner and lighter; picking or focusing a card brings out its own
+ * and fades the rest further, picking an edge brings out that edge alone. The
+ * difference is in weight and opacity, arrowheads included, not in color.
+ */
+.gedge[data-route="curve"] .gline {
+  stroke-linejoin: round;
+}
+
+.gedges[data-quiet] .gedge[data-route="curve"] .gline {
+  stroke-opacity: 0.6;
+  stroke-width: 1;
+}
+
+.gedges[data-quiet] .gedge[data-route="curve"][data-kind="report"] .gline {
+  stroke-width: 1.5;
+}
+
+.gedges[data-focus] .gedge[data-route="curve"] .gline {
+  stroke-opacity: 0.22;
+}
+
+.gedges[data-focus] .gedge[data-route="curve"] .gcount rect,
+.gedges[data-focus] .gedge[data-route="curve"] .gcount text {
+  fill-opacity: 0.35;
+  stroke-opacity: 0.35;
+}
+
+.gedges .gedge[data-route="curve"][data-hot] .gline {
+  stroke-opacity: 1;
+  stroke-width: 2.25;
+}
+
+.gedges .gedge[data-route="curve"][data-kind="report"][data-hot] .gline {
+  stroke-width: 3;
+}
+
+.gedges[data-focus] .gedge[data-route="curve"][data-hot] .gcount rect,
+.gedges[data-focus] .gedge[data-route="curve"][data-hot] .gcount text {
+  fill-opacity: 1;
+  stroke-opacity: 1;
+}
+
+.gedges .gedge[data-selected] .gline {
   stroke-width: 3.5;
 }
+
+/*
+ * No transition on these lines: one declared on them costs about a millisecond
+ * a frame while the tree grows (every path write restyles them; stress page,
+ * 4x CPU throttling). Emphasis therefore changes at once, with or without
+ * reduced motion.
+ */
 
 .gedge .gcount rect {
   fill: var(--surface);

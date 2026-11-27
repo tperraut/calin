@@ -228,6 +228,28 @@ export function repoChangers(
     .toSorted((a, b) => b.count - a.count);
 }
 
+/**
+ * The edges to bring out, and whether the others are to be faded: the picked
+ * edge alone; else every edge of the picked node, or of the focused one.
+ */
+export function edgeEmphasis(
+  model: GraphModel,
+  selection: { kind: "node" | "edge"; id: string } | undefined,
+  focused: string | undefined,
+): { active: boolean; hot: ReadonlySet<string> } {
+  if (selection?.kind === "edge" && model.edgeById.has(selection.id)) {
+    return { active: true, hot: new Set([selection.id]) };
+  }
+  const node = selection?.kind === "node" ? selection.id : focused;
+  if (node === undefined || !model.nodeById.has(node)) return { active: false, hot: new Set() };
+  return {
+    active: true,
+    hot: new Set(
+      model.edges.filter((edge) => edge.from === node || edge.to === node).map((edge) => edge.id),
+    ),
+  };
+}
+
 /** The edges that touch a node, for its details: each can be selected from there. */
 export const edgesOf = (nodeId: string, model: GraphModel): EdgeView[] =>
   model.edges.filter(
