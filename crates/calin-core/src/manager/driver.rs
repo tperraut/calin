@@ -425,103 +425,133 @@ impl Driver {
     /// Runs until the session has no agent, no preparation and nothing to do.
     /// Returns true when the driver already took itself off the map.
     async fn drive(&mut self) -> bool {
-        if let Err(err) = self.load().await {
-            tracing::error!(session = %self.session_id, %err, "could not load the session");
+        let loaded = self.load().await;
+        if self.or_halt(loaded, "could not load the session").is_err() {
             return false;
         }
         loop {
-            // A run and a place in the queue only exist in this task.
-            let idle = self.handle.is_none()
-                && self.preparation.is_none()
-                && self.attaching.is_none()
-                && self.shipping.is_none()
-                && self.polling.is_none()
-                && self.parked.is_none()
-                && self.run.is_none();
-            let step = if idle {
-                match self.commands.try_recv() {
-                    Ok(command) => Step::Command(command),
-                    Err(_) => {
-                        let mut drivers = self.inner.drivers();
-                        if self.commands.is_empty() {
-                            // A driver with nothing to do runs nothing.
-                            if self.setup.dispatch.is_none() {
-                                self.inner.queue.leave(&self.session_id);
-                            }
-                            drivers.remove(&self.session_id);
-                            return true;
-                        }
-                        continue;
-                    }
-                }
+            let step = if self.idle() {
+                let Some(command) = self.idle_command() else {
+                    return true;
+                };
+                Step::Command(command)
             } else {
-                tokio::select! {
-                    command = self.commands.recv() => match command {
-                        Some(command) => Step::Command(command),
-                        None => return false,
-                    },
-                    output = next_output(&mut self.handle) => Step::Output(output),
-                    prepared = next_prepared(&mut self.preparation) => Step::Prepared(prepared),
-                    attached = next_attached(&mut self.attaching) => Step::Attached(attached),
-                    shipped = next_shipped(&mut self.shipping) => Step::Shipped(shipped),
-                    polled = next_polled(&mut self.polling) => Step::Polled(polled),
-                    granted = next_granted(&mut self.parked) => Step::Granted(granted),
-                    worked = next_worked(&mut self.run) => Step::Worked(worked),
-                }
+                let Some(step) = self.next_step().await else {
+                    return false;
+                };
+                step
             };
-            let result = match step {
-                Step::Command(command) => self.on_command(command).await,
-                Step::Output(output) => self.on_output(output).await.map_err(|err| {
-                    tracing::error!(session = %self.session_id, %err, "could not record agent output");
-                    Halt
-                }),
-                Step::Prepared(prepared) => self.on_prepared(prepared).await.map_err(|err| {
-                    tracing::error!(session = %self.session_id, %err, "could not record the session's repos");
-                    Halt
-                }),
-                Step::Attached(attached) => self.on_attached(attached).await.map_err(|err| {
-                    tracing::error!(session = %self.session_id, %err, "could not record an attached repo");
-                    Halt
-                }),
-                Step::Shipped(shipped) => self.on_shipped(shipped).await.map_err(|err| {
-                    tracing::error!(session = %self.session_id, %err, "could not record a step of the ship");
-                    Halt
-                }),
-                Step::Polled(observed) => self.on_polled(observed).await.map_err(|err| {
-                    tracing::error!(session = %self.session_id, %err, "could not record the pull requests");
-                    Halt
-                }),
-                Step::Granted(granted) => self.on_granted(granted).await.map_err(|err| {
-                    tracing::error!(session = %self.session_id, %err, "could not start the session from the queue");
-                    Halt
-                }),
-                Step::Worked(worked) => self.on_worked(worked).await.map_err(|err| {
-                    tracing::error!(session = %self.session_id, %err, "could not record a step of the workflow");
-                    Halt
-                }),
-            };
-            if result.is_err() {
+            if self.on_step(step).await.is_err() || self.after_step().await.is_err() {
                 return false;
-            }
-            // Whatever the step ended of the workflow run, the run goes on from.
-            if let Err(err) = self.advance_run().await {
-                tracing::error!(session = %self.session_id, %err, "could not go on with the workflow");
-                return false;
-            }
-            if std::mem::take(&mut self.flush_pending)
-                && !self.defers_input()
-                && let Err(err) = self.run_pending().await
-            {
-                tracing::error!(session = %self.session_id, %err, "could not go on after the workflow");
-                return false;
-            }
-            // A slot is for a session that prepares or runs. Every path
-            // above gives it back with the status; this holds for the one
-            // that does not.
-            if !self.status.is_active() && self.parked.is_none() {
-                self.leave_queue();
             }
         }
+    }
+
+    /// True when nothing but a command can wake the driver. A run and a
+    /// place in the queue only exist in this task.
+    fn idle(&self) -> bool {
+        self.handle.is_none()
+            && self.preparation.is_none()
+            && self.attaching.is_none()
+            && self.shipping.is_none()
+            && self.polling.is_none()
+            && self.parked.is_none()
+            && self.run.is_none()
+    }
+
+    /// The next command of an idle driver, or `None` once it took itself
+    /// off the map: a driver with nothing to do runs nothing.
+    fn idle_command(&mut self) -> Option<Command> {
+        loop {
+            if let Ok(command) = self.commands.try_recv() {
+                return Some(command);
+            }
+            let mut drivers = self.inner.drivers();
+            if self.commands.is_empty() {
+                if self.setup.dispatch.is_none() {
+                    self.inner.queue.leave(&self.session_id);
+                }
+                drivers.remove(&self.session_id);
+                return None;
+            }
+        }
+    }
+
+    /// Waits for whatever comes first; `None` once the manager dropped the
+    /// session's command channel.
+    async fn next_step(&mut self) -> Option<Step> {
+        let step = tokio::select! {
+            command = self.commands.recv() => Step::Command(command?),
+            output = next_output(&mut self.handle) => Step::Output(output),
+            prepared = next_prepared(&mut self.preparation) => Step::Prepared(prepared),
+            attached = next_attached(&mut self.attaching) => Step::Attached(attached),
+            shipped = next_shipped(&mut self.shipping) => Step::Shipped(shipped),
+            polled = next_polled(&mut self.polling) => Step::Polled(polled),
+            granted = next_granted(&mut self.parked) => Step::Granted(granted),
+            worked = next_worked(&mut self.run) => Step::Worked(worked),
+        };
+        Some(step)
+    }
+
+    async fn on_step(&mut self, step: Step) -> std::result::Result<(), Halt> {
+        let (result, what) = match step {
+            Step::Command(command) => return self.on_command(command).await,
+            Step::Output(output) => (
+                self.on_output(output).await,
+                "could not record agent output",
+            ),
+            Step::Prepared(prepared) => (
+                self.on_prepared(prepared).await,
+                "could not record the session's repos",
+            ),
+            Step::Attached(attached) => (
+                self.on_attached(attached).await,
+                "could not record an attached repo",
+            ),
+            Step::Shipped(shipped) => (
+                self.on_shipped(shipped).await,
+                "could not record a step of the ship",
+            ),
+            Step::Polled(observed) => (
+                self.on_polled(observed).await,
+                "could not record the pull requests",
+            ),
+            Step::Granted(granted) => (
+                self.on_granted(granted).await,
+                "could not start the session from the queue",
+            ),
+            Step::Worked(worked) => (
+                self.on_worked(worked).await,
+                "could not record a step of the workflow",
+            ),
+        };
+        self.or_halt(result, what)
+    }
+
+    /// What follows every step, whichever it was.
+    async fn after_step(&mut self) -> std::result::Result<(), Halt> {
+        // Whatever the step ended of the workflow run, the run goes on from.
+        let advanced = self.advance_run().await;
+        self.or_halt(advanced, "could not go on with the workflow")?;
+        if std::mem::take(&mut self.flush_pending) && !self.defers_input() {
+            let ran = self.run_pending().await;
+            self.or_halt(ran, "could not go on after the workflow")?;
+        }
+        // A slot is for a session that prepares or runs. Every path above
+        // gives it back with the status; this holds for the one that does not.
+        if !self.status.is_active() && self.parked.is_none() {
+            self.leave_queue();
+        }
+        Ok(())
+    }
+
+    /// A storage error the driver cannot go on after: it is logged, saying
+    /// `what` failed.
+    fn or_halt<T>(&self, result: Result<T>, what: &str) -> std::result::Result<T, Halt> {
+        result.map_err(|err| {
+            tracing::error!(session = %self.session_id, %err, "{what}");
+            Halt
+        })
     }
 
     async fn load(&mut self) -> Result<()> {
@@ -628,14 +658,14 @@ impl Driver {
                 cause,
                 text,
                 ended,
-            } => self.deliver(message, cause, text, ended).await.map_err(|err| {
-                tracing::error!(session = %self.session_id, %err, "could not record a delivered message");
-                Halt
-            }),
-            Command::Spent => self.check_budget().await.map_err(|err| {
-                tracing::error!(session = %self.session_id, %err, "could not check the workflow's budget");
-                Halt
-            }),
+            } => {
+                let delivered = self.deliver(message, cause, text, ended).await;
+                self.or_halt(delivered, "could not record a delivered message")
+            }
+            Command::Spent => {
+                let checked = self.check_budget().await;
+                self.or_halt(checked, "could not check the workflow's budget")
+            }
             Command::Message { text, reply } => {
                 let result = self.message(text).await;
                 self.answer(reply, result)
@@ -667,11 +697,7 @@ impl Driver {
                     agent_id,
                     reply,
                 };
-                if self.attaching.is_some() {
-                    self.attach_queue.push_back(queued);
-                    return Ok(());
-                }
-                self.begin_attach(queued).await
+                self.attach_or_queue(queued).await
             }
             Command::Ship {
                 title,
@@ -682,10 +708,10 @@ impl Driver {
                 let result = self.begin_ship(title, body, draft);
                 self.answer(reply, result)
             }
-            Command::Poll { reply } => self.begin_poll(reply).await.map_err(|err| {
-                tracing::error!(session = %self.session_id, %err, "could not record the pull requests");
-                Halt
-            }),
+            Command::Poll { reply } => {
+                let polled = self.begin_poll(reply).await;
+                self.or_halt(polled, "could not record the pull requests")
+            }
         }
     }
 
@@ -696,9 +722,19 @@ impl Driver {
     }
 
     fn answer_with<T>(&self, reply: Reply<T>, result: Result<T>) -> std::result::Result<(), Halt> {
+        self.answer_as(reply, result, "session command failed")
+    }
+
+    /// [`Self::answer_with`], logging a failure as `what`.
+    fn answer_as<T>(
+        &self,
+        reply: Reply<T>,
+        result: Result<T>,
+        what: &str,
+    ) -> std::result::Result<(), Halt> {
         let halt = match &result {
             Err(err) if !err.is_refusal() => {
-                tracing::error!(session = %self.session_id, %err, "session command failed");
+                tracing::error!(session = %self.session_id, %err, "{what}");
                 Err(Halt)
             }
             _ => Ok(()),
@@ -773,12 +809,8 @@ impl Driver {
         } else {
             self.task()
         };
-        self.launch(prompt, cause, reservation)
-            .await
-            .map_err(|err| {
-                tracing::error!(session = %self.session_id, %err, "could not start the session");
-                Halt
-            })
+        let launched = self.launch(prompt, cause, reservation).await;
+        self.or_halt(launched, "could not start the session")
     }
 
     /// What the session asks of its agent: the prompt the user wrote, then
@@ -1075,6 +1107,15 @@ impl Driver {
         Ok(())
     }
 
+    /// Takes up an attach request, or queues it behind the one in progress.
+    async fn attach_or_queue(&mut self, queued: QueuedAttach) -> std::result::Result<(), Halt> {
+        if self.attaching.is_some() {
+            self.attach_queue.push_back(queued);
+            return Ok(());
+        }
+        self.begin_attach(queued).await
+    }
+
     /// Starts making a repo ready for a session that is already at work.
     /// The caller is answered when the repo is ready, or at once when the
     /// request cannot be met.
@@ -1099,14 +1140,7 @@ impl Driver {
                 });
                 Ok(())
             }
-            Err(err) => {
-                let halt = if err.is_refusal() { Ok(()) } else { Err(Halt) };
-                if halt.is_err() {
-                    tracing::error!(session = %self.session_id, %err, "could not attach a repo");
-                }
-                let _ = reply.send(Err(err));
-                halt
-            }
+            Err(err) => self.answer_as(reply, Err(err), "could not attach a repo"),
         }
     }
 
