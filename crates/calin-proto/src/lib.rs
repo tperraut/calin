@@ -14,6 +14,7 @@
 mod api;
 mod delivery;
 mod event;
+mod graph;
 mod model;
 mod permission;
 mod repo;
@@ -24,6 +25,7 @@ mod ws;
 pub use api::*;
 pub use delivery::*;
 pub use event::*;
+pub use graph::*;
 pub use model::*;
 pub use permission::*;
 pub use repo::*;

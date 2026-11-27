@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 use crate::{
-    Agent, AgentStatus, DecisionSource, FileOp, PermissionDecision, PermissionRequest, PullRequest,
-    SessionRepo, SessionStatus,
+    Agent, AgentMessage, AgentStatus, DecisionSource, FileOp, PermissionDecision,
+    PermissionRequest, PullRequest, Question, SessionRepo, SessionStatus,
 };
 
 /// One entry in a session's append-only log.
@@ -112,6 +112,27 @@ pub enum EventBody {
     /// The pull request changed: its state, checks or review. Always the full value.
     PullRequestUpdated {
         pull_request: PullRequest,
+    },
+    /// The emitting agent (or the user, when `agent_id` is absent) sent a
+    /// message. Appended to the sender's session.
+    MessageSent {
+        message: AgentMessage,
+    },
+    /// A message arrived for an agent of this session, or for the user.
+    /// Appended to the recipient's session.
+    MessageReceived {
+        message: AgentMessage,
+    },
+    /// The emitting agent asked the user a question and the session waits.
+    QuestionAsked {
+        question: Question,
+    },
+    /// The user answered. `agent_id` is the agent that asked. `by` is `user`,
+    /// or `expired` with an empty answer when the session ended first.
+    QuestionAnswered {
+        question_id: String,
+        answer: String,
+        by: DecisionSource,
     },
     /// Something went wrong that the user should see in the transcript.
     Error {

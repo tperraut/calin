@@ -18,6 +18,9 @@
 //! | POST | `/sessions/{id}/interrupt` | | `202`, empty body |
 //! | POST | `/sessions/{id}/stop` | | `202`, empty body |
 //! | POST | `/sessions/{id}/permissions/{request_id}` | [`ResolvePermissionRequest`] | `202`, empty body |
+//! | POST | `/sessions/{id}/questions/{question_id}` | [`AnswerQuestionRequest`] | `202`, empty body |
+//! | GET | `/sessions/{id}/graph?at=` | | [`Graph`] of the session's whole tree |
+//! | GET | `/sessions/{id}/timeline` | | [`Timeline`] of the session's whole tree |
 //! | POST | `/sessions/{id}/repos` | [`AttachRepoRequest`] | `201` [`SessionRepo`] |
 //! | POST | `/sessions/{id}/ship` | [`ShipRequest`] | `202`, empty body |
 //! | POST | `/sessions/{id}/pull-requests/refresh` | | `202`, empty body |
@@ -92,6 +95,41 @@
 //!   while `shipping` starts a turn as it does in `review`.
 //! - **Dry run** never pushes and never calls GitHub: shipping records
 //!   pull requests with made-up URLs under `https://example.invalid/`.
+//! - **Subagents.** When an agent starts a subagent inside its own process,
+//!   the session gets an `agent_spawned` for it (kind `subagent`, its
+//!   `parent_agent_id` set, role from the subagent's type), every event the
+//!   subagent produces carries its `agent_id`, and an `agent_status` closes it.
+//! - **Child sessions.** An agent can dispatch a child session through the
+//!   tool endpoint. The child is an ordinary session with `parent_session_id`
+//!   and `root_session_id` set, the same runner and permission mode as its
+//!   parent, and its own worktrees: for each repo it is given (a subset of the
+//!   parent's `write` repos, all of them by default) a new branch starting at
+//!   the parent's current commit in that repo. The brief is the child's
+//!   prompt, recorded as a `dispatch` message: `message_sent` in the parent,
+//!   `message_received` in the child. When the child reaches `review` or
+//!   `failed`, its report (what it passed to the `report` tool, else its last
+//!   text) goes back the same way as a `report` message and is delivered to
+//!   the dispatching agent as its next input, with the child's branch names.
+//!   At most four children of one session run at a time and a child cannot
+//!   dispatch (both are tool errors). Stopping a session stops its running
+//!   descendants. Children appear in `GET /sessions` like any session.
+//! - **Notes.** `send_message` on the tool endpoint sends a `note` to the
+//!   parent session's agent, to a child session's agent, or to the user. A
+//!   note to an agent is delivered as its next input; a note to the user only
+//!   appears in the transcript.
+//! - **Questions.** `ask_user` records `question_asked` and the session
+//!   becomes `waiting`. The tool call returns at once, telling the agent to
+//!   end its turn. The user's answer (`question_answered`) is delivered as the
+//!   agent's next input. 404 for an unknown question, 409 once it is answered.
+//!   A question still open when the session is stopped is closed as `expired`.
+//! - **The tool endpoint** therefore also offers `dispatch` (`title`, `brief`,
+//!   optional `repos`), `send_message` (`to`: `parent`, `user` or a child
+//!   session id; `text`), `report` (`summary`) and `ask_user` (`question`,
+//!   optional `options`).
+//! - **Graph and timeline** cover the whole tree of the session asked for.
+//!   `at` (Unix milliseconds) asks for the graph as it was at that moment:
+//!   only what had happened by then, with each agent's and session's status
+//!   as of then. Without `at` it is the present.
 //! - **Registering a repo**: the path must be the root of a git work tree
 //!   (400 otherwise); a name already in use is a 409. A repo attached to a
 //!   session that is not `done`, `failed` or `cancelled` cannot be deleted (409).
