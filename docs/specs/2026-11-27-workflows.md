@@ -62,8 +62,8 @@ Rules that hold for every file:
   id. A port has at most one outgoing edge. A node may have any number of incoming edges.
 - There is exactly one `start` node and at least one `end` node. Every node is reachable from
   `start`.
-- Every cycle passes through a `loop` node. Loop counters never reset during a run, so every run
-  is finite.
+- Every cycle leaves a `loop` node through its `repeat` port. Loop counters never reset during a
+  run, so every run is finite. (A cycle that only passes a loop through `exhausted` would not be.)
 - A port with no outgoing edge ends the run when it is taken: as `failed` for the failure ports
   listed below, as `success` otherwise.
 
@@ -82,7 +82,8 @@ Rules that hold for every file:
 | `commit` | `message` (required) | `done`, `nothing`, `failed` | |
 | `ship` | `title`, `draft` (default true) | `done`, `failed` | `urls` |
 
-Failure ports are `failed`, `fail`, `exhausted` and `reject`.
+Failure ports are `failed`, `fail`, `exhausted` and `reject`, by name: a verdict called `reject`
+is a failure port too. All outputs are strings. `timeout_seconds` is 1 to 86,400.
 
 - **`agent`** gives the session's lead agent a turn with `prompt`. It leaves through `done` when
   the turn ends and through `failed` when the agent fails. `summary` is the agent's last text.
@@ -116,8 +117,8 @@ branch's `prompt`) may contain:
 
 - `{{task}}`: the session's prompt.
 - `{{session.title}}`, `{{session.branch}}`.
-- `{{nodes.<id>.<output>}}`: an output of a node that has already run; the newest value when the
-  node ran several times. An output that does not exist yet is the empty string.
+- `{{nodes.<id>.<output>}}`: an output of a node that has already run, from its newest run. An
+  output that does not exist yet, or that the newest run did not produce, is the empty string.
 
 Whitespace inside the braces is ignored. A `{{` that does not form one of these is a validation
 error. Substituted text is never re-scanned for templates. Templates are checked at load time:
