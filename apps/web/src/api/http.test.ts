@@ -550,6 +550,49 @@ describe("http api", () => {
       ]);
     });
 
+    it("calls the push routes with their method, path and body", async () => {
+      const device = {
+        id: "p/1",
+        label: "Pixel",
+        endpoint_sha256: "ab",
+        service: "fcm.googleapis.com",
+        created_at: 1,
+        last_sent_at: null,
+      };
+      const preferences = { waiting: true, review: false, failed: true, merged: true };
+      const { api, fetchFn } = setup((input, init) => {
+        if (init?.method === "DELETE" || input.endsWith("/push/test")) {
+          return Promise.resolve(
+            new Response(null, { status: init?.method === "DELETE" ? 204 : 202 }),
+          );
+        }
+        if (input.endsWith("/push/key")) return Promise.resolve(json({ public_key: "BKey" }));
+        if (input.endsWith("/push/preferences")) return Promise.resolve(json(preferences));
+        if (init?.method === "POST") return Promise.resolve(json(device, 201));
+        return Promise.resolve(json([device]));
+      });
+      const subscription = { endpoint: "https://push.example/1", p256dh: "p", auth: "a" };
+
+      await expect(api.getPushKey()).resolves.toEqual({ public_key: "BKey" });
+      await expect(api.listPushSubscriptions()).resolves.toEqual([device]);
+      await expect(api.createPushSubscription(subscription)).resolves.toEqual(device);
+      await api.deletePushSubscription("p/1");
+      await expect(api.getPushPreferences()).resolves.toEqual(preferences);
+      await expect(api.putPushPreferences(preferences)).resolves.toEqual(preferences);
+      await api.sendTestPush();
+
+      const calls = fetchFn.mock.calls.map(([input, init]) => [init?.method, input, init?.body]);
+      expect(calls).toEqual([
+        ["GET", "/api/v1/push/key", undefined],
+        ["GET", "/api/v1/push/subscriptions", undefined],
+        ["POST", "/api/v1/push/subscriptions", JSON.stringify(subscription)],
+        ["DELETE", "/api/v1/push/subscriptions/p%2F1", undefined],
+        ["GET", "/api/v1/push/preferences", undefined],
+        ["PUT", "/api/v1/push/preferences", JSON.stringify(preferences)],
+        ["POST", "/api/v1/push/test", undefined],
+      ]);
+    });
+
     it("tells every listener about a 401, from any route, and still rejects", async () => {
       const { api } = setup((input) =>
         input.endsWith("/settings")

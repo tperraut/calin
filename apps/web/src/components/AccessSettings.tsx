@@ -51,7 +51,7 @@ function createListing<T>(read: () => Promise<T[]>) {
   return { listing, items, failure, load };
 }
 
-function When(props: { label: string; ts: number; now: number }) {
+export function When(props: { label: string; ts: number; now: number }) {
   return (
     <span>
       {props.label}{" "}
@@ -62,7 +62,7 @@ function When(props: { label: string; ts: number; now: number }) {
   );
 }
 
-function LoadFailure(props: { what: string; message: string; onRetry: () => void }) {
+export function LoadFailure(props: { what: string; message: string; onRetry: () => void }) {
   return (
     <p role="alert" class="flex items-center justify-between gap-2 text-sm">
       <span class="min-w-0">

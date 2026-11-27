@@ -10,6 +10,7 @@ import type { Session } from "../gen/Session";
 import type { SessionDetail } from "../gen/SessionDetail";
 import type { SessionRepo } from "../gen/SessionRepo";
 import type { WorkflowInfo } from "../gen/WorkflowInfo";
+import type { DeviceSubscription, Device, Permission, PushSupport } from "../lib/device";
 import type { Schedule } from "../lib/schedule";
 
 export function makeSession(id: string, createdAt = 1000, patch: Partial<Session> = {}): Session {
@@ -225,6 +226,13 @@ export function fakeApi(routes: Partial<Api> = {}): Api {
     listDeviceTokens: missing("listDeviceTokens"),
     createDeviceToken: missing("createDeviceToken"),
     revokeDeviceToken: missing("revokeDeviceToken"),
+    getPushKey: missing("getPushKey"),
+    listPushSubscriptions: missing("listPushSubscriptions"),
+    createPushSubscription: missing("createPushSubscription"),
+    deletePushSubscription: missing("deletePushSubscription"),
+    getPushPreferences: missing("getPushPreferences"),
+    putPushPreferences: missing("putPushPreferences"),
+    sendTestPush: missing("sendTestPush"),
     getSettings: missing("getSettings"),
     putSettings: missing("putSettings"),
     listRepos: missing("listRepos"),
@@ -314,3 +322,61 @@ export const makeMissingRepo = (id: string, patch: Partial<Repo> = {}): Repo =>
     url: `git@example.com:you/${id}.git`,
     ...patch,
   });
+
+/** A subscription as the fake browser holds it; `endpointSha256` is given, not computed. */
+export function makeDeviceSubscription(
+  endpointSha256: string,
+  publicKey: string | null = "server-key",
+  unsubscribe: () => Promise<boolean> = () => Promise.resolve(true),
+): DeviceSubscription {
+  return {
+    request: { endpoint: `https://push.example/${endpointSha256}`, p256dh: "p256", auth: "auth" },
+    endpointSha256,
+    publicKey,
+    unsubscribe,
+  };
+}
+
+/** A browser the test decides everything about: support, permission answers, its subscription. */
+export class FakeDevice implements Device {
+  support: PushSupport = "supported";
+  installed = false;
+  granted: Permission = "default";
+  /** What the permission prompt answers; an Error makes it throw. */
+  answer: Permission = "granted";
+  current: DeviceSubscription | null = null;
+  /** What `subscribe` makes, or the reason it fails. */
+  next: DeviceSubscription | Error = makeDeviceSubscription("hash-new");
+  renewed = false;
+  readonly subscribedWith: string[] = [];
+  asked = 0;
+
+  standalone(): boolean {
+    return this.installed;
+  }
+  pushSupport(): PushSupport {
+    return this.support;
+  }
+  permission(): Permission {
+    return this.granted;
+  }
+  requestPermission(): Promise<Permission> {
+    this.asked += 1;
+    this.granted = this.answer;
+    return Promise.resolve(this.answer);
+  }
+  subscription(): Promise<DeviceSubscription | null> {
+    return Promise.resolve(this.current);
+  }
+  subscribe(publicKey: string): Promise<DeviceSubscription> {
+    this.subscribedWith.push(publicKey);
+    if (this.next instanceof Error) return Promise.reject(this.next);
+    this.current = this.next;
+    return Promise.resolve(this.next);
+  }
+  takeRenewal(): Promise<boolean> {
+    const was = this.renewed;
+    this.renewed = false;
+    return Promise.resolve(was);
+  }
+}

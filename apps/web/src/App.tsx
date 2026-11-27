@@ -1,4 +1,4 @@
-import { useLocation } from "@solidjs/router";
+import { useLocation, useNavigate } from "@solidjs/router";
 import {
   createSignal,
   Errored,
@@ -26,12 +26,44 @@ function Unreachable() {
       class="flex flex-1 flex-col items-center justify-center gap-3 p-6 text-center"
     >
       <h1 class="text-lg font-semibold">Cannot reach the server</h1>
-      <p class="max-w-sm text-sm text-muted">
-        Calin did not answer at <span class="font-mono">{location.host}</span>. Check that{" "}
-        <span class="font-mono">calin serve</span> is running. This page keeps retrying on its own.
-      </p>
+      {/* The shell can open from the service worker's cache with no network at all. */}
+      <Show
+        when={app.online()}
+        fallback={
+          <p class="max-w-sm text-sm text-muted">
+            You are offline, or the server is unreachable. This page tries again as soon as the
+            connection is back.
+          </p>
+        }
+      >
+        <p class="max-w-sm text-sm text-muted">
+          Calin did not answer at <span class="font-mono">{location.host}</span>. Check that{" "}
+          <span class="font-mono">calin serve</span> is running. This page keeps retrying on its
+          own.
+        </p>
+      </Show>
       <button type="button" class="btn" onClick={() => app.retry()}>
         Retry now
+      </button>
+    </div>
+  );
+}
+
+/** A newer build is installed; it waits for the user rather than changing the page under them. */
+function UpdateNotice() {
+  const app = useContext(AppContext);
+  return (
+    <div
+      role="status"
+      class="flex items-center justify-between gap-3 border-b border-line bg-accent-soft px-3 text-sm"
+    >
+      <span>A new version is ready.</span>
+      <button
+        type="button"
+        class="flex min-h-11 items-center px-1 font-medium text-accent"
+        onClick={() => app.applyUpdate()}
+      >
+        Reload
       </button>
     </div>
   );
@@ -100,6 +132,14 @@ function Shell(props: ParentProps) {
   const [showUnsaved, setShowUnsaved] = createSignal(false);
   const keepPage = (): boolean => authorized() || (signedOut() && app.unsavedWork() !== undefined);
   const pageHidden = (): boolean => !authorized() && !showUnsaved();
+  // A tapped notification, through the service worker: open its session here.
+  const navigate = useNavigate();
+  onSettled(() => {
+    const stop = app.onNavigateRequest((path) => navigate(path));
+    return () => {
+      stop();
+    };
+  });
 
   return (
     // Positioned and clipped: screen-reader-only text is absolutely positioned, and
@@ -107,6 +147,9 @@ function Shell(props: ParentProps) {
     <div class="pt-safe px-safe pb-safe relative flex h-dvh flex-col overflow-clip bg-bg text-fg">
       <Show when={authorized()}>
         <ConnectionIndicator />
+      </Show>
+      <Show when={app.updateReady()}>
+        <UpdateNotice />
       </Show>
       <Show when={authorized() && dryRun()}>
         <p class="border-b border-line bg-attention-soft px-3 py-1 text-center text-xs">

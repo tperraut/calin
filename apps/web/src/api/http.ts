@@ -12,6 +12,10 @@ import type { Graph } from "../gen/Graph";
 import type { Health } from "../gen/Health";
 import type { Me } from "../gen/Me";
 import type { PublicHealth } from "../gen/PublicHealth";
+import type { PushKey } from "../gen/PushKey";
+import type { PushPreferences } from "../gen/PushPreferences";
+import type { PushSubscriptionInfo } from "../gen/PushSubscriptionInfo";
+import type { PushSubscriptionRequest } from "../gen/PushSubscriptionRequest";
 import type { RegisterRepoRequest } from "../gen/RegisterRepoRequest";
 import type { Repo } from "../gen/Repo";
 import type { RepoChanges } from "../gen/RepoChanges";
@@ -88,6 +92,17 @@ export interface Api {
   /** The answer carries the secret, which the server never shows again. */
   createDeviceToken(body: CreateDeviceTokenRequest): Promise<CreatedDeviceToken>;
   revokeDeviceToken(id: string): Promise<void>;
+  /** The server's VAPID public key. The push routes are a 409 in local mode. */
+  getPushKey(): Promise<PushKey>;
+  /** The devices notified for the signed-in identity, newest first. */
+  listPushSubscriptions(): Promise<PushSubscriptionInfo[]>;
+  /** An endpoint already registered for the caller is replaced and keeps its `id`. */
+  createPushSubscription(body: PushSubscriptionRequest): Promise<PushSubscriptionInfo>;
+  deletePushSubscription(id: string): Promise<void>;
+  getPushPreferences(): Promise<PushPreferences>;
+  putPushPreferences(body: PushPreferences): Promise<PushPreferences>;
+  /** Accepted at once; the notification follows through the push service. */
+  sendTestPush(): Promise<void>;
   getSettings(): Promise<Settings>;
   /** Replaces the stored settings; answers with them as stored. 400 names what is wrong. */
   putSettings(body: Settings): Promise<Settings>;
@@ -256,6 +271,15 @@ export function createApi(
     listDeviceTokens: () => json<DeviceTokenInfo[]>("GET", "/tokens"),
     createDeviceToken: (body) => json<CreatedDeviceToken>("POST", "/tokens", body),
     revokeDeviceToken: (id) => empty("DELETE", tokens(id)),
+    getPushKey: () => json<PushKey>("GET", "/push/key"),
+    listPushSubscriptions: () => json<PushSubscriptionInfo[]>("GET", "/push/subscriptions"),
+    createPushSubscription: (body) =>
+      json<PushSubscriptionInfo>("POST", "/push/subscriptions", body),
+    deletePushSubscription: (id) =>
+      empty("DELETE", `/push/subscriptions/${encodeURIComponent(id)}`),
+    getPushPreferences: () => json<PushPreferences>("GET", "/push/preferences"),
+    putPushPreferences: (body) => json<PushPreferences>("PUT", "/push/preferences", body),
+    sendTestPush: () => empty("POST", "/push/test"),
     getSettings: () => json<Settings>("GET", "/settings"),
     putSettings: (body) => json<Settings>("PUT", "/settings", body),
     listRepos: () => json<Repo[]>("GET", "/repos"),

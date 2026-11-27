@@ -23,5 +23,7 @@
     "erasableSyntaxOnly": true,
     "noFallthroughCasesInSwitch": true
   },
-  "include": ["src"]
+  "include": ["src"],
+  // The service worker's entry runs with worker globals instead of the DOM's (tsconfig.sw.json).
+  "exclude": ["src/sw/sw.ts"]
 }

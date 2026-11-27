@@ -2,11 +2,15 @@ import { createContext, createSignal, type Accessor } from "solid-js";
 import { HttpError, type Api } from "../api/http";
 import { TOPIC_SESSIONS, type ConnectionState, type SocketClient } from "../api/socket";
 import type { OpenTerminal } from "../api/terminal";
+import type { WorkerMessage } from "../sw/protocol";
 import type { AuthSessionInfo } from "../gen/AuthSessionInfo";
 import type { CreatedDeviceToken } from "../gen/CreatedDeviceToken";
 import type { CreateSessionRequest } from "../gen/CreateSessionRequest";
 import type { DeviceTokenInfo } from "../gen/DeviceTokenInfo";
 import type { Health } from "../gen/Health";
+import type { PushPreferences } from "../gen/PushPreferences";
+import type { PushSubscriptionInfo } from "../gen/PushSubscriptionInfo";
+import type { PushSubscriptionRequest } from "../gen/PushSubscriptionRequest";
 import type { RegisterRepoRequest } from "../gen/RegisterRepoRequest";
 import type { Repo } from "../gen/Repo";
 import type { RepoSet } from "../gen/RepoSet";
@@ -14,6 +18,8 @@ import type { Session } from "../gen/Session";
 import type { Settings } from "../gen/Settings";
 import type { WorkflowInfo } from "../gen/WorkflowInfo";
 import { signInUrl } from "../lib/auth";
+import { NO_DEVICE, type Device } from "../lib/device";
+import type { WorkerBridge } from "../lib/serviceWorker";
 import { errorMessage } from "../lib/errors";
 import { coalesce, type Schedule } from "../lib/schedule";
 import { createCatalog, type RepoRegistry } from "./catalog";
@@ -60,6 +66,10 @@ export type AppServices = {
   openTerminal?: OpenTerminal;
   /** Leaves the app for `url` with a full navigation; defaults to `location.assign`. */
   leave?: (url: string) => void;
+  /** Notification support of this browser; none when absent. */
+  device?: Device;
+  /** The registered service worker; absent under the development server and in tests. */
+  worker?: WorkerBridge;
 };
 
 /** Everything components read and do. They get it from `AppContext`, never from `src/api`. */
@@ -120,6 +130,26 @@ export type AppState = {
   openSession(id: string): SessionStore;
   /** Asks again for the server, without waiting for the backoff. */
   retry(): void;
+  /** What the browser says about its network connection. */
+  online: Accessor<boolean>;
+  /** True once a newer build of the app is installed and waits for a reload. */
+  updateReady: Accessor<boolean>;
+  /** Reloads into the newer build. */
+  applyUpdate(): void;
+  /** Called when a tapped notification asks to show `path`; returns the function that stops it. */
+  onNavigateRequest(listener: (path: string) => void): () => void;
+  /** This browser's notification support and subscription. */
+  device: Device;
+  /** The server's VAPID public key, base64url. */
+  pushKey(): Promise<string>;
+  listPushSubscriptions(): Promise<PushSubscriptionInfo[]>;
+  /** Registers this browser's subscription; the same endpoint keeps its id. */
+  registerPushSubscription(request: PushSubscriptionRequest): Promise<PushSubscriptionInfo>;
+  removePushSubscription(id: string): Promise<void>;
+  pushPreferences(): Promise<PushPreferences>;
+  /** Rejects with the server's reason. */
+  savePushPreferences(preferences: PushPreferences): Promise<PushPreferences>;
+  sendTestPush(): Promise<void>;
   /** Connects and loads; returns the function that undoes both. */
   start(): () => void;
 };
@@ -132,6 +162,7 @@ const ME_RETRY_MAX_MS = 15_000;
 
 export function createAppState(services: AppServices): AppState {
   const { api, socket } = services;
+  const device = services.device ?? NO_DEVICE;
 
   const [connection, setConnection] = createSignal<ConnectionState>(socket.state());
   const [health, setHealth] = createSignal<HealthState>({ status: "loading" });
@@ -142,6 +173,9 @@ export function createAppState(services: AppServices): AppState {
   const [now, setNow] = createSignal(Date.now());
   const [auth, setAuth] = createSignal<AuthState>({ status: "checking" });
   const [unsavedWork, setUnsavedWork] = createSignal<string>();
+  const [online, setOnline] = createSignal(typeof navigator === "undefined" || navigator.onLine);
+  const [updateReady, setUpdateReady] = createSignal(false);
+  const navigateListeners = new Set<(path: string) => void>();
   // Signals apply later; decisions made in the same turn read this.
   let authNow: AuthState = { status: "checking" };
   function changeAuth(next: AuthState): void {
@@ -296,6 +330,35 @@ export function createAppState(services: AppServices): AppState {
     meAttempt = 0;
     changeAuth(next);
     disconnect ??= connect();
+    if (next.status === "signed_in") reportRenewedSubscription();
+  }
+
+  /**
+   * The worker renewed this browser's push subscription while no page could
+   * tell the server (see `sw/worker.ts`): tell it now. Push exists in public mode only.
+   */
+  function reportRenewedSubscription(): void {
+    if (device.pushSupport() !== "supported") return;
+    void (async () => {
+      try {
+        if (!(await device.takeRenewal())) return;
+        const current = await device.subscription();
+        if (current) await api.createPushSubscription(current.request);
+      } catch {
+        // Settings offers "Notify this device" again if this did not reach the server.
+      }
+    })();
+  }
+
+  function onWorkerMessage(message: WorkerMessage): void {
+    if (message.type === "navigate") {
+      for (const listener of navigateListeners) listener(message.path);
+    } else if (message.type === "refresh") {
+      // The session is live over the socket; after a phone's sleep the socket may not be.
+      socket.reconnectNow();
+    } else if (message.type === "subscription-changed" && authNow.status === "signed_in") {
+      reportRenewedSubscription();
+    }
   }
 
   function checkMe(): void {
@@ -324,6 +387,8 @@ export function createAppState(services: AppServices): AppState {
           return;
         }
         changeAuth({ status: "unreachable" });
+        // The "offline" event may have fired before this page listened.
+        setOnline(navigator.onLine);
         const delay = Math.min(ME_RETRY_MAX_MS, ME_RETRY_BASE_MS * 2 ** meAttempt);
         meAttempt += 1;
         meTimer = setTimeout(checkMe, delay);
@@ -459,15 +524,49 @@ export function createAppState(services: AppServices): AppState {
       if (sessionsError() !== undefined) socket.resync(TOPIC_SESSIONS, 0);
       socket.reconnectNow();
     },
+    online,
+    updateReady,
+    applyUpdate: () => services.worker?.applyUpdate(),
+    onNavigateRequest(listener) {
+      navigateListeners.add(listener);
+      return () => navigateListeners.delete(listener);
+    },
+    device,
+    pushKey: async () => (await api.getPushKey()).public_key,
+    listPushSubscriptions: () => api.listPushSubscriptions(),
+    registerPushSubscription: (request) => api.createPushSubscription(request),
+    removePushSubscription: (id) => api.deletePushSubscription(id),
+    pushPreferences: () => api.getPushPreferences(),
+    savePushPreferences: (preferences) => api.putPushPreferences(preferences),
+    sendTestPush: () => api.sendTestPush(),
     start() {
       running = true;
       // A 401 before anyone was signed in is a sign-in to do, not one that ended.
       const offUnauthorized = api.onUnauthorized(() =>
         endSession(authNow.status !== "checking" && authNow.status !== "unreachable"),
       );
+      // Back online: ask for the server now rather than at the end of the backoff.
+      const wentOnline = (): void => {
+        setOnline(true);
+        if (authNow.status === "unreachable") {
+          meAttempt = 0;
+          checkMe();
+        }
+      };
+      const wentOffline = (): void => {
+        setOnline(false);
+      };
+      window.addEventListener("online", wentOnline);
+      window.addEventListener("offline", wentOffline);
+      const offReady = services.worker?.onUpdateReady(() => setUpdateReady(true));
+      const offMessages = services.worker?.onMessage(onWorkerMessage);
       checkMe();
       return () => {
         running = false;
+        window.removeEventListener("online", wentOnline);
+        window.removeEventListener("offline", wentOffline);
+        offReady?.();
+        offMessages?.();
         offUnauthorized();
         clearTimeout(meTimer);
         disconnect?.();
