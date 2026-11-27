@@ -12,9 +12,13 @@
   --surface: #ffffff;
   --sunken: #efefec;
   --line: #dcdcd7;
+  /* The edge of a field or a checkbox: 3:1 against --surface (WCAG 1.4.11). */
+  --line-strong: #8d8d86;
   --fg: #1b1b19;
   --muted: #5c5c56;
   --accent: #2a56c6;
+  /* The primary button's fill, and its text (4.5:1 on it). */
+  --accent-fill: #2a56c6;
   --accent-fg: #ffffff;
   --accent-soft: #e6ecfb;
 
@@ -35,10 +39,13 @@
   --surface: #1c1d1b;
   --sunken: #101110;
   --line: #33352f;
+  --line-strong: #73756d;
   --fg: #e8e8e4;
   --muted: #a5a59e;
   --accent: #8fb0ff;
-  --accent-fg: #0e1626;
+  /* Deeper than the accent: a pale fill would outshine every other control. */
+  --accent-fill: #3a5fd0;
+  --accent-fg: #ffffff;
   --accent-soft: #1d2740;
 
   --tone-neutral: #a5a59e;
@@ -69,9 +76,11 @@
   --color-surface: var(--surface);
   --color-sunken: var(--sunken);
   --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
   --color-fg: var(--fg);
   --color-muted: var(--muted);
   --color-accent: var(--accent);
+  --color-accent-fill: var(--accent-fill);
   --color-accent-fg: var(--accent-fg);
   --color-accent-soft: var(--accent-soft);
   --color-tone-neutral: var(--tone-neutral);
@@ -93,6 +102,8 @@
   html {
     background: var(--bg);
     color: var(--fg);
+    /* Inherited by every scroller: quiet thumbs in the theme's own grays. */
+    scrollbar-color: var(--line-strong) transparent;
     font-family: var(--font-sans);
     line-height: 1.45;
     -webkit-text-size-adjust: 100%;
@@ -160,14 +171,22 @@
   }
 
   .btn-primary {
-    border-color: var(--accent);
-    background: var(--accent);
+    border-color: var(--accent-fill);
+    background: var(--accent-fill);
     color: var(--accent-fg);
   }
 
   .btn-primary:hover:not(:disabled) {
-    border-color: var(--accent);
+    border-color: var(--accent-fill);
     filter: brightness(1.08);
+  }
+
+  /* Plainly off in both themes, rather than a faded accent that still reads as live. */
+  .btn-primary:disabled {
+    border-color: var(--line);
+    background: var(--sunken);
+    color: var(--muted);
+    opacity: 1;
   }
 
   /* One option of a radio group shown as a row of boxes: the checked one carries the accent. */
@@ -187,7 +206,7 @@
 
   .field {
     width: 100%;
-    border: 1px solid var(--line);
+    border: 1px solid var(--line-strong);
     border-radius: 6px;
     background: var(--surface);
     color: var(--fg);

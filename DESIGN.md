@@ -6,9 +6,11 @@ colors:
   surface: "#ffffff"
   sunken: "#efefec"
   line: "#dcdcd7"
+  line-strong: "#8d8d86"
   fg: "#1b1b19"
   muted: "#5c5c56"
   accent: "#2a56c6"
+  accent-fill: "#2a56c6"
   accent-fg: "#ffffff"
   accent-soft: "#e6ecfb"
   tone-attention: "#8a5a00"
@@ -20,10 +22,12 @@ colors:
   surface-dark: "#1c1d1b"
   sunken-dark: "#101110"
   line-dark: "#33352f"
+  line-strong-dark: "#73756d"
   fg-dark: "#e8e8e4"
   muted-dark: "#a5a59e"
   accent-dark: "#8fb0ff"
-  accent-fg-dark: "#0e1626"
+  accent-fill-dark: "#3a5fd0"
+  accent-fg-dark: "#ffffff"
   accent-soft-dark: "#1d2740"
   tone-attention-dark: "#e2b24a"
   tone-success-dark: "#6fcf8e"
@@ -71,7 +75,7 @@ components:
     padding: "0 0.9rem"
     height: "44px"
   button-primary:
-    backgroundColor: "{colors.accent}"
+    backgroundColor: "{colors.accent-fill}"
     textColor: "{colors.accent-fg}"
     rounded: "{rounded.control}"
     padding: "0 0.9rem"
@@ -109,7 +113,8 @@ sessions list is the home screen; from 1024 px the sessions list becomes a sideb
 shows its transcript beside a side panel. Nothing is decorative: no gradients, no illustrations,
 no shadows at rest, no motion without a state change behind it.
 
-Light and dark follow the system setting. Each color token has a light and a dark value.
+Light and dark are equal citizens. Each color token is defined once per theme; the reader picks
+System, Light or Dark in Settings, and the choice is applied before the first paint.
 
 **Key Characteristics:**
 
@@ -126,9 +131,11 @@ enough to sit in dense lists without shouting.
 
 ### Primary
 
-- **Cobalt** (`accent`, dark `accent-dark`): links, the primary action of a view, the selected
-  tab, the focus ring, checked choices, the user's own messages (on `accent-soft`). One primary
-  button per view.
+- **Cobalt** (`accent`, dark `accent-dark`): links, the selected tab, the focus ring, checked
+  choices, the user's own messages (on `accent-soft`).
+- **Cobalt fill** (`accent-fill`, with `accent-fg` text): the primary button, one per view. In
+  light it is the accent itself; in dark it is a deeper cobalt with white text, because the pale
+  dark accent as a fill outshone every other control.
 
 ### Neutral
 
@@ -137,6 +144,8 @@ enough to sit in dense lists without shouting.
 - **Well** (`sunken` / `sunken-dark`): inset areas, disabled fields, code chips, the graph's repo
   nodes.
 - **Hairline** (`line` / `line-dark`): every border and divider.
+- **Edge** (`line-strong` / `line-strong-dark`): the border of fields and the search box, and
+  scrollbar thumbs; 3:1 against Sheet so a field's boundary can be seen (WCAG 1.4.11).
 - **Ink** (`fg` / `fg-dark`) and **Pencil** (`muted` / `muted-dark`): text. Pencil is secondary
   text and keeps at least 4.5:1 on every surface it sits on.
 
@@ -152,7 +161,29 @@ Panel-scoped tokens extend these: editor and diff colors and the syntax palette
 (`panels/editor/editor.css`), the ANSI palette (`panels/terminal/terminal.css`) and the timeline's
 series colors (`panels/graph/graph.css`). Each has a light and a dark value.
 
+### Themes
+
+Every color token is defined twice in the stylesheets: once on `:root` (light) and once on
+`:root[data-theme="dark"]`. Nothing else decides the theme:
+
+- `public/theme.js`, a blocking classic script in the page head, sets `data-theme` before the
+  first paint from the stored choice (`calin.theme.v1` in local storage) or, without one, from
+  `prefers-color-scheme`. The CSP allows no inline script, so it is a file.
+- `src/lib/theme.ts` keeps it current: the choice made in Settings → Theme (System, Light, Dark)
+  and system changes while the choice is System. It also sets the `theme-color` meta tags to
+  `bg`, so the browser's bar matches.
+- `color-scheme` follows `data-theme`, so native controls and scrollbars switch too.
+- What paints with concrete colors reads the tokens and listens for `data-theme` changes
+  (`watchTheme`): the xterm theme and CodeMirror's dark flag. The graph, the timeline, the usage
+  chart, diffs and syntax highlighting use the tokens directly.
+
+Dark is not an inversion: surfaces step up in lightness from `bg` to `surface` (nearer the
+reader), `sunken` steps down, text is off-white, and each tone is lifted until it keeps 4.5:1 on
+dark surfaces.
+
 ### Named Rules
+
+**The Two Values Rule.** A color token without a dark value is a bug.
 
 **The One Signal Rule.** Color means state. The accent marks where the user acts; the tones mark
 status. Nothing is colored for decoration.
@@ -212,15 +243,16 @@ outline with a 2 px offset is the one focus style.
 
 - **Shape:** 6 px radius, at least 44 × 44 px, 1 px hairline border.
 - **Default:** Sheet background, Ink text, 500 weight. Hover darkens the border to Pencil.
-- **Primary:** Cobalt fill, white text (dark: pale cobalt fill, near-black text). One per view.
+- **Primary:** Cobalt fill, white text, in both themes. One per view.
 - **Pressed toggle:** `aria-pressed="true"` turns border and text Cobalt.
-- **Disabled:** half opacity, not-allowed cursor.
+- **Disabled:** half opacity, not-allowed cursor. A disabled primary drops its fill: Well
+  background, hairline border, Pencil text, so it never reads as live.
 
 ### Choices
 
-A radio group drawn as a row or stack of boxes: 44 px tall, hairline border, 6 px radius; the
-checked one gets a Cobalt border on `accent-soft`. Used for permission modes and automation
-triggers.
+A radio group drawn as a row or stack of boxes (`.choice`): 44 px tall, hairline border, 6 px
+radius; the checked one gets a Cobalt border on `accent-soft`. Used for permission modes,
+automation triggers and the theme.
 
 ### Badges
 
@@ -229,7 +261,7 @@ preparing and waiting dots pulse unless reduced motion is asked for.
 
 ### Inputs / Fields
 
-Sheet background, hairline border, 6 px radius, 16 px text, 44 px tall; Pencil placeholders;
+Sheet background, Edge border (3:1), 6 px radius, 16 px text, 44 px tall; Pencil placeholders;
 disabled fields sink to Well. Errors are a sentence in Danger under the field, tied by
 `aria-describedby`.
 
