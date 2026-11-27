@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::process::Output;
 
@@ -977,4 +979,97 @@ Next steps:
     ] {
         assert!(text.lines().any(|l| l == line), "{line:?} not in\n{text}");
     }
+}
+
+#[test]
+fn folders_that_cannot_be_described_are_skipped_with_a_note() {
+    let parent = TempDir::new().unwrap();
+    let code = parent.path().join("code");
+    clone_at(&code.join("api"), None);
+    fs::create_dir_all(code.join("broken")).unwrap();
+    fs::write(code.join("broken/.git"), "gitdir: /nowhere\n").unwrap();
+    fs::create_dir(code.join(OsStr::from_bytes(b"bad\xff"))).unwrap();
+    let code = fs::canonicalize(&code).unwrap();
+    let mut notes = Vec::new();
+    let found = repos_yaml::scan(
+        std::slice::from_ref(&code),
+        &parent.path().join("home"),
+        &mut notes,
+    )
+    .unwrap();
+    let names: Vec<&str> = found.iter().map(|repo| repo.name.as_str()).collect();
+    assert_eq!(names, ["api"]);
+    assert_eq!(notes.len(), 2, "{notes:?}");
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.ends_with("its name is not valid UTF-8")),
+        "{notes:?}"
+    );
+    let broken = format!("skipped {}: ", code.join("broken").display());
+    assert!(
+        notes.iter().any(|note| note.starts_with(&broken)),
+        "{notes:?}"
+    );
+}
+
+#[test]
+fn the_list_says_why_a_repo_has_no_url_and_what_was_guessed() {
+    let empty = repos_yaml::render(&[], &[PathBuf::from("/code"), PathBuf::from("/more")]);
+    assert!(
+        empty.contains("#\n# No git clone was found directly under /code, /more.\n"),
+        "{empty}"
+    );
+    let mut api = found("api");
+    api.url = Some("git@example.com:you/api.git".to_owned());
+    api.guess = Guess {
+        from: vec!["Cargo.toml".to_owned()],
+        setup: Some("cargo fetch".to_owned()),
+        checks: vec!["cargo test".to_owned()],
+    };
+    let mut renamed = found("api-2");
+    renamed.renamed_from = Some("api".to_owned());
+    renamed.guess = Guess {
+        from: vec!["pytest.ini".to_owned()],
+        setup: None,
+        checks: vec!["pytest".to_owned()],
+    };
+    let mut web = found("web");
+    web.guess = Guess {
+        from: vec!["go.mod".to_owned()],
+        setup: Some("go mod download".to_owned()),
+        checks: Vec::new(),
+    };
+    let text = repos_yaml::render(
+        &[api, renamed, web, found("docs")],
+        &[PathBuf::from("/code")],
+    );
+    let body = text.split_once("\nrepos:\n").unwrap().1;
+    assert_eq!(
+        body,
+        r#"  api:
+    url: "git@example.com:you/api.git"
+    # Guessed from Cargo.toml:
+    # setup: "cargo fetch"
+    # checks: ["cargo test"]
+  api-2:
+    # /code/api-2: renamed because an earlier repo is named api.
+    # It has no origin remote either, and a repo without `url:` is found
+    # by a folder of its own name: add a `url:` or rename the folder.
+    # Guessed from pytest.ini:
+    # checks: ["pytest"]
+  web:
+    # No origin remote: found by its folder name under a scan root.
+    # Add `url:` to find it by its remote instead.
+    # Guessed from go.mod:
+    # setup: "go mod download"
+  docs:
+    # No origin remote: found by its folder name under a scan root.
+    # Add `url:` to find it by its remote instead.
+
+# Named sets attach several repos in one step:
+# sets:
+#   main: [api, api-2, web]
+"#
+    );
 }
