@@ -135,7 +135,9 @@ Known gaps carried forward from M3:
 - [x] `make e2e` covers a workflow run with a check, a gate and a ship step (40 checks)
 - [ ] ACP runner for one more agent. Waiting on which agent CLI to target; none besides
       `claude` is installed here.
-- [ ] A workflow run with the real Claude Code runner. So far it ran with the mock only.
+- [x] A workflow run with the real Claude Code runner: the agent's first change left the repo's
+      own check failing, the run looped, the agent got the failing output and fixed it, the
+      check passed and the run ended in review.
 
 Known gaps carried forward from M4:
 
