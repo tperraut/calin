@@ -43,3 +43,45 @@ pub async fn run(command: HomeCommand, server: &str) -> Result<()> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser as _;
+    use tempfile::TempDir;
+
+    use super::*;
+
+    /// `calin home <args>`, parsed as the binary parses it.
+    fn parse(args: &[&str]) -> HomeCommand {
+        let cli = crate::Cli::try_parse_from(["calin", "home"].iter().chain(args)).unwrap();
+        let Some(crate::Command::Home(command)) = cli.command else {
+            panic!("not a home command: {args:?}");
+        };
+        command
+    }
+
+    #[tokio::test]
+    async fn init_scaffolds_the_folder_it_is_given() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path().join("home");
+        let command = parse(&["init", home.to_str().unwrap()]);
+        run(command, "http://127.0.0.1:4680").await.unwrap();
+        assert!(home.join(".git").is_dir());
+        assert!(home.join(".calin/repos.yaml").is_file());
+        assert!(home.join("README.md").is_file());
+    }
+
+    #[tokio::test]
+    async fn init_reports_what_stops_it() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("file");
+        std::fs::write(&file, "").unwrap();
+        let error = run(parse(&["init", file.to_str().unwrap()]), "http://x")
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().ends_with("is a file, not a directory."),
+            "{error}"
+        );
+    }
+}
