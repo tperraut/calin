@@ -119,25 +119,33 @@ pub(crate) async fn serve(
         .into_response()
 }
 
+/// The type of each extension the web app ships; anything else is bytes.
+const CONTENT_TYPES: [(&str, &str); 17] = [
+    ("html", "text/html; charset=utf-8"),
+    ("js", "text/javascript; charset=utf-8"),
+    ("mjs", "text/javascript; charset=utf-8"),
+    ("css", "text/css; charset=utf-8"),
+    ("json", "application/json"),
+    ("map", "application/json"),
+    ("webmanifest", "application/manifest+json"),
+    ("svg", "image/svg+xml"),
+    ("png", "image/png"),
+    ("jpg", "image/jpeg"),
+    ("jpeg", "image/jpeg"),
+    ("webp", "image/webp"),
+    ("ico", "image/x-icon"),
+    ("woff2", "font/woff2"),
+    ("woff", "font/woff"),
+    ("txt", "text/plain; charset=utf-8"),
+    ("wasm", "application/wasm"),
+];
+
 fn content_type(name: &str) -> &'static str {
     let extension = name.rsplit_once('.').map_or("", |(_, extension)| extension);
-    match extension {
-        "html" => "text/html; charset=utf-8",
-        "js" | "mjs" => "text/javascript; charset=utf-8",
-        "css" => "text/css; charset=utf-8",
-        "json" | "map" => "application/json",
-        "webmanifest" => "application/manifest+json",
-        "svg" => "image/svg+xml",
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "webp" => "image/webp",
-        "ico" => "image/x-icon",
-        "woff2" => "font/woff2",
-        "woff" => "font/woff",
-        "txt" => "text/plain; charset=utf-8",
-        "wasm" => "application/wasm",
-        _ => "application/octet-stream",
-    }
+    CONTENT_TYPES
+        .iter()
+        .find(|(known, _)| *known == extension)
+        .map_or("application/octet-stream", |(_, content_type)| content_type)
 }
 
 #[cfg(test)]
@@ -161,5 +169,35 @@ mod tests {
         );
         assert_eq!(content_type("favicon.svg"), "image/svg+xml");
         assert_eq!(content_type("LICENSE"), "application/octet-stream");
+    }
+
+    #[test]
+    fn every_known_extension_has_its_type_and_others_are_bytes() {
+        for (name, expected) in [
+            ("a.html", "text/html; charset=utf-8"),
+            ("a.js", "text/javascript; charset=utf-8"),
+            ("a.mjs", "text/javascript; charset=utf-8"),
+            ("a.css", "text/css; charset=utf-8"),
+            ("a.json", "application/json"),
+            ("a.js.map", "application/json"),
+            ("manifest.webmanifest", "application/manifest+json"),
+            ("a.svg", "image/svg+xml"),
+            ("a.png", "image/png"),
+            ("a.jpg", "image/jpeg"),
+            ("a.jpeg", "image/jpeg"),
+            ("a.webp", "image/webp"),
+            ("favicon.ico", "image/x-icon"),
+            ("a.woff2", "font/woff2"),
+            ("a.woff", "font/woff"),
+            ("robots.txt", "text/plain; charset=utf-8"),
+            ("a.wasm", "application/wasm"),
+            // The extension is the text after the last dot, compared exactly.
+            ("a.HTML", "application/octet-stream"),
+            ("html", "application/octet-stream"),
+            ("a.html.gz", "application/octet-stream"),
+            ("a.", "application/octet-stream"),
+        ] {
+            assert_eq!(content_type(name), expected, "{name}");
+        }
     }
 }

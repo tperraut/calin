@@ -8,3 +8,7 @@ docs/specs/diagrams/.receipts
 docs/specs/diagrams/*.delivery.json
 # raw agent recordings: contain local paths and account details, never committed
 fixtures/raw/
+# crapper, dryer and mutator reports
+.metrics/
+# llvm-cov profiles written by instrumented test runs
+*.profraw
