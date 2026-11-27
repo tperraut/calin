@@ -14,6 +14,8 @@ use calin_core::{ManagerConfig, SessionManager, Store, resolve_home};
 use calin_push::EndpointPolicy;
 use calin_server::{AUTH_FILE, AppState, Assets, Push, PushSetup, Server, SignIn, vapid_subject};
 use clap::{Args, Parser, Subcommand};
+
+mod server_cmd;
 use tracing_subscriber::EnvFilter;
 
 const DEFAULT_BIND: &str = "127.0.0.1:4680";
@@ -45,6 +47,9 @@ struct Cli {
 enum Command {
     /// Run the server (the default when no command is given)
     Serve(ServeArgs),
+    /// Install Calin as a service on a Linux server, or verify an installation
+    #[command(subcommand)]
+    Server(server_cmd::ServerCommand),
 }
 
 #[derive(Args)]
@@ -72,6 +77,7 @@ async fn main() -> Result<()> {
     init_logging();
     match cli.command {
         Some(Command::Serve(args)) => serve(args).await,
+        Some(Command::Server(command)) => server_cmd::run(command).await,
         None => serve(ServeArgs::default()).await,
     }
 }

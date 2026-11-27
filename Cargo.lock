@@ -255,6 +255,7 @@ dependencies = [
  "calin-agents",
  "calin-auth",
  "calin-core",
+ "calin-install",
  "calin-push",
  "calin-server",
  "clap",

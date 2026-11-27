@@ -20,6 +20,7 @@ clap = { version = "4.6.10", features = ["derive"] }
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "signal", "net"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+calin-install = { version = "0.0.1", path = "../calin-install" }
 
 [lints]
 workspace = true
