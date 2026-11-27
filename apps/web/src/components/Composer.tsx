@@ -242,7 +242,7 @@ export function Composer(props: {
                 </a>
                 <button
                   type="button"
-                  class="btn shrink-0 border-transparent px-2"
+                  class="btn btn-ghost shrink-0 px-2"
                   aria-label={`Remove issue #${chosenIssue().issue.number}`}
                   onClick={() => setPicked(undefined)}
                 >

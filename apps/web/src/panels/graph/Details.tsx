@@ -53,7 +53,7 @@ export function DetailsSheet(
         <h2 class="min-w-0 pt-2.5 font-semibold wrap-anywhere">{props.title}</h2>
         <button
           type="button"
-          class="btn shrink-0 border-transparent px-0"
+          class="btn btn-ghost shrink-0 px-0"
           aria-label="Close details"
           title="Close details"
           onClick={() => props.onClose()}

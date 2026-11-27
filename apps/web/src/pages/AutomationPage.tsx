@@ -878,11 +878,7 @@ export default function AutomationPage() {
     <section class="min-h-0 flex-1 overflow-y-auto overscroll-contain">
       <div class="mx-auto flex w-full max-w-2xl flex-col gap-5 px-3 py-3 lg:px-4 lg:py-8">
         <header class="flex items-center gap-2">
-          <a
-            href="/automations"
-            aria-label="Back to automations"
-            class="btn border-transparent px-0"
-          >
+          <a href="/automations" aria-label="Back to automations" class="btn btn-ghost px-0">
             <span aria-hidden="true">←</span>
           </a>
           <h1 class="min-w-0 flex-1 truncate text-xl font-semibold">{title()}</h1>

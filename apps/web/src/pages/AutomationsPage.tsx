@@ -217,7 +217,7 @@ export default function AutomationsPage() {
     <section class="min-h-0 flex-1 overflow-y-auto overscroll-contain">
       <div class="mx-auto flex w-full max-w-2xl flex-col gap-4 px-3 py-3 lg:px-4 lg:py-8">
         <header class="flex items-center gap-2">
-          <a href="/" aria-label="Back to sessions" class="btn border-transparent px-0 lg:hidden">
+          <a href="/" aria-label="Back to sessions" class="btn btn-ghost px-0 lg:hidden">
             <span aria-hidden="true">←</span>
           </a>
           <h1 class="flex-1 text-xl font-semibold">Automations</h1>

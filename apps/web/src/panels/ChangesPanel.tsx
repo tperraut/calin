@@ -400,7 +400,7 @@ export default function ChangesPanel(props: PanelProps) {
           </p>
           <button
             type="button"
-            class="btn border-transparent px-0"
+            class="btn btn-ghost px-0"
             aria-label="Refresh the changes"
             title="Refresh the changes"
             disabled={refreshing()}
@@ -468,7 +468,7 @@ export default function ChangesPanel(props: PanelProps) {
           <section aria-label="Diff" class="flex min-h-0 min-w-0 flex-1 flex-col">
             <div class="flex flex-wrap items-center gap-x-1 border-b border-line bg-surface px-1">
               <Show when={mode() === "levels"}>
-                <button type="button" class="btn border-transparent px-2" onClick={deselect}>
+                <button type="button" class="btn btn-ghost px-2" onClick={deselect}>
                   <span aria-hidden="true">‹</span> Changes
                 </button>
               </Show>
@@ -484,7 +484,7 @@ export default function ChangesPanel(props: PanelProps) {
                     <>
                       <button
                         type="button"
-                        class="btn border-transparent px-0"
+                        class="btn btn-ghost px-0"
                         aria-label="Previous change"
                         title="Previous change"
                         disabled={diffControls().changes === 0}
@@ -494,7 +494,7 @@ export default function ChangesPanel(props: PanelProps) {
                       </button>
                       <button
                         type="button"
-                        class="btn border-transparent px-0"
+                        class="btn btn-ghost px-0"
                         aria-label="Next change"
                         title="Next change"
                         disabled={diffControls().changes === 0}

@@ -246,7 +246,10 @@ outline with a 2 px offset is the one focus style.
 - **Shape:** 6 px radius, at least 44 × 44 px, 1 px hairline border.
 - **Default:** Sheet background, Ink text, 500 weight. Hover darkens the border to Pencil.
 - **Primary:** Cobalt fill, white text, in both themes. One per view.
-- **Pressed toggle:** `aria-pressed="true"` turns border and text Cobalt.
+- **Ghost** (`.btn-ghost`): back arrows, close buttons, toolbar actions (Wrap, Find): no box
+  and no fill until pointed at, then the Well.
+- **Pressed toggle:** `aria-pressed="true"` fills it with `accent-soft` under a Cobalt border, so
+  the state does not rest on hue alone.
 - **Disabled:** half opacity, not-allowed cursor. A disabled primary drops its fill: Well
   background, hairline border, Pencil text, so it never reads as live.
 

@@ -166,7 +166,7 @@ function SettingsForm(props: { stored: Settings; onSave: (next: Settings) => Pro
                   </span>
                   <button
                     type="button"
-                    class="btn border-transparent px-2 text-sm"
+                    class="btn btn-ghost px-2 text-sm"
                     aria-label={`Remove ${root}`}
                     onClick={() => {
                       setScanRoots(scanRoots().filter((one) => one !== root));
@@ -552,7 +552,7 @@ export default function SettingsPage() {
     <section class="min-h-0 flex-1 overflow-y-auto overscroll-contain">
       <div class="mx-auto flex w-full max-w-2xl flex-col gap-5 px-3 py-3 lg:px-4 lg:py-8">
         <header class="flex items-center gap-2">
-          <a href="/" aria-label="Back to sessions" class="btn border-transparent px-0 lg:hidden">
+          <a href="/" aria-label="Back to sessions" class="btn btn-ghost px-0 lg:hidden">
             <span aria-hidden="true">←</span>
           </a>
           <h1 class="text-xl font-semibold">Settings</h1>

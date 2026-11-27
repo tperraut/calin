@@ -14,7 +14,9 @@ export function SignInScreen(props: { onShowUnsaved: () => void }) {
   };
   return (
     <div class="flex flex-1 flex-col items-center justify-center gap-4 p-6 text-center">
-      <h1 class="text-2xl font-semibold">Calin</h1>
+      {/* The app's own icon, served from its origin: the one picture of the brand there is. */}
+      <img src="/favicon.svg" alt="" width="48" height="48" class="size-12" />
+      <h1 class="-mt-1 text-2xl font-semibold">Calin</h1>
       <p class="max-w-sm text-sm text-muted">
         {ended()
           ? "Your session ended. Sign in again."

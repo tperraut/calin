@@ -119,7 +119,7 @@ export function SidePane(
           <Show when={props.panel !== undefined}>
             <button
               type="button"
-              class="btn border-transparent px-0"
+              class="btn btn-ghost px-0"
               aria-label="Collapse the panel"
               title="Collapse the panel"
               onClick={() => props.onCollapse()}

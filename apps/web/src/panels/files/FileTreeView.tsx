@@ -95,7 +95,7 @@ export function FileTreeView(props: {
 
   const itemClass =
     "flex min-h-11 min-w-0 flex-1 cursor-pointer items-center gap-1.5 pr-2 text-left -outline-offset-2 hover:bg-sunken";
-  const actionClass = "btn shrink-0 rounded-none border-transparent bg-transparent px-0 text-muted";
+  const actionClass = "btn btn-ghost shrink-0 rounded-none px-0 text-muted";
   const indent = (row: TreeRow): string => `${(row.level - 1) * INDENT + 8}px`;
 
   return (

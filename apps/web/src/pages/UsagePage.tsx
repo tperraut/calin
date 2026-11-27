@@ -50,7 +50,8 @@ function ShareTable(props: {
   rows: readonly UsageRow[];
   emptyLabel: string;
 }) {
-  const top = (): number => Math.max(0, ...props.rows.map((row) => row.totals.cost_usd));
+  // Each bar is the row's share of the total: equal rows read as equal halves, not as two full bars.
+  const total = (): number => props.rows.reduce((sum, row) => sum + row.totals.cost_usd, 0);
   return (
     <section class="flex min-w-0 flex-col gap-2">
       <h2 class="font-semibold">{props.caption}</h2>
@@ -68,7 +69,7 @@ function ShareTable(props: {
               <th scope="col" class="py-1 text-right font-medium">
                 Cost
               </th>
-              <th scope="col" class="py-1 text-right font-medium">
+              <th scope="col" class="py-1 text-right font-medium whitespace-nowrap">
                 Tokens in / out
               </th>
             </tr>
@@ -85,7 +86,7 @@ function ShareTable(props: {
                       <span
                         class="block h-full rounded-full bg-accent"
                         style={{
-                          width: `${top() > 0 ? (row().totals.cost_usd / top()) * 100 : 0}%`,
+                          width: `${total() > 0 ? (row().totals.cost_usd / total()) * 100 : 0}%`,
                         }}
                       />
                     </span>
@@ -168,7 +169,7 @@ export default function UsagePage() {
     <section class="min-h-0 flex-1 overflow-y-auto overscroll-contain">
       <div class="mx-auto flex w-full max-w-4xl flex-col gap-6 px-3 py-3 lg:px-4 lg:py-8">
         <header class="flex flex-wrap items-center gap-2">
-          <a href="/" aria-label="Back to sessions" class="btn border-transparent px-0 lg:hidden">
+          <a href="/" aria-label="Back to sessions" class="btn btn-ghost px-0 lg:hidden">
             <span aria-hidden="true">←</span>
           </a>
           <h1 class="flex-1 text-xl font-semibold">Usage</h1>
@@ -265,7 +266,10 @@ export default function UsagePage() {
                             <th scope="col" class="py-1 text-right font-medium">
                               Cost
                             </th>
-                            <th scope="col" class="py-1 pl-2 text-right font-medium">
+                            <th
+                              scope="col"
+                              class="py-1 pl-2 text-right font-medium whitespace-nowrap"
+                            >
                               Tokens in / out
                             </th>
                           </tr>

@@ -125,7 +125,7 @@ export function BufferView(props: {
         <Show when={isText()}>
           <button
             type="button"
-            class="btn border-transparent px-2 text-sm"
+            class="btn btn-ghost px-2 text-sm"
             aria-pressed={props.wrap ? "true" : "false"}
             title="Wrap long lines"
             onClick={() => props.onWrap(!props.wrap)}
@@ -134,7 +134,7 @@ export function BufferView(props: {
           </button>
           <button
             type="button"
-            class="btn border-transparent px-2 text-sm"
+            class="btn btn-ghost px-2 text-sm"
             disabled={controls() === undefined || props.buffer.comparing() !== undefined}
             onClick={() => controls()?.openSearch()}
           >

@@ -164,6 +164,17 @@
     opacity: 0.5;
   }
 
+  /* A quiet action in a toolbar or a header (back, close, wrap): no box until pointed at. */
+  .btn-ghost {
+    border-color: transparent;
+    background: transparent;
+  }
+
+  .btn-ghost:hover:not(:disabled) {
+    border-color: transparent;
+    background: var(--sunken);
+  }
+
   /* A toggle that is on: filled, so the state does not rest on the hue alone. */
   .btn[aria-pressed="true"] {
     border-color: var(--accent);

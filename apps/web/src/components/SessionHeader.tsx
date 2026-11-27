@@ -61,7 +61,7 @@ export function SessionHeader(props: {
     <>
       <header class="border-b border-line bg-surface px-2 py-1.5 lg:px-4">
         <div class="flex items-center gap-2">
-          <a href="/" aria-label="Back to sessions" class="btn border-transparent px-0 lg:hidden">
+          <a href="/" aria-label="Back to sessions" class="btn btn-ghost px-0 lg:hidden">
             <span aria-hidden="true">←</span>
           </a>
           <h1 class="min-w-0 flex-1 truncate font-semibold">{title()}</h1>

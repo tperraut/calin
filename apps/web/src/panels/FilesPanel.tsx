@@ -183,7 +183,7 @@ export default function FilesPanel(props: PanelProps) {
             </span>
             <button
               type="button"
-              class="btn border-transparent px-3 text-sm"
+              class="btn btn-ghost px-3 text-sm"
               onClick={() => setView("editor")}
             >
               Editor <span aria-hidden="true">›</span>
