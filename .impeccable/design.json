@@ -4,21 +4,62 @@
   "title": "Design System: Calin",
   "extensions": {
     "colorMeta": {
-      "accent": { "role": "primary", "displayName": "Cobalt", "canonical": "#2a56c6" },
-      "bg": { "role": "neutral", "displayName": "Paper", "canonical": "#f7f7f5" },
-      "surface": { "role": "neutral", "displayName": "Sheet", "canonical": "#ffffff" },
-      "sunken": { "role": "neutral", "displayName": "Well", "canonical": "#efefec" },
-      "line": { "role": "neutral", "displayName": "Hairline", "canonical": "#dcdcd7" },
-      "fg": { "role": "neutral", "displayName": "Ink", "canonical": "#1b1b19" },
-      "muted": { "role": "neutral", "displayName": "Pencil", "canonical": "#5c5c56" }
+      "accent": {
+        "role": "primary",
+        "displayName": "Cobalt",
+        "canonical": "#2a56c6"
+      },
+      "bg": {
+        "role": "neutral",
+        "displayName": "Paper",
+        "canonical": "#f7f7f5"
+      },
+      "surface": {
+        "role": "neutral",
+        "displayName": "Sheet",
+        "canonical": "#ffffff"
+      },
+      "sunken": {
+        "role": "neutral",
+        "displayName": "Well",
+        "canonical": "#efefec"
+      },
+      "line": {
+        "role": "neutral",
+        "displayName": "Hairline",
+        "canonical": "#dcdcd7"
+      },
+      "fg": {
+        "role": "neutral",
+        "displayName": "Ink",
+        "canonical": "#1b1b19"
+      },
+      "muted": {
+        "role": "neutral",
+        "displayName": "Pencil",
+        "canonical": "#5c5c56"
+      }
     },
     "shadows": [
-      { "name": "float", "value": "Tailwind shadow-md", "purpose": "Only on what floats over content: graph legend, jump-to-latest button." }
+      {
+        "name": "float",
+        "value": "Tailwind shadow-md",
+        "purpose": "Only on what floats over content: graph legend, jump-to-latest button."
+      }
     ],
     "motion": [
-      { "name": "pulse", "value": "opacity 1.6s ease-in-out infinite", "purpose": "Live status dots and the streaming cursor; off under reduced motion." }
+      {
+        "name": "pulse",
+        "value": "opacity 1.6s ease-in-out infinite",
+        "purpose": "Live status dots and the streaming cursor; off under reduced motion."
+      }
     ],
-    "breakpoints": [{ "name": "lg", "value": "64rem" }]
+    "breakpoints": [
+      {
+        "name": "lg",
+        "value": "64rem"
+      }
+    ]
   },
   "components": [
     {
@@ -70,13 +111,29 @@
       "Hairline borders and tonal steps (bg, surface, sunken) instead of shadows.",
       "System sans for prose and UI, system mono for anything the machine wrote.",
       "44 px touch targets everywhere, 16 px form text so iOS does not zoom.",
-      "Dense type: 15 px body, 14 px secondary, 12 px labels; one 18 px page title."
+      "Dense type: 15 px body, 14 px secondary, 12 px labels; one 20 px page title."
     ],
     "rules": [
-      { "name": "The One Signal Rule", "body": "Color means state. The accent marks where the user acts; the tones mark status. Nothing is colored for decoration.", "section": "colors" },
-      { "name": "The Word Beside The Dot Rule", "body": "A status is a dot and a word, never color alone.", "section": "colors" },
-      { "name": "The Machine Wrote It Rule", "body": "Paths, branch names, commands, ids and amounts are mono; prose is never mono.", "section": "typography" },
-      { "name": "The Flat-At-Rest Rule", "body": "Nothing at rest casts a shadow; a shadow means this floats above.", "section": "elevation" }
+      {
+        "name": "The One Signal Rule",
+        "body": "Color means state. The accent marks where the user acts; the tones mark status. Nothing is colored for decoration.",
+        "section": "colors"
+      },
+      {
+        "name": "The Word Beside The Dot Rule",
+        "body": "A status is a dot and a word, never color alone.",
+        "section": "colors"
+      },
+      {
+        "name": "The Machine Wrote It Rule",
+        "body": "Paths, branch names, commands, ids and amounts are mono; prose is never mono.",
+        "section": "typography"
+      },
+      {
+        "name": "The Flat-At-Rest Rule",
+        "body": "Nothing at rest casts a shadow; a shadow means this floats above.",
+        "section": "elevation"
+      }
     ],
     "dos": [
       "Do take every color from a token, with a light and a dark value.",

@@ -274,32 +274,35 @@ export function DayChart(props: { days: readonly UsageRow[]; today: string | und
       <p class="text-xs text-muted" data-part="day-zone">
         Days are the server's local days.
       </p>
-      <table class="sr-only" data-part="day-table">
-        <caption>Cost by day</caption>
-        <thead>
-          <tr>
-            <th scope="col">Day</th>
-            <th scope="col">Cost</th>
-            <th scope="col">Tokens in</th>
-            <th scope="col">Tokens out</th>
-          </tr>
-        </thead>
-        <tbody>
-          <For each={props.days} keyed={(day) => day.key}>
-            {(day) => (
-              <tr>
-                <th scope="row">
-                  {dayLabel(day().key, "long")}
-                  {props.today !== undefined && day().key === props.today ? " (today)" : ""}
-                </th>
-                <td>{formatCost(day().totals.cost_usd)}</td>
-                <td>{day().totals.tokens_in}</td>
-                <td>{day().totals.tokens_out}</td>
-              </tr>
-            )}
-          </For>
-        </tbody>
-      </table>
+      {/* Clipped by a wrapper: a table keeps the size of its cells whatever width it is given. */}
+      <div class="sr-only">
+        <table data-part="day-table">
+          <caption>Cost by day</caption>
+          <thead>
+            <tr>
+              <th scope="col">Day</th>
+              <th scope="col">Cost</th>
+              <th scope="col">Tokens in</th>
+              <th scope="col">Tokens out</th>
+            </tr>
+          </thead>
+          <tbody>
+            <For each={props.days} keyed={(day) => day.key}>
+              {(day) => (
+                <tr>
+                  <th scope="row">
+                    {dayLabel(day().key, "long")}
+                    {props.today !== undefined && day().key === props.today ? " (today)" : ""}
+                  </th>
+                  <td>{formatCost(day().totals.cost_usd)}</td>
+                  <td>{day().totals.tokens_in}</td>
+                  <td>{day().totals.tokens_out}</td>
+                </tr>
+              )}
+            </For>
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }

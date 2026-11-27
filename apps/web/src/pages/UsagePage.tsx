@@ -171,7 +171,7 @@ export default function UsagePage() {
           <a href="/" aria-label="Back to sessions" class="btn border-transparent px-0 lg:hidden">
             <span aria-hidden="true">←</span>
           </a>
-          <h1 class="flex-1 text-lg font-semibold">Usage</h1>
+          <h1 class="flex-1 text-xl font-semibold">Usage</h1>
           <div role="group" aria-label="Range" class="flex gap-1">
             <For each={USAGE_RANGES}>
               {(days) => (

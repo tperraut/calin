@@ -37,7 +37,7 @@ colors:
 typography:
   title:
     fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Helvetica Neue, sans-serif"
-    fontSize: "1.125rem"
+    fontSize: "1.25rem"
     fontWeight: 600
     lineHeight: 1.45
   body:
@@ -122,7 +122,7 @@ System, Light or Dark in Settings, and the choice is applied before the first pa
 - Hairline borders and tonal steps (bg, surface, sunken) instead of shadows.
 - System sans for prose and UI, system mono for anything the machine wrote.
 - 44 px touch targets everywhere, 16 px form text so iOS does not zoom.
-- Dense type: 15 px body, 14 px secondary, 12 px labels; one 18 px page title.
+- Dense type: 15 px body, 14 px secondary, 12 px labels; one 20 px page title.
 
 ## Colors
 
@@ -200,7 +200,9 @@ mono marks everything that came from a machine (paths, branches, commands, costs
 
 ### Hierarchy
 
-- **Title** (600, 18 px): one per page: the page or session title.
+- **Title** (600, 20 px): one per page: Settings, Usage, Automations, an automation, the
+  error and not-found screens. A session's title in its header stays at body size (600, 15 px):
+  the header is dense and the transcript is the page.
 - **Section** (500–600, 14 px): headings inside a page and panel, labels of fields.
 - **Body** (400, 15 px, line height 1.45): transcript prose, list rows.
 - **Secondary** (400, 14 px): descriptions, table cells, panel text.

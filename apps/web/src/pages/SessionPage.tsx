@@ -64,7 +64,7 @@ function lastCompletedText(transcript: readonly TranscriptEntry[]): string {
 function Notice(props: { title: string; detail: string; onRetry?: () => void }) {
   return (
     <div class="flex flex-1 flex-col items-center justify-center gap-3 p-6 text-center">
-      <h1 class="text-lg font-semibold">{props.title}</h1>
+      <h1 class="text-xl font-semibold">{props.title}</h1>
       <p class="max-w-sm text-sm text-muted">{props.detail}</p>
       <div class="flex gap-2">
         <Show when={props.onRetry}>
@@ -328,6 +328,7 @@ export function SessionScreen(props: {
               hidden={transcriptHidden()}
               class="flex min-h-0 flex-1 flex-col"
             >
+              <h2 class="sr-only">Transcript</h2>
               <Transcript
                 entries={store.view().transcript}
                 synced={store.synced()}

@@ -885,7 +885,7 @@ export default function AutomationPage() {
           >
             <span aria-hidden="true">←</span>
           </a>
-          <h1 class="min-w-0 flex-1 truncate text-lg font-semibold">{title()}</h1>
+          <h1 class="min-w-0 flex-1 truncate text-xl font-semibold">{title()}</h1>
         </header>
         <Switch>
           <Match when={failure()}>

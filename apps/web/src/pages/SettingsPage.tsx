@@ -555,7 +555,7 @@ export default function SettingsPage() {
           <a href="/" aria-label="Back to sessions" class="btn border-transparent px-0 lg:hidden">
             <span aria-hidden="true">←</span>
           </a>
-          <h1 class="text-lg font-semibold">Settings</h1>
+          <h1 class="text-xl font-semibold">Settings</h1>
         </header>
         <AppearanceSettings />
         <Switch>

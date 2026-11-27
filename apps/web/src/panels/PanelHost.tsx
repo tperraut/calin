@@ -22,6 +22,8 @@ function KeptPanel(props: {
   return (
     // Hidden, not unmounted: an editor keeps its unsaved text and a terminal its shell.
     <div hidden={!props.active} class="flex min-h-0 min-w-0 flex-1 flex-col">
+      {/* The page's outline: the session is the h1, each panel an h2 under it. */}
+      <h2 class="sr-only">{props.definition.label}</h2>
       {/* One boundary per panel: its code is fetched when it is first shown, and a failed
           fetch (a deploy in between, a dropped connection) takes down that panel only. */}
       <Errored

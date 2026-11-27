@@ -26,7 +26,7 @@ function Unreachable() {
       role="alert"
       class="flex flex-1 flex-col items-center justify-center gap-3 p-6 text-center"
     >
-      <h1 class="text-lg font-semibold">Cannot reach the server</h1>
+      <h1 class="text-xl font-semibold">Cannot reach the server</h1>
       {/* The shell can open from the service worker's cache with no network at all. */}
       <Show
         when={app.online()}
@@ -244,7 +244,7 @@ function Shell(props: ParentProps) {
 function Crash(props: { error: unknown }) {
   return (
     <div role="alert" class="flex h-dvh flex-col items-center justify-center gap-3 p-6 text-center">
-      <h1 class="text-lg font-semibold">Something went wrong</h1>
+      <h1 class="text-xl font-semibold">Something went wrong</h1>
       <p class="max-w-sm font-mono text-sm text-muted">{errorMessage(props.error)}</p>
       <button type="button" class="btn" onClick={() => location.reload()}>
         Reload

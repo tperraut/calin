@@ -220,7 +220,7 @@ export default function AutomationsPage() {
           <a href="/" aria-label="Back to sessions" class="btn border-transparent px-0 lg:hidden">
             <span aria-hidden="true">←</span>
           </a>
-          <h1 class="flex-1 text-lg font-semibold">Automations</h1>
+          <h1 class="flex-1 text-xl font-semibold">Automations</h1>
           <Show when={(list()?.length ?? 0) > 0}>
             <a href="/automations/new" class="btn btn-primary">
               New automation
