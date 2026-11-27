@@ -70,15 +70,59 @@ impl File {
 /// Blocking. Scaffolds the home repo `options.dir`.
 pub fn init(options: &Options) -> Result<Report> {
     let dir = absolute(&options.dir)?;
-    let exists = match fs::metadata(&dir) {
-        Ok(meta) if !meta.is_dir() => bail!("{} is a file, not a directory.", dir.display()),
-        Ok(_) => true,
-        Err(err) if err.kind() == ErrorKind::NotFound => false,
-        Err(err) => return Err(io_sentence(&err, "read", &dir)),
+    let before = Before::look(&dir)?;
+    let scan_roots = scan_roots(&options.scan)?;
+    let (root, initialized) = prepare(&dir, before, !scan_roots.is_empty(), &options.git)?;
+    let mut report = Report {
+        root,
+        initialized,
+        scan_roots,
+        ..Report::default()
     };
+    let repos_text = repos_text(&mut report, before.has_repos_file)?;
+    write_scaffold(&repos_text, &mut report)?;
+    Ok(report)
+}
 
+/// What is at the home repo's path before anything is written.
+#[derive(Clone, Copy)]
+struct Before {
+    exists: bool,
+    is_repo: bool,
+    has_repos_file: bool,
+}
+
+impl Before {
+    fn look(dir: &Path) -> Result<Self> {
+        let exists = folder_exists(dir)?;
+        let has = |path: &str| exists && fs::symlink_metadata(dir.join(path)).is_ok();
+        Ok(Self {
+            exists,
+            is_repo: has(".git"),
+            has_repos_file: has(REPOS_FILE),
+        })
+    }
+
+    /// git runs to make the repo, or to read the clones a scan finds.
+    fn needs_git(self, scan: bool) -> bool {
+        !self.is_repo || (scan && !self.has_repos_file)
+    }
+}
+
+/// False when nothing is at `dir`; an error when a file is.
+fn folder_exists(dir: &Path) -> Result<bool> {
+    match fs::metadata(dir) {
+        Ok(meta) if !meta.is_dir() => bail!("{} is a file, not a directory.", dir.display()),
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(io_sentence(&err, "read", dir)),
+    }
+}
+
+/// The scan directories, canonical and each once.
+fn scan_roots(scan: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let mut scan_roots = Vec::new();
-    for path in &options.scan {
+    for path in scan {
         let path = absolute(path)?;
         let real = fs::canonicalize(&path)
             .ok()
@@ -93,42 +137,46 @@ pub fn init(options: &Options) -> Result<Report> {
             scan_roots.push(real);
         }
     }
+    Ok(scan_roots)
+}
 
+/// Makes `dir` a git repo if it is not one. Returns it canonical, and
+/// whether `git init` ran.
+fn prepare(dir: &Path, before: Before, scan: bool, git: &OsString) -> Result<(PathBuf, bool)> {
     // Everything that can be refused is checked before anything is written.
-    let is_repo = exists && fs::symlink_metadata(dir.join(".git")).is_ok();
-    let repos_file_exists = exists && fs::symlink_metadata(dir.join(REPOS_FILE)).is_ok();
-    let scanning = !scan_roots.is_empty() && !repos_file_exists;
-    if !is_repo || scanning {
-        check_git(&options.git)?;
+    if before.needs_git(scan) {
+        check_git(git)?;
     }
-    if !exists {
-        fs::create_dir_all(&dir).map_err(|err| io_sentence(&err, "create", &dir))?;
+    if !before.exists {
+        fs::create_dir_all(dir).map_err(|err| io_sentence(&err, "create", dir))?;
     }
-    let root = fs::canonicalize(&dir).map_err(|err| io_sentence(&err, "read", &dir))?;
-    let mut report = Report {
-        root: root.clone(),
-        scan_roots,
-        ..Report::default()
-    };
-    if !is_repo {
-        git_init(&options.git, &root)?;
-        report.initialized = true;
+    let root = fs::canonicalize(dir).map_err(|err| io_sentence(&err, "read", dir))?;
+    if !before.is_repo {
+        git_init(git, &root)?;
     }
+    Ok((root, !before.is_repo))
+}
 
-    let repos_text = if repos_file_exists {
+/// The text of a new `repos.yaml`, from the scan. An existing one is kept,
+/// so the scan is not used.
+fn repos_text(report: &mut Report, has_repos_file: bool) -> Result<String> {
+    if has_repos_file {
         if !report.scan_roots.is_empty() {
             report.notes.push(format!(
                 "{REPOS_FILE} already exists, so the scan was not used; nothing in it changed."
             ));
         }
-        String::new()
-    } else {
-        report.repos = repos_yaml::scan(&report.scan_roots, &root, &mut report.notes)?;
-        repos_yaml::render(&report.repos, &report.scan_roots)
-    };
+        return Ok(String::new());
+    }
+    report.repos = repos_yaml::scan(&report.scan_roots, &report.root, &mut report.notes)?;
+    Ok(repos_yaml::render(&report.repos, &report.scan_roots))
+}
 
+/// Writes every file and folder of the scaffold that is not there yet.
+fn write_scaffold(repos_text: &str, report: &mut Report) -> Result<()> {
+    let root = report.root.clone();
     let mut files = vec![
-        File::new(REPOS_FILE, &repos_text),
+        File::new(REPOS_FILE, repos_text),
         File::new(
             ".calin/workflows/implement-and-check.yaml",
             IMPLEMENT_AND_CHECK,
@@ -147,22 +195,24 @@ pub fn init(options: &Options) -> Result<Report> {
         None => files.push(File::new("README.md", README)),
     }
     for file in &files {
-        write_new(&root, file, &mut report)?;
+        write_new(&root, file, report)?;
     }
     for folder in ["skills", "agents", "commands"] {
-        let path = root.join(folder);
-        if fs::symlink_metadata(&path).is_ok() {
-            report.kept.push(format!("{folder}/"));
-            continue;
-        }
-        fs::create_dir(&path).map_err(|err| io_sentence(&err, "create", &path))?;
-        write_new(
-            &root,
-            &File::new(&format!("{folder}/.gitkeep"), ""),
-            &mut report,
-        )?;
+        write_folder(&root, folder, report)?;
     }
-    Ok(report)
+    Ok(())
+}
+
+/// An empty folder, with a `.gitkeep` so git keeps it, unless something is
+/// already at its path.
+fn write_folder(root: &Path, folder: &str, report: &mut Report) -> Result<()> {
+    let path = root.join(folder);
+    if fs::symlink_metadata(&path).is_ok() {
+        report.kept.push(format!("{folder}/"));
+        return Ok(());
+    }
+    fs::create_dir(&path).map_err(|err| io_sentence(&err, "create", &path))?;
+    write_new(root, &File::new(&format!("{folder}/.gitkeep"), ""), report)
 }
 
 /// Writes the file unless something is already at its path, which is then
