@@ -47,6 +47,23 @@ describe("limits", () => {
     expect(refusingWindow(list, undefined)).toBeUndefined();
   });
 
+  it("takes a report as new as the one held: it is no older", () => {
+    const held = makeLimits("mock", [makeWindow("five_hour", { used: 0.1 })], 100);
+    const same = makeLimits("mock", [makeWindow("five_hour", { used: 0.4 })], 100);
+    expect(mergeLimits([held], same)).toEqual([same]);
+  });
+
+  it("keeps the first window found when two are as full, or reset as late", () => {
+    const list: RunnerLimits[] = [
+      makeLimits("claude", [
+        makeWindow("five_hour", { used: 0.5, refused: true, resets_at: 9000 }),
+        makeWindow("seven_day", { used: 0.5, refused: true, resets_at: 9000 }),
+      ]),
+    ];
+    expect(closestToFull(list)?.name).toBe("five_hour");
+    expect(refusingWindow(list, "claude")?.name).toBe("five_hour");
+  });
+
   it("takes a refusing window with no reset time as the one resetting last", () => {
     const list: RunnerLimits[] = [
       makeLimits("claude", [
