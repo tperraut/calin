@@ -833,6 +833,110 @@ fn graph_rules() {
 }
 
 #[test]
+fn blank_fields_are_reported() {
+    for (node, id, fragments) in [
+        (
+            "{ id: a, type: agent, prompt: p, fresh: true, runner: \" \" }",
+            "a",
+            ["node `a`", "`runner` must not be empty"],
+        ),
+        (
+            "{ id: c, type: check, command: make, repo: \" \" }",
+            "c",
+            ["node `c`", "`repo` must not be empty"],
+        ),
+        (
+            "{ id: q, type: ask, question: q, options: [a, \" \"] }",
+            "q",
+            ["node `q`", "`options` has an empty option"],
+        ),
+        (
+            "{ id: p, type: parallel, branches: [{ id: a, prompt: \" \" }, { id: b, prompt: y }] }",
+            "p",
+            ["node `p`: branch `a`", "`prompt` must not be empty"],
+        ),
+    ] {
+        let yaml = with_node(node, id);
+        let p = problems(&yaml);
+        assert_eq!(p.len(), 1, "{p}");
+        assert_mentions(&p, &fragments, &yaml);
+    }
+}
+
+#[test]
+fn a_branch_whose_id_was_reported_is_not_checked_again() {
+    let yaml = with_node(
+        "{ id: p, type: parallel, branches: [{ id: 5, prompt: \" \" }, { id: b, prompt: y }] }",
+        "p",
+    );
+    let p = problems(&yaml);
+    assert_eq!(p.len(), 1, "{p}");
+    assert_mentions(&p, &["branch #1", "`id` must be a string"], &yaml);
+}
+
+/// Ranges the YAML reader checks itself are checked again on the JSON path.
+#[test]
+fn json_form_ranges() {
+    for (node, key, value, fragment) in [
+        (
+            "{ id: c, type: check }",
+            "timeout_seconds",
+            0,
+            "node `c`: `timeout_seconds` must be from 1 to 86400, found 0",
+        ),
+        (
+            "{ id: c, type: loop, max: 2 }",
+            "max",
+            21,
+            "node `c`: `max` must be from 1 to 20, found 21",
+        ),
+    ] {
+        let w = ok(&with_node(node, "c"));
+        let mut json: serde_json::Value = serde_json::to_value(&w).unwrap();
+        json["nodes"][3][key] = value.into();
+        let err = serde_json::from_value::<Workflow>(json).unwrap_err();
+        assert!(err.to_string().contains(fragment), "{err}");
+    }
+}
+
+#[test]
+fn edges_that_fail_still_count_for_reachability() {
+    let more = format!("{BASE_NODES}  - {{ id: more, type: commit, message: m }}\n");
+    // A second edge from one port.
+    let p = problems(&doc(
+        &more,
+        &format!("{BASE_EDGES}  - {{ from: work.done, to: more }}\n"),
+    ));
+    assert_eq!(p.len(), 1, "{p}");
+    assert_mentions(&p, &["port `work.done` already has an outgoing edge"], "");
+    // An edge without a port from a node with two.
+    let p = problems(&doc(
+        &more,
+        &format!("{BASE_EDGES}  - {{ from: work, to: more }}\n"),
+    ));
+    assert_eq!(p.len(), 1, "{p}");
+    assert_mentions(&p, &["more than one port"], "");
+}
+
+#[test]
+fn a_node_of_unknown_type_raises_nothing_else() {
+    // An edge without a port from it, and a template naming its output.
+    let p = problems(&doc(
+        "  - { id: start, type: start }
+  - { id: x, type: bogus }
+  - { id: a, type: agent, prompt: \"{{nodes.x.anything}}\" }
+  - { id: e, type: end }
+",
+        "  - { from: start, to: x }
+  - { from: x, to: a }
+  - { from: a.done, to: e }
+",
+    ));
+    assert_eq!(p.len(), 1, "{p}");
+    assert_mentions(&p, &["unknown type `bogus`"], "");
+}
+
+#[test]
 fn bad_port_does_not_cascade() {
     let p = problems(&doc(
         &format!("{BASE_NODES}  - {{ id: more, type: commit, message: m }}\n"),
