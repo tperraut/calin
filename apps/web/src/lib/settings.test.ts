@@ -30,6 +30,37 @@ describe("blameSettingsField", () => {
     expect(blameSettingsField(message, sent)).toEqual(blame);
   });
 
+  it("blames the longest path quoted, wherever it was sent", () => {
+    const roots = (scan_roots: string[]): Settings => ({ ...sent, scan_roots });
+    const message = "scan root /srv/git/web is inside /srv/git";
+    for (const order of [
+      ["/srv/git", "/srv/git/web"],
+      ["/srv/git/web", "/srv/git"],
+    ]) {
+      expect(blameSettingsField(message, roots(order))).toEqual({
+        field: "scan_roots",
+        scanRoot: "/srv/git/web",
+      });
+    }
+    const nested = (home_repo: string, scan_roots: string[]): Settings => ({
+      ...sent,
+      home_repo,
+      scan_roots,
+    });
+    expect(
+      blameSettingsField("/code/web: permission denied", nested("/code", ["/code/web"])),
+    ).toEqual({ field: "scan_roots", scanRoot: "/code/web" });
+    expect(
+      blameSettingsField("/code/home: permission denied", nested("/code/home", ["/code"])),
+    ).toEqual({ field: "home_repo" });
+  });
+
+  it("blames the one scan root sent for a folder that is not one", () => {
+    expect(
+      blameSettingsField("not an existing directory", { ...sent, scan_roots: ["/x"] }),
+    ).toEqual({ field: "scan_roots" });
+  });
+
   it("blames nothing when the message points nowhere", () => {
     expect(blameSettingsField("invalid settings", sent)).toBeUndefined();
     expect(blameSettingsField("", sent)).toBeUndefined();
