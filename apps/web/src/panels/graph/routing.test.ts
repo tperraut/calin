@@ -463,6 +463,100 @@ describe("routeOverlay", () => {
     );
     expect(result.routes.size).toBe(0);
   });
+
+  it("loops an edge from a card back to itself on the card's right side", () => {
+    for (const mode of modes) {
+      const routed = route(fan(2, [makeEdge("message", "agent:w0", "agent:w0")]), mode);
+      const w0 = routed.boxes.get("agent:w0") as RouteBox;
+      const right = w0.x + w0.w;
+      const middle = w0.y + w0.h / 2;
+      expect(pathOf(routed, "message:agent:w0:agent:w0")).toEqual([
+        { x: right, y: middle - 6 },
+        { x: right + 14, y: middle - 6 },
+        { x: right + 14, y: middle + 6 },
+        { x: right, y: middle + 6 },
+      ]);
+      expect(routed.routing.routes.get("message:agent:w0:agent:w0")?.label).toEqual({
+        fraction: 0.5,
+      });
+    }
+  });
+
+  it("draws an edge between two repos straight, from centre to centre", () => {
+    for (const mode of modes) {
+      const routed = route(fan(1, [makeEdge("changed", "repo:api", "repo:web")]), mode);
+      const centre = (id: string): Point => {
+        const box = routed.boxes.get(id) as RouteBox;
+        return { x: box.x + box.w / 2, y: box.y + box.h / 2 };
+      };
+      expect(pathOf(routed, "changed:repo:api:repo:web")).toEqual([
+        centre("repo:api"),
+        centre("repo:web"),
+      ]);
+      expect(routed.routing.routes.get("changed:repo:api:repo:web")?.channel).toBe("");
+    }
+  });
+
+  it("runs an edge out of a repo back along the repo's trunk, its count near the agent", () => {
+    for (const mode of modes) {
+      const routed = route(
+        fan(2, [
+          makeEdge("changed", "agent:w1", "repo:web"),
+          makeEdge("changed", "repo:web", "agent:w0"),
+        ]),
+        mode,
+      );
+      const into = routed.routing.routes.get("changed:agent:w1:repo:web");
+      const out = routed.routing.routes.get("changed:repo:web:agent:w0");
+      expect(`${out?.channel}#${out?.lane}`).toBe(`${into?.channel}#${into?.lane}`);
+      // It leaves where the other comes in, and ends on the agent's right side.
+      expect(pathOf(routed, "changed:repo:web:agent:w0")[0]).toEqual(
+        pathOf(routed, "changed:agent:w1:repo:web").at(-1),
+      );
+      const w0 = routed.boxes.get("agent:w0") as RouteBox;
+      expect(pathOf(routed, "changed:repo:web:agent:w0").at(-1)?.x).toBe(w0.x + w0.w);
+      expect(out?.label).toEqual({ distance: -22 });
+      expect(into?.label).toEqual({ distance: 22 });
+    }
+  });
+
+  it("draws straight an edge from an agent that lies right of its repo's column", () => {
+    const boxes = new Map<string, RouteBox>([
+      ["repo:web", { x: 0, y: 0, w: 132, h: 44, kind: "repo" }],
+      ["agent:a1", { x: 440, y: 0, w: 176, h: 52, kind: "agent" }],
+    ]);
+    const edge: OverlayEdge = { id: "e", from: "agent:a1", to: "repo:web", kind: "changed" };
+    const found = routeOverlay("columns", boxes, [edge]).routes.get("e");
+    expect(found?.channel).toBe("");
+    expect(resolvePoints(found?.points ?? [], (id) => boxes.get(id))).toEqual([
+      { x: 528, y: 26 },
+      { x: 66, y: 22 },
+    ]);
+  });
+
+  it("brings a change into a repo with nothing above it from two rows above", () => {
+    const boxes = new Map<string, RouteBox>([
+      ["repo:web", { x: 0, y: 0, w: 132, h: 44, kind: "repo" }],
+      ["agent:a1", { x: 0, y: 100, w: 176, h: 52, kind: "agent" }],
+    ]);
+    const edge: OverlayEdge = { id: "e", from: "agent:a1", to: "repo:web", kind: "changed" };
+    const found = routeOverlay("indented", boxes, [edge]).routes.get("e");
+    const points = resolvePoints(found?.points ?? [], (id) => boxes.get(id));
+    // Halfway up the two empty rows over the repo, then down into its top.
+    expect(points.slice(2)).toEqual([
+      { x: 190, y: -64 },
+      { x: 66, y: -64 },
+      { x: 66, y: 10 },
+    ]);
+  });
+});
+
+describe("resolvePoints", () => {
+  it("keeps a corner where it is when its node is not drawn", () => {
+    expect(resolvePoints([{ x: 5, y: 7, xn: "gone", yn: "gone" }], () => undefined)).toEqual([
+      { x: 5, y: 7 },
+    ]);
+  });
 });
 
 describe("edgeEmphasis", () => {
