@@ -312,6 +312,25 @@ describe("socket client", () => {
     ]);
   });
 
+  it("asks for what follows the very first event once it has it", () => {
+    const client = connect();
+    client.subscribe(
+      "session:s1",
+      () => {},
+      () => 1,
+    );
+    latest().accept();
+    expect(latest().take()).toEqual([{ op: "subscribe", topic: "session:s1", after_seq: 1 }]);
+  });
+
+  it("takes a server error frame in its stride when nobody listens for one", () => {
+    const client = connect();
+    client.subscribe("sessions", () => {});
+    latest().accept();
+    expect(() => latest().push({ op: "error", message: "unknown topic" })).not.toThrow();
+    expect(client.state()).toBe("open");
+  });
+
   it("asks for the oldest position when subscribers of a topic differ", () => {
     const client = connect();
     client.subscribe(
