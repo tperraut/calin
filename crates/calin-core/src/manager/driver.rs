@@ -1102,22 +1102,16 @@ impl Driver {
     /// The setup command shows in the transcript as a tool call nobody but
     /// the orchestrator made.
     async fn setup_started(&mut self, item: Item) -> Result<()> {
-        let started = EventBody::ItemStarted { item };
-        self.append(EventDraft::new(started).parent(self.cause.clone()))
-            .await?;
+        self.record(EventBody::ItemStarted { item }).await?;
         Ok(())
     }
 
     /// A setup that failed is said, and the session goes on: the agent can
     /// often work without it, or run it again itself.
     async fn setup_ended(&mut self, item: Item, failure: Option<String>) -> Result<()> {
-        let completed = EventBody::ItemCompleted { item };
-        self.append(EventDraft::new(completed).parent(self.cause.clone()))
-            .await?;
+        self.record(EventBody::ItemCompleted { item }).await?;
         if let Some(message) = failure {
-            let error = EventBody::Error { message };
-            self.append(EventDraft::new(error).parent(self.cause.clone()))
-                .await?;
+            self.record(EventBody::Error { message }).await?;
         }
         Ok(())
     }
@@ -1432,9 +1426,7 @@ impl Driver {
             tokens_in: 0,
             tokens_out: 0,
         };
-        let spawned = EventBody::AgentSpawned { agent };
-        self.append(EventDraft::new(spawned).parent(self.cause.clone()))
-            .await?;
+        self.record(EventBody::AgentSpawned { agent }).await?;
         self.lead = Some(Lead {
             id: agent_id,
             status: AgentStatus::Running,
@@ -2094,10 +2086,16 @@ impl Driver {
     }
 
     async fn set_status(&mut self, status: SessionStatus, reason: Option<String>) -> Result<()> {
-        let body = EventBody::SessionStatus { status, reason };
-        self.append(EventDraft::new(body).parent(self.cause.clone()))
+        self.record(EventBody::SessionStatus { status, reason })
             .await?;
         Ok(())
+    }
+
+    /// Appends what the orchestrator itself says, caused by the input the
+    /// current turn answers.
+    async fn record(&mut self, body: EventBody) -> Result<Arc<Event>> {
+        self.append(EventDraft::new(body).parent(self.cause.clone()))
+            .await
     }
 
     /// Moves the lead agent to `status`, unless it has none, is already

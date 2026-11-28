@@ -270,8 +270,7 @@ impl Driver {
             graph: workflows::graph(&workflow),
             budget_usd: workflow.budget_usd(),
         };
-        let started = EventDraft::new(started).parent(self.cause.clone());
-        let started_event = self.append(started).await?.id.clone();
+        let started_event = self.record(started).await?.id.clone();
         let budget_usd = workflow.budget_usd();
         let (state, actions) = calin_workflow::start(workflow, context);
         self.run = Some(Run {
