@@ -102,6 +102,265 @@ const HOME_TOP = 60;
 
 const ease = (t: number): number => 1 - (1 - t) * (1 - t) * (1 - t);
 
+export const lerp = (from: number, to: number, t: number): number => from + (to - from) * t;
+
+/** How far a tween that started at `start` is at `time`, from 0 to 1, not eased. */
+export const tweenProgress = (time: number, start: number): number =>
+  Math.min(1, (time - start) / TWEEN_MS);
+
+/** A rectangle by its corners, in drawing coordinates. */
+export type Area = { x0: number; y0: number; x1: number; y1: number };
+
+/** The area kept in the drawing, and the zoom it was worked out at. */
+type Kept = Area & { k: number };
+
+const areaAt = (x: number, y: number, size: Size): Area => ({
+  x0: x,
+  y0: y,
+  x1: x + size.w,
+  y1: y + size.h,
+});
+
+export const contains = (outer: Area, inner: Area): boolean =>
+  inner.x0 >= outer.x0 && inner.y0 >= outer.y0 && inner.x1 <= outer.x1 && inner.y1 <= outer.y1;
+
+export const overlaps = (a: Area, b: Area): boolean =>
+  a.x0 < b.x1 && a.x1 > b.x0 && a.y0 < b.y1 && a.y1 > b.y0;
+
+/** What the viewport shows of the drawing. */
+export const visibleArea = (view: ViewTransform, viewport: Size): Area => ({
+  x0: -view.x / view.k,
+  y0: -view.y / view.k,
+  x1: (viewport.w - view.x) / view.k,
+  y1: (viewport.h - view.y) / view.k,
+});
+
+/** `area` and half of it again on every side: a pan inside it culls nothing again. */
+export function grown(area: Area): Area {
+  const marginX = (area.x1 - area.x0) / 2;
+  const marginY = (area.y1 - area.y0) / 2;
+  return {
+    x0: area.x0 - marginX,
+    y0: area.y0 - marginY,
+    x1: area.x1 + marginX,
+    y1: area.y1 + marginY,
+  };
+}
+
+/** Where it is and where it is going: a node on its way in is drawn all the way. */
+export const nodeShown = (node: SceneNode, kept: Area, pinned: string | undefined): boolean =>
+  node.id === pinned ||
+  overlaps(areaAt(node.x, node.y, node), kept) ||
+  overlaps(areaAt(node.tx, node.ty, node), kept);
+
+/** An edge not drawn yet, or on its way, stays in. */
+export const edgeShown = (edge: Pick<SceneEdge, "current" | "moving">, kept: Area): boolean =>
+  !edge.current || edge.moving || overlaps(reach(edge.current), kept);
+
+/** The corners of a route's bounding box: its ends and, for a curve, its control points. */
+export function reach(route: Route): Area {
+  if (route.kind === "poly") {
+    const box = { x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity };
+    for (const point of route.points) {
+      box.x0 = Math.min(box.x0, point.x);
+      box.y0 = Math.min(box.y0, point.y);
+      box.x1 = Math.max(box.x1, point.x);
+      box.y1 = Math.max(box.y1, point.y);
+    }
+    return box;
+  }
+  const xs =
+    route.kind === "cubic" ? [route.x0, route.c1x, route.c2x, route.x1] : [route.x0, route.x1];
+  const ys =
+    route.kind === "cubic" ? [route.y0, route.c1y, route.c2y, route.y1] : [route.y0, route.y1];
+  return { x0: Math.min(...xs), y0: Math.min(...ys), x1: Math.max(...xs), y1: Math.max(...ys) };
+}
+
+/** Shows or hides an item's element, when that changes or when `force`. */
+function display(
+  item: { shown: boolean },
+  shown: boolean,
+  force: boolean,
+  element: ElementCSSInlineStyle | null | undefined,
+): void {
+  if (shown === item.shown && !force) return;
+  item.shown = shown;
+  if (element) element.style.display = shown ? "" : "none";
+}
+
+function place(element: Element | undefined, at: Point): void {
+  element?.setAttribute("transform", translate(at.x, at.y));
+}
+
+const rightMiddle = (box: Box): Point => ({ x: box.x + box.w, y: box.y + box.h / 2 });
+
+/** Corners on their way from `start` to `target`: those tied to a node are already where it is. */
+function midCorners(
+  start: readonly Point[],
+  target: readonly Point[],
+  points: readonly RoutePoint[],
+  progress: number,
+): Point[] {
+  return target.map((point, index) => {
+    const was = start[index];
+    const source = points[index];
+    return {
+      x: source.xn === undefined ? lerp(was.x, point.x, progress) : point.x,
+      y: source.yn === undefined ? lerp(was.y, point.y, progress) : point.y,
+    };
+  });
+}
+
+type Lookup = (id: string) => Point | undefined;
+
+/** A curve's corners now: those tied to a node follow it; the others move from where they were. */
+export function cornersOf(
+  edge: Pick<SceneEdge, "points" | "start">,
+  from: Box,
+  to: Box,
+  at: Lookup,
+  progress: number,
+): Point[] {
+  if (!edge.points || edge.points.length < 2) return [rightMiddle(from), rightMiddle(to)];
+  const target = resolvePoints(edge.points, at);
+  const start = edge.start;
+  if (!start || progress >= 1 || start.length !== target.length) return target;
+  return midCorners(start, target, edge.points, progress);
+}
+
+export function routeOf(
+  edge: Pick<SceneEdge, "from" | "to" | "route" | "points" | "start">,
+  nodes: ReadonlyMap<string, Box>,
+  mode: LayoutMode,
+  progress: number,
+): Route | undefined {
+  const from = nodes.get(edge.from);
+  const to = nodes.get(edge.to);
+  if (!from || !to) return undefined;
+  return edge.route === "tree"
+    ? treeRoute(mode, from, to)
+    : { kind: "poly", points: cornersOf(edge, from, to, (id) => nodes.get(id), progress) };
+}
+
+/** Where an edge's count sits. */
+export function labelPoint(label: LabelAt | undefined, route: Route): Point {
+  if (route.kind !== "poly" || !label) return routePoint(route, 0.5);
+  if ("distance" in label) return polyPoint(route.points, label.distance);
+  return polyPoint(route.points, label.fraction * polyLength(route.points));
+}
+
+const samePoints = (a: readonly Point[], b: readonly Point[]): boolean =>
+  a.length === b.length &&
+  b.every((point, index) => point.x === a[index].x && point.y === a[index].y);
+
+/**
+ * Where a curve's corners start from when a tween moves it to new lanes: from
+ * where it is drawn now, mid-tween included. None when its lanes stay.
+ */
+export function lanesFrom(
+  points: readonly RoutePoint[] | undefined,
+  drawn: readonly Point[] | undefined,
+  targets: Lookup,
+): readonly Point[] | undefined {
+  if (!drawn || !points) return undefined;
+  return samePoints(drawn, resolvePoints(points, targets)) ? undefined : drawn;
+}
+
+/** Where a pulse is along its edge, `t` of the way; none once it ended or its edge has no route. */
+export const pulsePoint = (route: Route | undefined, t: number): Point | undefined =>
+  t >= 1 || !route ? undefined : routePoint(route, t);
+
+export const clampZoom = (k: number): number => Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, k));
+
+export const viewTransform = (view: ViewTransform): string =>
+  `translate(${view.x},${view.y}) scale(${view.k})`;
+
+/** No size yet: the pane was not measured. */
+const unmeasured = (size: Size): boolean => size.w === 0 || size.h === 0;
+
+/**
+ * The first view: readable first, and from the top-left corner, so a tree that
+ * grows downwards then moves nothing that is already on screen. None before
+ * the pane and the drawing have a size.
+ */
+export function homeView(
+  viewport: Size,
+  content: Size,
+  homeWidth: number,
+): ViewTransform | undefined {
+  if (unmeasured(viewport) || content.w === 0) return undefined;
+  const wide = homeWidth > 0 ? Math.min(content.w, homeWidth) : content.w;
+  const k = Math.min(1, Math.max(HOME_MIN_ZOOM, (viewport.w - 2 * PADDING) / wide));
+  return { x: PADDING, y: HOME_TOP, k };
+}
+
+/** The whole drawing in view; with `legible`, see `Scene.fit`. */
+export function fitTo(content: Size, viewport: Size, legible: boolean): ViewTransform {
+  const next = fitView(content, viewport, PADDING, legible ? LEGIBLE_ZOOM : MIN_ZOOM, 1);
+  if (legible) next.y = Math.max(next.y, HOME_TOP);
+  return next;
+}
+
+/** The view zoomed by `factor` about the point (`px`, `py`) of the viewport, which stays where it is. */
+export function zoomAbout(
+  view: ViewTransform,
+  px: number,
+  py: number,
+  factor: number,
+): ViewTransform {
+  const k = clampZoom(view.k * factor);
+  const ratio = k / view.k;
+  return { x: px - (px - view.x) * ratio, y: py - (py - view.y) * ratio, k };
+}
+
+/** How far to move a span on screen, from `start` to `end`, to bring it inside `length` and its padding. */
+function shiftInto(start: number, end: number, length: number): number {
+  if (start < PADDING) return PADDING - start;
+  if (end > length - PADDING) return length - PADDING - end;
+  return 0;
+}
+
+/** The smallest pan that brings `box` into the viewport. */
+export function revealShift(
+  box: Box,
+  view: ViewTransform,
+  viewport: Size,
+): { dx: number; dy: number } {
+  const left = box.x * view.k + view.x;
+  const top = box.y * view.k + view.y;
+  return {
+    dx: shiftInto(left, left + box.w * view.k, viewport.w),
+    dy: shiftInto(top, top + box.h * view.k, viewport.h),
+  };
+}
+
+/** A node that enters the drawing: it flies out of `origin` when there is one. */
+export function newNode(
+  input: SceneNodeInput,
+  origin: Point | undefined,
+  el: SVGGElement | undefined,
+): SceneNode {
+  const start = origin ?? input;
+  return {
+    ...input,
+    x: start.x,
+    y: start.y,
+    fx: start.x,
+    fy: start.y,
+    tx: input.x,
+    ty: input.y,
+    moving: origin !== undefined,
+    shown: true,
+    el,
+  };
+}
+
+/** Removes every entry whose id is not in `ids`. */
+function keepOnly(map: Map<string, unknown>, ids: readonly string[]): void {
+  const wanted = new Set(ids);
+  for (const id of map.keys()) if (!wanted.has(id)) map.delete(id);
+}
+
 export type Scene = ReturnType<typeof createScene>;
 
 /**
@@ -139,57 +398,12 @@ export function createScene(options: SceneOptions) {
   let untouched = true;
   let pulseSeq = 0;
   let disposed = false;
-  let kept = { x0: 0, y0: 0, x1: 0, y1: 0, k: 0 };
+  let kept: Kept = { x0: 0, y0: 0, x1: 0, y1: 0, k: 0 };
   // The node that holds the keyboard's tab stop is never taken out: it must stay focusable.
   let pinned: string | undefined;
 
-  const box = (node: SceneNode): Box => node;
-
-  const at = (id: string): SceneNode | undefined => nodes.get(id);
-
-  /** A curve's corners now: those tied to a node follow it; the others move from where they were. */
-  function cornersOf(edge: SceneEdge, from: SceneNode, to: SceneNode): Point[] {
-    if (!edge.points || edge.points.length < 2) {
-      return [
-        { x: from.x + from.w, y: from.y + from.h / 2 },
-        { x: to.x + to.w, y: to.y + to.h / 2 },
-      ];
-    }
-    const target = resolvePoints(edge.points, at);
-    const start = edge.start;
-    if (!start || progress >= 1 || start.length !== target.length) return target;
-    return target.map((point, index) => {
-      const was = start[index];
-      const source = edge.points?.[index];
-      return {
-        x: source?.xn === undefined ? was.x + (point.x - was.x) * progress : point.x,
-        y: source?.yn === undefined ? was.y + (point.y - was.y) * progress : point.y,
-      };
-    });
-  }
-
-  function routeOf(edge: SceneEdge): Route | undefined {
-    const from = nodes.get(edge.from);
-    const to = nodes.get(edge.to);
-    if (!from || !to) return undefined;
-    return edge.route === "tree"
-      ? treeRoute(mode, box(from), box(to))
-      : { kind: "poly", points: cornersOf(edge, from, to) };
-  }
-
-  /** Where an edge's count sits. */
-  function labelPoint(edge: SceneEdge, route: Route): Point {
-    if (route.kind !== "poly" || !edge.label) return routePoint(route, 0.5);
-    if ("distance" in edge.label) return polyPoint(route.points, edge.label.distance);
-    return polyPoint(route.points, edge.label.fraction * polyLength(route.points));
-  }
-
-  function writeNode(node: SceneNode): void {
-    node.el?.setAttribute("transform", translate(node.x, node.y));
-  }
-
   function writeEdge(edge: SceneEdge): void {
-    const route = routeOf(edge);
+    const route = routeOf(edge, nodes, mode, progress);
     edge.current = route;
     if (!route || !edge.els) return;
     const d = routePath(route);
@@ -197,29 +411,7 @@ export function createScene(options: SceneOptions) {
     edge.written = d;
     edge.els.path?.setAttribute("d", d);
     edge.els.hit?.setAttribute("d", d);
-    if (edge.els.label) {
-      const middle = labelPoint(edge, route);
-      edge.els.label.setAttribute("transform", translate(middle.x, middle.y));
-    }
-  }
-
-  /** The corners of a route's bounding box: its ends and, for a curve, its control points. */
-  function reach(route: Route): { x0: number; y0: number; x1: number; y1: number } {
-    if (route.kind === "poly") {
-      const box = { x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity };
-      for (const point of route.points) {
-        box.x0 = Math.min(box.x0, point.x);
-        box.y0 = Math.min(box.y0, point.y);
-        box.x1 = Math.max(box.x1, point.x);
-        box.y1 = Math.max(box.y1, point.y);
-      }
-      return box;
-    }
-    const xs =
-      route.kind === "cubic" ? [route.x0, route.c1x, route.c2x, route.x1] : [route.x0, route.x1];
-    const ys =
-      route.kind === "cubic" ? [route.y0, route.c1y, route.c2y, route.y1] : [route.y0, route.y1];
-    return { x0: Math.min(...xs), y0: Math.min(...ys), x1: Math.max(...xs), y1: Math.max(...ys) };
+    if (edge.els.label) place(edge.els.label, labelPoint(edge.label, route));
   }
 
   /**
@@ -229,55 +421,22 @@ export function createScene(options: SceneOptions) {
    * every side, worked out again only when the view leaves it.
    */
   function cull(force: boolean): void {
-    if (viewport.w === 0 || viewport.h === 0) return;
-    const left = -view.x / view.k;
-    const top = -view.y / view.k;
-    const right = (viewport.w - view.x) / view.k;
-    const bottom = (viewport.h - view.y) / view.k;
-    const inside =
-      view.k === kept.k &&
-      left >= kept.x0 &&
-      top >= kept.y0 &&
-      right <= kept.x1 &&
-      bottom <= kept.y1;
-    if (!force && inside) return;
-    const marginX = (right - left) / 2;
-    const marginY = (bottom - top) / 2;
-    kept = {
-      x0: left - marginX,
-      y0: top - marginY,
-      x1: right + marginX,
-      y1: bottom + marginY,
-      k: view.k,
-    };
-    const within = (x0: number, y0: number, x1: number, y1: number): boolean =>
-      x0 < kept.x1 && x1 > kept.x0 && y0 < kept.y1 && y1 > kept.y0;
+    if (unmeasured(viewport)) return;
+    const visible = visibleArea(view, viewport);
+    if (!force && view.k === kept.k && contains(kept, visible)) return;
+    kept = { ...grown(visible), k: view.k };
     for (const node of nodes.values()) {
-      // Where it is and where it is going: a node on its way in is drawn all the way.
-      const shown =
-        node.id === pinned ||
-        within(node.x, node.y, node.x + node.w, node.y + node.h) ||
-        within(node.tx, node.ty, node.tx + node.w, node.ty + node.h);
-      if (shown !== node.shown || force) {
-        node.shown = shown;
-        if (node.el) node.el.style.display = shown ? "" : "none";
-      }
+      display(node, nodeShown(node, kept, pinned), force, node.el);
     }
     for (const edge of edges.values()) {
-      const box = edge.current ? reach(edge.current) : undefined;
-      const shown = box === undefined || edge.moving || within(box.x0, box.y0, box.x1, box.y1);
-      if (shown !== edge.shown || force) {
-        edge.shown = shown;
-        const group = edge.els?.path?.parentElement;
-        if (group) group.style.display = shown ? "" : "none";
-      }
+      display(edge, edgeShown(edge, kept), force, edge.els?.path?.parentElement);
     }
   }
 
   function writeView(): void {
     viewDirty = false;
     cull(false);
-    viewEl?.setAttribute("transform", `translate(${view.x},${view.y}) scale(${view.k})`);
+    viewEl?.setAttribute("transform", viewTransform(view));
     const wanted = view.k < LOD_BELOW;
     if (wanted !== lod || viewEl?.classList.contains("lod") !== wanted) {
       lod = wanted;
@@ -300,16 +459,16 @@ export function createScene(options: SceneOptions) {
     if (disposed) return;
     const time = now();
     if (tweenStart !== undefined) {
-      const t = Math.min(1, (time - tweenStart) / TWEEN_MS);
+      const t = tweenProgress(time, tweenStart);
       const eased = ease(t);
       progress = eased;
       const held = anchor === undefined ? undefined : nodes.get(anchor);
       const heldAt = held ? { x: held.x, y: held.y } : undefined;
       for (const node of nodes.values()) {
         if (!node.moving) continue;
-        node.x = node.fx + (node.tx - node.fx) * eased;
-        node.y = node.fy + (node.ty - node.fy) * eased;
-        writeNode(node);
+        node.x = lerp(node.fx, node.tx, eased);
+        node.y = lerp(node.fy, node.ty, eased);
+        place(node.el, node);
         if (t >= 1) node.moving = false;
       }
       for (const edge of edges.values()) {
@@ -330,27 +489,18 @@ export function createScene(options: SceneOptions) {
         cull(true);
       }
     }
-    if (pulses.size > 0) {
-      let ended = false;
-      for (const pulse of pulses.values()) {
-        const t = (time - pulse.start) / PULSE_MS;
-        const route = edges.get(pulse.edge)?.current;
-        if (t >= 1 || !route) {
-          pulses.delete(pulse.id);
-          ended = true;
-          continue;
-        }
-        const at = routePoint(route, t);
-        pulse.el?.setAttribute("transform", translate(at.x, at.y));
+    let ended = false;
+    for (const pulse of pulses.values()) {
+      const at = pulsePoint(edges.get(pulse.edge)?.current, (time - pulse.start) / PULSE_MS);
+      if (at) place(pulse.el, at);
+      else {
+        pulses.delete(pulse.id);
+        ended = true;
       }
-      if (ended) publishPulses();
     }
+    if (ended) publishPulses();
     if (viewDirty) writeView();
     if (tweenStart !== undefined || pulses.size > 0) schedule();
-  }
-
-  function clampZoom(k: number): number {
-    return Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, k));
   }
 
   function touchView(): void {
@@ -359,13 +509,10 @@ export function createScene(options: SceneOptions) {
   }
 
   function home(): void {
-    if (viewport.w === 0 || viewport.h === 0 || content.w === 0) return;
+    const next = homeView(viewport, content, homeWidth);
+    if (!next) return;
     homed = true;
-    // Readable first, and from the top-left corner: a tree that grows downwards
-    // then moves nothing that is already on screen.
-    const wide = homeWidth > 0 ? Math.min(content.w, homeWidth) : content.w;
-    const k = Math.min(1, Math.max(HOME_MIN_ZOOM, (viewport.w - 2 * PADDING) / wide));
-    Object.assign(view, { x: PADDING, y: HOME_TOP, k });
+    Object.assign(view, next);
     touchView();
   }
 
@@ -383,7 +530,7 @@ export function createScene(options: SceneOptions) {
         return;
       }
       node.el = element;
-      writeNode(node);
+      place(element, node);
       if (!node.shown) element.style.display = "none";
     },
     edgeRef(id: string, part: EdgePart, element: SVGPathElement | SVGGElement): void {
@@ -401,10 +548,7 @@ export function createScene(options: SceneOptions) {
       if (!pulse) return;
       pulse.el = element;
       const route = edges.get(pulse.edge)?.current;
-      if (route) {
-        const at = routePoint(route, 0);
-        element.setAttribute("transform", translate(at.x, at.y));
-      }
+      if (route) place(element, routePoint(route, 0));
     },
     /** Takes a new layout: what moved is tweened to its place, unless `animate` is false. */
     setLayout(layout: SceneLayout, animate: boolean): void {
@@ -412,8 +556,10 @@ export function createScene(options: SceneOptions) {
       mode = layout.mode;
       content = { w: layout.width, h: layout.height };
       homeWidth = layout.homeWidth ?? 0;
-      const wanted = new Set(layout.nodes.map((node) => node.id));
-      for (const id of nodes.keys()) if (!wanted.has(id)) nodes.delete(id);
+      keepOnly(
+        nodes,
+        layout.nodes.map((node) => node.id),
+      );
       let anyMoving = false;
       for (const input of layout.nodes) {
         const existing = nodes.get(input.id);
@@ -429,58 +575,38 @@ export function createScene(options: SceneOptions) {
             existing.x = input.x;
             existing.y = input.y;
             existing.moving = false;
-            writeNode(existing);
+            place(existing.el, existing);
           }
           anyMoving ||= existing.moving;
           continue;
         }
         // A newcomer flies out of the node that started it.
         const origin = tween && input.origin !== undefined ? nodes.get(input.origin) : undefined;
-        const start = origin ? { x: origin.x, y: origin.y } : { x: input.x, y: input.y };
-        const node: SceneNode = {
-          ...input,
-          x: start.x,
-          y: start.y,
-          fx: start.x,
-          fy: start.y,
-          tx: input.x,
-          ty: input.y,
-          moving: origin !== undefined,
-          shown: true,
-          el: pendingNodeEls.get(input.id),
-        };
+        const node = newNode(input, origin, pendingNodeEls.get(input.id));
         pendingNodeEls.delete(input.id);
         nodes.set(input.id, node);
-        writeNode(node);
+        place(node.el, node);
         anyMoving ||= node.moving;
       }
-      const wantedEdges = new Set(layout.edges.map((edge) => edge.id));
-      for (const id of edges.keys()) if (!wantedEdges.has(id)) edges.delete(id);
+      keepOnly(
+        edges,
+        layout.edges.map((edge) => edge.id),
+      );
+      const targets = (id: string): Point | undefined => {
+        const node = nodes.get(id);
+        return node ? { x: node.tx, y: node.ty } : undefined;
+      };
       for (const input of layout.edges) {
         const existing = edges.get(input.id);
-        // Where a curve is drawn now, mid-tween included: its new lanes start from there.
-        const shown = existing?.current?.kind === "poly" ? existing.current.points : undefined;
+        const drawn = existing?.current?.kind === "poly" ? existing.current.points : undefined;
         const edge: SceneEdge = existing
           ? Object.assign(existing, input)
           : { ...input, moving: false, shown: true, els: pendingEdgeEls.get(input.id) };
         pendingEdgeEls.delete(input.id);
         edges.set(input.id, edge);
         const ends = [nodes.get(edge.from), nodes.get(edge.to)];
-        edge.moving = ends.some((end) => end?.moving === true);
-        edge.start = undefined;
-        if (tween && shown && edge.points) {
-          const target = resolvePoints(edge.points, (id) => {
-            const node = nodes.get(id);
-            return node ? { x: node.tx, y: node.ty } : undefined;
-          });
-          const lanesMoved =
-            shown.length !== target.length ||
-            target.some((point, index) => point.x !== shown[index].x || point.y !== shown[index].y);
-          if (lanesMoved) {
-            edge.start = shown;
-            edge.moving = true;
-          }
-        }
+        edge.start = tween ? lanesFrom(edge.points, drawn, targets) : undefined;
+        edge.moving = edge.start !== undefined || ends.some((end) => end?.moving === true);
         anyMoving ||= edge.moving;
       }
       progress = anyMoving ? 0 : 1;
@@ -490,11 +616,9 @@ export function createScene(options: SceneOptions) {
         tweenStart = now();
         schedule();
       }
-      // Elements of nodes and edges that came and went between two layouts.
-      for (const id of pendingNodeEls.keys()) if (!wanted.has(id)) pendingNodeEls.delete(id);
-      for (const id of pendingEdgeEls.keys()) {
-        if (!wantedEdges.has(id)) pendingEdgeEls.delete(id);
-      }
+      // Every element this layout wanted is taken: the rest belong to nodes and edges that came and went.
+      pendingNodeEls.clear();
+      pendingEdgeEls.clear();
       if (!homed) home();
     },
     setViewport(size: Size): void {
@@ -522,11 +646,7 @@ export function createScene(options: SceneOptions) {
     /** Zooms by `factor` keeping the point (`px`, `py`) of the viewport where it is. */
     zoomAt(px: number, py: number, factor: number): void {
       untouched = false;
-      const k = clampZoom(view.k * factor);
-      const ratio = k / view.k;
-      view.x = px - (px - view.x) * ratio;
-      view.y = py - (py - view.y) * ratio;
-      view.k = k;
+      Object.assign(view, zoomAbout(view, px, py, factor));
       touchView();
     },
     zoomBy(factor: number): void {
@@ -538,28 +658,21 @@ export function createScene(options: SceneOptions) {
      * canvas: a drawing that is then too big starts at its top-left corner.
      */
     fit(legible = false): void {
-      if (viewport.w === 0 || viewport.h === 0) return;
+      if (unmeasured(viewport)) return;
       homed = true;
       untouched = false;
-      const next = fitView(content, viewport, PADDING, legible ? LEGIBLE_ZOOM : MIN_ZOOM, 1);
-      if (legible) next.y = Math.max(next.y, HOME_TOP);
-      Object.assign(view, next);
+      Object.assign(view, fitTo(content, viewport, legible));
       touchView();
     },
     /** Pans just enough to bring a node into the viewport. */
     reveal(id: string): void {
       const node = nodes.get(id);
       if (!node || viewport.w === 0) return;
-      const left = node.tx * view.k + view.x;
-      const top = node.ty * view.k + view.y;
-      const right = left + node.w * view.k;
-      const bottom = top + node.h * view.k;
-      let dx = 0;
-      let dy = 0;
-      if (left < PADDING) dx = PADDING - left;
-      else if (right > viewport.w - PADDING) dx = viewport.w - PADDING - right;
-      if (top < PADDING) dy = PADDING - top;
-      else if (bottom > viewport.h - PADDING) dy = viewport.h - PADDING - bottom;
+      const { dx, dy } = revealShift(
+        { x: node.tx, y: node.ty, w: node.w, h: node.h },
+        view,
+        viewport,
+      );
       if (dx !== 0 || dy !== 0) this.panBy(dx, dy);
       // At once, not at the next frame: the node is about to take the focus.
       cull(false);

@@ -1,5 +1,34 @@
 import { describe, expect, it, vi } from "vite-plus/test";
-import { createScene, LOD_BELOW, PULSE_MS, TWEEN_MS, type SceneLayout } from "./scene";
+import {
+  clampZoom,
+  contains,
+  cornersOf,
+  createScene,
+  edgeShown,
+  fitTo,
+  grown,
+  homeView,
+  labelPoint,
+  lanesFrom,
+  lerp,
+  LOD_BELOW,
+  MAX_ZOOM,
+  MIN_ZOOM,
+  newNode,
+  nodeShown,
+  overlaps,
+  PULSE_MS,
+  pulsePoint,
+  reach,
+  revealShift,
+  routeOf,
+  TWEEN_MS,
+  tweenProgress,
+  visibleArea,
+  viewTransform,
+  zoomAbout,
+  type SceneLayout,
+} from "./scene";
 
 const SVG = "http://www.w3.org/2000/svg";
 const g = (): SVGGElement => document.createElementNS(SVG, "g") as SVGGElement;
@@ -460,5 +489,243 @@ describe("scene", () => {
     live.panBy(1, 1);
     live.dispose();
     expect(cancel).toHaveBeenCalledWith(7);
+  });
+});
+
+describe("scene arithmetic", () => {
+  const card = { x: 0, y: 0, w: 100, h: 40 };
+  const line = {
+    kind: "poly",
+    points: [
+      { x: 0, y: 0 },
+      { x: 100, y: 0 },
+    ],
+  } as const;
+
+  it("tweens from one value to another, clamped to the tween's length", () => {
+    expect(lerp(10, 20, 0.25)).toBe(12.5);
+    expect(tweenProgress(TWEEN_MS / 2 + 100, 100)).toBe(0.5);
+    expect(tweenProgress(TWEEN_MS * 3, 0)).toBe(1);
+  });
+
+  it("tells areas that contain or overlap one another, edges included or not", () => {
+    const area = { x0: 0, y0: 0, x1: 10, y1: 10 };
+    expect(contains(area, area)).toBe(true);
+    expect(contains(area, { ...area, x1: 11 })).toBe(false);
+    expect(contains(area, { ...area, y0: -1 })).toBe(false);
+    expect(overlaps(area, { x0: 9, y0: 9, x1: 20, y1: 20 })).toBe(true);
+    // Touching is not overlapping.
+    expect(overlaps(area, { x0: 10, y0: 0, x1: 20, y1: 10 })).toBe(false);
+    expect(overlaps(area, { x0: 0, y0: 10, x1: 10, y1: 20 })).toBe(false);
+  });
+
+  it("finds what the viewport shows, and grows it by half on every side", () => {
+    expect(visibleArea({ x: -50, y: 20, k: 2 }, { w: 300, h: 200 })).toEqual({
+      x0: 25,
+      y0: -10,
+      x1: 175,
+      y1: 90,
+    });
+    expect(grown({ x0: 0, y0: 0, x1: 100, y1: 40 })).toEqual({ x0: -50, y0: -20, x1: 150, y1: 60 });
+  });
+
+  it("keeps a node in the drawing where it is, where it goes, or when it holds the tab stop", () => {
+    const flying = newNode({ id: "a", ...card }, { x: 500, y: 500 }, undefined);
+    const far = { x0: 1000, y0: 1000, x1: 1100, y1: 1100 };
+    expect(nodeShown(flying, far, undefined)).toBe(false);
+    expect(nodeShown(flying, far, "a")).toBe(true);
+    expect(nodeShown(flying, { x0: 550, y0: 520, x1: 600, y1: 600 }, undefined)).toBe(true);
+    expect(nodeShown(flying, { x0: 50, y0: 20, x1: 60, y1: 30 }, undefined)).toBe(true);
+  });
+
+  it("keeps an edge in the drawing until it is drawn, while it moves, or when it reaches in", () => {
+    const route = { kind: "elbow", x0: 0, y0: 0, x1: 10, y1: 10 } as const;
+    const far = { x0: 1000, y0: 1000, x1: 1100, y1: 1100 };
+    expect(edgeShown({ current: undefined, moving: false }, far)).toBe(true);
+    expect(edgeShown({ current: route, moving: true }, far)).toBe(true);
+    expect(edgeShown({ current: route, moving: false }, far)).toBe(false);
+    expect(edgeShown({ current: route, moving: false }, { x0: 5, y0: 5, x1: 6, y1: 6 })).toBe(true);
+  });
+
+  it("bounds a route by its ends, its corners and its control points", () => {
+    const corners = [
+      { x: 0, y: 5 },
+      { x: 10, y: -5 },
+      { x: 4, y: 20 },
+    ];
+    expect(reach({ kind: "poly", points: corners })).toEqual({ x0: 0, y0: -5, x1: 10, y1: 20 });
+    expect(reach({ kind: "elbow", x0: 5, y0: 0, x1: 0, y1: 10 })).toEqual({
+      x0: 0,
+      y0: 0,
+      x1: 5,
+      y1: 10,
+    });
+    const cubic = {
+      kind: "cubic",
+      x0: 0,
+      y0: 0,
+      c1x: -5,
+      c1y: 3,
+      c2x: 20,
+      c2y: -2,
+      x1: 10,
+      y1: 10,
+    };
+    expect(reach({ ...cubic, kind: "cubic" })).toEqual({ x0: -5, y0: -2, x1: 20, y1: 10 });
+  });
+
+  it("moves a curve's free corners over the tween while the tied ones follow their card", () => {
+    const below = { ...card, y: 64 };
+    const points = [
+      { x: 100, xn: "a", y: 20, yn: "a" },
+      { x: 130, y: 20, yn: "a" },
+      { x: 130, y: 50 },
+    ];
+    const at = (id: string) => (id === "a" ? { x: 0, y: 10 } : undefined);
+    const start = [
+      { x: 100, y: 20 },
+      { x: 110, y: 20 },
+      { x: 110, y: 60 },
+    ];
+    const straight = [
+      { x: 100, y: 20 },
+      { x: 100, y: 84 },
+    ];
+    expect(cornersOf({}, card, below, at, 0.5)).toEqual(straight);
+    expect(cornersOf({ points: points.slice(0, 1) }, card, below, at, 0.5)).toEqual(straight);
+    expect(cornersOf({ points, start }, card, below, at, 0.5)).toEqual([
+      { x: 100, y: 30 },
+      { x: 120, y: 30 },
+      { x: 120, y: 55 },
+    ]);
+    const target = [
+      { x: 100, y: 30 },
+      { x: 130, y: 30 },
+      { x: 130, y: 50 },
+    ];
+    expect(cornersOf({ points, start }, card, below, at, 1)).toEqual(target);
+    expect(cornersOf({ points }, card, below, at, 0.5)).toEqual(target);
+    expect(cornersOf({ points, start: start.slice(0, 1) }, card, below, at, 0.5)).toEqual(target);
+  });
+
+  it("routes an edge between the cards it joins, and none when one is missing", () => {
+    const boxes = new Map([
+      ["a", card],
+      ["b", { ...card, y: 64 }],
+    ]);
+    expect(routeOf({ from: "a", to: "x", route: "tree" }, boxes, "indented", 1)).toBeUndefined();
+    expect(routeOf({ from: "x", to: "b", route: "tree" }, boxes, "indented", 1)).toBeUndefined();
+    expect(routeOf({ from: "a", to: "b", route: "tree" }, boxes, "indented", 1)?.kind).toBe(
+      "elbow",
+    );
+    expect(routeOf({ from: "a", to: "b", route: "curve" }, boxes, "indented", 1)).toEqual({
+      kind: "poly",
+      points: [
+        { x: 100, y: 20 },
+        { x: 100, y: 84 },
+      ],
+    });
+  });
+
+  it("puts a count halfway, at a distance or at a fraction of the line", () => {
+    expect(labelPoint(undefined, line)).toEqual({ x: 50, y: 0 });
+    expect(labelPoint({ distance: 10 }, line)).toEqual({ x: 10, y: 0 });
+    expect(labelPoint({ fraction: 0.25 }, line)).toEqual({ x: 25, y: 0 });
+  });
+
+  it("starts a curve from where it is drawn only when its lanes move", () => {
+    const points = [
+      { x: 100, xn: "a", y: 20, yn: "a" },
+      { x: 130, y: 20 },
+    ];
+    const targets = (id: string) => (id === "a" ? { x: 0, y: 0 } : undefined);
+    const still = [
+      { x: 100, y: 20 },
+      { x: 130, y: 20 },
+    ];
+    const moved = [
+      { x: 100, y: 20 },
+      { x: 110, y: 20 },
+    ];
+    expect(lanesFrom(points, still, targets)).toBeUndefined();
+    expect(lanesFrom(points, moved, targets)).toBe(moved);
+    expect(lanesFrom(points, [{ x: 100, y: 21 }, ...still.slice(1)], targets)).toEqual([
+      { x: 100, y: 21 },
+      { x: 130, y: 20 },
+    ]);
+    expect(lanesFrom(points, still.slice(0, 1), targets)).toEqual(still.slice(0, 1));
+    expect(lanesFrom(points, undefined, targets)).toBeUndefined();
+    expect(lanesFrom(undefined, still, targets)).toBeUndefined();
+  });
+
+  it("places a pulse along its route until it ends", () => {
+    expect(pulsePoint(line, 0.25)).toEqual({ x: 25, y: 0 });
+    expect(pulsePoint(line, 1)).toBeUndefined();
+    expect(pulsePoint(undefined, 0.25)).toBeUndefined();
+  });
+
+  it("clamps the zoom and writes the view as a transform", () => {
+    expect(clampZoom(100)).toBe(MAX_ZOOM);
+    expect(clampZoom(0)).toBe(MIN_ZOOM);
+    expect(clampZoom(1)).toBe(1);
+    expect(viewTransform({ x: 1, y: 2, k: 0.5 })).toBe("translate(1,2) scale(0.5)");
+  });
+
+  it("homes readable across the home width, once the pane and the drawing have a size", () => {
+    const pane = { w: 432, h: 300 };
+    expect(homeView({ w: 0, h: 300 }, { w: 1000, h: 400 }, 0)).toBeUndefined();
+    expect(homeView({ w: 432, h: 0 }, { w: 1000, h: 400 }, 0)).toBeUndefined();
+    expect(homeView(pane, { w: 0, h: 400 }, 0)).toBeUndefined();
+    expect(homeView(pane, { w: 1000, h: 400 }, 500)).toEqual({ x: 16, y: 60, k: 0.8 });
+    expect(homeView(pane, { w: 1000, h: 400 }, 0)).toEqual({ x: 16, y: 60, k: 0.6 });
+    expect(homeView(pane, { w: 100, h: 400 }, 0)).toEqual({ x: 16, y: 60, k: 1 });
+    expect(homeView(pane, { w: 100, h: 400 }, 500)).toEqual({ x: 16, y: 60, k: 1 });
+  });
+
+  it("fits the drawing, legibly under the buttons when asked", () => {
+    const fitted = fitTo({ w: 400, h: 400 }, { w: 200, h: 200 }, false);
+    expect(fitted.k).toBeCloseTo(0.42);
+    expect(fitted.y).toBeCloseTo(16);
+    expect(fitTo({ w: 400, h: 400 }, { w: 200, h: 200 }, true)).toEqual({ x: 16, y: 60, k: 0.5 });
+  });
+
+  it("zooms about a point, within the zoom's bounds", () => {
+    expect(zoomAbout({ x: 0, y: 0, k: 1 }, 100, 50, 2)).toEqual({ x: -100, y: -50, k: 2 });
+    expect(zoomAbout({ x: 0, y: 0, k: 1 }, 100, 50, 10)).toEqual({ x: -150, y: -75, k: MAX_ZOOM });
+  });
+
+  it("pans a box just inside the viewport's padding, on each side", () => {
+    const pane = { w: 300, h: 300 };
+    expect(revealShift(card, { x: 16, y: 16, k: 1 }, pane)).toEqual({ dx: 0, dy: 0 });
+    expect(revealShift(card, { x: -50, y: 0, k: 1 }, pane)).toEqual({ dx: 66, dy: 16 });
+    expect(revealShift(card, { x: 250, y: 280, k: 1 }, pane)).toEqual({ dx: -66, dy: -36 });
+    expect(revealShift(card, { x: 100, y: 100, k: 2 }, pane)).toEqual({ dx: -16, dy: 0 });
+  });
+
+  it("starts a node where its origin is, or at its place when it has none", () => {
+    const element = g();
+    const input = { id: "a", x: 10, y: 20, w: 100, h: 40 };
+    expect(newNode(input, { x: 5, y: 6 }, element)).toEqual({
+      ...input,
+      x: 5,
+      y: 6,
+      fx: 5,
+      fy: 6,
+      tx: 10,
+      ty: 20,
+      moving: true,
+      shown: true,
+      el: element,
+    });
+    expect(newNode(input, undefined, undefined)).toEqual({
+      ...input,
+      fx: 10,
+      fy: 20,
+      tx: 10,
+      ty: 20,
+      moving: false,
+      shown: true,
+      el: undefined,
+    });
   });
 });
