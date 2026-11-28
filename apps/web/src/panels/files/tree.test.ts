@@ -153,6 +153,38 @@ describe("file tree", () => {
     expect(rows()).toContain("  Cargo.toml");
   });
 
+  it("drops a failure that answers after a refresh asked again", async () => {
+    const { tree, rows, list } = setup();
+    const slow = deferred<TreeEntry[]>();
+    list.mockReturnValueOnce(slow.promise);
+    tree.expand(dirKey("api", ""));
+    tree.refresh("api");
+    await settle();
+    slow.reject(new Error("stale failure"));
+    await settle();
+    expect(rows()).toContain("  Cargo.toml");
+    expect(rows().join()).not.toContain("stale failure");
+  });
+
+  it("asks nothing again of a folder already open, closed, or never listed", async () => {
+    const { tree, rows, list } = setup();
+    tree.collapse(dirKey("api", ""));
+    tree.expand(dirKey("api", ""));
+    tree.expand(dirKey("api", ""));
+    await settle();
+    tree.reloadDir("api", "src");
+    tree.reloadDir("web", "");
+    expect(list.mock.calls).toEqual([["api", ""]]);
+    // A folder listed before is listed again, as after a file was created in it.
+    tree.reloadDir("api", "");
+    await settle();
+    expect(list.mock.calls).toEqual([
+      ["api", ""],
+      ["api", ""],
+    ]);
+    expect(rows()).toContain("  Cargo.toml");
+  });
+
   it("follows the repo set", () => {
     const { rows, setKnown } = setup();
     setKnown([makeSessionRepo("web"), makeSessionRepo("docs", { mode: "read" })]);
