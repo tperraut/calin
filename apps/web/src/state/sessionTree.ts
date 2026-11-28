@@ -1,5 +1,6 @@
 import type { Session } from "../gen/Session";
 import type { SessionStatus } from "../gen/SessionStatus";
+import { compareText } from "../lib/format";
 
 /**
  * The sessions of one tree: a root session and every session dispatched from
@@ -24,7 +25,7 @@ export const emptySessionTree: SessionTree = {
 };
 
 const oldestFirst = (a: Session, b: Session): number =>
-  a.created_at - b.created_at || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+  a.created_at - b.created_at || compareText(a.id, b.id);
 
 /** The tree `session` belongs to, among `sessions`. Pure. */
 export function sessionTreeOf(

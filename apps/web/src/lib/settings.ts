@@ -20,36 +20,50 @@ const NAMED: ReadonlyArray<[RegExp, SettingsField]> = [
  * rule that failed is about. `undefined` when nothing points anywhere.
  */
 export function blameSettingsField(message: string, sent: Settings): SettingsBlame | undefined {
+  return namedBlame(message, sent) ?? quotedBlame(message, sent) ?? ruleBlame(message, sent);
+}
+
+/** The field the message names in words, and the longest scan root it quotes for that one. */
+function namedBlame(message: string, sent: Settings): SettingsBlame | undefined {
   const text = message.toLowerCase();
-  const quotedRoot = sent.scan_roots
-    .filter((root) => root !== "" && message.includes(root))
-    .toSorted((a, b) => b.length - a.length)
-    .at(0);
   // The field named first is the subject: "scan root /x is inside the home repo" is about the scan root.
   const named = NAMED.map(([pattern, field]) => ({ field, at: text.search(pattern) }))
     .filter((one) => one.at !== -1)
     .toSorted((a, b) => a.at - b.at)
     .at(0);
-  if (named) {
-    return named.field === "scan_roots"
-      ? { field: named.field, scanRoot: quotedRoot }
-      : { field: named.field };
-  }
+  if (!named) return undefined;
+  if (named.field !== "scan_roots") return { field: named.field };
+  const quotedRoot = sent.scan_roots
+    .filter((root) => root !== "" && message.includes(root))
+    .toSorted((a, b) => b.length - a.length)
+    .at(0);
+  return { field: named.field, scanRoot: quotedRoot };
+}
 
+/** Every path that was sent, with the field it was sent in. */
+function sentPaths(sent: Settings): Array<{ path: string; blame: SettingsBlame }> {
   const paths: Array<{ path: string; blame: SettingsBlame }> = [];
   if (sent.home_repo) paths.push({ path: sent.home_repo, blame: { field: "home_repo" } });
   if (sent.clone_root) paths.push({ path: sent.clone_root, blame: { field: "clone_root" } });
   for (const root of sent.scan_roots) {
     if (root !== "") paths.push({ path: root, blame: { field: "scan_roots", scanRoot: root } });
   }
-  const quoted = paths
+  return paths;
+}
+
+/** The field of the longest sent path the message quotes back. */
+function quotedBlame(message: string, sent: Settings): SettingsBlame | undefined {
+  const [longest, next] = sentPaths(sent)
     .filter((one) => message.includes(one.path))
     .toSorted((a, b) => b.path.length - a.path.length);
-  const [longest, next] = quoted;
   // Two fields holding the same path say nothing about which one is meant.
   if (longest && (!next || next.path.length < longest.path.length)) return longest.blame;
+  return undefined;
+}
 
-  // api.rs: the home repo must be the root of a git work tree, a scan root an existing directory.
+/** api.rs: the home repo must be the root of a git work tree, a scan root an existing directory. */
+function ruleBlame(message: string, sent: Settings): SettingsBlame | undefined {
+  const text = message.toLowerCase();
   if (/work ?tree|git/.test(text)) return { field: "home_repo" };
   if (/director|folder/.test(text) && sent.scan_roots.length > 0) return { field: "scan_roots" };
   return undefined;

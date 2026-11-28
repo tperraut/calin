@@ -29,6 +29,13 @@ describe("sessionTreeOf", () => {
     expect(tree.parent?.id).toBe("s1");
   });
 
+  it("orders sessions made in the same millisecond by id", () => {
+    const twinB = makeSession("s5", 300, { parent_session_id: "s1", root_session_id: "s1" });
+    const twinA = makeSession("s4", 300, { parent_session_id: "s1", root_session_id: "s1" });
+    const tree = sessionTreeOf([twinB, childA, root, twinA], root);
+    expect(tree.sessions.map((one) => one.id)).toEqual(["s1", "s2", "s4", "s5"]);
+  });
+
   it("is empty until the session is known", () => {
     expect(sessionTreeOf([root], undefined).sessions).toEqual([]);
   });

@@ -3,6 +3,7 @@ import {
   blankAsNull,
   clockTime,
   compactCount,
+  compareText,
   filesLabel,
   formatCost,
   formatDuration,
@@ -94,6 +95,10 @@ describe("counts and costs", () => {
     expect(filesLabel(0)).toBe("0 files");
     expect(filesLabel(1)).toBe("1 file");
     expect(filesLabel(2)).toBe("2 files");
+  });
+
+  it("orders text by code point, whatever the locale", () => {
+    expect(["b", "B", "a", "b"].toSorted(compareText)).toEqual(["B", "a", "b", "b"]);
   });
 
   it("reads an optional field trimmed, and a blank one as not set", () => {

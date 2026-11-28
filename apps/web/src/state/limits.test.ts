@@ -47,6 +47,17 @@ describe("limits", () => {
     expect(refusingWindow(list, undefined)).toBeUndefined();
   });
 
+  it("takes a refusing window with no reset time as the one resetting last", () => {
+    const list: RunnerLimits[] = [
+      makeLimits("claude", [
+        makeWindow("five_hour", { refused: true, resets_at: 5000 }),
+        makeWindow("opus", { refused: true, resets_at: null }),
+        makeWindow("seven_day", { refused: true, resets_at: 9000 }),
+      ]),
+    ];
+    expect(refusingWindow(list, "claude")?.name).toBe("opus");
+  });
+
   it("adds no transcript row for a limits event", () => {
     const { view, outcome } = applyEvent(
       emptySessionView,

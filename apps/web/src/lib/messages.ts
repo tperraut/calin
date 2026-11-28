@@ -1,5 +1,6 @@
 import type { Agent } from "../gen/Agent";
 import type { AgentMessage } from "../gen/AgentMessage";
+import type { MessageKind } from "../gen/MessageKind";
 import type { Session } from "../gen/Session";
 
 /** Names a participant of the session tree as the transcript reads it; `agentId` is `null` for the user. */
@@ -25,6 +26,19 @@ export function speakerFor(
   };
 }
 
+const sentWords: Record<MessageKind, string> = {
+  // api.rs, "Child sessions": the brief that starts a child, sent by its parent.
+  dispatch: "Dispatched child session",
+  note: "Note to",
+  report: "Report to",
+};
+
+const receivedWords: Record<MessageKind, string> = {
+  dispatch: "Brief from",
+  note: "Note from",
+  report: "Report from",
+};
+
 /**
  * What a message was, in words, from the side of the session that shows it:
  * `sent` when it left this session, `received` when it arrived here (event.rs).
@@ -34,22 +48,13 @@ export function messageHeading(
   direction: "sent" | "received",
   speaker: Speaker,
 ): string {
-  const from = speaker(message.from_session_id, message.from_agent_id);
-  const to = speaker(message.to_session_id, message.to_agent_id);
-  switch (message.kind) {
-    case "dispatch":
-      // api.rs, "Child sessions": the brief that starts a child, sent by its parent.
-      return direction === "sent" ? `Dispatched child session ${to}` : `Brief from ${from}`;
-    case "note":
-      return direction === "sent" ? `Note to ${to}` : `Note from ${from}`;
-    case "report":
-      return direction === "sent" ? `Report to ${to}` : `Report from ${from}`;
-    default:
-      // A kind from a newer server keeps its wire name.
-      return direction === "sent"
-        ? `${String(message.kind)} to ${to}`
-        : `${String(message.kind)} from ${from}`;
+  // A kind from a newer server is missing from the tables and keeps its wire name.
+  if (direction === "sent") {
+    const to = speaker(message.to_session_id, message.to_agent_id);
+    return `${sentWords[message.kind] ?? `${String(message.kind)} to`} ${to}`;
   }
+  const from = speaker(message.from_session_id, message.from_agent_id);
+  return `${receivedWords[message.kind] ?? `${String(message.kind)} from`} ${from}`;
 }
 
 /** Above this many characters or lines a message body starts folded. */

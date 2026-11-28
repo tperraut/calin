@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vite-plus/test";
+import type { AgentMessage } from "../gen/AgentMessage";
 import { makeSession } from "../test/fakes";
 import { makeAgent, makeMessage, makeSubagent } from "../test/orchestration";
 import { isLongBody, messageHeading, speakerFor } from "./messages";
@@ -63,6 +64,16 @@ describe("messageHeading", () => {
     expect(messageHeading(makeMessage("m", { kind: "dispatch" }), "sent", lonelyParent)).toBe(
       "Dispatched child session a child session",
     );
+  });
+
+  it("keeps the wire name of a kind a newer server may send", () => {
+    const handoff = makeMessage("m", {
+      kind: "handoff" as AgentMessage["kind"],
+      from_session_id: "s2",
+      from_agent_id: "a2",
+    });
+    expect(messageHeading(handoff, "sent", inParent)).toBe("handoff to API: add /health");
+    expect(messageHeading(handoff, "received", inParent)).toBe("handoff from API: add /health");
   });
 });
 

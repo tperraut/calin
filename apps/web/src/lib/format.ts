@@ -37,7 +37,14 @@ export function compactCount(count: number): string {
   return `${trimZero((count / 1_000_000).toFixed(1))}M`;
 }
 
-export const filesLabel = (count: number): string => `${count} ${count === 1 ? "file" : "files"}`;
+/** "1 repo", "3 repos": the count with the word that goes with it. */
+export const counted = (count: number, one: string, many: string): string =>
+  `${count} ${count === 1 ? one : many}`;
+
+export const filesLabel = (count: number): string => counted(count, "file", "files");
+
+/** Code-point order of two strings, for a sort that must not depend on the locale. */
+export const compareText = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
 
 /** Text typed in an optional field, trimmed; `null` when nothing is left, which the server reads as "not set". */
 export const blankAsNull = (typed: string): string | null => typed.trim() || null;
