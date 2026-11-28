@@ -34,6 +34,17 @@ describe("locateInRepos", () => {
     expect(locateInRepos(absolute, repos)).toBeUndefined();
   });
 
+  it("finds every absolute path in a repo at the file system's root", () => {
+    const root = makeSessionRepo("root", { path: "/" });
+    expect(locateInRepos("/etc/hosts", [root])).toEqual({ repo: root, path: "etc/hosts" });
+    expect(locateInRepos("/", [root])).toEqual({ repo: root, path: "" });
+  });
+
+  it("takes the first of two repos at the same path", () => {
+    const twin = makeSessionRepo("twin", { path: "/sessions/s1/api" });
+    expect(locateInRepos("/sessions/s1/api/a.rs", [api, twin])?.repo).toBe(api);
+  });
+
   it("ignores a repo without a path", () => {
     expect(locateInRepos("/x", [makeSessionRepo("ghost", { path: "" })])).toBeUndefined();
   });
