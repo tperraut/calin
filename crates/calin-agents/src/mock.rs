@@ -16,6 +16,7 @@ use calin_proto::{
 use serde_json::json;
 use tokio::sync::mpsc::error::TryRecvError;
 
+use crate::prose::Prose;
 use crate::runner::{
     AgentHandle, AgentIo, Exit, PermissionAsk, Runner, RunnerError, RunnerInput, RunnerOutput,
     StartParams, SubagentStart, ToolAccess,
@@ -661,28 +662,6 @@ impl MockAgent {
     fn next_item_id(&mut self) -> String {
         self.items += 1;
         format!("mock-{}-{}", self.start_seq, self.items)
-    }
-}
-
-#[derive(Clone, Copy)]
-enum Prose {
-    Text,
-    Reasoning,
-}
-
-impl Prose {
-    fn content(self, text: String) -> ItemContent {
-        match self {
-            Self::Text => ItemContent::Text { text },
-            Self::Reasoning => ItemContent::Reasoning { text },
-        }
-    }
-
-    fn delta(self, text: String) -> ItemDelta {
-        match self {
-            Self::Text => ItemDelta::Text { text },
-            Self::Reasoning => ItemDelta::Reasoning { text },
-        }
     }
 }
 

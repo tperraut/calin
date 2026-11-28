@@ -11,7 +11,8 @@ use calin_proto::{
 use serde_json::{Value, json};
 
 use super::tools::{self, Endpoint};
-use super::{Cut, MockAgent, Prose, quote};
+use super::{Cut, MockAgent, quote};
+use crate::prose::Prose;
 use crate::runner::{PermissionAsk, ToolAccess};
 
 /// What Calin hands an agent, as `calin-core`'s briefing writes it.

@@ -9,12 +9,13 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
 use calin_proto::{
-    EventBody, Item, ItemContent, ItemDelta, ItemStatus, LimitWindow, PermissionDecision,
-    PermissionRequest, ToolKind,
+    EventBody, Item, ItemContent, ItemStatus, LimitWindow, PermissionDecision, PermissionRequest,
+    ToolKind,
 };
 use serde_json::{Value, json};
 
 use super::tools;
+use crate::prose::Prose;
 use crate::runner::{DirGrant, PermissionAsk, RunnerOutput, SubagentStart};
 
 /// Told to the agent with a denial that carries no message of its own.
@@ -90,28 +91,6 @@ struct Block {
     text: String,
     /// Reasoning starts with its first text: the CLI usually sends none.
     started: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Prose {
-    Text,
-    Reasoning,
-}
-
-impl Prose {
-    fn content(self, text: String) -> ItemContent {
-        match self {
-            Self::Text => ItemContent::Text { text },
-            Self::Reasoning => ItemContent::Reasoning { text },
-        }
-    }
-
-    fn delta(self, text: String) -> ItemDelta {
-        match self {
-            Self::Text => ItemDelta::Text { text },
-            Self::Reasoning => ItemDelta::Reasoning { text },
-        }
-    }
 }
 
 #[derive(Debug)]

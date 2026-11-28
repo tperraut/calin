@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use calin_proto::PlanStatus;
+use calin_proto::{ItemDelta, PlanStatus};
 
 use super::*;
 use crate::runner::ToolAccess;
