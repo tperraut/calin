@@ -506,109 +506,127 @@ function buildList(bullets: readonly Bullet[], raw: string): ListBlock {
   return root;
 }
 
+const isBlank = (line: string): boolean => line.trim() === "";
+
+/** A line that starts a block of its own, ending the paragraph or list before it. */
+const startsBlock = (line: string): boolean =>
+  fenceAt(line) !== undefined || headingAt(line) !== undefined || isRule(line);
+
+const rawOf = (lines: readonly string[], from: number, to: number): string =>
+  lines.slice(from, to).join("\n");
+
+/** A block read from the lines, and the line after it. */
+type Read = { block: Block; next: number };
+
 /** Reads the blocks of `source`. Incomplete text reads as what it is so far; nothing throws. */
 export function parseMarkdown(source: string): Block[] {
   const lines = source.replace(/\r\n?/g, "\n").split("\n");
   const blocks: Block[] = [];
-  const startsBlock = (line: string): boolean =>
-    fenceAt(line) !== undefined || headingAt(line) !== undefined || isRule(line);
   let index = 0;
   while (index < lines.length) {
-    const line = lines[index];
-    if (line.trim() === "") {
+    if (isBlank(lines[index])) {
       index += 1;
       continue;
     }
-    const from = index;
-    const raw = (): string => lines.slice(from, index).join("\n");
-
-    const fence = fenceAt(line);
-    if (fence) {
-      index += 1;
-      const body: string[] = [];
-      let closed = false;
-      while (index < lines.length) {
-        const next = lines[index];
-        index += 1;
-        if (closesFence(next, fence)) {
-          closed = true;
-          break;
-        }
-        // Code inside an indented fence is indented with it.
-        body.push(next.slice(Math.min(fence.indent, next.length - next.trimStart().length)));
-      }
-      blocks.push({
-        kind: "code",
-        raw: raw(),
-        text: body.join("\n"),
-        lang: fence.info.split(/\s+/)[0] ?? "",
-        closed,
-      });
-      continue;
-    }
-
-    const heading = headingAt(line);
-    if (heading) {
-      index += 1;
-      blocks.push({
-        kind: "heading",
-        raw: raw(),
-        level: heading.level,
-        content: parseInline(heading.text),
-      });
-      continue;
-    }
-
-    if (isRule(line)) {
-      index += 1;
-      blocks.push({ kind: "rule", raw: raw() });
-      continue;
-    }
-
-    const first = bulletAt(line);
-    if (first) {
-      const bullets: Bullet[] = [];
-      while (index < lines.length) {
-        const next = lines[index];
-        if (next.trim() === "") {
-          // A blank line between items is spacing; before anything else it ends the list.
-          let after = index + 1;
-          while (after < lines.length && lines[after].trim() === "") after += 1;
-          if (after >= lines.length || isRule(lines[after]) || !bulletAt(lines[after])) break;
-          index = after;
-          continue;
-        }
-        if (bullets.length > 0 && startsBlock(next)) break;
-        const bullet = bulletAt(next);
-        if (!bullet) {
-          // A line that is not a bullet continues the item above it.
-          const last = bullets[bullets.length - 1];
-          last.text += `\n${next.trim()}`;
-        } else if (
-          bullets.length > 0 &&
-          bullet.ordered !== first.ordered &&
-          bullet.indent < first.indent + 2
-        ) {
-          // Bullets after numbers at the same level are another list.
-          break;
-        } else bullets.push(bullet);
-        index += 1;
-      }
-      blocks.push(buildList(bullets, raw()));
-      continue;
-    }
-
-    index += 1;
-    while (index < lines.length) {
-      const next = lines[index];
-      if (next.trim() === "" || startsBlock(next) || bulletAt(next)) break;
-      index += 1;
-    }
-    const text = raw();
-    blocks.push({ kind: "paragraph", raw: text, content: parseInline(text) });
+    const read = readBlock(lines, index);
+    blocks.push(read.block);
+    index = read.next;
   }
   return blocks;
 }
+
+/** The block that starts at the line `from`, which is not blank. */
+function readBlock(lines: readonly string[], from: number): Read {
+  const line = lines[from];
+  const fence = fenceAt(line);
+  if (fence) return readFence(lines, from, fence);
+  const heading = headingAt(line);
+  if (heading) {
+    const content = parseInline(heading.text);
+    return { block: { kind: "heading", raw: line, level: heading.level, content }, next: from + 1 };
+  }
+  if (isRule(line)) return { block: { kind: "rule", raw: line }, next: from + 1 };
+  const first = bulletAt(line);
+  if (first) return readList(lines, from, first);
+  return readParagraph(lines, from);
+}
+
+function readFence(lines: readonly string[], from: number, fence: Fence): Read {
+  let index = from + 1;
+  const body: string[] = [];
+  let closed = false;
+  while (index < lines.length) {
+    const next = lines[index];
+    index += 1;
+    if (closesFence(next, fence)) {
+      closed = true;
+      break;
+    }
+    // Code inside an indented fence is indented with it.
+    body.push(next.slice(Math.min(fence.indent, next.length - next.trimStart().length)));
+  }
+  const block: Block = {
+    kind: "code",
+    raw: rawOf(lines, from, index),
+    text: body.join("\n"),
+    lang: fence.info.split(/\s+/)[0] ?? "",
+    closed,
+  };
+  return { block, next: index };
+}
+
+function readList(lines: readonly string[], from: number, first: Bullet): Read {
+  const bullets = [first];
+  let index = from + 1;
+  while (index < lines.length) {
+    if (isBlank(lines[index])) {
+      const after = nextFilled(lines, index);
+      if (!continuesList(lines[after])) break;
+      index = after;
+      continue;
+    }
+    if (!addListLine(bullets, lines[index])) break;
+    index += 1;
+  }
+  return { block: buildList(bullets, rawOf(lines, from, index)), next: index };
+}
+
+/** The first line after `from` that is not blank, or the end. */
+function nextFilled(lines: readonly string[], from: number): number {
+  let at = from + 1;
+  while (at < lines.length && isBlank(lines[at])) at += 1;
+  return at;
+}
+
+/** A blank line between items is spacing; before anything else it ends the list. */
+const continuesList = (line: string | undefined): boolean =>
+  line !== undefined && !isRule(line) && bulletAt(line) !== undefined;
+
+/** Adds `line` to the list, as an item or as more of the last one; false when it ends the list. */
+function addListLine(bullets: Bullet[], line: string): boolean {
+  if (startsBlock(line)) return false;
+  const bullet = bulletAt(line);
+  if (!bullet) {
+    // A line that is not a bullet continues the item above it.
+    bullets[bullets.length - 1].text += `\n${line.trim()}`;
+    return true;
+  }
+  // Bullets after numbers at the same level are another list.
+  const [first] = bullets;
+  if (bullet.ordered !== first.ordered && bullet.indent < first.indent + 2) return false;
+  bullets.push(bullet);
+  return true;
+}
+
+function readParagraph(lines: readonly string[], from: number): Read {
+  let index = from + 1;
+  while (index < lines.length && !endsParagraph(lines[index])) index += 1;
+  const raw = rawOf(lines, from, index);
+  return { block: { kind: "paragraph", raw, content: parseInline(raw) }, next: index };
+}
+
+const endsParagraph = (line: string): boolean =>
+  isBlank(line) || startsBlock(line) || bulletAt(line) !== undefined;
 
 /**
  * `next`, with the blocks of `previous` kept wherever they read the same.
