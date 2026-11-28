@@ -11,6 +11,8 @@ import type { RepoChanges } from "./gen/RepoChanges";
 import type { Settings } from "./gen/Settings";
 import type { SessionRepo } from "./gen/SessionRepo";
 import type { SessionStatus } from "./gen/SessionStatus";
+import type { WorkflowRun } from "./gen/WorkflowRun";
+import { specGraph } from "./test/workflows";
 import type { OpenTerminal } from "./api/terminal";
 import { editorFor, editors, resetFakeEditors } from "./test/fakeEditor";
 import { fakeTerminals, resetFakeTerminals, views } from "./test/fakeTerminal";
@@ -455,6 +457,89 @@ describe("App", () => {
     const main = find(host, "main");
     expect(main.textContent).toContain("Cannot reach the server");
     expect(findByText(main, "button", "Try again")).toBeDefined();
+  });
+
+  it("says a session could not load, in the server's words, and loads it again on request", async () => {
+    const getSession = vi
+      .fn<Api["getSession"]>()
+      .mockRejectedValueOnce(conflict("the index is being rebuilt"))
+      .mockResolvedValue(makeDetail(makeSession("s1", 1000, { title: "Add a health check" })));
+    const { host, socket } = await start("/s/s1", { getSession });
+    socket.setState("open");
+    flush();
+    const main = find(host, "main");
+    expect(main.textContent).toContain("Could not load the session");
+    expect(main.textContent).toContain("the index is being rebuilt");
+
+    await click(findByText(main, "button", "Try again"));
+    await settle();
+    flush();
+    expect(find(main, "h1").textContent).toBe("Add a health check");
+  });
+
+  it("says why the message box is closed, by the session's status", async () => {
+    const placeholder = async (status: SessionStatus) => {
+      const { main } = await openSession("/s/s1", {}, status);
+      const hint = find<HTMLTextAreaElement>(main, "textarea").placeholder;
+      unmountAll();
+      return hint;
+    };
+    expect(await placeholder("queued")).toBe("Messages open once the session is running");
+    expect(await placeholder("preparing")).toBe("Messages open once the session is running");
+  });
+
+  it("counts a workflow loop's attempts against the limit the run reports", async () => {
+    const graph = specGraph();
+    const run: WorkflowRun = {
+      workflow_id: "itr",
+      name: "Implement",
+      graph,
+      nodes: graph.nodes.map((one) => ({
+        id: one.id,
+        state: "idle",
+        runs: 0,
+        last_port: null,
+        outcome: null,
+        iteration: one.kind === "loop" ? 0 : null,
+        max: one.kind === "loop" ? 3 : null,
+      })),
+      taken: [],
+      status: "running",
+      reason: null,
+      budget_usd: 5,
+      cost_usd: 0,
+    };
+    const session = makeSession("s1", 1000, { status: "running", workflow: "itr" });
+    const { main, emit, caughtUp } = await openSession("/s/s1", {
+      getSession: () => Promise.resolve(makeDetail(session)),
+      getWorkflow: () => Promise.resolve(run),
+    });
+    const loop = (phase: "started" | "finished", port: string | null = null) =>
+      emit({ type: "workflow_node", node_id: "retry", phase, port, outcome: null }, null);
+    emit(
+      { type: "workflow_started", workflow_id: "itr", name: "Implement", graph, budget_usd: 5 },
+      null,
+    );
+    loop("started");
+    loop("finished", "repeat");
+    loop("started");
+    caughtUp();
+    await settle();
+    flush();
+    expect(find(main, '[role="log"]').textContent).toContain("Loop: attempt 2 of 3");
+  });
+
+  it("says when part of the transcript could not be loaded", async () => {
+    const { main, emit, socket } = await openSession("/s/s1");
+    emit({ type: "session_status", status: "running", reason: null }, null);
+    // The server keeps announcing events the replay never brings.
+    for (let round = 0; round < 10; round += 1) {
+      socket.emit("session:s1", { op: "subscribed", topic: "session:s1", head_seq: 3 });
+    }
+    flush();
+    expect(find(main, '[role="alert"]').textContent).toBe(
+      "Part of this transcript could not be loaded. Reload the page to try again.",
+    );
   });
 
   it("shows a not-found page for an unknown address", async () => {

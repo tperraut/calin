@@ -6,6 +6,7 @@ import {
   createUniqueId,
   Match,
   onSettled,
+  type ParentProps,
   Show,
   Switch,
   useContext,
@@ -18,7 +19,9 @@ import { QuestionBar } from "../components/QuestionBar";
 import { SessionHeader } from "../components/SessionHeader";
 import { SidePane } from "../components/SidePane";
 import { Transcript, type RevealRequest } from "../components/Transcript";
+import type { PullRequest } from "../gen/PullRequest";
 import type { SessionStatus } from "../gen/SessionStatus";
+import type { WorkflowRun } from "../gen/WorkflowRun";
 import { changedFileCount } from "../lib/changeCount";
 import { needsAttention } from "../lib/delivery";
 import { createMediaQuery, WIDE_QUERY } from "../lib/media";
@@ -36,7 +39,13 @@ import {
 } from "../panels/registry";
 import { AppContext } from "../state/app";
 import { createPermissionAnswers } from "../state/permissionAnswers";
-import type { OpenQuestion, PendingPermission, TranscriptEntry } from "../state/sessionReducer";
+import type {
+  OpenQuestion,
+  PendingPermission,
+  SessionView,
+  TranscriptEntry,
+} from "../state/sessionReducer";
+import type { SessionLoad, SessionStore } from "../state/sessionStore";
 
 const ANNOUNCED_CHARS = 300;
 const NONE_PENDING: readonly PendingPermission[] = [];
@@ -60,6 +69,77 @@ function lastCompletedText(transcript: readonly TranscriptEntry[]): string {
   }
   return "";
 }
+
+/** What the live region reads out of the transcript: nothing while it is still replaying. */
+const announcedText = (synced: boolean, transcript: readonly TranscriptEntry[]): string =>
+  synced ? lastCompletedText(transcript).slice(0, ANNOUNCED_CHARS) : "";
+
+// A replay passes through every request ever made; only the caught-up lists are worth showing.
+const pendingOf = (synced: boolean, view: SessionView): readonly PendingPermission[] =>
+  synced ? view.pendingPermissions : NONE_PENDING;
+
+// One thing at a time above the message box: a permission holds a tool call, so it goes first.
+const questionsOf = (synced: boolean, view: SessionView): readonly OpenQuestion[] =>
+  synced && view.pendingPermissions.length === 0 ? view.openQuestions : NO_QUESTIONS;
+
+type LoadFailure = Extract<SessionLoad, { status: "error" }>;
+
+const loadFailureOf = (load: SessionLoad): LoadFailure | undefined =>
+  load.status === "error" ? load : undefined;
+
+/** What a session that could not load says: the server out of reach, or its refusal. */
+function loadFailureLook(failure: LoadFailure): { title: string; detail: string } {
+  return failure.unreachable
+    ? {
+        title: "Cannot reach the server",
+        detail: "The session will load as soon as the server answers again.",
+      }
+    : { title: "Could not load the session", detail: failure.message };
+}
+
+/** api.rs, "The queue": a session past the limit waits for a slot; the server says so in words. */
+function queuedReasonOf(
+  status: SessionStatus | undefined,
+  reason: string | null,
+): string | undefined {
+  if (status !== "queued" || reason === null || reason.trim() === "") return undefined;
+  return reason.trim();
+}
+
+/**
+ * The tab title. What needs the reader leads it, so a background tab shows it:
+ * a request to answer, or a pull request whose checks or review went wrong.
+ */
+function documentTitleOf(
+  title: string | undefined,
+  status: SessionStatus | undefined,
+  pullRequests: readonly PullRequest[],
+): string {
+  if (title === undefined) return "Calin";
+  if (status === "waiting") return `Waiting for you · ${title} · Calin`;
+  if (status === "shipping" && pullRequests.some(needsAttention)) {
+    return `Pull request needs you · ${title} · Calin`;
+  }
+  return `${title} · Calin`;
+}
+
+const doneNoteOf = (hasPullRequests: boolean): string =>
+  hasPullRequests
+    ? "Done: every pull request is merged or closed. This session is now read-only."
+    : "Done: this session is now read-only.";
+
+const shipFailureNote = (failed: number): string =>
+  failed === 1 ? "1 repo could not be shipped." : `${failed} repos could not be shipped.`;
+
+/** The side panels' tabs; the Changes tab counts the changed files once there are any. */
+const sideTabsOf = (changed: number): Tab<SidePanelId>[] =>
+  sidePanels.map(({ id, label }) =>
+    id === "changes" && changed > 0 ? { id, label, badge: String(changed) } : { id, label },
+  );
+
+/** A workflow loop's limit, when the run is known and has that node. */
+const loopLimitIn = (run: WorkflowRun | undefined, nodeId: string): number | null =>
+  run?.nodes.find((node) => node.id === nodeId)?.max ?? null;
 
 function Notice(props: { title: string; detail: string; onRetry?: () => void }) {
   return (
@@ -101,10 +181,7 @@ export function SessionScreen(props: {
   const wide = createMediaQuery(WIDE_QUERY);
   const idBase = createUniqueId();
 
-  const loadError = () => {
-    const load = store.load();
-    return load.status === "error" ? load : undefined;
-  };
+  const loadError = (): LoadFailure | undefined => loadFailureOf(store.load());
   const sidePanel = (): SidePanelId | undefined =>
     props.panel === "transcript" ? undefined : props.panel;
 
@@ -122,14 +199,18 @@ export function SessionScreen(props: {
   }
   // The ship form lives under the header; the header and the Changes panel both open it.
   const [shipOpen, setShipOpen] = createSignal(false);
+  // On a phone the transcript and its box are behind the panel that asked; in
+  // the wide layout they are already beside it.
+  function transcriptOnPhone(): void {
+    if (!wide()) props.onPanel("transcript");
+  }
   // A message written for the reader by another part of the screen; the message box takes it.
   const [prefill, setPrefill] = createSignal<{ text: string; seq: number }>();
   let prefills = 0;
   function draftMessage(text: string): void {
     prefills += 1;
     setPrefill({ text, seq: prefills });
-    // On a phone the box is behind the panel that asked.
-    if (!wide()) props.onPanel("transcript");
+    transcriptOnPhone();
   }
   // The one agent whose rows the transcript shows; the graph can set it, the transcript's own control too.
   const [agentFilter, setAgentFilter] = createSignal<string | null>(null);
@@ -137,14 +218,13 @@ export function SessionScreen(props: {
   let reveals = 0;
   function showAgent(agentId: string): void {
     setAgentFilter(agentId);
-    // In the wide layout the transcript is already beside the panel that asked.
-    if (!wide()) props.onPanel("transcript");
+    transcriptOnPhone();
   }
   function showItem(itemId: string): void {
     reveals += 1;
     setAgentFilter(null);
     setReveal({ itemId, seq: reveals });
-    if (!wide()) props.onPanel("transcript");
+    transcriptOnPhone();
   }
   let panels: HTMLDivElement | undefined;
   void (
@@ -168,25 +248,13 @@ export function SessionScreen(props: {
   );
   // On a phone only the selected panel shows; the transcript keeps its place in the page meanwhile.
   const transcriptHidden = (): boolean => !wide() && props.panel !== "transcript";
-  // A replay passes through every request ever made; only the caught-up list is worth showing.
-  const pending = (): readonly PendingPermission[] =>
-    store.synced() ? store.view().pendingPermissions : NONE_PENDING;
-
-  // One thing at a time above the message box: a permission holds a tool call, so it goes first.
-  const questions = (): readonly OpenQuestion[] =>
-    store.synced() && pending().length === 0 ? store.view().openQuestions : NO_QUESTIONS;
+  const pending = (): readonly PendingPermission[] => pendingOf(store.synced(), store.view());
+  const questions = (): readonly OpenQuestion[] => questionsOf(store.synced(), store.view());
   const speaker = createMemo(() =>
     speakerFor(store.session(), store.view().agents, store.tree().sessions),
   );
 
-  const loopLimit = (nodeId: string): number | null =>
-    store.workflow.run()?.nodes.find((node) => node.id === nodeId)?.max ?? null;
-  // api.rs, "The queue": a session past the limit waits for a slot; the server says so in words.
-  const queuedReason = (): string | undefined => {
-    if (store.status() !== "queued") return undefined;
-    const reason = store.view().statusReason;
-    return reason === null || reason.trim() === "" ? undefined : reason.trim();
-  };
+  const loopLimit = (nodeId: string): number | null => loopLimitIn(store.workflow.run(), nodeId);
 
   // The server's list, once read, sees what the events do not: a shell's edits, a revert.
   const changedCount = createMemo(() =>
@@ -200,38 +268,17 @@ export function SessionScreen(props: {
       if (ready) store.changes.request();
     },
   );
-  const sideTabs = createMemo((): Tab<SidePanelId>[] =>
-    sidePanels.map(({ id, label }) =>
-      id === "changes" && changedCount() > 0
-        ? { id, label, badge: String(changedCount()) }
-        : { id, label },
-    ),
-  );
+  const sideTabs = createMemo((): Tab<SidePanelId>[] => sideTabsOf(changedCount()));
   const allTabs = createMemo((): Tab<PanelId>[] => [
     { id: "transcript", label: "Transcript" },
     ...sideTabs(),
   ]);
 
-  const announcedMessage = createMemo(() =>
-    store.synced() ? lastCompletedText(store.view().transcript).slice(0, ANNOUNCED_CHARS) : "",
-  );
+  const announcedMessage = createMemo(() => announcedText(store.synced(), store.view().transcript));
 
-  // What needs the reader leads the tab title, so a background tab shows it: a
-  // request to answer, or a pull request whose checks or review went wrong.
-  const documentTitle = createMemo(() => {
-    const title = store.session()?.title;
-    if (title === undefined) return "Calin";
-    const status = store.status();
-    if (status === "waiting") return `Waiting for you · ${title} · Calin`;
-    if (status === "shipping" && store.delivery.pullRequests().some(needsAttention)) {
-      return `Pull request needs you · ${title} · Calin`;
-    }
-    return `${title} · Calin`;
-  });
-  const doneNote = (): string =>
-    store.delivery.pullRequests().length > 0
-      ? "Done: every pull request is merged or closed. This session is now read-only."
-      : "Done: this session is now read-only.";
+  const documentTitle = createMemo(() =>
+    documentTitleOf(store.session()?.title, store.status(), store.delivery.pullRequests()),
+  );
   createEffect(documentTitle, (title) => {
     document.title = title;
     return () => {
@@ -250,64 +297,16 @@ export function SessionScreen(props: {
       <Match when={loadError()}>
         {(failure) => (
           <Notice
-            title={failure().unreachable ? "Cannot reach the server" : "Could not load the session"}
-            detail={
-              failure().unreachable
-                ? "The session will load as soon as the server answers again."
-                : failure().message
-            }
+            title={loadFailureLook(failure()).title}
+            detail={loadFailureLook(failure()).detail}
             onRetry={() => store.reload()}
           />
         )}
       </Match>
       <Match when={true}>
         <SessionHeader store={store} shipOpen={shipOpen()} onShipOpen={setShipOpen} />
-        <Show when={queuedReason()}>
-          {(reason) => (
-            <p
-              data-part="queued"
-              class="border-b border-line bg-sunken px-3 py-2 text-sm wrap-break-word"
-            >
-              <span class="font-medium">Queued:</span> {reason()}
-            </p>
-          )}
-        </Show>
-        <Show when={store.stalled()}>
-          <p role="alert" class="border-b border-line bg-attention-soft px-3 py-2 text-sm">
-            Part of this transcript could not be loaded. Reload the page to try again.
-          </p>
-        </Show>
-        {/* Shown once the record is loaded: for an unknown session the not-found screen says it better. */}
-        <Show when={store.load().status === "ready" && store.subscriptionError()}>
-          {(message) => (
-            <p
-              role="alert"
-              class="flex items-center justify-between gap-2 border-b border-line bg-attention-soft px-3 py-2 text-sm"
-            >
-              <span class="min-w-0">
-                The server refused live updates for this session: {message()}
-              </span>
-              <button type="button" class="btn" onClick={() => store.resubscribe()}>
-                Try again
-              </button>
-            </p>
-          )}
-        </Show>
-        {/* Coarse announcements only: status changes and whole agent messages, never deltas. */}
-        <div class="sr-only" role="status" aria-live="polite">
-          <Show when={store.synced() && store.status()}>
-            {(status) => <p>Session status: {sessionLook(status()).label}</p>}
-          </Show>
-          <p>{announcedMessage()}</p>
-          <Show when={store.delivery.failed() > 0}>
-            <p>
-              {store.delivery.failed() === 1
-                ? "1 repo could not be shipped."
-                : `${store.delivery.failed()} repos could not be shipped.`}{" "}
-              The transcript says why.
-            </p>
-          </Show>
-        </div>
+        <SessionNotices store={store} />
+        <LiveAnnouncements store={store} message={announcedMessage()} />
         <div class="flex min-h-0 flex-1">
           <div class="flex min-h-0 min-w-0 flex-1 flex-col">
             <Show when={!wide()}>
@@ -321,14 +320,7 @@ export function SessionScreen(props: {
                 />
               </div>
             </Show>
-            <div
-              role={wide() ? undefined : "tabpanel"}
-              id={tabPanelId(idBase, "transcript")}
-              aria-labelledby={wide() ? undefined : tabId(idBase, "transcript")}
-              hidden={transcriptHidden()}
-              class="flex min-h-0 flex-1 flex-col"
-            >
-              <h2 class="sr-only">Transcript</h2>
+            <TranscriptSlot idBase={idBase} tab={!wide()} hidden={transcriptHidden()}>
               <Transcript
                 entries={store.view().transcript}
                 synced={store.synced()}
@@ -346,18 +338,9 @@ export function SessionScreen(props: {
               <Show when={store.view().plan.length > 0}>
                 <PlanPanel entries={store.view().plan} />
               </Show>
-            </div>
+            </TranscriptSlot>
             <Show when={!wide()}>
-              {/* Kept in the page while the transcript shows, so the panels stay laid out where they were. */}
-              <div
-                role={sidePanel() === undefined ? undefined : "tabpanel"}
-                id={tabPanelId(idBase, sidePanel() ?? "none")}
-                aria-labelledby={sidePanel() === undefined ? undefined : tabId(idBase, props.panel)}
-                hidden={sidePanel() === undefined}
-                class="flex min-h-0 flex-1 flex-col"
-              >
-                <PanelOutlet panels={panels} />
-              </div>
+              <PhonePanelSlot idBase={idBase} panel={sidePanel()} panels={panels} />
             </Show>
             {/* Under every panel: a request must not wait unseen behind a tab. */}
             <PermissionBar
@@ -374,21 +357,7 @@ export function SessionScreen(props: {
               }
               compact={transcriptHidden()}
             />
-            <div hidden={transcriptHidden()}>
-              <Show when={store.status() === "done"}>
-                <p data-part="done-note" class="border-t border-line bg-sunken px-3 py-2 text-sm">
-                  {doneNote()}
-                </p>
-              </Show>
-              <MessageBox
-                enabled={canMessage(store.status())}
-                closedHint={closedHint(store.status())}
-                resumes={resumesOnMessage(store.status())}
-                prefill={prefill()}
-                shown={!transcriptHidden()}
-                onSend={(text) => store.send(text)}
-              />
-            </div>
+            <MessageArea store={store} prefill={prefill()} hidden={transcriptHidden()} />
           </div>
           <Show when={wide()}>
             <SidePane
@@ -404,6 +373,121 @@ export function SessionScreen(props: {
         </div>
       </Match>
     </Switch>
+  );
+}
+
+/** What holds the session back, above everything else: a queue, a stalled replay, refused live updates. */
+function SessionNotices(props: { store: SessionStore }) {
+  return (
+    <>
+      <Show when={queuedReasonOf(props.store.status(), props.store.view().statusReason)}>
+        {(reason) => (
+          <p
+            data-part="queued"
+            class="border-b border-line bg-sunken px-3 py-2 text-sm wrap-break-word"
+          >
+            <span class="font-medium">Queued:</span> {reason()}
+          </p>
+        )}
+      </Show>
+      <Show when={props.store.stalled()}>
+        <p role="alert" class="border-b border-line bg-attention-soft px-3 py-2 text-sm">
+          Part of this transcript could not be loaded. Reload the page to try again.
+        </p>
+      </Show>
+      {/* Shown once the record is loaded: for an unknown session the not-found screen says it better. */}
+      <Show when={props.store.load().status === "ready" && props.store.subscriptionError()}>
+        {(message) => (
+          <p
+            role="alert"
+            class="flex items-center justify-between gap-2 border-b border-line bg-attention-soft px-3 py-2 text-sm"
+          >
+            <span class="min-w-0">
+              The server refused live updates for this session: {message()}
+            </span>
+            <button type="button" class="btn" onClick={() => props.store.resubscribe()}>
+              Try again
+            </button>
+          </p>
+        )}
+      </Show>
+    </>
+  );
+}
+
+/** Coarse announcements only: status changes and whole agent messages, never deltas. */
+function LiveAnnouncements(props: { store: SessionStore; message: string }) {
+  return (
+    <div class="sr-only" role="status" aria-live="polite">
+      <Show when={props.store.synced() && props.store.status()}>
+        {(status) => <p>Session status: {sessionLook(status()).label}</p>}
+      </Show>
+      <p>{props.message}</p>
+      <Show when={props.store.delivery.failed() > 0}>
+        <p>{shipFailureNote(props.store.delivery.failed())} The transcript says why.</p>
+      </Show>
+    </div>
+  );
+}
+
+/** The transcript's place: on a phone one of the session's tabs, in the wide layout always in view. */
+function TranscriptSlot(props: ParentProps<{ idBase: string; tab: boolean; hidden: boolean }>) {
+  return (
+    <div
+      role={props.tab ? "tabpanel" : undefined}
+      id={tabPanelId(props.idBase, "transcript")}
+      aria-labelledby={props.tab ? tabId(props.idBase, "transcript") : undefined}
+      hidden={props.hidden}
+      class="flex min-h-0 flex-1 flex-col"
+    >
+      <h2 class="sr-only">Transcript</h2>
+      {props.children}
+    </div>
+  );
+}
+
+/** On a phone, the side panel the address names, as the tabpanel of its tab. */
+function PhonePanelSlot(props: {
+  idBase: string;
+  panel: SidePanelId | undefined;
+  panels: HTMLElement | undefined;
+}) {
+  return (
+    // Kept in the page while the transcript shows, so the panels stay laid out where they were.
+    <div
+      role={props.panel === undefined ? undefined : "tabpanel"}
+      id={tabPanelId(props.idBase, props.panel ?? "none")}
+      aria-labelledby={props.panel === undefined ? undefined : tabId(props.idBase, props.panel)}
+      hidden={props.panel === undefined}
+      class="flex min-h-0 flex-1 flex-col"
+    >
+      <PanelOutlet panels={props.panels} />
+    </div>
+  );
+}
+
+/** The message box, under a note once the session is done. */
+function MessageArea(props: {
+  store: SessionStore;
+  prefill: { text: string; seq: number } | undefined;
+  hidden: boolean;
+}) {
+  return (
+    <div hidden={props.hidden}>
+      <Show when={props.store.status() === "done"}>
+        <p data-part="done-note" class="border-t border-line bg-sunken px-3 py-2 text-sm">
+          {doneNoteOf(props.store.delivery.pullRequests().length > 0)}
+        </p>
+      </Show>
+      <MessageBox
+        enabled={canMessage(props.store.status())}
+        closedHint={closedHint(props.store.status())}
+        resumes={resumesOnMessage(props.store.status())}
+        prefill={props.prefill}
+        shown={!props.hidden}
+        onSend={(text) => props.store.send(text)}
+      />
+    </div>
   );
 }
 

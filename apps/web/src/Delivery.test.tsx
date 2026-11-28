@@ -481,6 +481,16 @@ describe("shipping from review", () => {
     expect(action(header).textContent).toBe("Updating pull requests…");
   });
 
+  it("counts several repos that failed in the last ship", async () => {
+    const { main, emit } = await openSession();
+    await click(submit(await openForm(main)));
+    emit({ type: "error", message: "api: the push was rejected" });
+    emit({ type: "error", message: "web: the push was rejected" });
+    expect(find(main, '[role="status"][aria-live="polite"]').textContent).toContain(
+      "2 repos could not be shipped. The transcript says why.",
+    );
+  });
+
   it("closes the form when the session leaves review, and does not bring it back by itself", async () => {
     const { main, header, emit } = await openSession();
     await openForm(main);
