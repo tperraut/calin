@@ -58,6 +58,13 @@ describe("describeUserAgent", () => {
 
   it("shows anything else as it is, cut short", () => {
     expect(describeUserAgent("curl/8.9.1")).toBe("curl/8.9.1");
+    // A known browser on an unknown system, and a known system under an unknown browser.
+    expect(describeUserAgent("Mozilla/5.0 (X11; FreeBSD amd64; rv:133.0) Firefox/133.0")).toBe(
+      "Firefox",
+    );
+    expect(describeUserAgent("SomeBot/1.0 (Linux)")).toBe("SomeBot/1.0 (Linux)");
+    const exact = `SomeClient/1.0 ${"x".repeat(45)}`;
+    expect(describeUserAgent(exact)).toBe(exact);
     const long = `SomeClient/1.0 ${"x".repeat(100)}`;
     const shown = describeUserAgent(long);
     expect(shown).toHaveLength(60);
