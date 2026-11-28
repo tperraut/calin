@@ -2124,39 +2124,55 @@ impl Driver {
         let draft = self.by(subagent, body).parent(self.cause.clone());
         let event = self.append(draft).await?;
         match &event.body {
-            EventBody::ItemStarted { item } => {
-                let tool = match &item.content {
-                    ItemContent::Tool { name, .. } => Some(name.clone()),
-                    _ => None,
-                };
-                let started = TurnItem {
-                    event_id: event.id.clone(),
-                    tool,
-                };
-                self.turn_items.insert(item.id.clone(), started);
-            }
+            EventBody::ItemStarted { item } => self.item_started(&event, item),
             EventBody::ItemCompleted { item } => {
-                self.turn_items.remove(&item.id);
-                if let (None, ItemContent::Text { text }) = (subagent, &item.content)
-                    && !text.trim().is_empty()
-                {
-                    self.last_text = Some(text.clone());
-                    self.lead_said(text);
-                }
-                self.file_changes(&event, item).await?;
+                self.item_completed(&event, item, subagent).await?
             }
-            // The tree costs more now: a workflow's budget is checked here,
-            // and in the session that dispatched this one.
-            EventBody::Usage { .. } => {
-                if let Some(dispatch) = &self.setup.dispatch {
-                    self.manager()
-                        .post(&dispatch.parent_session_id, Command::Spent);
-                }
-                self.check_budget().await?;
-            }
+            EventBody::Usage { .. } => self.spent().await?,
             _ => {}
         }
         Ok(())
+    }
+
+    /// Keeps a running item of the turn, recorded by `event`.
+    fn item_started(&mut self, event: &Event, item: &Item) {
+        let tool = match &item.content {
+            ItemContent::Tool { name, .. } => Some(name.clone()),
+            _ => None,
+        };
+        let started = TurnItem {
+            event_id: event.id.clone(),
+            tool,
+        };
+        self.turn_items.insert(item.id.clone(), started);
+    }
+
+    /// An item of the turn is over. The lead's text is what it said last;
+    /// an edit records the files it changed.
+    async fn item_completed(
+        &mut self,
+        event: &Event,
+        item: &Item,
+        subagent: Option<&str>,
+    ) -> Result<()> {
+        self.turn_items.remove(&item.id);
+        if let (None, ItemContent::Text { text }) = (subagent, &item.content)
+            && !text.trim().is_empty()
+        {
+            self.last_text = Some(text.clone());
+            self.lead_said(text);
+        }
+        self.file_changes(event, item).await
+    }
+
+    /// The tree costs more now: a workflow's budget is checked here, and in
+    /// the session that dispatched this one.
+    async fn spent(&mut self) -> Result<()> {
+        if let Some(dispatch) = &self.setup.dispatch {
+            self.manager()
+                .post(&dispatch.parent_session_id, Command::Spent);
+        }
+        self.check_budget().await
     }
 
     /// The agent started a subagent inside its process: it becomes an agent
@@ -2812,47 +2828,67 @@ impl Driver {
         else {
             return Ok(());
         };
-        let op = match tool_kind {
-            ToolKind::Edit => FileOp::Edit,
-            ToolKind::Delete => FileOp::Delete,
-            ToolKind::Move => FileOp::Rename,
-            _ => return Ok(()),
+        let Some(op) = file_op(*tool_kind) else {
+            return Ok(());
         };
         if item.status != ItemStatus::Completed {
             return Ok(());
         }
         let tracker = unreported::tracker(&self.inner.trackers, &self.session_id);
         for location in locations {
-            let (session_repo_id, path) = locate(&self.repos, location);
-            // The file as the call left it, so that the turn's end reports
-            // it again only if it changed after this.
-            let repo = session_repo_id
-                .as_ref()
-                .and_then(|id| self.repos.iter().find(|repo| repo.id == *id))
-                .filter(|repo| tracker.is_some() && unreported::is_tracked(repo))
-                .cloned();
-            let state = match repo {
-                Some(repo) => {
-                    let (repo_id, rel) = (repo.id.clone(), path.clone());
-                    let state = blocking(move || Ok(unreported::state_of(&repo, &rel)));
-                    state.await.ok().flatten().map(|state| (repo_id, state))
-                }
-                None => None,
-            };
-            let changed = EventBody::FileChanged {
-                session_repo_id,
-                path: path.clone(),
-                op,
-            };
-            // By whoever made the call: the lead or one of its subagents.
-            let draft = as_agent(completed.agent_id.clone(), changed);
-            self.append(draft.parent(Some(completed.id.clone())))
+            self.file_changed(completed, location, op, tracker.as_ref())
                 .await?;
-            if let (Some(tracker), Some((repo_id, state))) = (&tracker, state) {
-                tracker.lock().await.reported(&repo_id, &path, state);
-            }
         }
         Ok(())
+    }
+
+    /// One `file_changed` for `location`, by whoever made the call: the
+    /// lead or one of its subagents.
+    async fn file_changed(
+        &mut self,
+        completed: &Event,
+        location: &str,
+        op: FileOp,
+        tracker: Option<&Arc<tokio::sync::Mutex<Tracker>>>,
+    ) -> Result<()> {
+        let (session_repo_id, path) = locate(&self.repos, location);
+        let state = match tracker {
+            Some(_) => self.file_state(session_repo_id.as_deref(), &path).await,
+            None => None,
+        };
+        let changed = EventBody::FileChanged {
+            session_repo_id,
+            path: path.clone(),
+            op,
+        };
+        let draft = as_agent(completed.agent_id.clone(), changed);
+        self.append(draft.parent(Some(completed.id.clone())))
+            .await?;
+        if let (Some(tracker), Some((repo_id, state))) = (tracker, state) {
+            tracker.lock().await.reported(&repo_id, &path, state);
+        }
+        Ok(())
+    }
+
+    /// The file as the call left it, with the id of its repo, so that the
+    /// turn's end reports it again only if it changed after this. `None`
+    /// outside the repos whose changes are followed.
+    async fn file_state(
+        &self,
+        session_repo_id: Option<&str>,
+        path: &str,
+    ) -> Option<(String, calin_git::FileState)> {
+        let repo = self
+            .repos
+            .iter()
+            .find(|repo| Some(repo.id.as_str()) == session_repo_id)?;
+        if !unreported::is_tracked(repo) {
+            return None;
+        }
+        let (repo, rel) = (repo.clone(), path.to_owned());
+        let state = blocking(move || Ok(unreported::state_of(&repo, &rel)));
+        let state = state.await.ok().flatten()?;
+        session_repo_id.map(|id| (id.to_owned(), state))
     }
 
     /// Appends to the session's log and keeps the driver's view of the
@@ -2860,49 +2896,66 @@ impl Driver {
     async fn append(&mut self, draft: EventDraft) -> Result<Arc<Event>> {
         let event = self.inner.store.append(&self.session_id, draft).await?;
         self.head_seq = event.seq;
-        let from_lead = |lead: &Lead| event.agent_id.as_deref() == Some(lead.id.as_str());
         match &event.body {
-            EventBody::SessionStatus { status, .. } => {
-                self.status = *status;
-                // Only a session that prepares or runs holds a slot, and
-                // only a `queued` one waits for one.
-                if !status.is_active() && *status != SessionStatus::Queued {
-                    self.leave_queue();
-                    // What waited for a slot with the session is the
-                    // agent's to have: its turn, if any, goes on.
-                    self.forward_held();
-                }
-            }
-            EventBody::AgentStatus { status } => {
-                if let Some(lead) = self.lead.as_mut().filter(|lead| from_lead(lead)) {
-                    lead.status = *status;
-                }
-            }
-            EventBody::AgentSession {
-                native_session_id,
-                model,
-            } => {
-                if let Some(lead) = self.lead.as_mut().filter(|lead| from_lead(lead)) {
-                    lead.native_session_id = Some(native_session_id.clone());
-                    if model.is_some() {
-                        lead.model.clone_from(model);
-                    }
-                }
+            EventBody::SessionStatus { status, .. } => self.status_recorded(*status),
+            EventBody::AgentStatus { .. } | EventBody::AgentSession { .. } => {
+                self.lead_recorded(&event);
             }
             EventBody::RepoAttached { repo } => self.repos.push(repo.clone()),
             EventBody::PullRequestOpened { pull_request }
             | EventBody::PullRequestUpdated { pull_request } => {
-                let same_repo = |known: &&mut PullRequest| {
-                    known.session_repo_id == pull_request.session_repo_id
-                };
-                match self.pull_requests.iter_mut().find(same_repo) {
-                    Some(known) => *known = pull_request.clone(),
-                    None => self.pull_requests.push(pull_request.clone()),
-                }
+                self.keep_pull_request(pull_request)
             }
             _ => {}
         }
         Ok(event)
+    }
+
+    /// Keeps the lead as `event` says it is now, when the event is the lead's.
+    fn lead_recorded(&mut self, event: &Event) {
+        let by = event.agent_id.as_deref();
+        let Some(lead) = self
+            .lead
+            .as_mut()
+            .filter(|lead| by == Some(lead.id.as_str()))
+        else {
+            return;
+        };
+        match &event.body {
+            EventBody::AgentStatus { status } => lead.status = *status,
+            EventBody::AgentSession {
+                native_session_id,
+                model,
+            } => {
+                lead.native_session_id = Some(native_session_id.clone());
+                if model.is_some() {
+                    lead.model.clone_from(model);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The session is in `status` now. Only a session that prepares or runs
+    /// holds a slot, and only a `queued` one waits for one.
+    fn status_recorded(&mut self, status: SessionStatus) {
+        self.status = status;
+        if !status.is_active() && status != SessionStatus::Queued {
+            self.leave_queue();
+            // What waited for a slot with the session is the agent's to
+            // have: its turn, if any, goes on.
+            self.forward_held();
+        }
+    }
+
+    /// Keeps the pull request on record, one per repo.
+    fn keep_pull_request(&mut self, pull_request: &PullRequest) {
+        let same_repo =
+            |known: &&mut PullRequest| known.session_repo_id == pull_request.session_repo_id;
+        match self.pull_requests.iter_mut().find(same_repo) {
+            Some(known) => *known = pull_request.clone(),
+            None => self.pull_requests.push(pull_request.clone()),
+        }
     }
 
     /// Starts delivering the session in the background (the "Shipping"
@@ -3192,6 +3245,17 @@ async fn reported_branches(repos: &[SessionRepo]) -> Vec<ReportedBranch> {
         });
     }
     branches
+}
+
+/// What a completed tool call of `kind` did to the files it names, when it
+/// changed them.
+fn file_op(kind: ToolKind) -> Option<FileOp> {
+    match kind {
+        ToolKind::Edit => Some(FileOp::Edit),
+        ToolKind::Delete => Some(FileOp::Delete),
+        ToolKind::Move => Some(FileOp::Rename),
+        _ => None,
+    }
 }
 
 fn as_agent(agent_id: Option<String>, body: EventBody) -> EventDraft {
