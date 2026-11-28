@@ -354,3 +354,21 @@ pub(crate) fn resolve_commit(dir: &Path, rev: &str) -> Result<Option<String>> {
 pub(crate) fn require_commit(dir: &Path, rev: &str) -> Result<String> {
     resolve_commit(dir, rev)?.ok_or_else(|| Error::NotFound(format!("commit {rev}")))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_timeout_says_its_limit_in_whole_seconds_or_else_in_milliseconds() {
+        for (limit, said) in [
+            (Duration::from_secs(30), "30 seconds"),
+            (Duration::from_secs(1), "1 seconds"),
+            (Duration::from_millis(1500), "1500 ms"),
+            (Duration::from_millis(400), "400 ms"),
+            (Duration::ZERO, "0 ms"),
+        ] {
+            assert_eq!(how_long(limit), said, "{limit:?}");
+        }
+    }
+}

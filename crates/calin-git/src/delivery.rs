@@ -326,6 +326,17 @@ mod tests {
     }
 
     #[test]
+    fn a_directory_that_is_not_a_repository_is_said_to_be_one() {
+        let sandbox = Sandbox::new();
+        let plain = sandbox.dir("plain");
+        write(&plain, "a.txt", "a\n");
+        assert!(matches!(
+            commit_all(&plain, "add a", LIMIT),
+            Err(Error::NotARepository { .. })
+        ));
+    }
+
+    #[test]
     fn a_file_git_cannot_read_fails_the_commit_with_gits_words() {
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -494,6 +505,20 @@ mod tests {
                 "{odd:?}"
             );
         }
+        assert_eq!(remote_tip(&d.remote, BRANCH), None);
+        // Git keeps a remote of any name, even one `git push` would read as
+        // an option: `-f` is force. Such a name is no remote here.
+        git(
+            &d.clone,
+            &["config", "remote.-f.url", d.remote.to_str().unwrap()],
+        );
+        write(&d.worktree, "a.txt", "a\n");
+        commit(&d.worktree, "first");
+        assert!(!has_remote(&d.worktree, "-f").unwrap());
+        assert!(matches!(
+            push_branch(&d.worktree, "-f", BRANCH, LIMIT),
+            Err(Error::NotFound(what)) if what == "remote -f"
+        ));
         assert_eq!(remote_tip(&d.remote, BRANCH), None);
         // A detached worktree has no branch to speak of.
         git(&d.worktree, &["checkout", "-q", "--detach"]);
