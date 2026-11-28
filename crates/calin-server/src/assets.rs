@@ -63,6 +63,16 @@ impl Assets {
             .ok()
             .map(|index| self.files[index].1)
     }
+
+    /// The file `name` and its bytes; for what is not a file, a route of
+    /// the single-page app that the client resolves, the index. `None`
+    /// when the web app was not built.
+    fn page<'a>(&self, name: &'a str) -> Option<(&'a str, &'static [u8])> {
+        match self.get(name) {
+            Some(bytes) => Some((name, bytes)),
+            None => self.get(INDEX).map(|bytes| (INDEX, bytes)),
+        }
+    }
 }
 
 /// The router's fallback: everything that is not an API route.
@@ -72,38 +82,18 @@ pub(crate) async fn serve(
     OriginalUri(uri): OriginalUri,
 ) -> Response {
     let path = uri.path();
-    if crate::guard::is_api_path(path) {
-        // An API client must never get the web app's HTML for a mistyped route.
-        return ApiFailure::new(StatusCode::NOT_FOUND, format!("no such route: {path}"))
+    if let Some(refusal) = refusal(path, &method) {
+        return refusal;
+    }
+    let Some((name, bytes)) = state.assets.page(path.trim_start_matches('/')) else {
+        return (
+            [
+                (CONTENT_TYPE, "text/html; charset=utf-8"),
+                (CACHE_CONTROL, "no-cache"),
+            ],
+            NOT_BUILT,
+        )
             .into_response();
-    }
-    // Sign-in's own prefix: what is not one of its routes is nothing, not
-    // the web app (which never has a page there).
-    if crate::guard::is_auth_path(path) {
-        return crate::auth::not_found();
-    }
-    if method != Method::GET && method != Method::HEAD {
-        return (StatusCode::METHOD_NOT_ALLOWED, [(ALLOW, "GET, HEAD")]).into_response();
-    }
-
-    let assets = state.assets;
-    let name = path.trim_start_matches('/');
-    let (name, bytes) = match assets.get(name) {
-        Some(bytes) => (name, bytes),
-        // Not a file: a route of the single-page app, which the client resolves.
-        None => match assets.get(INDEX) {
-            Some(bytes) => (INDEX, bytes),
-            None => {
-                return (
-                    [
-                        (CONTENT_TYPE, "text/html; charset=utf-8"),
-                        (CACHE_CONTROL, "no-cache"),
-                    ],
-                    NOT_BUILT,
-                )
-                    .into_response();
-            }
-        },
     };
     // Vite puts a content hash in the names under `assets/`; everything else
     // keeps its name across builds and must be revalidated.
@@ -117,6 +107,25 @@ pub(crate) async fn serve(
         Body::from(bytes),
     )
         .into_response()
+}
+
+/// The answer to a request the web app does not serve: an API or sign-in
+/// path, or a method other than GET and HEAD.
+fn refusal(path: &str, method: &Method) -> Option<Response> {
+    if crate::guard::is_api_path(path) {
+        // An API client must never get the web app's HTML for a mistyped route.
+        let failure = ApiFailure::new(StatusCode::NOT_FOUND, format!("no such route: {path}"));
+        return Some(failure.into_response());
+    }
+    // Sign-in's own prefix: what is not one of its routes is nothing, not
+    // the web app (which never has a page there).
+    if crate::guard::is_auth_path(path) {
+        return Some(crate::auth::not_found());
+    }
+    if method != Method::GET && method != Method::HEAD {
+        return Some((StatusCode::METHOD_NOT_ALLOWED, [(ALLOW, "GET, HEAD")]).into_response());
+    }
+    None
 }
 
 /// The type of each extension the web app ships; anything else is bytes.
