@@ -97,6 +97,10 @@ export const repoModeLabel = (mode: RepoMode): string => lookup(repoModeLabels, 
 /** In the order they are offered; a worktree is the default (repo.rs). */
 export const repoModes: readonly RepoMode[] = ["write", "read", "live"];
 
+/** The repo mode `value` names, if it names one: a select's value, or a stored one. */
+export const repoModeFrom = (value: unknown): RepoMode | undefined =>
+  repoModes.find((mode) => mode === value);
+
 /**
  * How a repo is attached unless the reader says otherwise: the home repo is
  * edited in place, any other one gets a worktree (design spec, section 13).

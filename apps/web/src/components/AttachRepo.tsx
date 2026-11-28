@@ -3,9 +3,71 @@ import type { AttachRepoRequest } from "../gen/AttachRepoRequest";
 import type { Repo } from "../gen/Repo";
 import type { RepoMode } from "../gen/RepoMode";
 import type { SessionRepo } from "../gen/SessionRepo";
-import { errorMessage } from "../lib/errors";
-import { defaultRepoMode, repoModeLabel, repoModes } from "../lib/status";
+import { createRequest } from "../lib/request";
+import { defaultRepoMode, repoModeFrom } from "../lib/status";
+import { onFormSubmit } from "../lib/submit";
 import type { RepoRegistry } from "../state/app";
+import { LoadFailure } from "./AccessSettings";
+import { RepoModeOptions } from "./RepoPicker";
+
+/** The repos that can still join: cloned, and not attached already (one at most once, api.rs). */
+function attachable(registry: RepoRegistry, attached: readonly SessionRepo[]): readonly Repo[] {
+  if (registry.status !== "ready") return [];
+  return registry.repos.filter(
+    (repo) => repo.available && !attached.some((one) => one.repo_id === repo.id),
+  );
+}
+
+const registryFailure = (registry: RepoRegistry) =>
+  registry.status === "error" ? registry : undefined;
+
+/** The two choices: which repo, and how it is attached. */
+function AttachFields(props: {
+  candidates: readonly Repo[];
+  repo: Repo | undefined;
+  mode: RepoMode;
+  busy: boolean;
+  onRepo: (id: string) => void;
+  onMode: (mode: RepoMode | undefined) => void;
+}) {
+  const repoId = createUniqueId();
+  const modeId = createUniqueId();
+  return (
+    <div class="flex flex-wrap gap-2">
+      <label for={repoId} class="flex min-w-0 flex-1 basis-40 flex-col gap-1 text-sm">
+        Repo to attach
+        <select
+          id={repoId}
+          class="field h-11 px-2"
+          disabled={props.busy}
+          value={props.repo?.id}
+          onChange={(event) => props.onRepo(event.currentTarget.value)}
+        >
+          <For each={props.candidates} keyed={(one) => one.id}>
+            {(one) => (
+              <option value={one().id}>
+                {one().name}
+                {one().home ? " (home)" : ""}
+              </option>
+            )}
+          </For>
+        </select>
+      </label>
+      <label for={modeId} class="flex min-w-0 flex-1 basis-40 flex-col gap-1 text-sm">
+        Attached as
+        <select
+          id={modeId}
+          class="field h-11 px-2"
+          disabled={props.busy}
+          value={props.mode}
+          onChange={(event) => props.onMode(repoModeFrom(event.currentTarget.value))}
+        >
+          <RepoModeOptions />
+        </select>
+      </label>
+    </div>
+  );
+}
 
 /**
  * Picks a repo to add to a session under way, and how. Nothing shows as
@@ -25,18 +87,8 @@ export function AttachRepo(props: {
   const [picked, setPicked] = createSignal<string>();
   // Until the reader chooses, the mode is the default of the repo picked.
   const [modeChoice, setModeChoice] = createSignal<RepoMode>();
-  const [busy, setBusy] = createSignal(false);
-  const [error, setError] = createSignal<string>();
-  const repoId = createUniqueId();
-  const modeId = createUniqueId();
 
-  const loadError = () => (props.registry.status === "error" ? props.registry : undefined);
-  const candidates = (): readonly Repo[] =>
-    props.registry.status === "ready"
-      ? props.registry.repos.filter(
-          (repo) => repo.available && !props.attached.some((one) => one.repo_id === repo.id),
-        )
-      : [];
+  const candidates = (): readonly Repo[] => attachable(props.registry, props.attached);
   const repo = (): Repo | undefined =>
     candidates().find((one) => one.id === picked()) ?? candidates().at(0);
   const mode = (): RepoMode => {
@@ -44,42 +96,36 @@ export function AttachRepo(props: {
     return modeChoice() ?? (chosen ? defaultRepoMode(chosen) : "write");
   };
 
+  const attaching = createRequest(async (chosen: Repo) => {
+    await props.onAttach({ repo_id: chosen.id, mode: mode() });
+    props.onClose();
+  });
   async function attach(): Promise<void> {
     const chosen = repo();
-    if (!chosen || busy() || !props.enabled) return;
-    setBusy(true);
-    setError(undefined);
-    try {
-      await props.onAttach({ repo_id: chosen.id, mode: mode() });
-      props.onClose();
-    } catch (reason) {
-      setError(errorMessage(reason));
-    } finally {
-      setBusy(false);
-    }
+    if (chosen && props.enabled) await attaching.run(chosen);
+  }
+  function pickRepo(id: string): void {
+    setPicked(id);
+    setModeChoice(undefined);
   }
 
   return (
     <form
       aria-label="Attach a repo"
       class="flex flex-col gap-2 border-b border-line bg-attention-soft p-3"
-      onSubmit={(event) => {
-        event.preventDefault();
-        void attach();
-      }}
+      onSubmit={onFormSubmit(attach)}
     >
       <Switch>
         <Match when={props.registry.status === "loading"}>
           <p class="text-sm text-muted">Loading repos…</p>
         </Match>
-        <Match when={loadError()}>
+        <Match when={registryFailure(props.registry)}>
           {(failure) => (
-            <p role="alert" class="flex items-center justify-between gap-2 text-sm">
-              <span class="min-w-0">The repos could not be loaded: {failure().message}</span>
-              <button type="button" class="btn" onClick={() => props.onRetry()}>
-                Retry
-              </button>
-            </p>
+            <LoadFailure
+              what="The repos"
+              message={failure().message}
+              onRetry={() => props.onRetry()}
+            />
           )}
         </Match>
         <Match when={candidates().length === 0}>
@@ -88,49 +134,17 @@ export function AttachRepo(props: {
           </p>
         </Match>
         <Match when={true}>
-          <div class="flex flex-wrap gap-2">
-            <label for={repoId} class="flex min-w-0 flex-1 basis-40 flex-col gap-1 text-sm">
-              Repo to attach
-              <select
-                id={repoId}
-                class="field h-11 px-2"
-                disabled={busy()}
-                value={repo()?.id}
-                onChange={(event) => {
-                  setPicked(event.currentTarget.value);
-                  setModeChoice(undefined);
-                }}
-              >
-                <For each={candidates()} keyed={(one) => one.id}>
-                  {(one) => (
-                    <option value={one().id}>
-                      {one().name}
-                      {one().home ? " (home)" : ""}
-                    </option>
-                  )}
-                </For>
-              </select>
-            </label>
-            <label for={modeId} class="flex min-w-0 flex-1 basis-40 flex-col gap-1 text-sm">
-              Attached as
-              <select
-                id={modeId}
-                class="field h-11 px-2"
-                disabled={busy()}
-                value={mode()}
-                onChange={(event) =>
-                  setModeChoice(repoModes.find((one) => one === event.currentTarget.value))
-                }
-              >
-                <For each={repoModes}>
-                  {(one) => <option value={one}>{repoModeLabel(one)}</option>}
-                </For>
-              </select>
-            </label>
-          </div>
+          <AttachFields
+            candidates={candidates()}
+            repo={repo()}
+            mode={mode()}
+            busy={attaching.busy()}
+            onRepo={pickRepo}
+            onMode={setModeChoice}
+          />
         </Match>
       </Switch>
-      <Show when={error()}>
+      <Show when={attaching.error()}>
         {(message) => (
           <p role="alert" class="text-sm text-tone-danger">
             {message()}
@@ -149,9 +163,9 @@ export function AttachRepo(props: {
         <button
           type="submit"
           class="btn btn-primary"
-          disabled={busy() || !props.enabled || repo() === undefined}
+          disabled={attaching.busy() || !props.enabled || repo() === undefined}
         >
-          {busy() ? "Attaching…" : "Attach"}
+          {attaching.busy() ? "Attaching…" : "Attach"}
         </button>
       </div>
     </form>

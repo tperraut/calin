@@ -1,6 +1,6 @@
 import type { PermissionMode } from "../gen/PermissionMode";
 import type { RepoMode } from "../gen/RepoMode";
-import { permissionModes, repoModes } from "./status";
+import { permissionModes, repoModeFrom } from "./status";
 import type { ThemeChoice } from "./theme";
 
 export type RepoChoice = { repoId: string; mode: RepoMode };
@@ -53,7 +53,7 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
 
 function repoChoice(value: unknown): RepoChoice | undefined {
   if (!isRecord(value) || typeof value.repoId !== "string") return undefined;
-  const mode = repoModes.find((one) => one === value.mode) ?? "write";
+  const mode = repoModeFrom(value.mode) ?? "write";
   return { repoId: value.repoId, mode };
 }
 

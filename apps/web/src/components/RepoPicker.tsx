@@ -6,13 +6,21 @@ import { errorMessage } from "../lib/errors";
 import { createMediaQuery, WIDE_QUERY } from "../lib/media";
 import type { RepoMode } from "../gen/RepoMode";
 import type { RepoChoice } from "../lib/prefs";
-import { defaultRepoMode, repoModeLabel, repoModes } from "../lib/status";
+import { defaultRepoMode, repoModeFrom, repoModeLabel, repoModes } from "../lib/status";
 import type { RepoRegistry } from "../state/app";
+import { LoadFailure } from "./AccessSettings";
 
 /** From this many repos on, the list gets a filter box. */
 const FILTER_FROM = 9;
 
 const tag = "shrink-0 rounded-full border border-line px-2 py-0.5 text-xs font-medium";
+
+/** The ways a repo can be attached, as a select's options. */
+export function RepoModeOptions() {
+  return (
+    <For each={repoModes}>{(mode) => <option value={mode}>{repoModeLabel(mode)}</option>}</For>
+  );
+}
 
 /** Adds a clone on the server's machine to the registry. `onRegister` rejects with the server's reason. */
 export function RegisterRepoForm(props: {
@@ -236,13 +244,11 @@ function RepoRow(props: {
               class="field h-11 w-auto min-w-0 px-2"
               value={choice().mode}
               onChange={(event) => {
-                const picked = repoModes.find((mode) => mode === event.currentTarget.value);
+                const picked = repoModeFrom(event.currentTarget.value);
                 if (picked) props.onMode(picked);
               }}
             >
-              <For each={repoModes}>
-                {(mode) => <option value={mode}>{repoModeLabel(mode)}</option>}
-              </For>
+              <RepoModeOptions />
             </select>
             <Show when={!props.primary}>
               <button type="button" class="btn text-sm" onClick={() => props.onMakePrimary()}>
@@ -458,12 +464,11 @@ export function RepoPicker(props: {
           </Match>
           <Match when={loadError()}>
             {(failure) => (
-              <p role="alert" class="flex items-center justify-between gap-2 text-sm">
-                <span class="min-w-0">The repos could not be loaded: {failure().message}</span>
-                <button type="button" class="btn" onClick={() => props.onRetry()}>
-                  Retry
-                </button>
-              </p>
+              <LoadFailure
+                what="The repos"
+                message={failure().message}
+                onRetry={() => props.onRetry()}
+              />
             )}
           </Match>
           <Match when={repos().length === 0}>
