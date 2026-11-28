@@ -62,6 +62,9 @@ describe("inline Markdown", () => {
     ["`*not bold*`", "<c>*not bold*</c>"],
     ["`<b>&amp;</b>`", "<c><b>&amp;</b></c>"],
     ["a `line\nbreak` b", "a <c>line break</c> b"],
+    // A space on one side only is part of the code.
+    ["`ab `", "<c>ab </c>"],
+    ["` ab`", "<c> ab</c>"],
     // Bold and italics.
     ["**bold** and *italic*", "<b>bold</b> and <i>italic</i>"],
     ["__bold__ and _italic_", "<b>bold</b> and <i>italic</i>"],
@@ -70,12 +73,20 @@ describe("inline Markdown", () => {
     ["*italic with **bold** inside*", "<i>italic with <b>bold</b> inside</i>"],
     ["***a* b**", "<b><i>a</i> b</b>"],
     ["**`code` in bold**", "<b><c>code</c> in bold</b>"],
+    // `*` works inside a word; `_` does not.
+    ["un*frigging*believable", "un<i>frigging</i>believable"],
+    ["*foo*bar", "<i>foo</i>bar"],
+    ["a_b_ c", "a_b_ c"],
+    ["_foo_bar", "_foo_bar"],
     // What is not emphasis.
     ["2 * 3 * 4", "2 * 3 * 4"],
     ["snake_case_name and __init__.py", "snake_case_name and <b>init</b>.py"],
     ["a_b_c", "a_b_c"],
     ["src/*.ts and *.md", "src/*.ts and *.md"],
     ["a ** b ** c", "a ** b ** c"],
+    ["x * a* y", "x * a* y"],
+    ["a *\tb* c", "a *\tb* c"],
+    ["a *\nb* c", "a *\nb* c"],
     ["\\*not italic\\*", "*not italic*"],
     ["\\`not code\\`", "`not code`"],
     ["a \\ b", "a \\ b"],
@@ -119,6 +130,8 @@ describe("inline Markdown", () => {
     ["&lt;script&gt; &amp; &quot;x&quot; &apos;y&apos;", "<script> & \"x\" 'y'"],
     ["&#60;b&#62; &#x3C;i&#x3e;", "<b> <i>"],
     ["&#0; &#xD800; &#1114112;", "� � �"],
+    // The ends of the ranges a code point may take.
+    ["&#1; &#x10FFFF; &#xD7FF; &#xDFFF; &#xE000;", "\u0001 \u{10ffff} ퟿ � "],
     ["&nope; &amp &; AT&T", "&nope; &amp &; AT&T"],
     ["a&nbsp;b", "a b"],
     // Unclosed constructs show as written.
