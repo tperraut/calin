@@ -39,6 +39,9 @@ export function compactCount(count: number): string {
 
 export const filesLabel = (count: number): string => `${count} ${count === 1 ? "file" : "files"}`;
 
+/** Text typed in an optional field, trimmed; `null` when nothing is left, which the server reads as "not set". */
+export const blankAsNull = (typed: string): string | null => typed.trim() || null;
+
 /** "api", "api and web", "api, web and docs". */
 export function listInWords(items: readonly string[]): string {
   if (items.length <= 1) return items.join("");

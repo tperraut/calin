@@ -2,7 +2,16 @@ import { describe, expect, it } from "vite-plus/test";
 import type { WorkflowRun } from "../gen/WorkflowRun";
 import type { WorkflowNote } from "../state/sessionReducer";
 import { node, specGraph, workflowInfo } from "../test/workflows";
-import { isUsable, mergeRun, noteWords, problemLines, shapeSummary, startRun } from "./workflow";
+import {
+  isUsable,
+  mergeRun,
+  noteWords,
+  problemLines,
+  QUICK_WORKFLOW,
+  sentWorkflow,
+  shapeSummary,
+  startRun,
+} from "./workflow";
 
 const started = (nodeKind: string, nodeId: string, label: string, run = 1): WorkflowNote => ({
   what: "node_started",
@@ -149,5 +158,11 @@ describe("workflow files", () => {
     expect(isUsable(broken)).toBe(false);
     expect(isUsable(workflowInfo("fine"))).toBe(true);
     expect(problemLines(workflowInfo("fine"))).toEqual([]);
+  });
+
+  it("sends the id of the workflow picked, and nothing for Quick or none", () => {
+    expect(sentWorkflow(workflowInfo("review"))).toBe("review");
+    expect(sentWorkflow(workflowInfo(QUICK_WORKFLOW))).toBeUndefined();
+    expect(sentWorkflow(undefined)).toBeUndefined();
   });
 });

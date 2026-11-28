@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vite-plus/test";
 import {
+  blankAsNull,
   clockTime,
   compactCount,
   filesLabel,
@@ -93,6 +94,12 @@ describe("counts and costs", () => {
     expect(filesLabel(0)).toBe("0 files");
     expect(filesLabel(1)).toBe("1 file");
     expect(filesLabel(2)).toBe("2 files");
+  });
+
+  it("reads an optional field trimmed, and a blank one as not set", () => {
+    expect(blankAsNull(" api ")).toBe("api");
+    expect(blankAsNull("   ")).toBeNull();
+    expect(blankAsNull("")).toBeNull();
   });
 
   it("lists items in words", () => {

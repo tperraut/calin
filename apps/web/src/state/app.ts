@@ -40,6 +40,10 @@ export type HealthState =
   | { status: "ready"; health: Health }
   | { status: "unreachable" };
 
+/** The runners the server offers, default first; none until it has answered. */
+export const healthRunners = (health: HealthState): readonly string[] =>
+  health.status === "ready" ? health.health.runners : [];
+
 export type { RepoRegistry } from "./catalog";
 
 /**
@@ -66,6 +70,10 @@ export type WorkflowCatalog =
   | { status: "loading" }
   | { status: "ready"; workflows: readonly WorkflowInfo[] }
   | { status: "error"; message: string };
+
+/** The workflows listed; none until the list is read. */
+export const catalogWorkflows = (catalog: WorkflowCatalog | undefined): readonly WorkflowInfo[] =>
+  catalog?.status === "ready" ? catalog.workflows : [];
 
 export type AppServices = {
   api: Api;

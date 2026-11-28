@@ -11,6 +11,10 @@ import type { WorkflowNote } from "../state/sessionReducer";
 /** The workflow a session runs when it names none (workflows spec, section 1). */
 export const QUICK_WORKFLOW = "quick";
 
+/** The workflow id a session is started with; `quick` is said by saying nothing. */
+export const sentWorkflow = (picked: WorkflowInfo | undefined): string | undefined =>
+  picked?.id === QUICK_WORKFLOW ? undefined : picked?.id;
+
 /** Node types in the order of the spec's table (section 3); a newer one sorts last. */
 export const NODE_KINDS = [
   "start",

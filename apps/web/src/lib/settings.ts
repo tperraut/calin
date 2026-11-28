@@ -1,4 +1,5 @@
 import type { Settings } from "../gen/Settings";
+import { blankAsNull } from "./format";
 
 export type SettingsField = "home_repo" | "scan_roots" | "clone_root" | "max_parallel";
 
@@ -68,9 +69,9 @@ export function settingsFromForm(form: {
     if (path !== "" && !roots.includes(path)) roots.push(path);
   }
   return {
-    home_repo: form.homeRepo.trim() === "" ? null : form.homeRepo.trim(),
+    home_repo: blankAsNull(form.homeRepo),
     scan_roots: roots,
-    clone_root: form.cloneRoot.trim() === "" ? null : form.cloneRoot.trim(),
+    clone_root: blankAsNull(form.cloneRoot),
     max_parallel: parallelOf(form.maxParallel ?? ""),
   };
 }

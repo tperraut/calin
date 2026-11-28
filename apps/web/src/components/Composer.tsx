@@ -13,8 +13,8 @@ import { errorMessage } from "../lib/errors";
 import { loadComposerPrefs, saveComposerPrefs, type RepoChoice } from "../lib/prefs";
 import { defaultRepoMode, permissionModes } from "../lib/status";
 import { refusalText } from "../lib/usage";
-import { isUsable, QUICK_WORKFLOW } from "../lib/workflow";
-import type { RepoRegistry, WorkflowCatalog } from "../state/app";
+import { isUsable, QUICK_WORKFLOW, sentWorkflow } from "../lib/workflow";
+import { catalogWorkflows, type RepoRegistry, type WorkflowCatalog } from "../state/app";
 import { refusingWindow } from "../state/limits";
 import { Markdown } from "./Markdown";
 import { RepoPicker } from "./RepoPicker";
@@ -77,6 +77,10 @@ export function chosenWorkflow(
   return usable(wanted) ?? usable(QUICK_WORKFLOW);
 }
 
+/** The runner a form starts with: the one chosen while the server still offers it, else its default (the first). */
+export const offeredRunner = (wanted: string, runners: readonly string[]): string | undefined =>
+  runners.includes(wanted) ? wanted : runners[0];
+
 /**
  * The form that starts a session. `runners` comes from `GET /health`, default
  * first, `registry` from `GET /repos` and `sets` from `GET /repo-sets`.
@@ -119,18 +123,9 @@ export function Composer(props: {
   const errorId = createUniqueId();
   const noticeId = createUniqueId();
 
-  const workflowList = (): readonly WorkflowInfo[] =>
-    props.workflows?.status === "ready" ? props.workflows.workflows : [];
+  const workflowList = (): readonly WorkflowInfo[] => catalogWorkflows(props.workflows);
   const pickedWorkflow = createMemo(() => chosenWorkflow(workflow(), workflowList()));
-  /** The id a session is started with; `quick` is said by saying nothing. */
-  const workflowToSend = (): string | undefined => {
-    const id = pickedWorkflow()?.id;
-    return id === undefined || id === QUICK_WORKFLOW ? undefined : id;
-  };
-
-  // A remembered runner the server no longer offers gives way to its default (the first).
-  const selectedRunner = (): string | undefined =>
-    props.runners.includes(runner()) ? runner() : props.runners[0];
+  const selectedRunner = (): string | undefined => offeredRunner(runner(), props.runners);
   // Nothing is attached until the registry is read.
   const chosen = createMemo((): readonly RepoChoice[] =>
     props.registry.status === "ready" ? attachedRepos(choices(), props.registry.repos) : [],
@@ -190,7 +185,7 @@ export function Composer(props: {
     if (model().trim() !== "") request.model = model().trim();
     // Without a list, nothing can be checked; the last choice is kept for the next visit.
     const known = props.workflows?.status === "ready";
-    const usedWorkflow = known ? workflowToSend() : undefined;
+    const usedWorkflow = known ? sentWorkflow(pickedWorkflow()) : undefined;
     if (usedWorkflow !== undefined) request.workflow = usedWorkflow;
     setBusy(true);
     setError(undefined);
