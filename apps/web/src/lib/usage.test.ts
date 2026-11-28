@@ -6,6 +6,7 @@ import {
   dayKey,
   dayLabel,
   fillDays,
+  labelStep,
   meterState,
   niceScale,
   percentUsed,
@@ -81,6 +82,27 @@ describe("days", () => {
     expect(fillDays([])).toEqual([]);
   });
 
+  it("runs to the last day of all, however many came before it", () => {
+    const days = fillDays([row("2026-11-01", 1), row("2026-11-05", 3), row("2026-11-02", 2)]);
+    expect(days.map((day) => [day.key, day.totals.cost_usd])).toEqual([
+      ["2026-11-01", 1],
+      ["2026-11-02", 2],
+      ["2026-11-03", 0],
+      ["2026-11-04", 0],
+      ["2026-11-05", 3],
+    ]);
+  });
+
+  it("never draws more than 400 days, whatever the answer spans", () => {
+    const days = fillDays([row("2025-01-01", 1), row("2026-11-28", 1)]);
+    expect(days).toHaveLength(400);
+    expect(days.at(0)?.key).toBe("2025-01-01");
+  });
+
+  it("labels every day up to 10 bars, every fifth up to a month, every fourteenth beyond", () => {
+    expect([1, 10, 11, 31, 32, 90].map(labelStep)).toEqual([1, 1, 5, 5, 14, 14]);
+  });
+
   it("crosses a month end and a clock change", () => {
     const days = fillDays([row("2026-10-24", 1), row("2026-11-02", 1)]);
     expect(days).toHaveLength(10);
@@ -106,6 +128,7 @@ describe("days", () => {
     expect(rangeFromQuery("7")).toBe(7);
     expect(rangeFromQuery("90")).toBe(90);
     expect(rangeFromQuery(["30"])).toBe(30);
+    expect(rangeFromQuery(["7", "90"])).toBe(7);
     expect(rangeFromQuery(undefined)).toBe(30);
     expect(rangeFromQuery("12")).toBe(30);
   });
@@ -116,6 +139,8 @@ describe("limit windows", () => {
     expect(windowName("five_hour")).toBe("5-hour window");
     expect(windowName("seven_day")).toBe("7-day window");
     expect(windowName("seven_day_opus")).toBe("7-day window (opus)");
+    expect(windowName("5_hour")).toBe("5-hour window");
+    expect(windowName("30_day_sonnet_4")).toBe("30-day window (sonnet 4)");
     expect(windowName("burst_quota")).toBe("burst_quota");
     expect(windowName("RateLimit")).toBe("RateLimit");
   });
@@ -124,6 +149,8 @@ describe("limit windows", () => {
     const now = at(26, 15); // a Thursday
     expect(percentUsed(0.623)).toBe("62%");
     expect(percentUsed(1.4)).toBe("100%");
+    expect(percentUsed(-0.2)).toBe("0%");
+    expect(percentUsed(Number.NaN)).toBe("0%");
     expect(resetText(makeWindow("five_hour", { resets_at: at(26, 18) }), now)).toBe(
       "resets at 18:00",
     );
@@ -133,6 +160,13 @@ describe("limit windows", () => {
     // Beyond the week, the date in the viewer's locale.
     expect(resetText(makeWindow("seven_day", { resets_at: at(26 + 10, 9) }), now)).toMatch(
       /^resets (6 December|December 6) 09:00$/,
+    );
+    expect(resetText(makeWindow("five_hour", { resets_at: at(27, 9) }), now)).toBe(
+      "resets Friday 09:00",
+    );
+    // Six and a half days on, the weekday would read as this week's: the date says it.
+    expect(resetText(makeWindow("seven_day", { resets_at: now + 6.5 * 86_400_000 }), now)).toMatch(
+      /^resets (3 December|December 3) 03:00$/,
     );
     expect(resetText(makeWindow("five_hour"), now)).toBeUndefined();
     expect(reportedText(now - 3 * 60_000, now)).toBe("reported 3 min ago");
@@ -155,6 +189,8 @@ describe("limit windows", () => {
       tone: "success",
     });
     expect(meterState(makeWindow("a", { used: 0.8 })).label).toBe("Filling up");
+    expect(meterState(makeWindow("a", { used: 0.75 })).label).toBe("Filling up");
+    expect(meterState(makeWindow("a", { used: 0.9 })).label).toBe("Nearly full");
     expect(meterState(makeWindow("a", { used: 0.95 })).label).toBe("Nearly full");
     expect(meterState(makeWindow("a", { used: 0.1, refused: true })).label).toBe(
       "Refusing requests",
