@@ -2,8 +2,8 @@ import { flush } from "solid-js";
 import { describe, expect, it, vi } from "vite-plus/test";
 import type { Api } from "../api/http";
 import type { Repo } from "../gen/Repo";
-import { deferred, fakeApi, makeRepo, settle } from "../test/fakes";
-import { compareRepos, createCatalog } from "./catalog";
+import { deferred, fakeApi, makeMissingRepo, makeRepo, settle } from "../test/fakes";
+import { compareRepos, createCatalog, markCloning, withRepo } from "./catalog";
 
 const names = (catalog: ReturnType<typeof createCatalog>) => {
   flush();
@@ -20,6 +20,23 @@ describe("compareRepos", () => {
   });
 });
 
+describe("withRepo and markCloning", () => {
+  it("replace the repo of the same id, or add it", () => {
+    const web = makeRepo("web");
+    const renamed = makeRepo("api", { name: "API" });
+    expect(withRepo([makeRepo("api"), web], renamed)).toEqual([web, renamed]);
+    expect(withRepo([web], makeRepo("docs"))).toEqual([web, makeRepo("docs")]);
+  });
+
+  it("show one repo cloning, with its last problem cleared", () => {
+    const failed = makeMissingRepo("web", { problem: "git clone failed" });
+    const other = makeMissingRepo("api");
+    expect(markCloning([failed, other], "web")).toEqual([
+      { ...failed, cloning: true, problem: null },
+      other,
+    ]);
+  });
+});
 describe("the repo catalog before its list was read", () => {
   it("reads the server's list after a registration instead of showing one repo", async () => {
     const listRepos = vi

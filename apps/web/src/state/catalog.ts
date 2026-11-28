@@ -1,4 +1,4 @@
-import { createSignal, type Accessor } from "solid-js";
+import { createSignal, type Accessor, type Setter } from "solid-js";
 import type { Api } from "../api/http";
 import type { RegisterRepoRequest } from "../gen/RegisterRepoRequest";
 import type { Repo } from "../gen/Repo";
@@ -47,122 +47,160 @@ export type Catalog = {
   forget(): void;
 };
 
+/** `list` with `repo` in place of the one of the same id, or added. Pure. */
+export const withRepo = (list: readonly Repo[], repo: Repo): Repo[] => [
+  ...list.filter((one) => one.id !== repo.id),
+  repo,
+];
+
+/** `list` with repo `id` shown cloning, as a 202 says (api.rs), before the next read confirms it. Pure. */
+export const markCloning = (list: readonly Repo[], id: string): Repo[] =>
+  list.map((repo) => (repo.id === id ? { ...repo, cloning: true, problem: null } : repo));
+
 export function createCatalog(api: Api): Catalog {
-  const [repos, setRepos] = createSignal<RepoRegistry>({ status: "loading" });
-  const [sets, setSets] = createSignal<readonly RepoSet[]>([]);
+  return new RepoCatalog(api);
+}
 
-  let registry: readonly Repo[] | undefined;
-  let wanted = false;
-  let inFlight = false;
+// A class rather than a closure of methods: each method then stands, and is measured, on its own.
+// `private`, not `#`: the complexity report does not see `#` methods.
+class RepoCatalog implements Catalog {
+  readonly repos: Accessor<RepoRegistry>;
+  readonly sets: Accessor<readonly RepoSet[]>;
+  private readonly setRepos: Setter<RepoRegistry>;
+  private readonly setSets: Setter<readonly RepoSet[]>;
+  private registry: readonly Repo[] | undefined;
+  private wanted = false;
+  private inFlight = false;
   // Set when the list changed under a read in flight: its answer is from before, so it is asked again.
-  let outdated = false;
-  let active = true;
-  let poll: ReturnType<typeof setTimeout> | undefined;
+  private outdated = false;
+  private active = true;
+  private poll: ReturnType<typeof setTimeout> | undefined;
 
-  function schedulePoll(): void {
-    const cloning = active && registry?.some((repo) => repo.cloning) === true;
-    if (!cloning) {
-      if (poll !== undefined) clearTimeout(poll);
-      poll = undefined;
+  private readonly api: Api;
+
+  constructor(api: Api) {
+    this.api = api;
+    [this.repos, this.setRepos] = createSignal<RepoRegistry>({ status: "loading" });
+    [this.sets, this.setSets] = createSignal<readonly RepoSet[]>([]);
+  }
+
+  load(): void {
+    this.wanted = true;
+    if (!this.registry) this.setRepos({ status: "loading" });
+    this.readAll();
+  }
+
+  reload(options?: { missingOnly?: boolean }): void {
+    if (!this.wanted || (options?.missingOnly === true && this.registry)) return;
+    this.readAll();
+  }
+
+  invalidate(): void {
+    if (!this.wanted) return;
+    if (this.inFlight) this.outdated = true;
+    this.readAll();
+  }
+
+  async register(request: RegisterRepoRequest): Promise<Repo> {
+    const repo = await this.api.registerRepo(request);
+    // Without a list to add to, the server's own is the only complete one.
+    this.change((list) => withRepo(list, repo));
+    return repo;
+  }
+
+  async remove(id: string): Promise<void> {
+    await this.api.removeRepo(id);
+    if (this.registry) this.publish(this.registry.filter((one) => one.id !== id));
+  }
+
+  async clone(id: string): Promise<void> {
+    await this.api.cloneRepo(id);
+    this.change((list) => markCloning(list, id));
+  }
+
+  async rescan(): Promise<void> {
+    const loaded = await this.api.refreshRepos();
+    this.wanted = true;
+    this.publish(loaded);
+    this.readSets();
+  }
+
+  setActive(active: boolean): void {
+    this.active = active;
+    this.schedulePoll();
+  }
+
+  forget(): void {
+    this.wanted = false;
+    this.registry = undefined;
+    this.active = false;
+    this.schedulePoll();
+    this.setRepos({ status: "loading" });
+    this.setSets([]);
+  }
+
+  /** Applies `edit` to the list on screen, or reads the server's when there is none yet. */
+  private change(edit: (list: readonly Repo[]) => readonly Repo[]): void {
+    if (this.registry) this.publish(edit(this.registry));
+    else this.readRepos();
+  }
+
+  private readAll(): void {
+    this.readRepos();
+    this.readSets();
+  }
+
+  private cloning(): boolean {
+    return this.active && this.registry?.some((repo) => repo.cloning) === true;
+  }
+
+  private schedulePoll(): void {
+    if (!this.cloning()) {
+      clearTimeout(this.poll);
+      this.poll = undefined;
       return;
     }
-    if (poll !== undefined) return;
-    poll = setTimeout(() => {
-      poll = undefined;
-      readRepos();
+    this.poll ??= setTimeout(() => {
+      this.poll = undefined;
+      this.readRepos();
     }, CLONE_POLL_MS);
   }
 
-  function publish(next: readonly Repo[]): void {
-    registry = next.toSorted(compareRepos);
-    if (inFlight) outdated = true;
-    setRepos({ status: "ready", repos: registry });
-    schedulePoll();
+  private publish(next: readonly Repo[]): void {
+    this.registry = next.toSorted(compareRepos);
+    if (this.inFlight) this.outdated = true;
+    this.setRepos({ status: "ready", repos: this.registry });
+    this.schedulePoll();
   }
 
-  function readRepos(): void {
-    if (inFlight) return;
-    inFlight = true;
-    outdated = false;
-    api.listRepos().then(
-      (loaded) => {
-        inFlight = false;
-        if (outdated) readRepos();
-        else publish(loaded);
-      },
-      (error: unknown) => {
-        inFlight = false;
-        // A list that was read once stays usable through an outage.
-        if (!registry) setRepos({ status: "error", message: errorMessage(error) });
-        schedulePoll();
-      },
+  private readRepos(): void {
+    if (this.inFlight) return;
+    this.inFlight = true;
+    this.outdated = false;
+    this.api.listRepos().then(
+      (loaded) => this.answered(loaded),
+      (error: unknown) => this.failed(error),
     );
   }
 
-  function readSets(): void {
-    // Sets are shortcuts over the list: without them the picker works the same, so a failure is silent.
-    api.listRepoSets().then(setSets, () => {});
+  private answered(loaded: readonly Repo[]): void {
+    this.inFlight = false;
+    if (this.outdated) this.readRepos();
+    else this.publish(loaded);
   }
 
-  return {
-    repos,
-    sets,
-    load() {
-      wanted = true;
-      if (!registry) setRepos({ status: "loading" });
-      readRepos();
-      readSets();
-    },
-    reload(options) {
-      if (!wanted || (options?.missingOnly === true && registry)) return;
-      readRepos();
-      readSets();
-    },
-    invalidate() {
-      if (!wanted) return;
-      if (inFlight) outdated = true;
-      readRepos();
-      readSets();
-    },
-    async register(request) {
-      const repo = await api.registerRepo(request);
-      // Without a list to add to, the server's own is the only complete one.
-      if (registry) publish([...registry.filter((one) => one.id !== repo.id), repo]);
-      else readRepos();
-      return repo;
-    },
-    async remove(id) {
-      await api.removeRepo(id);
-      if (registry) publish(registry.filter((one) => one.id !== id));
-    },
-    async clone(id) {
-      await api.cloneRepo(id);
-      // 202 means the clone is running (api.rs): say so now, the next read confirms it.
-      if (registry) {
-        publish(
-          registry.map((repo) =>
-            repo.id === id ? { ...repo, cloning: true, problem: null } : repo,
-          ),
-        );
-      } else readRepos();
-    },
-    async rescan() {
-      const loaded = await api.refreshRepos();
-      wanted = true;
-      publish(loaded);
-      readSets();
-    },
-    setActive(next) {
-      active = next;
-      schedulePoll();
-    },
-    forget() {
-      wanted = false;
-      registry = undefined;
-      active = false;
-      schedulePoll();
-      setRepos({ status: "loading" });
-      setSets([]);
-    },
-  };
+  private failed(error: unknown): void {
+    this.inFlight = false;
+    // A list that was read once stays usable through an outage.
+    if (!this.registry) this.setRepos({ status: "error", message: errorMessage(error) });
+    this.schedulePoll();
+  }
+
+  private readSets(): void {
+    // Sets are shortcuts over the list: without them the picker works the same, so a failure is silent.
+    this.api.listRepoSets().then(
+      (sets) => this.setSets(sets),
+      () => {},
+    );
+  }
 }
