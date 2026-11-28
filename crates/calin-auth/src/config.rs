@@ -84,92 +84,33 @@ impl AuthMode {
         let allowed_users = set(ENV_ALLOWED_USERS);
 
         let Some(public_url) = lookup(ENV_PUBLIC_URL) else {
-            let present: Vec<&'static str> = [
+            return Self::without_public_url([
                 (ENV_OIDC_ISSUER, issuer.is_some()),
                 (ENV_OIDC_CLIENT_ID, client_id.is_some()),
                 (ENV_OIDC_CLIENT_SECRET, client_secret.is_some()),
                 (ENV_ALLOWED_USERS, allowed_users.is_some()),
-            ]
-            .into_iter()
-            .filter_map(|(name, is_set)| is_set.then_some(name))
-            .collect();
-            return if present.is_empty() {
-                Ok(Self::Local)
-            } else {
-                Err(ConfigError {
-                    problems: vec![ConfigProblem::PublicUrlNotSet { present }],
-                })
-            };
+            ]);
         };
 
+        // Every variable is checked, in this order, so the error lists every
+        // problem at once.
         let mut problems = Vec::new();
-        let invalid = |variable, reason| ConfigProblem::Invalid { variable, reason };
-
-        let origin = match parse_public_url(public_url.trim(), loopback_http) {
-            Ok(origin) => Some(origin),
-            Err(reason) => {
-                problems.push(invalid(ENV_PUBLIC_URL, reason));
-                None
-            }
-        };
-        let issuer = match issuer.as_deref().map(str::trim) {
-            None => {
-                problems.push(ConfigProblem::Missing(ENV_OIDC_ISSUER));
-                None
-            }
-            Some(issuer) => match check_issuer(issuer, loopback_http) {
-                Ok(()) => Some(issuer.to_owned()),
-                Err(reason) => {
-                    problems.push(invalid(ENV_OIDC_ISSUER, reason));
-                    None
-                }
-            },
-        };
-        let client_id = match client_id.as_deref().map(str::trim) {
-            None => {
-                problems.push(ConfigProblem::Missing(ENV_OIDC_CLIENT_ID));
-                None
-            }
-            Some(id) if id.len() > MAX_CLIENT_ID_BYTES => {
-                problems.push(invalid(ENV_OIDC_CLIENT_ID, "is too long"));
-                None
-            }
-            Some(id) if id.chars().any(char::is_control) => {
-                problems.push(invalid(ENV_OIDC_CLIENT_ID, "contains a control character"));
-                None
-            }
-            Some(id) => Some(id.to_owned()),
-        };
-        let client_secret = match client_secret {
-            // Not trimmed: a secret is used byte for byte, so stray blanks
-            // (a CRLF env file) are an error here, not a refusal at the provider.
-            Some(secret) if secret.trim() != secret || secret.chars().any(char::is_control) => {
-                problems.push(invalid(
-                    ENV_OIDC_CLIENT_SECRET,
-                    "has surrounding whitespace or a control character",
-                ));
-                None
-            }
-            Some(secret) => Some(ClientSecret(secret)),
-            None => None,
-        };
-        let allow_list = match AllowList::parse(allowed_users.as_deref().unwrap_or("")) {
-            Ok(list) => Some(list),
-            Err(list_problems) => {
-                problems.extend(list_problems.into_iter().map(ConfigProblem::AllowList));
-                None
-            }
-        };
+        let origin = parse_public_url(public_url.trim(), loopback_http)
+            .map_err(|reason| invalid(ENV_PUBLIC_URL, reason));
+        let origin = keep(origin, &mut problems);
+        let issuer = keep(read_issuer(issuer.as_deref(), loopback_http), &mut problems);
+        let client_id = keep(read_client_id(client_id.as_deref()), &mut problems);
+        let client_secret = keep(read_client_secret(client_secret), &mut problems).flatten();
+        let allow_list = AllowList::parse(allowed_users.as_deref().unwrap_or(""))
+            .map_err(|list| problems.extend(list.into_iter().map(ConfigProblem::AllowList)))
+            .ok();
 
         match (origin, issuer, client_id, allow_list) {
             (Some(origin), Some(issuer), Some(client_id), Some(allow_list))
                 if problems.is_empty() =>
             {
                 Ok(Self::Public(PublicConfig {
-                    authority: origin
-                        .split_once("://")
-                        .map(|(_, authority)| authority.to_owned())
-                        .unwrap_or_default(),
+                    authority: authority_of(&origin),
                     origin,
                     issuer,
                     client_id,
@@ -181,6 +122,73 @@ impl AuthMode {
             _ => Err(ConfigError { problems }),
         }
     }
+
+    /// Local mode, unless a sign-in variable is set (`present` pairs each
+    /// name with whether it is).
+    fn without_public_url(present: [(&'static str, bool); 4]) -> Result<Self, ConfigError> {
+        let present: Vec<&'static str> = present
+            .into_iter()
+            .filter_map(|(name, is_set)| is_set.then_some(name))
+            .collect();
+        if present.is_empty() {
+            return Ok(Self::Local);
+        }
+        Err(ConfigError {
+            problems: vec![ConfigProblem::PublicUrlNotSet { present }],
+        })
+    }
+}
+
+/// The value, or `None` with the problem recorded.
+fn keep<T>(result: Result<T, ConfigProblem>, problems: &mut Vec<ConfigProblem>) -> Option<T> {
+    result.map_err(|problem| problems.push(problem)).ok()
+}
+
+fn invalid(variable: &'static str, reason: &'static str) -> ConfigProblem {
+    ConfigProblem::Invalid { variable, reason }
+}
+
+fn read_issuer(issuer: Option<&str>, loopback_http: LoopbackHttp) -> Result<String, ConfigProblem> {
+    let issuer = issuer
+        .map(str::trim)
+        .ok_or(ConfigProblem::Missing(ENV_OIDC_ISSUER))?;
+    check_issuer(issuer, loopback_http).map_err(|reason| invalid(ENV_OIDC_ISSUER, reason))?;
+    Ok(issuer.to_owned())
+}
+
+fn read_client_id(client_id: Option<&str>) -> Result<String, ConfigProblem> {
+    let id = client_id
+        .map(str::trim)
+        .ok_or(ConfigProblem::Missing(ENV_OIDC_CLIENT_ID))?;
+    if id.len() > MAX_CLIENT_ID_BYTES {
+        return Err(invalid(ENV_OIDC_CLIENT_ID, "is too long"));
+    }
+    if id.chars().any(char::is_control) {
+        return Err(invalid(ENV_OIDC_CLIENT_ID, "contains a control character"));
+    }
+    Ok(id.to_owned())
+}
+
+/// Not trimmed: a secret is used byte for byte, so stray blanks (a CRLF env
+/// file) are an error here, not a refusal at the provider.
+fn read_client_secret(secret: Option<String>) -> Result<Option<ClientSecret>, ConfigProblem> {
+    match secret {
+        Some(secret) if secret.trim() != secret || secret.chars().any(char::is_control) => {
+            Err(invalid(
+                ENV_OIDC_CLIENT_SECRET,
+                "has surrounding whitespace or a control character",
+            ))
+        }
+        secret => Ok(secret.map(ClientSecret)),
+    }
+}
+
+/// `calin.example.com[:port]` from a normalized origin.
+fn authority_of(origin: &str) -> String {
+    origin
+        .split_once("://")
+        .map(|(_, authority)| authority.to_owned())
+        .unwrap_or_default()
 }
 
 /// A complete public-mode configuration. Exists only if every part is valid.
@@ -337,20 +345,26 @@ pub(crate) fn parse_strict_url(text: &str) -> Result<Url, &'static str> {
     if text.len() > MAX_URL_BYTES {
         return Err("is too long");
     }
-    if text
-        .chars()
-        .any(|c| c.is_whitespace() || c.is_control() || c == '\\')
-    {
+    if text.chars().any(the_parser_repairs) {
         return Err("contains whitespace, a control character or a backslash");
     }
     if !(text.starts_with("https://") || text.starts_with("http://")) {
         return Err("must be an https URL");
     }
     let url = Url::parse(text).map_err(|_| "is not a valid URL")?;
-    if !url.username().is_empty() || url.password().is_some() {
+    if has_credentials(&url) {
         return Err("must not contain credentials");
     }
     Ok(url)
+}
+
+/// A character the URL parser drops or rewrites instead of refusing.
+fn the_parser_repairs(c: char) -> bool {
+    c.is_whitespace() || c.is_control() || c == '\\'
+}
+
+fn has_credentials(url: &Url) -> bool {
+    !url.username().is_empty() || url.password().is_some()
 }
 
 /// Validates the public URL and returns its normalized origin.
@@ -460,10 +474,6 @@ mod tests {
             Err(error) => error.problems().to_vec(),
             Ok(mode) => panic!("expected an error, got {mode:?}"),
         }
-    }
-
-    fn invalid(variable: &'static str, reason: &'static str) -> ConfigProblem {
-        ConfigProblem::Invalid { variable, reason }
     }
 
     #[test]
@@ -628,6 +638,41 @@ mod tests {
         assert_eq!(
             problems(&with(ENV_PUBLIC_URL, long), LoopbackHttp::Refuse),
             vec![invalid(ENV_PUBLIC_URL, "is too long")]
+        );
+    }
+
+    #[test]
+    fn strict_url_checks_run_in_order() {
+        let long_and_spaced = format!("ftp://a b.example.com/{}", "a".repeat(2100));
+        let cases = [
+            (long_and_spaced.as_str(), "is too long"),
+            (
+                "ftp://a b.example.com",
+                "contains whitespace, a control character or a backslash",
+            ),
+            ("ftp://user:pw@idp.example.com", "must be an https URL"),
+            ("https://user@", "is not a valid URL"),
+            (
+                "https://user:pw@idp.example.com",
+                "must not contain credentials",
+            ),
+            (
+                "https://:pw@idp.example.com",
+                "must not contain credentials",
+            ),
+        ];
+        for (text, reason) in cases {
+            assert_eq!(parse_strict_url(text).map(|_| ()), Err(reason), "{text}");
+        }
+        assert!(parse_strict_url("https://idp.example.com/a?b#c").is_ok());
+    }
+
+    #[test]
+    fn a_client_id_too_long_is_refused_before_its_characters_are_read() {
+        let long: &'static str = Box::leak(format!("{}\u{7}", "c".repeat(513)).into_boxed_str());
+        assert_eq!(
+            problems(&with(ENV_OIDC_CLIENT_ID, long), LoopbackHttp::Refuse),
+            vec![invalid(ENV_OIDC_CLIENT_ID, "is too long")]
         );
     }
 
