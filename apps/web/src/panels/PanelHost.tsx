@@ -13,6 +13,32 @@ import {
   type SidePanelId,
 } from "./registry";
 
+/** The panels opened so far, with `panel` added. Grows only: a panel joins when it is first shown. */
+export function withShown(
+  seen: ReadonlySet<SidePanelId> = new Set(),
+  panel: SidePanelId | undefined,
+): ReadonlySet<SidePanelId> {
+  return panel === undefined || seen.has(panel) ? seen : new Set(seen).add(panel);
+}
+
+/**
+ * What to ask before going to `to` while the panels hold `unsaved` work;
+ * undefined lets it go. A link to another session or to the home page would
+ * drop the panels and what they hold. Moving between this session's own
+ * panels never does, and the browser's Back (a number) cannot be told apart
+ * from that, so it is let through.
+ */
+export function leaveQuestion(
+  unsaved: string | undefined,
+  to: string | number,
+  home: string,
+): string | undefined {
+  if (unsaved === undefined || typeof to !== "string") return undefined;
+  const path = to.split(/[?#]/)[0];
+  if (path === home || path.startsWith(`${home}/`)) return undefined;
+  return `${unsaved} Leave this session and lose them?`;
+}
+
 function KeptPanel(props: {
   definition: SidePanel;
   store: SessionStore;
@@ -75,12 +101,9 @@ export function PanelHost(props: {
   onUnsavedWork?: (description: string | undefined) => void;
   ref: (element: HTMLDivElement) => void;
 }) {
-  // Grows only: a panel joins when it is first shown.
-  const opened = createMemo<ReadonlySet<SidePanelId>>((previous) => {
-    const seen = previous ?? new Set<SidePanelId>();
-    const panel = props.panel;
-    return panel === undefined || seen.has(panel) ? seen : new Set(seen).add(panel);
-  });
+  const opened = createMemo<ReadonlySet<SidePanelId>>((previous) =>
+    withShown(previous, props.panel),
+  );
 
   let unsaved: string | undefined;
   const links: PanelLinks = {
@@ -97,15 +120,11 @@ export function PanelHost(props: {
     showItem: (itemId) => props.onShowItem(itemId),
   };
 
-  // A link to another session or to the home page would drop the panels and
-  // what they hold. Moving between this session's own panels never does, and
-  // the browser's Back cannot be told apart from that, so it is let through.
   const home = sessionPath(props.store.id);
   useBeforeLeave((leave) => {
-    if (unsaved === undefined || leave.defaultPrevented || typeof leave.to !== "string") return;
-    const to = leave.to.split(/[?#]/)[0];
-    if (to === home || to.startsWith(`${home}/`)) return;
-    if (!window.confirm(`${unsaved} Leave this session and lose them?`)) leave.preventDefault();
+    if (leave.defaultPrevented) return;
+    const question = leaveQuestion(unsaved, leave.to, home);
+    if (question !== undefined && !window.confirm(question)) leave.preventDefault();
   });
 
   return (
