@@ -8,10 +8,11 @@
 //! without a subscription cost nothing.
 
 use std::collections::{HashMap, HashSet};
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use calin_core::{LiveEnd, Store};
+use calin_core::{Live, LiveEnd, Store};
 use calin_proto::{Event, EventBody, PushKind, PushPayload, Session, SessionStatus};
 use calin_push::SendReport;
 use tokio::sync::mpsc;
@@ -109,43 +110,76 @@ impl Watcher {
         let started = now_ms();
         let mut known: HashMap<String, SessionStatus> = HashMap::new();
         let mut first = true;
-        loop {
-            let subscribed = tokio::select! {
-                () = shutdown.cancelled() => return,
-                subscribed = self.store.subscribe_sessions() => subscribed,
-            };
-            let (sessions, mut live) = match subscribed {
-                Ok(subscribed) => subscribed,
-                Err(error) => {
-                    tracing::warn!(%error, "push notifications stop: the store is closed");
-                    return;
-                }
-            };
+        while let Some((sessions, live)) = self.subscribe(&shutdown).await {
             // After a lag, the snapshot says what changed while updates were lost.
             for session in sessions {
-                let previous = known.insert(session.id.clone(), session.status);
-                if !first {
-                    self.changed(previous, &session, started).await;
-                }
+                self.seen(&mut known, &session, started, !first).await;
             }
             first = false;
-            loop {
-                let update = tokio::select! {
-                    () = shutdown.cancelled() => return,
-                    update = live.recv() => update,
-                };
-                match update {
-                    Ok(session) => {
-                        let previous = known.insert(session.id.clone(), session.status);
-                        self.changed(previous, &session, started).await;
-                    }
-                    Err(LiveEnd::Lagged(missed)) => {
-                        tracing::warn!(missed, "push notifications fell behind; catching up");
-                        break;
-                    }
-                    Err(LiveEnd::Closed) => return,
-                }
+            if self
+                .follow(live, &mut known, started, &shutdown)
+                .await
+                .is_break()
+            {
+                return;
             }
+        }
+    }
+
+    /// The sessions now and their changes from here on; `None` to stop.
+    async fn subscribe(
+        &self,
+        shutdown: &CancellationToken,
+    ) -> Option<(Vec<Session>, Live<Session>)> {
+        let subscribed = tokio::select! {
+            () = shutdown.cancelled() => return None,
+            subscribed = self.store.subscribe_sessions() => subscribed,
+        };
+        match subscribed {
+            Ok(subscribed) => Some(subscribed),
+            Err(error) => {
+                tracing::warn!(%error, "push notifications stop: the store is closed");
+                None
+            }
+        }
+    }
+
+    /// Handles live changes until the feed ends: `Continue` after a lag,
+    /// to subscribe again, `Break` to stop.
+    async fn follow(
+        &self,
+        mut live: Live<Session>,
+        known: &mut HashMap<String, SessionStatus>,
+        started: i64,
+        shutdown: &CancellationToken,
+    ) -> ControlFlow<()> {
+        loop {
+            let update = tokio::select! {
+                () = shutdown.cancelled() => return ControlFlow::Break(()),
+                update = live.recv() => update,
+            };
+            match update {
+                Ok(session) => self.seen(known, &session, started, true).await,
+                Err(LiveEnd::Lagged(missed)) => {
+                    tracing::warn!(missed, "push notifications fell behind; catching up");
+                    return ControlFlow::Continue(());
+                }
+                Err(LiveEnd::Closed) => return ControlFlow::Break(()),
+            }
+        }
+    }
+
+    /// Remembers the session's status and, when `news`, acts on the change.
+    async fn seen(
+        &self,
+        known: &mut HashMap<String, SessionStatus>,
+        session: &Session,
+        started: i64,
+        news: bool,
+    ) {
+        let previous = known.insert(session.id.clone(), session.status);
+        if news {
+            self.changed(previous, session, started).await;
         }
     }
 
@@ -157,56 +191,12 @@ impl Watcher {
         if previous == session.status || session.updated_at < started {
             return;
         }
-        let child = session.parent_session_id.is_some();
-        let kind = match session.status {
-            // A child blocked on the user blocks its whole tree.
-            SessionStatus::Waiting => Some(PushKind::Waiting),
-            SessionStatus::Review if !child => Some(PushKind::Review),
-            SessionStatus::Failed if !child => Some(PushKind::Failed),
-            SessionStatus::Done if !child && previous == SessionStatus::Shipping => {
-                Some(PushKind::Merged)
-            }
-            _ => None,
-        };
-        let Some(kind) = kind else {
-            if matches!(
-                session.status,
-                SessionStatus::Waiting
-                    | SessionStatus::Review
-                    | SessionStatus::Failed
-                    | SessionStatus::Done
-            ) {
-                observe(
-                    self.observer.as_ref(),
-                    Decision {
-                        session_id: session.id.clone(),
-                        status: session.status,
-                        kind: None,
-                        identity: None,
-                        outcome: Outcome::Ignored,
-                    },
-                );
-            }
+        let Some(kind) = push_kind(previous, session) else {
+            self.ignored(session);
             return;
         };
-        let reason = match kind {
-            PushKind::Waiting => waiting_reason(&self.store, session).await,
-            PushKind::Review => review_summary(&self.store, session).await,
-            PushKind::Failed => failure_reason(&self.store, session).await,
-            PushKind::Merged | PushKind::Test => "All pull requests merged.".to_owned(),
-        };
-        let (title, body) = if child {
-            let root = match self.store.session(&session.root_session_id).await {
-                Ok(root) => root.session.title,
-                Err(_) => session.title.clone(),
-            };
-            (
-                root,
-                format!("In \"{}\": {reason}", one_line(&session.title)),
-            )
-        } else {
-            (session.title.clone(), reason)
-        };
+        let reason = reason(&self.store, kind, session).await;
+        let (title, body) = self.title_and_body(session, reason).await;
         let notification = Notification {
             session_id: session.id.clone(),
             status: session.status,
@@ -222,6 +212,68 @@ impl Watcher {
         if self.queue.try_send(notification).is_err() {
             tracing::warn!(session = %session.id, "a push notification was dropped: too many pending");
         }
+    }
+
+    /// Tells the tests about a status that could have notified but does not.
+    fn ignored(&self, session: &Session) {
+        if matches!(
+            session.status,
+            SessionStatus::Waiting
+                | SessionStatus::Review
+                | SessionStatus::Failed
+                | SessionStatus::Done
+        ) {
+            observe(
+                self.observer.as_ref(),
+                Decision {
+                    session_id: session.id.clone(),
+                    status: session.status,
+                    kind: None,
+                    identity: None,
+                    outcome: Outcome::Ignored,
+                },
+            );
+        }
+    }
+
+    /// A child's notification goes under its root's title and names the child.
+    async fn title_and_body(&self, session: &Session, reason: String) -> (String, String) {
+        if session.parent_session_id.is_none() {
+            return (session.title.clone(), reason);
+        }
+        let root = match self.store.session(&session.root_session_id).await {
+            Ok(root) => root.session.title,
+            Err(_) => session.title.clone(),
+        };
+        (
+            root,
+            format!("In \"{}\": {reason}", one_line(&session.title)),
+        )
+    }
+}
+
+/// The notification a status change makes, if any.
+fn push_kind(previous: SessionStatus, session: &Session) -> Option<PushKind> {
+    let child = session.parent_session_id.is_some();
+    match session.status {
+        // A child blocked on the user blocks its whole tree.
+        SessionStatus::Waiting => Some(PushKind::Waiting),
+        SessionStatus::Review if !child => Some(PushKind::Review),
+        SessionStatus::Failed if !child => Some(PushKind::Failed),
+        SessionStatus::Done if !child && previous == SessionStatus::Shipping => {
+            Some(PushKind::Merged)
+        }
+        _ => None,
+    }
+}
+
+/// What the body of a notification of `kind` says.
+async fn reason(store: &Store, kind: PushKind, session: &Session) -> String {
+    match kind {
+        PushKind::Waiting => waiting_reason(store, session).await,
+        PushKind::Review => review_summary(store, session).await,
+        PushKind::Failed => failure_reason(store, session).await,
+        PushKind::Merged | PushKind::Test => "All pull requests merged.".to_owned(),
     }
 }
 
@@ -309,7 +361,24 @@ async fn tail(store: &Store, session: &Session, window: Option<u64>) -> (Vec<Eve
 /// Why the session waits: its newest open permission request or question.
 async fn waiting_reason(store: &Store, session: &Session) -> String {
     let fallback = "Waiting for you.".to_owned();
-    let mut open: HashSet<String> = HashSet::new();
+    let open = open_requests(store, session).await;
+    if open.is_empty() {
+        return fallback;
+    }
+    let (events, whole) = tail(store, session, Some(TAIL)).await;
+    if let Some(reason) = newest_open(&events, &open) {
+        return reason;
+    }
+    if whole {
+        return fallback;
+    }
+    let (events, _) = tail(store, session, None).await;
+    newest_open(&events, &open).unwrap_or(fallback)
+}
+
+/// The event ids of the session's open permission requests and questions.
+async fn open_requests(store: &Store, session: &Session) -> HashSet<String> {
+    let mut open = HashSet::new();
     match store.open_permissions(Some(&session.id)).await {
         Ok(requests) => open.extend(requests.into_iter().map(|request| request.event_id)),
         Err(error) => tracing::warn!(%error, "could not list open permission requests"),
@@ -318,32 +387,23 @@ async fn waiting_reason(store: &Store, session: &Session) -> String {
         Ok(questions) => open.extend(questions.into_iter().map(|question| question.event_id)),
         Err(error) => tracing::warn!(%error, "could not list open questions"),
     }
-    if open.is_empty() {
-        return fallback;
-    }
-    let newest = |events: &[Event]| {
-        events
-            .iter()
-            .rev()
-            .find(|event| open.contains(&event.id))
-            .and_then(|event| match &event.body {
-                EventBody::PermissionRequested { request } => {
-                    Some(format!("Wants to run: {}", one_line(&request.title)))
-                }
-                // A gate's text is its message; a question's first line says it.
-                EventBody::QuestionAsked { question } => Some(one_line(&question.text)),
-                _ => None,
-            })
-    };
-    let (events, whole) = tail(store, session, Some(TAIL)).await;
-    if let Some(reason) = newest(&events) {
-        return reason;
-    }
-    if whole {
-        return fallback;
-    }
-    let (events, _) = tail(store, session, None).await;
-    newest(&events).unwrap_or(fallback)
+    open
+}
+
+/// What the newest of `events` that is still open asks.
+fn newest_open(events: &[Event], open: &HashSet<String>) -> Option<String> {
+    events
+        .iter()
+        .rev()
+        .find(|event| open.contains(&event.id))
+        .and_then(|event| match &event.body {
+            EventBody::PermissionRequested { request } => {
+                Some(format!("Wants to run: {}", one_line(&request.title)))
+            }
+            // A gate's text is its message; a question's first line says it.
+            EventBody::QuestionAsked { question } => Some(one_line(&question.text)),
+            _ => None,
+        })
 }
 
 /// The reason the newest `failed` status gives.
@@ -413,6 +473,105 @@ async fn review_summary(store: &Store, session: &Session) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use calin_core::{EventDraft, Home, NewSession};
+    use calin_proto::{PermissionMode, PermissionRequest, ToolKind};
+
+    /// A session in a store of its own, and the session as of its last event.
+    struct Logged {
+        _dir: tempfile::TempDir,
+        store: Store,
+        session: Session,
+    }
+
+    impl Logged {
+        async fn new() -> Self {
+            let dir = tempfile::TempDir::new().unwrap();
+            let store = Store::open(Home::new(dir.path())).await.unwrap();
+            let session = store
+                .create_session(NewSession {
+                    title: "Fix the login bug".to_owned(),
+                    prompt: "fix it".to_owned(),
+                    runner: "mock".to_owned(),
+                    permission_mode: PermissionMode::Ask,
+                    workflow: None,
+                    model: None,
+                    repos: Vec::new(),
+                    dispatch: None,
+                    issue: None,
+                    context: None,
+                    automation_id: None,
+                })
+                .await
+                .unwrap();
+            Self {
+                _dir: dir,
+                store,
+                session,
+            }
+        }
+
+        async fn append(&mut self, body: EventBody) {
+            let event = self
+                .store
+                .append(&self.session.id, EventDraft::new(body))
+                .await
+                .unwrap();
+            self.session.head_seq = event.seq;
+        }
+
+        async fn messages(&mut self, count: u64) {
+            for n in 0..count {
+                let text = format!("message {n}");
+                self.append(EventBody::UserMessage { text }).await;
+            }
+        }
+
+        async fn ask_permission(&mut self, title: &str) {
+            let request = PermissionRequest {
+                id: "p1".to_owned(),
+                tool_name: "Bash".to_owned(),
+                tool_kind: ToolKind::Execute,
+                title: title.to_owned(),
+                input: serde_json::Value::Null,
+                item_id: None,
+            };
+            self.append(EventBody::PermissionRequested { request })
+                .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn without_an_open_request_the_session_just_waits() {
+        let mut logged = Logged::new().await;
+        logged.messages(3).await;
+        assert_eq!(
+            waiting_reason(&logged.store, &logged.session).await,
+            "Waiting for you."
+        );
+    }
+
+    #[tokio::test]
+    async fn an_open_request_is_found_in_the_end_of_the_log() {
+        let mut logged = Logged::new().await;
+        logged.ask_permission("cargo test").await;
+        logged.messages(3).await;
+        assert_eq!(
+            waiting_reason(&logged.store, &logged.session).await,
+            "Wants to run: cargo test"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_open_request_older_than_the_end_of_the_log_is_found_in_the_whole() {
+        let mut logged = Logged::new().await;
+        logged.ask_permission("make check").await;
+        logged.messages(TAIL + 10).await;
+        assert_eq!(
+            waiting_reason(&logged.store, &logged.session).await,
+            "Wants to run: make check"
+        );
+    }
 
     #[test]
     fn a_line_is_the_first_non_blank_one_cut_short() {
