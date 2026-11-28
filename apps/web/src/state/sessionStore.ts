@@ -32,6 +32,7 @@ import type { WorkflowRun } from "../gen/WorkflowRun";
 import type { WriteFileRequest } from "../gen/WriteFileRequest";
 import { mergePullRequests, shipPlan } from "../lib/delivery";
 import { errorMessage } from "../lib/errors";
+import { filled } from "../lib/format";
 import { createRefresher, type Refresher } from "../lib/refresher";
 import { coalesce, type Schedule } from "../lib/schedule";
 import { mergeRun } from "../lib/workflow";
@@ -259,12 +260,6 @@ export function namedRepo(
     .toSorted(([, a], [, b]) => b.length - a.length)
     .find(([, name]) => mentions(message, name));
   return named?.[0];
-}
-
-/** Trimmed, or `undefined` when there is nothing but blanks. */
-function filled(text: string | undefined): string | undefined {
-  const trimmed = text?.trim();
-  return trimmed === "" ? undefined : trimmed;
 }
 
 function resolution(

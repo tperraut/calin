@@ -5,6 +5,7 @@ import {
   compactCount,
   compareText,
   filesLabel,
+  filled,
   formatCost,
   formatDuration,
   listInWords,
@@ -126,5 +127,14 @@ describe("clockTime", () => {
   it("says the time of day to the second on a 24-hour clock", () => {
     const afternoon = new Date(2026, 10, 28, 14, 3, 27).getTime();
     expect(clockTime(afternoon)).toMatch(/^14\D03\D27$/);
+  });
+});
+
+describe("filled", () => {
+  it("trims what was typed, and gives nothing for blanks or nothing", () => {
+    expect(filled("  ship it \n")).toBe("ship it");
+    expect(filled(" \t ")).toBeUndefined();
+    expect(filled("")).toBeUndefined();
+    expect(filled(undefined)).toBeUndefined();
   });
 });
