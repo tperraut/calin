@@ -315,52 +315,25 @@ impl AuthStore {
         allow_list: AllowList,
         clock: Arc<dyn Clock>,
     ) -> Result<Self, StoreError> {
-        let io_error = |source| StoreError::Io {
-            path: path.clone(),
-            source,
-        };
         // Found out now rather than at the first sign-in or, worse, at the
         // first revocation: a store that cannot write keeps nothing.
-        let probe = write_temporary(&path, b"").map_err(io_error)?;
-        std::fs::remove_file(probe).map_err(io_error)?;
+        let probe = write_temporary(&path, b"").map_err(io_error(&path))?;
+        std::fs::remove_file(probe).map_err(io_error(&path))?;
 
         let now = clock.now();
+        let loaded = load(&path)?;
         let mut report = LoadReport {
-            file: LoadedFile::Missing,
-            permissions_corrected: false,
+            file: loaded.file,
+            permissions_corrected: loaded.permissions_corrected,
             revoked: 0,
             expired: 0,
         };
         let mut state = State {
-            sessions: Vec::new(),
-            device_tokens: Vec::new(),
+            sessions: loaded.sessions,
+            device_tokens: loaded.device_tokens,
             allow_list,
             generation: 0,
         };
-        match std::fs::read(&path) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(io_error(error)),
-            Ok(bytes) => {
-                report.permissions_corrected = tighten_permissions(&path).map_err(io_error)?;
-                match parse_file(&bytes) {
-                    Ok(file) => {
-                        report.file = LoadedFile::Loaded {
-                            sessions: file.sessions.len(),
-                            device_tokens: file.device_tokens.len(),
-                        };
-                        state.sessions = file.sessions;
-                        state.device_tokens = file.device_tokens;
-                    }
-                    Err(reason) => {
-                        // Kept, not overwritten: it may be a newer version's
-                        // file, or hold device tokens worth recovering.
-                        let kept_as = corrupt_path(&path);
-                        std::fs::rename(&path, &kept_as).map_err(io_error)?;
-                        report.file = LoadedFile::Corrupt { reason, kept_as };
-                    }
-                }
-            }
-        }
         report.expired = state.drop_expired(now);
         report.revoked = state.drop_not_allowed();
 
@@ -847,15 +820,11 @@ impl Inner {
             state.drop_expired(now);
             (state.to_file(), state.generation)
         };
-        let mut bytes = serde_json::to_vec_pretty(&file).map_err(|error| StoreError::Io {
-            path: self.path.clone(),
-            source: io::Error::other(error),
-        })?;
+        let mut bytes = serde_json::to_vec_pretty(&file)
+            .map_err(io::Error::other)
+            .map_err(io_error(&self.path))?;
         bytes.push(b'\n');
-        write_atomically(&self.path, &bytes).map_err(|source| StoreError::Io {
-            path: self.path.clone(),
-            source,
-        })?;
+        write_atomically(&self.path, &bytes).map_err(io_error(&self.path))?;
         self.persisted.store(generation, Ordering::SeqCst);
         self.writes.fetch_add(1, Ordering::SeqCst);
         Ok(())
@@ -951,6 +920,73 @@ fn clean_text(text: &str, max_chars: usize) -> String {
         .filter(|c| !c.is_control())
         .take(max_chars)
         .collect()
+}
+
+/// What the store's file held at startup, before anything was dropped.
+struct Loaded {
+    file: LoadedFile,
+    permissions_corrected: bool,
+    sessions: Vec<SessionRecord>,
+    device_tokens: Vec<DeviceTokenRecord>,
+}
+
+impl Loaded {
+    fn empty(file: LoadedFile, permissions_corrected: bool) -> Self {
+        Self {
+            file,
+            permissions_corrected,
+            sessions: Vec::new(),
+            device_tokens: Vec::new(),
+        }
+    }
+}
+
+/// Reads the store's file: missing is a first start, and a file that
+/// cannot be parsed is set aside.
+fn load(path: &Path) -> Result<Loaded, StoreError> {
+    let Some(bytes) = read_if_present(path)? else {
+        return Ok(Loaded::empty(LoadedFile::Missing, false));
+    };
+    let permissions_corrected = tighten_permissions(path).map_err(io_error(path))?;
+    match parse_file(&bytes) {
+        Ok(file) => Ok(Loaded {
+            file: LoadedFile::Loaded {
+                sessions: file.sessions.len(),
+                device_tokens: file.device_tokens.len(),
+            },
+            permissions_corrected,
+            sessions: file.sessions,
+            device_tokens: file.device_tokens,
+        }),
+        Err(reason) => Ok(Loaded::empty(
+            set_aside(path, reason)?,
+            permissions_corrected,
+        )),
+    }
+}
+
+fn read_if_present(path: &Path) -> Result<Option<Vec<u8>>, StoreError> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(io_error(path)(error)),
+    }
+}
+
+/// Kept, not overwritten: it may be a newer version's file, or hold device
+/// tokens worth recovering.
+fn set_aside(path: &Path, reason: String) -> Result<LoadedFile, StoreError> {
+    let kept_as = corrupt_path(path);
+    std::fs::rename(path, &kept_as).map_err(io_error(path))?;
+    Ok(LoadedFile::Corrupt { reason, kept_as })
+}
+
+/// Names the store's file in an I/O error.
+fn io_error(path: &Path) -> impl Fn(io::Error) -> StoreError + '_ {
+    |source| StoreError::Io {
+        path: path.to_owned(),
+        source,
+    }
 }
 
 fn parse_file(bytes: &[u8]) -> Result<StoreFile, String> {
