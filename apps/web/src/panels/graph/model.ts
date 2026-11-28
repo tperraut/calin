@@ -257,6 +257,14 @@ export function describeGraph(
   };
 }
 
+/** The node of a session's lead: it carries the session's title and status, a subagent's node does not. */
+export function sessionLead(sessionId: string | null, model: GraphModel): GraphNode | undefined {
+  if (sessionId === null) return undefined;
+  return model.nodes.find(
+    (one) => one.node.session_id === sessionId && one.node.session_title !== null,
+  )?.node;
+}
+
 /** Who changed a repo, and how many files each, most first. */
 export function repoChangers(
   repoId: string,

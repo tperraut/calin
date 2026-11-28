@@ -10,7 +10,7 @@ import {
   userNode,
 } from "../../test/orchestration";
 import { layoutGraph } from "./layout";
-import { describeGraph, edgeSentence, graphModel, type EdgeView } from "./model";
+import { describeGraph, edgeSentence, graphModel, sessionLead, type EdgeView } from "./model";
 
 const model = () => graphModel(makeGraph(), "s1");
 
@@ -236,5 +236,17 @@ describe("describeGraph", () => {
     });
     expect(text.tree.map((item) => item.id)).toEqual(["user"]);
     expect(text.tree[0]?.children.map((item) => item.id)).toEqual(["agent:a1"]);
+  });
+});
+
+describe("sessionLead", () => {
+  it("finds the node that carries a session's title, for any agent of that session", () => {
+    expect(sessionLead("s3", model())?.id).toBe("agent:a3");
+    expect(sessionLead("s1", model())?.id).toBe("agent:a1");
+  });
+
+  it("finds none for no session, or for a session whose lead is not in the graph", () => {
+    expect(sessionLead(null, model())).toBeUndefined();
+    expect(sessionLead("s9", model())).toBeUndefined();
   });
 });
