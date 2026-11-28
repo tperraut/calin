@@ -551,6 +551,496 @@ describe("routeOverlay", () => {
   });
 });
 
+describe("routeOverlay, corner by corner", () => {
+  const agent = (x: number, y: number): RouteBox => ({ x, y, w: 176, h: 52, kind: "agent" });
+  const repo = (x: number, y: number): RouteBox => ({ x, y, w: 132, h: 44, kind: "repo" });
+
+  /** Routes `edges` (kind, from, to) between `cards`; each edge's id is `kind:from:to`. */
+  function routeCards(
+    mode: LayoutMode,
+    cards: Record<string, RouteBox>,
+    edges: [OverlayEdge["kind"], string, string][],
+    previous?: LaneMemory,
+  ) {
+    const boxes = new Map(Object.entries(cards));
+    const list = edges.map(([kind, from, to]) => ({ id: `${kind}:${from}:${to}`, from, to, kind }));
+    const routing = routeOverlay(mode, boxes, list, previous);
+    const at = (id: string) => {
+      const found = routing.routes.get(id);
+      if (!found) throw new Error(`no route for ${id}`);
+      const points = resolvePoints(found.points, (node) => boxes.get(node));
+      return {
+        where: `${found.channel}#${found.lane} ${found.bundle}`,
+        label: found.label,
+        points: points.map((point) => [point.x, point.y]),
+      };
+    };
+    return { routing, at };
+  }
+
+  it("runs a bundle along the gutter, a line each, its ports spread around the card's middle", () => {
+    const { routing, at } = routeCards("indented", { a: agent(0, 0), b: agent(28, 64) }, [
+      ["report", "b", "a"],
+      ["message", "a", "b"],
+    ]);
+    // The gutter's first lane is 14 px right of the widest card (204), the lines 2 px apart.
+    expect(at("message:a:b")).toEqual({
+      where: "gutter#0 a|b",
+      label: { fraction: 0.42 },
+      points: [
+        [176, 29.5],
+        [217, 29.5],
+        [217, 86.5],
+        [204, 86.5],
+      ],
+    });
+    expect(at("report:b:a")).toEqual({
+      where: "gutter#0 a|b",
+      label: { fraction: 0.58 },
+      points: [
+        [204, 93.5],
+        [219, 93.5],
+        [219, 22.5],
+        [176, 22.5],
+      ],
+    });
+    expect(routing.right).toBe(222);
+    expect([...routing.memory]).toEqual([
+      ["order|gutter", 1],
+      ["gutter|a|b", 0],
+    ]);
+  });
+
+  it("runs an edge within one column along the corridor to its right, out of and into right sides", () => {
+    const { routing, at } = routeCards("columns", { a: agent(0, 0), b: agent(0, 128) }, [
+      ["message", "b", "a"],
+    ]);
+    expect(at("message:b:a")).toEqual({
+      where: "c0#0 a|b",
+      label: { fraction: 0.5 },
+      points: [
+        [176, 154],
+        [184, 154],
+        [184, 26],
+        [176, 26],
+      ],
+    });
+    expect(routing.right).toBe(188);
+  });
+
+  it("runs an edge between neighbouring columns along the corridor between them, into the left side", () => {
+    const { routing, at } = routeCards("columns", { a: agent(0, 0), b: agent(220, 64) }, [
+      ["message", "b", "a"],
+    ]);
+    expect(at("message:b:a").points).toEqual([
+      [220, 90],
+      [184, 90],
+      [184, 26],
+      [176, 26],
+    ]);
+    expect(routing.right).toBe(396);
+  });
+
+  it("runs an edge level across an empty column to the corridor before the far card", () => {
+    const { at } = routeCards("columns", { a: agent(0, 0), b: agent(440, 128) }, [
+      ["message", "a", "b"],
+    ]);
+    expect(at("message:a:b")).toMatchObject({
+      where: "c1#0 a|b",
+      points: [
+        [176, 26],
+        [404, 26],
+        [404, 154],
+        [440, 154],
+      ],
+    });
+  });
+
+  it("crosses a column a card blocks along the gap between two rows", () => {
+    const { routing, at } = routeCards(
+      "columns",
+      { a: agent(0, 0), c: agent(220, 0), b: agent(440, 128) },
+      [
+        ["message", "a", "b"],
+        ["report", "b", "a"],
+      ],
+    );
+    // Down the corridor right of a, along the gap under its row (y 58), down the corridor left of b.
+    expect(at("message:a:b")).toEqual({
+      where: "c1#0 a|b",
+      label: { fraction: 0.42 },
+      points: [
+        [176, 29.5],
+        [183, 29.5],
+        [183, 57.4],
+        [403, 57.4],
+        [403, 157.5],
+        [440, 157.5],
+      ],
+    });
+    expect(at("report:b:a").points).toEqual([
+      [440, 150.5],
+      [405, 150.5],
+      [405, 58.6],
+      [185, 58.6],
+      [185, 22.5],
+      [176, 22.5],
+    ]);
+    expect(routing.right).toBe(616);
+    expect([...routing.memory]).toEqual([
+      ["order|c0", 1],
+      ["c0|a|b@1", 0],
+      ["order|c1", 1],
+      ["c1|a|b@2", 0],
+      ["track|a|b", 0],
+    ]);
+  });
+
+  it("brings changes into the band's repos along a trunk each, over the row, the leftmost highest", () => {
+    const { routing, at } = routeCards(
+      "indented",
+      { a: agent(0, 0), b: agent(28, 64), r1: repo(0, 200), r2: repo(144, 200) },
+      [
+        ["changed", "a", "r2"],
+        ["changed", "a", "r1"],
+        ["changed", "b", "r1"],
+      ],
+    );
+    // The tracks split the 84 px between the tree (bottom 116) and the row in thirds.
+    expect(at("changed:a:r1")).toEqual({
+      where: "gutter#0 >r1",
+      label: { distance: 22 },
+      points: [
+        [176, 29.5],
+        [290, 29.5],
+        [290, 144],
+        [66, 144],
+        [66, 210],
+      ],
+    });
+    expect(at("changed:b:r1").points).toEqual([
+      [204, 90],
+      [290, 90],
+      [290, 144],
+      [66, 144],
+      [66, 210],
+    ]);
+    // A second line out of the same card has its count further along.
+    expect(at("changed:a:r2")).toEqual({
+      where: "gutter#1 >r2",
+      label: { distance: 46 },
+      points: [
+        [176, 22.5],
+        [297, 22.5],
+        [297, 172],
+        [210, 172],
+        [210, 210],
+      ],
+    });
+    expect(routing.right).toBe(301);
+  });
+
+  it("brings changes into a column's repo along the corridor left of it, around a card in the way", () => {
+    const { routing, at } = routeCards(
+      "columns",
+      { a: agent(0, 0), c: agent(220, 0), d: agent(220, 64), r: repo(440, 0) },
+      [
+        ["changed", "a", "r"],
+        ["changed", "d", "r"],
+        ["changed", "r", "c"],
+      ],
+    );
+    expect(at("changed:a:r")).toEqual({
+      where: "c1#0 >r",
+      label: { distance: 22 },
+      points: [
+        [176, 26],
+        [184, 26],
+        [184, 58],
+        [404, 58],
+        [404, 27],
+        [440, 27],
+      ],
+    });
+    expect(at("changed:d:r").points).toEqual([
+      [396, 90],
+      [404, 90],
+      [404, 27],
+      [440, 27],
+    ]);
+    expect(at("changed:r:c")).toEqual({
+      where: "c1#0 >r",
+      label: { distance: -22 },
+      points: [
+        [440, 27],
+        [404, 27],
+        [404, 26],
+        [396, 26],
+      ],
+    });
+    expect(routing.right).toBe(572);
+    expect(routing.memory.get("track|>r@a")).toBe(0);
+  });
+
+  it("enters a column's repo level with its middle, 27 px under its top", () => {
+    const { at } = routeCards("columns", { d: agent(220, 64), r: repo(440, 64) }, [
+      ["changed", "d", "r"],
+    ]);
+    expect(at("changed:d:r").points).toEqual([
+      [396, 90],
+      [404, 90],
+      [404, 91],
+      [440, 91],
+    ]);
+  });
+
+  it("counts a corridor's lanes from the right when that crosses fewer lines", () => {
+    const { routing, at } = routeCards(
+      "columns",
+      {
+        a: agent(0, 0),
+        d: agent(220, 64),
+        b: agent(440, 128),
+        r1: repo(440, 0),
+        r2: repo(440, 200),
+      },
+      [
+        ["message", "a", "b"],
+        ["changed", "d", "r1"],
+        ["changed", "a", "r2"],
+      ],
+    );
+    // Counted from the left, a's line into r2 would cross the two lanes before it.
+    expect(routing.memory.get("order|c1")).toBe(-1);
+    expect(at("message:a:b")).toMatchObject({
+      where: "c1#0 a|b",
+      points: [
+        [176, 22.5],
+        [416, 22.5],
+        [416, 154],
+        [440, 154],
+      ],
+    });
+    expect(at("changed:d:r1")).toMatchObject({
+      where: "c1#1 >r1",
+      points: [
+        [396, 90],
+        [410, 90],
+        [410, 27],
+        [440, 27],
+      ],
+    });
+    expect(at("changed:a:r2")).toMatchObject({
+      where: "c1#2 >r2",
+      points: [
+        [176, 29.5],
+        [404, 29.5],
+        [404, 227],
+        [440, 227],
+      ],
+    });
+  });
+
+  it("puts each band row's tracks over that row, its repos taken left to right", () => {
+    const { at } = routeCards(
+      "indented",
+      { r2: repo(144, 200), a: agent(0, 0), r1: repo(0, 200), r3: repo(0, 260) },
+      [
+        ["changed", "a", "r1"],
+        ["changed", "a", "r2"],
+        ["changed", "a", "r3"],
+      ],
+    );
+    // Row 200 splits the 148 px under the tree in thirds; r3 has the 16 px over its own row.
+    expect(at("changed:a:r1").points[2][1]).toBeCloseTo(52 + 148 / 3);
+    expect(at("changed:a:r2").points[2][1]).toBeCloseTo(52 + (2 * 148) / 3);
+    expect(at("changed:a:r3")).toEqual({
+      where: "gutter#2 >r3",
+      label: { distance: 70 },
+      points: [
+        [176, 19],
+        [304, 19],
+        [304, 252],
+        [66, 252],
+        [66, 270],
+      ],
+    });
+  });
+
+  it("draws straight a change from an agent in its repo's own column", () => {
+    const { at } = routeCards("columns", { a: agent(440, 64), r: repo(440, 0) }, [
+      ["changed", "a", "r"],
+    ]);
+    expect(at("changed:a:r")).toEqual({
+      where: "#0 changed:a:r",
+      label: { fraction: 0.5 },
+      points: [
+        [528, 90],
+        [506, 22],
+      ],
+    });
+  });
+
+  it("squeezes a corridor's lanes into the room a wide card leaves, from the side it keeps to", () => {
+    const cards = {
+      a: agent(0, 0),
+      b: agent(0, 64),
+      c: agent(0, 128),
+      d: agent(0, 192),
+    };
+    const edges: [OverlayEdge["kind"], string, string][] = [
+      ["message", "a", "c"],
+      ["message", "b", "d"],
+    ];
+    const laneXs = (width: number, previous?: LaneMemory) => {
+      const { at } = routeCards(
+        "columns",
+        { ...cards, a: { ...cards.a, w: width } },
+        edges,
+        previous,
+      );
+      return [at("message:a:c").points[1][0], at("message:b:d").points[1][0]];
+    };
+    // A 200 px card leaves 4 px of corridor: two lanes 4 px apart rather than 6.
+    expect(laneXs(200)).toEqual([208, 212]);
+    expect(laneXs(200, new Map([["order|c0", -1]]))).toEqual([212, 208]);
+    // Wider still, no room is left: the lanes meet.
+    expect(laneXs(210)).toEqual([218, 218]);
+    expect(laneXs(176)).toEqual([184, 190]);
+  });
+
+  it("measures a corridor from the widest agent of its column, never from a repo", () => {
+    const { at } = routeCards(
+      "columns",
+      {
+        a: { ...agent(0, 0), w: 150 },
+        b: { ...agent(0, 128), w: 150 },
+        q: { ...repo(0, 300), w: 200 },
+      },
+      [["message", "a", "b"]],
+    );
+    expect(at("message:a:b").points[1]).toEqual([158, 26]);
+  });
+
+  it("spreads ports over what a short card has, and stacks them on one too short", () => {
+    const { at } = routeCards(
+      "indented",
+      { a: { ...agent(0, 0), h: 20 }, b: { ...agent(0, 64), h: 10 } },
+      [
+        ["message", "a", "b"],
+        ["report", "a", "b"],
+      ],
+    );
+    // 20 px less 7 at each end leaves 6 px between the two ports; 10 px leaves none.
+    expect(at("message:a:b").points).toEqual([
+      [176, 13],
+      [189, 13],
+      [189, 69],
+      [176, 69],
+    ]);
+    expect(at("report:a:b").points).toEqual([
+      [176, 7],
+      [191, 7],
+      [191, 69],
+      [176, 69],
+    ]);
+  });
+
+  it("orders the ports into a card's left side: the line from above enters higher", () => {
+    const { at } = routeCards("columns", { a: agent(0, 0), b: agent(220, 64), c: agent(0, 128) }, [
+      ["message", "a", "b"],
+      ["message", "c", "b"],
+    ]);
+    expect(at("message:a:b").points.at(-1)).toEqual([220, 86.5]);
+    expect(at("message:c:b").points.at(-1)).toEqual([220, 93.5]);
+  });
+
+  it("gives runs along one gap tracks of their own, keeping a remembered one while it is free", () => {
+    const cards = { a: agent(0, 0), c: agent(220, 0), b: agent(440, 128), e: agent(440, 192) };
+    const edges: [OverlayEdge["kind"], string, string][] = [
+      ["message", "a", "b"],
+      ["message", "a", "e"],
+    ];
+    const gapY = (previous?: LaneMemory) => {
+      const { at } = routeCards("columns", cards, edges, previous);
+      return [at("message:a:b").points[2][1], at("message:a:e").points[2][1]];
+    };
+    // The middle of the gap first, then 3 px over it, then 3 px under it.
+    expect(gapY()).toEqual([58, 55]);
+    expect(
+      gapY(
+        new Map([
+          ["track|a|b", 2],
+          ["track|a|e", 2],
+        ]),
+      ),
+    ).toEqual([61, 58]);
+  });
+
+  it("takes the gap under a card when the other card's middle is level with its top", () => {
+    const { at } = routeCards(
+      "columns",
+      { a: agent(0, 64), c: agent(220, 64), b: agent(440, 38) },
+      [["message", "a", "b"]],
+    );
+    expect(at("message:a:b").points).toEqual([
+      [176, 90],
+      [184, 90],
+      [184, 122],
+      [404, 122],
+      [404, 64],
+      [440, 64],
+    ]);
+  });
+
+  it.each([
+    ["2 px under the row", { x: 220, y: 54, w: 176 }, false],
+    ["less than 2 px under it", { x: 220, y: 53, w: 176 }, true],
+    ["2 px over the row", { x: 220, y: -54, w: 176 }, false],
+    ["less than 2 px over it", { x: 220, y: -53, w: 176 }, true],
+    ["from the corridor on", { x: 404, y: 0, w: 10 }, false],
+    ["a pixel before the corridor", { x: 403, y: 0, w: 10 }, true],
+    ["ending where the card ends", { x: 166, y: 0, w: 10 }, false],
+    ["ending a pixel past it", { x: 167, y: 0, w: 10 }, true],
+  ])("goes around a card %s only when it is in the way", (_, place, blocks) => {
+    const { at } = routeCards(
+      "columns",
+      { a: agent(0, 0), c: { ...agent(0, 0), ...place }, b: agent(440, 128) },
+      [["message", "a", "b"]],
+    );
+    expect(at("message:a:b").points).toHaveLength(blocks ? 6 : 4);
+  });
+
+  it("shares a lane between bundles 2 px apart along the tree, not closer", () => {
+    const lanes = (y: number) => {
+      const { at } = routeCards(
+        "indented",
+        { a: agent(0, 0), b: agent(28, 64), c: agent(28, y), d: agent(56, y + 64) },
+        [
+          ["message", "a", "b"],
+          ["message", "c", "d"],
+        ],
+      );
+      return [at("message:a:b").where, at("message:c:d").where];
+    };
+    expect(lanes(118)).toEqual(["gutter#0 a|b", "gutter#0 c|d"]);
+    expect(lanes(117)).toEqual(["gutter#0 a|b", "gutter#1 c|d"]);
+  });
+
+  it("orders the lines of a bundle of one kind from one card by id", () => {
+    const boxes = new Map([
+      ["a", agent(0, 0)],
+      ["b", agent(28, 64)],
+    ]);
+    const { routes } = routeOverlay("indented", boxes, [
+      { id: "m2", from: "a", to: "b", kind: "message" },
+      { id: "m1", from: "a", to: "b", kind: "message" },
+    ]);
+    expect(routes.get("m1")?.label).toEqual({ fraction: 0.42 });
+    expect(routes.get("m2")?.label).toEqual({ fraction: 0.58 });
+  });
+});
+
 describe("resolvePoints", () => {
   it("keeps a corner where it is when its node is not drawn", () => {
     expect(resolvePoints([{ x: 5, y: 7, xn: "gone", yn: "gone" }], () => undefined)).toEqual([
