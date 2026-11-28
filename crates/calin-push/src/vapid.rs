@@ -85,22 +85,31 @@ impl VapidKeys {
     }
 
     fn load_or_generate_blocking(path: &Path) -> Result<Self, VapidError> {
-        let io_error = |source| VapidError::Io {
-            path: path.to_owned(),
-            source,
-        };
-        match std::fs::read(path) {
-            Ok(bytes) => {
-                tighten_permissions(path).map_err(io_error)?;
-                return Self::parse(&bytes, false).map_err(|reason| VapidError::Corrupt {
-                    path: path.to_owned(),
-                    reason,
-                });
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(io_error(error)),
+        if let Some(keys) = Self::load_existing(path)? {
+            return Ok(keys);
         }
+        let (keys, bytes) = Self::generate(path)?;
+        if create_atomically(path, &bytes).map_err(io_error(path))? {
+            return Ok(keys);
+        }
+        // Another process created it first: theirs is the key browsers get.
+        let bytes = std::fs::read(path).map_err(io_error(path))?;
+        Self::parse_file(path, &bytes)
+    }
 
+    /// The key pair in the file at `path`; `None` when there is no file.
+    fn load_existing(path: &Path) -> Result<Option<Self>, VapidError> {
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(io_error(path)(error)),
+        };
+        tighten_permissions(path).map_err(io_error(path))?;
+        Self::parse_file(path, &bytes).map(Some)
+    }
+
+    /// A new key pair, and the file that keeps it at `path`.
+    fn generate(path: &Path) -> Result<(Self, Vec<u8>), VapidError> {
         let rng = SystemRandom::new();
         let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng)
             .map_err(|_| VapidError::Random)?;
@@ -110,15 +119,16 @@ impl VapidKeys {
             pkcs8: base64url(pkcs8.as_ref()),
             public_key: keys.public_key_base64url(),
         };
-        let mut bytes =
-            serde_json::to_vec_pretty(&file).map_err(|e| io_error(io::Error::other(e)))?;
+        let mut bytes = serde_json::to_vec_pretty(&file)
+            .map_err(|error| io_error(path)(io::Error::other(error)))?;
         bytes.push(b'\n');
-        if create_atomically(path, &bytes).map_err(io_error)? {
-            return Ok(keys);
-        }
-        // Another process created it first: theirs is the key browsers get.
-        let bytes = std::fs::read(path).map_err(io_error)?;
-        Self::parse(&bytes, false).map_err(|reason| VapidError::Corrupt {
+        Ok((keys, bytes))
+    }
+
+    /// The key pair in `bytes`, read from `path`; `Corrupt` naming `path`
+    /// when it does not hold one.
+    fn parse_file(path: &Path, bytes: &[u8]) -> Result<Self, VapidError> {
+        Self::parse(bytes, false).map_err(|reason| VapidError::Corrupt {
             path: path.to_owned(),
             reason,
         })
@@ -202,6 +212,13 @@ impl VapidKeys {
             base64url(signature.as_ref()),
             self.public_key_base64url()
         ))
+    }
+}
+
+fn io_error(path: &Path) -> impl Fn(io::Error) -> VapidError + '_ {
+    move |source| VapidError::Io {
+        path: path.to_owned(),
+        source,
     }
 }
 
@@ -289,6 +306,20 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, VapidError::Io { .. }), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_key_file_that_cannot_be_read_is_an_io_error_and_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory where the file should be: there, but not readable as one.
+        let path = dir.path().join("vapid.json");
+        std::fs::create_dir(&path).unwrap();
+        let error = VapidKeys::load_or_generate(&path).await.unwrap_err();
+        let VapidError::Io { path: named, .. } = &error else {
+            panic!("{error}");
+        };
+        assert_eq!(named, &path);
+        assert!(path.is_dir());
     }
 
     #[tokio::test]
