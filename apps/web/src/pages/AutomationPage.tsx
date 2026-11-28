@@ -31,6 +31,7 @@ import {
   outcomeText,
   placeholders,
   runNumberLabel,
+  runWanted,
   saveFailure,
   sessionOf,
   triggerKinds,
@@ -717,24 +718,20 @@ function RunNow(props: { automation: Automation; onRan: (run: AutomationRun) => 
   const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal<string>();
   const [result, setResult] = createSignal<AutomationRun>();
-  const numberId = createUniqueId();
   const numberLabel = (): string | undefined => runNumberLabel(props.automation.trigger);
 
   async function run(): Promise<void> {
     if (busy()) return;
-    let wanted: number | undefined;
-    if (numberLabel() !== undefined) {
-      wanted = Number(number().trim().replace(/^#/, ""));
-      if (!Number.isInteger(wanted) || wanted <= 0) {
-        setError(`Give the ${numberLabel()?.toLowerCase()}, a whole number such as 12.`);
-        return;
-      }
+    const wanted = runWanted(props.automation.trigger, number());
+    if ("problem" in wanted) {
+      setError(wanted.problem);
+      return;
     }
     setBusy(true);
     setError(undefined);
     setResult(undefined);
     try {
-      const ran = await app.runAutomation(props.automation.id, wanted);
+      const ran = await app.runAutomation(props.automation.id, wanted.number);
       setResult(ran);
       setAsking(false);
       setNumber("");
@@ -746,59 +743,34 @@ function RunNow(props: { automation: Automation; onRan: (run: AutomationRun) => 
     }
   }
 
+  function start(): void {
+    setResult(undefined);
+    setError(undefined);
+    if (numberLabel() === undefined) void run();
+    else setAsking(true);
+  }
+
   return (
     <section aria-label="Run now" class="flex flex-col gap-2">
       <Show
         when={asking() && numberLabel()}
         fallback={
           <div>
-            <button
-              type="button"
-              class="btn"
-              disabled={busy()}
-              onClick={() => {
-                setResult(undefined);
-                setError(undefined);
-                if (numberLabel() === undefined) void run();
-                else setAsking(true);
-              }}
-            >
-              {busy() ? "Starting…" : "Run now"}
+            <button type="button" class="btn" disabled={busy()} onClick={() => start()}>
+              {startLabel(busy(), "Run now")}
             </button>
           </div>
         }
       >
         {(label) => (
-          <form
-            aria-label="Run now"
-            class="flex flex-wrap items-end gap-2"
-            onSubmit={(event) => {
-              event.preventDefault();
-              void run();
-            }}
-          >
-            <div class="flex flex-col gap-1">
-              <label for={numberId} class="text-sm font-medium">
-                {label()}
-              </label>
-              <input
-                id={numberId}
-                ref={(element) => queueMicrotask(() => element.focus())}
-                type="text"
-                inputmode="numeric"
-                class="field h-11 w-32 px-3 font-mono"
-                autocomplete="off"
-                value={number()}
-                onInput={(event) => setNumber(event.currentTarget.value)}
-              />
-            </div>
-            <button type="submit" class="btn btn-primary" disabled={busy()}>
-              {busy() ? "Starting…" : "Run"}
-            </button>
-            <button type="button" class="btn" onClick={() => setAsking(false)}>
-              Cancel
-            </button>
-          </form>
+          <RunNumberForm
+            label={label()}
+            number={number()}
+            busy={busy()}
+            onNumber={(typed) => setNumber(typed)}
+            onRun={() => void run()}
+            onCancel={() => setAsking(false)}
+          />
         )}
       </Show>
       <Show when={error()}>
@@ -808,24 +780,72 @@ function RunNow(props: { automation: Automation; onRan: (run: AutomationRun) => 
           </p>
         )}
       </Show>
-      <Show when={result()}>
-        {(ran) => (
-          <p role="status" class="flex flex-wrap items-center gap-x-2 text-sm">
-            <span>{outcomeText(ran())}.</span>
-            <Show when={ran().session_id}>
-              {(id) => (
-                <a
-                  href={sessionPath(id())}
-                  class="inline-flex min-h-11 items-center text-accent underline"
-                >
-                  Open the started session
-                </a>
-              )}
-            </Show>
-          </p>
+      <Show when={result()}>{(ran) => <RunResult run={ran()} />}</Show>
+    </section>
+  );
+}
+
+const startLabel = (busy: boolean, idle: string): string => (busy ? "Starting…" : idle);
+
+/** Asks which issue or pull request a trigger is run for; the field takes focus as it opens. */
+function RunNumberForm(props: {
+  label: string;
+  number: string;
+  busy: boolean;
+  onNumber: (typed: string) => void;
+  onRun: () => void;
+  onCancel: () => void;
+}) {
+  const numberId = createUniqueId();
+  return (
+    <form
+      aria-label="Run now"
+      class="flex flex-wrap items-end gap-2"
+      onSubmit={(event) => {
+        event.preventDefault();
+        props.onRun();
+      }}
+    >
+      <div class="flex flex-col gap-1">
+        <label for={numberId} class="text-sm font-medium">
+          {props.label}
+        </label>
+        <input
+          id={numberId}
+          ref={(element) => queueMicrotask(() => element.focus())}
+          type="text"
+          inputmode="numeric"
+          class="field h-11 w-32 px-3 font-mono"
+          autocomplete="off"
+          value={props.number}
+          onInput={(event) => props.onNumber(event.currentTarget.value)}
+        />
+      </div>
+      <button type="submit" class="btn btn-primary" disabled={props.busy}>
+        {startLabel(props.busy, "Run")}
+      </button>
+      <button type="button" class="btn" onClick={() => props.onCancel()}>
+        Cancel
+      </button>
+    </form>
+  );
+}
+
+function RunResult(props: { run: AutomationRun }) {
+  return (
+    <p role="status" class="flex flex-wrap items-center gap-x-2 text-sm">
+      <span>{outcomeText(props.run)}.</span>
+      <Show when={props.run.session_id}>
+        {(id) => (
+          <a
+            href={sessionPath(id())}
+            class="inline-flex min-h-11 items-center text-accent underline"
+          >
+            Open the started session
+          </a>
         )}
       </Show>
-    </section>
+    </p>
   );
 }
 
@@ -908,22 +928,20 @@ type Load =
   | { status: "ready"; automation: Automation | undefined }
   | { status: "error"; message: string };
 
-/** `/automations/new` and `/automations/:id`: the editor, and for one that exists, Run now and its history. */
-export default function AutomationPage() {
-  const app = useContext(AppContext);
-  const params = useParams<{ id?: string }>();
-  const navigate = useNavigate();
+const loadedOf = (load: Load) => (load.status === "ready" ? load : undefined);
+const loadError = (load: Load): string | undefined =>
+  load.status === "error" ? load.message : undefined;
+const pageTitle = (latest: Automation | undefined, id: string | undefined): string =>
+  latest?.name ?? (id ? "Automation" : "New automation");
+
+/** The automation `id` names, read again each time it changes, and its run history. */
+function createAutomationRead(app: AppState, automationId: () => string | undefined) {
   const [load, setLoad] = createSignal<Load>({ status: "loading" });
   const [runs, setRuns] = createSignal<readonly AutomationRun[]>();
   const [runsError, setRunsError] = createSignal<string>();
   // The automation as last saved or read; the editor keeps its own drafts from the first read.
   const [latest, setLatest] = createSignal<Automation>();
   let asked = 0;
-
-  onSettled(() => {
-    app.loadRepos();
-    app.loadWorkflows();
-  });
 
   function readRuns(id: string): void {
     app.automationRuns(id).then(
@@ -935,41 +953,58 @@ export default function AutomationPage() {
     );
   }
 
-  createEffect(
-    () => params.id,
-    (id) => {
-      asked += 1;
-      const mine = asked;
-      setRuns(undefined);
-      setLatest(undefined);
-      if (id === undefined) {
-        setLoad({ status: "ready", automation: undefined });
-        return;
-      }
-      setLoad({ status: "loading" });
-      app.getAutomation(id).then(
-        (automation) => {
-          if (mine !== asked) return;
-          setLatest(automation);
-          setLoad({ status: "ready", automation });
-        },
-        (error: unknown) => {
-          if (mine === asked) setLoad({ status: "error", message: errorMessage(error) });
-        },
-      );
-      readRuns(id);
-    },
-  );
+  createEffect(automationId, (id) => {
+    asked += 1;
+    const mine = asked;
+    setRuns(undefined);
+    setLatest(undefined);
+    if (id === undefined) {
+      setLoad({ status: "ready", automation: undefined });
+      return;
+    }
+    setLoad({ status: "loading" });
+    app.getAutomation(id).then(
+      (automation) => {
+        if (mine !== asked) return;
+        setLatest(automation);
+        setLoad({ status: "ready", automation });
+      },
+      (error: unknown) => {
+        if (mine === asked) setLoad({ status: "error", message: errorMessage(error) });
+      },
+    );
+    readRuns(id);
+  });
 
-  const ready = () => {
-    const current = load();
-    return current.status === "ready" ? current : undefined;
-  };
-  const failure = (): string | undefined => {
-    const current = load();
-    return current.status === "error" ? current.message : undefined;
-  };
-  const title = (): string => latest()?.name ?? (params.id ? "Automation" : "New automation");
+  return { load, runs, runsError, latest, setLatest, readRuns };
+}
+
+/** What fires a saved automation, why Calin switched it off if it did, and Run now. */
+function AutomationSummary(props: { automation: Automation; onRan: () => void }) {
+  return (
+    <>
+      <p class="text-sm">{props.automation.trigger_text}</p>
+      <Show when={props.automation.disabled_reason}>
+        {(reason) => (
+          <p class="text-sm wrap-break-word text-tone-danger">Switched off by Calin: {reason()}</p>
+        )}
+      </Show>
+      <RunNow automation={props.automation} onRan={() => props.onRan()} />
+    </>
+  );
+}
+
+/** `/automations/new` and `/automations/:id`: the editor, and for one that exists, Run now and its history. */
+export default function AutomationPage() {
+  const app = useContext(AppContext);
+  const params = useParams<{ id?: string }>();
+  const navigate = useNavigate();
+  const read = createAutomationRead(app, () => params.id);
+
+  onSettled(() => {
+    app.loadRepos();
+    app.loadWorkflows();
+  });
 
   return (
     <section class="min-h-0 flex-1 overflow-y-auto overscroll-contain">
@@ -978,32 +1013,27 @@ export default function AutomationPage() {
           <a href="/automations" aria-label="Back to automations" class="btn btn-ghost px-0">
             <span aria-hidden="true">←</span>
           </a>
-          <h1 class="min-w-0 flex-1 truncate text-xl font-semibold">{title()}</h1>
+          <h1 class="min-w-0 flex-1 truncate text-xl font-semibold">
+            {pageTitle(read.latest(), params.id)}
+          </h1>
         </header>
         <Switch>
-          <Match when={failure()}>
+          <Match when={loadError(read.load())}>
             {(message) => (
               <p role="alert" class="text-sm wrap-break-word">
                 The automation could not be loaded: {message()}
               </p>
             )}
           </Match>
-          <Match when={ready()}>
+          <Match when={loadedOf(read.load())}>
             {(loaded) => (
               <>
-                <Show when={latest()}>
+                <Show when={read.latest()}>
                   {(automation) => (
-                    <>
-                      <p class="text-sm">{automation().trigger_text}</p>
-                      <Show when={automation().disabled_reason}>
-                        {(reason) => (
-                          <p class="text-sm wrap-break-word text-tone-danger">
-                            Switched off by Calin: {reason()}
-                          </p>
-                        )}
-                      </Show>
-                      <RunNow automation={automation()} onRan={() => readRuns(automation().id)} />
-                    </>
+                    <AutomationSummary
+                      automation={automation()}
+                      onRan={() => read.readRuns(automation().id)}
+                    />
                   )}
                 </Show>
                 {/* Keyed on the read: another automation starts the drafts over, a save does not. */}
@@ -1013,13 +1043,13 @@ export default function AutomationPage() {
                       stored={current.automation}
                       onSaved={(automation, created) => {
                         if (created) navigate(`/automations/${encodeURIComponent(automation.id)}`);
-                        else setLatest(automation);
+                        else read.setLatest(automation);
                       }}
                     />
                   )}
                 </Show>
-                <Show when={latest()}>
-                  <RunHistory runs={runs()} error={runsError()} now={app.now()} />
+                <Show when={read.latest()}>
+                  <RunHistory runs={read.runs()} error={read.runsError()} now={app.now()} />
                 </Show>
               </>
             )}
