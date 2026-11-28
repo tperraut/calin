@@ -907,6 +907,8 @@ describe("routeOverlay, corner by corner", () => {
     // Wider still, no room is left: the lanes meet.
     expect(laneXs(210)).toEqual([218, 218]);
     expect(laneXs(176)).toEqual([184, 190]);
+    // 8 px still holds two lanes 6 px apart.
+    expect(laneXs(196)).toEqual([204, 210]);
   });
 
   it("measures a corridor from the widest agent of its column, never from a repo", () => {
@@ -953,6 +955,19 @@ describe("routeOverlay, corner by corner", () => {
     ]);
     expect(at("message:a:b").points.at(-1)).toEqual([220, 86.5]);
     expect(at("message:c:b").points.at(-1)).toEqual([220, 93.5]);
+  });
+
+  it("spreads the ports of a card's left side over every line into it, crossing or not", () => {
+    const { at } = routeCards(
+      "columns",
+      { a: agent(0, 0), c: agent(220, 0), e: agent(220, 192), b: agent(440, 128) },
+      [
+        ["message", "a", "b"],
+        ["message", "e", "b"],
+      ],
+    );
+    expect(at("message:a:b").points.at(-1)).toEqual([440, 150.5]);
+    expect(at("message:e:b").points.at(-1)).toEqual([440, 157.5]);
   });
 
   it("gives runs along one gap tracks of their own, keeping a remembered one while it is free", () => {
@@ -1025,6 +1040,100 @@ describe("routeOverlay, corner by corner", () => {
     };
     expect(lanes(118)).toEqual(["gutter#0 a|b", "gutter#0 c|d"]);
     expect(lanes(117)).toEqual(["gutter#0 a|b", "gutter#1 c|d"]);
+    // The same with the lower bundle given its lane first.
+    const lowerFirst = (y: number) => {
+      const { at } = routeCards(
+        "indented",
+        { x: agent(0, 0), y: agent(28, 64), a: agent(28, y), b: agent(56, y + 64) },
+        [
+          ["message", "x", "y"],
+          ["message", "a", "b"],
+        ],
+      );
+      return [at("message:a:b").where, at("message:x:y").where];
+    };
+    expect(lowerFirst(118)).toEqual(["gutter#0 a|b", "gutter#0 x|y"]);
+    expect(lowerFirst(117)).toEqual(["gutter#0 a|b", "gutter#1 x|y"]);
+  });
+
+  it("orders a bundle's lines by kind before the card they leave", () => {
+    const { at } = routeCards("indented", { a: agent(0, 0), b: agent(28, 64) }, [
+      ["message", "b", "a"],
+      ["report", "a", "b"],
+    ]);
+    expect(at("message:b:a").label).toEqual({ fraction: 0.42 });
+    expect(at("report:a:b").label).toEqual({ fraction: 0.58 });
+  });
+
+  it("puts the nearer lane's port first on a card level with the other", () => {
+    const { at } = routeCards("columns", { a: agent(0, 0), b: agent(220, 0) }, [
+      ["message", "a", "b"],
+      ["report", "b", "a"],
+    ]);
+    expect(at("message:a:b").points).toEqual([
+      [176, 22.5],
+      [183, 22.5],
+      [183, 29.5],
+      [220, 29.5],
+    ]);
+    expect(at("report:b:a").points).toEqual([
+      [220, 22.5],
+      [185, 22.5],
+      [185, 29.5],
+      [176, 29.5],
+    ]);
+  });
+
+  it("keeps a lone lane at the start of a corridor too narrow for two, or closed", () => {
+    for (const [width, x] of [
+      [200, 208],
+      [210, 218],
+    ]) {
+      const { at } = routeCards("columns", { a: { ...agent(0, 0), w: width }, b: agent(0, 128) }, [
+        ["message", "a", "b"],
+      ]);
+      expect(at("message:a:b").points[1]).toEqual([x, 26]);
+    }
+  });
+
+  it("squeezes a bundle's lines with its lanes, from either side", () => {
+    const cards = {
+      a: { ...agent(0, 0), w: 200 },
+      b: agent(0, 64),
+      c: agent(0, 128),
+      d: agent(0, 192),
+    };
+    const edges: [OverlayEdge["kind"], string, string][] = [
+      ["message", "a", "c"],
+      ["report", "a", "c"],
+      ["message", "b", "d"],
+    ];
+    const laneXs = (previous?: LaneMemory) => {
+      const { at } = routeCards("columns", cards, edges, previous);
+      return ["message:a:c", "report:a:c", "message:b:d"].map((id) => at(id).points[1][0]);
+    };
+    // Lanes 4 px apart rather than 6: the lines 2 px apart become 4/6 of that.
+    const left = laneXs();
+    expect(left[0]).toBeCloseTo(208 - 2 / 3);
+    expect(left[1]).toBeCloseTo(208 + 2 / 3);
+    expect(left[2]).toBe(212);
+    const right = laneXs(new Map([["order|c0", -1]]));
+    expect(right[0]).toBeCloseTo(212 - 2 / 3);
+    expect(right[1]).toBeCloseTo(212 + 2 / 3);
+    expect(right[2]).toBe(208);
+  });
+
+  it("gives a corridor's trunks their lanes by how far their lines spread, the least first", () => {
+    const { at } = routeCards(
+      "columns",
+      { a: agent(0, 300), d: agent(220, 400), r1: repo(440, 400), r2: repo(440, 0) },
+      [
+        ["changed", "d", "r1"],
+        ["changed", "a", "r2"],
+      ],
+    );
+    expect(at("changed:d:r1").where).toBe("c1#0 >r1");
+    expect(at("changed:a:r2").where).toBe("c1#1 >r2");
   });
 
   it("orders the lines of a bundle of one kind from one card by id", () => {
@@ -1032,12 +1141,16 @@ describe("routeOverlay, corner by corner", () => {
       ["a", agent(0, 0)],
       ["b", agent(28, 64)],
     ]);
-    const { routes } = routeOverlay("indented", boxes, [
-      { id: "m2", from: "a", to: "b", kind: "message" },
-      { id: "m1", from: "a", to: "b", kind: "message" },
-    ]);
-    expect(routes.get("m1")?.label).toEqual({ fraction: 0.42 });
-    expect(routes.get("m2")?.label).toEqual({ fraction: 0.58 });
+    const m1 = { id: "m1", from: "a", to: "b", kind: "message" } as const;
+    const m2 = { ...m1, id: "m2" };
+    for (const edges of [
+      [m2, m1],
+      [m1, m2],
+    ]) {
+      const { routes } = routeOverlay("indented", boxes, edges);
+      expect(routes.get("m1")?.label).toEqual({ fraction: 0.42 });
+      expect(routes.get("m2")?.label).toEqual({ fraction: 0.58 });
+    }
   });
 });
 
