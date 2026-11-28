@@ -1049,6 +1049,17 @@ fn shapes_the_reader_refuses() {
             "a",
             vec!["node `a`", "`verdicts` must be a list of strings"],
         ),
+        // A list with no string entry is not then also "an empty list".
+        (
+            "{ id: a, type: agent, prompt: p, verdicts: [3] }",
+            "a",
+            vec!["node `a`", "every entry of `verdicts` must be a string"],
+        ),
+        (
+            "{ id: q, type: ask, question: Q, options: [3] }",
+            "q",
+            vec!["node `q`", "every entry of `options` must be a string"],
+        ),
         (
             "{ id: p, type: parallel, branches: [x, { id: b, prompt: y }] }",
             "p",
@@ -1089,6 +1100,44 @@ fn a_second_edge_from_one_port_does_not_count_for_cycles() {
 }
 
 #[test]
+fn a_yaml_error_on_the_first_line_keeps_its_line() {
+    let p = problems("version: 1: 2\nname: x\n");
+    assert_eq!(p.len(), 1, "{p}");
+    assert_mentions(&p, &["invalid YAML"], "");
+    assert_eq!(p.0[0].line, Some(1), "{p}");
+}
+
+#[test]
+fn problems_without_a_line_come_last() {
+    // The file name problem has no line and is found first; it is still listed last.
+    let yaml = doc(BASE_NODES, BASE_EDGES).replace("version: 1", "version: 2");
+    let p = parse("Bad Name", &yaml).unwrap_err();
+    let mut lines = Vec::new();
+    for q in &p {
+        lines.push(q.line);
+    }
+    assert_eq!(lines, [Some(1), None], "{p}");
+    // Shown one per line, in that order.
+    let text = p.to_string();
+    let shown: Vec<&str> = text.split('\n').collect();
+    assert_eq!(shown.len(), 2, "{text:?}");
+    assert!(shown[0].starts_with("line 1: "), "{text:?}");
+    assert!(shown[1].starts_with("workflow id `Bad Name`"), "{text:?}");
+}
+
+#[test]
+fn a_label_keeps_sixty_characters_and_shortens_longer_ones() {
+    for (len, label) in [(60, "x".repeat(60)), (61, format!("{}…", "x".repeat(59)))] {
+        let message = "x".repeat(len);
+        let w = ok(&with_node(
+            &format!("{{ id: g, type: gate, message: {message} }}"),
+            "g",
+        ));
+        assert_eq!(w.node("g").unwrap().label(), label, "{len}");
+    }
+}
+
+#[test]
 fn an_id_of_forty_characters_is_valid() {
     let id = "a".repeat(40);
     let w = ok(&with_node(
@@ -1111,6 +1160,13 @@ fn a_node_without_an_id_is_named_by_its_position() {
         .unwrap_or_else(|| panic!("no blank message problem:\n{p}"));
     assert!(blank.message.starts_with("node #4: "), "{blank}");
     assert_eq!(blank.subject, Subject::Node { id: "#4".into() });
+
+    // The reader names a node that is not a mapping the same way.
+    let yaml = doc(&format!("{BASE_NODES}  - just a string\n"), BASE_EDGES);
+    let p = problems(&yaml);
+    assert_eq!(p.len(), 1, "{p}");
+    assert_mentions(&p, &["node #4 must be a mapping"], &yaml);
+    assert_eq!(p.0[0].subject, Subject::Node { id: "#4".into() });
 }
 
 #[test]

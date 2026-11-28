@@ -301,6 +301,18 @@ mod tests {
     }
 
     #[test]
+    fn an_unclosed_brace_is_quoted_up_to_forty_characters() {
+        let err = Template::parse("hi {{ task").unwrap_err();
+        assert_eq!(err.message, "`{{` is never closed: `{{ task`");
+        let long = format!("{{{{{}", "x".repeat(50));
+        let err = Template::parse(&long).unwrap_err();
+        assert_eq!(
+            err.message,
+            format!("`{{{{` is never closed: `{}…`", &long[..40])
+        );
+    }
+
+    #[test]
     fn substituted_text_is_not_rescanned() {
         let mut outputs = Outputs::new();
         outputs.record(
@@ -326,9 +338,22 @@ mod tests {
     #[test]
     fn newest_value_wins() {
         let mut outputs = Outputs::new();
-        outputs.record("a", [("summary".to_owned(), "first".to_owned())].into());
+        outputs.record(
+            "a",
+            [
+                ("summary".to_owned(), "first".to_owned()),
+                ("verdict".to_owned(), "approve".to_owned()),
+            ]
+            .into(),
+        );
         outputs.record("a", [("summary".to_owned(), "second".to_owned())].into());
         assert_eq!(render("{{nodes.a.summary}}", &outputs), "second");
+        // The newest run replaces the older one as a whole.
+        assert_eq!(
+            outputs.node("a"),
+            Some(&[("summary".to_owned(), "second".to_owned())].into())
+        );
+        assert_eq!(outputs.node("b"), None);
     }
 
     #[test]
