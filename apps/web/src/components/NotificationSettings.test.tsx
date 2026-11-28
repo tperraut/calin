@@ -244,6 +244,33 @@ describe("Notify this device", () => {
     expect(rows.map((row) => row.dataset.mine !== undefined)).toEqual([false, true]);
   });
 
+  it("reads the browser's answer when its prompt fails", async () => {
+    const fake = new FakeDevice();
+    fake.granted = "denied";
+    vi.spyOn(fake, "requestPermission").mockRejectedValue(new Error("not in a user gesture"));
+    const { section } = await open({ device: fake });
+    await press(button(section(), "Notify this device"));
+    expect(alertText(section())).toBe(PROBLEMS.denied);
+    expect(fake.subscribedWith).toEqual([]);
+  });
+
+  it("explains a block it already knows of, before any click", async () => {
+    const fake = new FakeDevice();
+    fake.granted = "denied";
+    const { section } = await open({ device: fake });
+    expect(alertText(section())).toBe("");
+    expect(section().textContent).toContain(PROBLEMS.denied);
+    expect(button(section(), "Notify this device").disabled).toBe(false);
+  });
+
+  it("offers to notify when the browser cannot say what it holds", async () => {
+    const fake = new FakeDevice();
+    vi.spyOn(fake, "subscription").mockRejectedValue(new Error("no worker yet"));
+    const { section } = await open({ device: fake, devices: [device("p1", "hash-a")] });
+    expect(button(section(), "Notify this device")).toBeDefined();
+    expect(deviceRows(section())).toHaveLength(1);
+  });
+
   it("does not take a subscription the server does not list for a notified device", async () => {
     const fake = new FakeDevice();
     fake.current = makeDeviceSubscription("hash-z");
@@ -291,6 +318,31 @@ describe("Stop notifying this device", () => {
       "This browser unsubscribed, but the server still lists this device: storage is read-only",
     );
   });
+
+  it("says nothing changed when both the browser and the server refuse", async () => {
+    const deletePushSubscription = vi
+      .fn<Api["deletePushSubscription"]>()
+      .mockRejectedValue(conflict("storage is read-only"));
+    const { section } = await notified(() => Promise.resolve(false), { deletePushSubscription });
+    expect(alertText(section())).toBe(
+      "Nothing changed: this browser could not unsubscribe, and the server refused to remove this device: storage is read-only",
+    );
+    expect(section().textContent).toContain("This device is notified");
+  });
+
+  it("stops from the device's own row in the list", async () => {
+    const fake = new FakeDevice();
+    fake.granted = "granted";
+    fake.current = makeDeviceSubscription("hash-b");
+    const { section, api } = await open({
+      device: fake,
+      devices: [device("p1", "hash-a"), device("p2", "hash-b")],
+    });
+    await press(find<HTMLButtonElement>(section(), 'button[aria-label="Remove device Device p2"]'));
+    expect(api.deletePushSubscription).toHaveBeenCalledWith("p2");
+    expect(section().textContent).toContain("This device is no longer notified.");
+    expect(button(section(), "Notify this device")).toBeDefined();
+  });
 });
 
 describe("Notified devices", () => {
@@ -325,6 +377,22 @@ describe("Notified devices", () => {
     });
     await press(find<HTMLButtonElement>(section(), 'button[aria-label="Remove device Device p1"]'));
     expect(api.deletePushSubscription).toHaveBeenCalledWith("p1");
+    expect(deviceRows(section())).toHaveLength(1);
+  });
+
+  it("says when the list could not be read, and reads it again on Retry", async () => {
+    let fail = true;
+    const listPushSubscriptions = vi.fn<Api["listPushSubscriptions"]>(() =>
+      fail ? Promise.reject(conflict("index is rebuilding")) : Promise.resolve([device("p1", "h")]),
+    );
+    const { section } = await open({ routes: { listPushSubscriptions } });
+    expect(alertText(section())).toBe(
+      "The notified devices could not be loaded: index is rebuildingRetry",
+    );
+    expect(section().textContent).toContain("Checking this device…");
+    fail = false;
+    await press(button(findByText(section(), "section", "Notified devices"), "Retry"));
+    expect(alertText(section())).toBe("");
     expect(deviceRows(section())).toHaveLength(1);
   });
 
@@ -380,6 +448,21 @@ describe("Notify me when", () => {
     expect(toggle(section(), "Failed").checked).toBe(true);
     expect(alertText(section())).toBe("Not saved: preferences are locked");
   });
+
+  it("says when the choices could not be read, and reads them again on Retry", async () => {
+    let fail = true;
+    const getPushPreferences = vi.fn<Api["getPushPreferences"]>(() =>
+      fail ? Promise.reject(conflict("database is locked")) : Promise.resolve(allOn),
+    );
+    const { section } = await open({ routes: { getPushPreferences } });
+    expect(alertText(section())).toBe(
+      "The notification choices could not be loaded: database is lockedRetry",
+    );
+    fail = false;
+    await press(button(findByText(section(), "fieldset", "Notify me when"), "Retry"));
+    expect(alertText(section())).toBe("");
+    expect(toggle(section(), "Failed").checked).toBe(true);
+  });
 });
 
 describe("Send a test notification", () => {
@@ -419,6 +502,21 @@ describe("a change of the server's key", () => {
       expect.objectContaining({ endpoint: "https://push.example/hash-renewed" }),
     );
     expect(api.deletePushSubscription).toHaveBeenCalledWith("p-old");
+    expect(section().textContent).toContain("This device is notified");
+  });
+
+  it("says so when it cannot renew, and keeps what the browser still holds", async () => {
+    const fake = new FakeDevice();
+    fake.granted = "granted";
+    fake.current = makeDeviceSubscription("hash-old", "old-key");
+    fake.next = new Error("push service unreachable");
+    const { section, api } = await open({ device: fake, devices: [device("p-old", "hash-old")] });
+
+    expect(fake.subscribedWith).toEqual([KEY]);
+    expect(api.createPushSubscription).not.toHaveBeenCalled();
+    expect(alertText(section())).toBe(
+      "Could not renew this device after the server's key changed: push service unreachable",
+    );
     expect(section().textContent).toContain("This device is notified");
   });
 
