@@ -2,8 +2,8 @@ import { createSignal, createUniqueId, For, onSettled, Show } from "solid-js";
 import type { ShipRequest } from "../gen/ShipRequest";
 import { skippedLine, stepLine, type ShipPlan } from "../lib/delivery";
 import { errorMessage } from "../lib/errors";
+import { onFormSubmit, onSubmitChord } from "../lib/submit";
 import type { SessionStore } from "../state/sessionStore";
-import { isSubmitChord } from "./Composer";
 
 /**
  * Asks what the pull requests should say, shows what shipping will do repo by
@@ -55,20 +55,13 @@ export function ShipForm(props: { store: SessionStore; plan: ShipPlan; onClose: 
     }
   }
 
-  const onChord = (event: KeyboardEvent): void => {
-    if (!isSubmitChord(event)) return;
-    event.preventDefault();
-    void submit();
-  };
+  const onChord = onSubmitChord(submit);
 
   return (
     <form
       aria-label="Ship the session"
       class="flex max-h-[70dvh] flex-col gap-2 overflow-y-auto overscroll-contain border-b border-line bg-attention-soft p-3"
-      onSubmit={(event) => {
-        event.preventDefault();
-        void submit();
-      }}
+      onSubmit={onFormSubmit(submit)}
       onKeyDown={(event) => {
         // Escape closes a form nothing was typed in; it never throws a description away.
         if (event.key === "Escape" && titleEdit() === undefined && description() === "") {

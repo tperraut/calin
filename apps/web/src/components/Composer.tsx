@@ -12,6 +12,7 @@ import type { WorkflowInfo } from "../gen/WorkflowInfo";
 import { errorMessage } from "../lib/errors";
 import { loadComposerPrefs, saveComposerPrefs, type RepoChoice } from "../lib/prefs";
 import { defaultRepoMode, permissionModes } from "../lib/status";
+import { onFormSubmit, onSubmitChord } from "../lib/submit";
 import { refusalText } from "../lib/usage";
 import { isUsable, QUICK_WORKFLOW, sentWorkflow } from "../lib/workflow";
 import { catalogWorkflows, type RepoRegistry, type WorkflowCatalog } from "../state/app";
@@ -41,10 +42,6 @@ type PickedIssue = {
 
 export const DEFAULT_PLACEHOLDER = "Describe what the agent should do";
 export const ISSUE_PLACEHOLDER = "Extra instructions (optional)";
-
-/** True for the chord that submits a multi-line field: Ctrl+Enter, or Cmd+Enter on a Mac. */
-export const isSubmitChord = (event: KeyboardEvent): boolean =>
-  event.key === "Enter" && (event.ctrlKey || event.metaKey);
 
 /**
  * What is attached given what the reader picked or the last session remembered.
@@ -210,14 +207,7 @@ export function Composer(props: {
 
   return (
     <div class="flex flex-col gap-3">
-      <form
-        id={formId}
-        class="flex flex-col gap-2"
-        onSubmit={(event) => {
-          event.preventDefault();
-          void submit();
-        }}
-      >
+      <form id={formId} class="flex flex-col gap-2" onSubmit={onFormSubmit(submit)}>
         <label for={promptId} class="text-sm font-medium">
           New session
         </label>
@@ -285,11 +275,7 @@ export function Composer(props: {
           value={prompt()}
           aria-describedby={error() === undefined ? undefined : errorId}
           onInput={(event) => setPrompt(event.currentTarget.value)}
-          onKeyDown={(event) => {
-            if (!isSubmitChord(event)) return;
-            event.preventDefault();
-            void submit();
-          }}
+          onKeyDown={onSubmitChord(submit)}
         />
         <Show when={error()}>
           {(message) => (
