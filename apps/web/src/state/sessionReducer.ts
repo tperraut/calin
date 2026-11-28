@@ -13,6 +13,7 @@ import type { PullRequest } from "../gen/PullRequest";
 import type { Question } from "../gen/Question";
 import type { SessionRepo } from "../gen/SessionRepo";
 import type { SessionStatus } from "../gen/SessionStatus";
+import type { WorkflowNodeInfo } from "../gen/WorkflowNodeInfo";
 import type { WorkflowRun } from "../gen/WorkflowRun";
 import type { WorkflowStatus } from "../gen/WorkflowStatus";
 import { finishRun, foldNode, isFailurePort, startRun } from "../lib/workflow";
@@ -276,48 +277,85 @@ const showsRequest = (entry: TranscriptEntry, requestId: string): boolean =>
     : entry.kind === "item" &&
       entry.permissions?.some((asked) => asked.request.id === requestId) === true;
 
-function putItem(view: SessionView, event: Event, item: Item): SessionView {
-  const index = findItem(view.transcript, item.id);
-  const existing = index === -1 ? undefined : view.transcript[index];
-  let transcript = view.transcript;
-  let permissions = existing?.kind === "item" ? existing.permissions : undefined;
-  if (!existing && item.content.kind === "tool") {
-    // A request that arrived before its tool call waits in a row of its own; it moves into the card.
-    const early = view.pendingPermissions.filter((one) => one.request.item_id === item.id);
-    if (early.length > 0) {
-      transcript = transcript.filter(
-        (entry) =>
-          entry.kind !== "permission" || !early.some((one) => one.request.id === entry.request.id),
-      );
-      permissions = early.map((one) => ({
-        request: one.request,
-        outcome: { state: "pending" },
-        ts: one.ts,
-      }));
-    }
-  }
-  const entry: TranscriptEntry = {
+function appendRow(view: SessionView, entry: TranscriptEntry): SessionView {
+  return { ...view, transcript: [...view.transcript, entry] };
+}
+
+/** Ids are unique within a session; a repeat replaces the row instead of doubling it. */
+function putRow(transcript: readonly TranscriptEntry[], entry: TranscriptEntry): TranscriptEntry[] {
+  const index = transcript.findLastIndex((one) => one.key === entry.key);
+  return index === -1 ? [...transcript, entry] : withEntry(transcript, index, entry);
+}
+
+/** A delegation call: what a subagent's `agent_spawned` may point back to. */
+const isTask = (item: Item): boolean =>
+  item.content.kind === "tool" && item.content.tool_kind === "task";
+
+function itemEntry(
+  event: Event,
+  item: Item,
+  ts: number,
+  permissions: readonly ToolPermission[] | undefined,
+): TranscriptEntry {
+  return {
     kind: "item",
     key: itemKey(item.id),
-    // A completed item keeps the place and time at which it started.
-    ts: existing?.ts ?? event.ts,
+    ts,
     agentId: event.agent_id,
     item,
     interrupted: false,
     ...(permissions ? { permissions } : {}),
   };
-  // A delegation call is what a subagent's `agent_spawned` may point back to.
-  const taskStarts =
-    !existing && item.content.kind === "tool" && item.content.tool_kind === "task"
-      ? { ...view.taskStarts, [event.id]: item.id }
-      : view.taskStarts;
+}
+
+/** Requests that named this tool call before it arrived, each waiting in a row of its own. */
+function earlyRequests(view: SessionView, item: Item): readonly PendingPermission[] {
+  if (item.content.kind !== "tool") return [];
+  return view.pendingPermissions.filter((one) => one.request.item_id === item.id);
+}
+
+function addItem(view: SessionView, event: Event, item: Item): SessionView {
+  // An early request leaves its row for the card.
+  const early = earlyRequests(view, item);
+  const moved = new Set(early.map((one) => one.request.id));
+  const transcript = view.transcript.filter(
+    (entry) => entry.kind !== "permission" || !moved.has(entry.request.id),
+  );
+  const permissions = early.map((one): ToolPermission => ({
+    request: one.request,
+    outcome: { state: "pending" },
+    ts: one.ts,
+  }));
+  const entry = itemEntry(event, item, event.ts, early.length > 0 ? permissions : undefined);
   return {
     ...view,
     turnStarted: true,
-    taskStarts,
-    transcript: existing ? withEntry(transcript, index, entry) : [...transcript, entry],
+    taskStarts: isTask(item) ? { ...view.taskStarts, [event.id]: item.id } : view.taskStarts,
+    transcript: [...transcript, entry],
   };
 }
+
+function putItem(view: SessionView, event: Event, item: Item): SessionView {
+  const index = findItem(view.transcript, item.id);
+  if (index === -1) return addItem(view, event, item);
+  const existing = view.transcript[index];
+  const permissions = existing.kind === "item" ? existing.permissions : undefined;
+  // A completed item keeps the place and time at which it started.
+  const entry = itemEntry(event, item, existing.ts, permissions);
+  return { ...view, turnStarted: true, transcript: withEntry(view.transcript, index, entry) };
+}
+
+/** A delegation call of `parentId` still running and not yet taken by another subagent. */
+const isOpenTask = (
+  entry: TranscriptEntry,
+  parentId: string | null,
+  taken: ReadonlySet<string>,
+): boolean =>
+  entry.kind === "item" &&
+  entry.agentId === parentId &&
+  entry.item.status === "running" &&
+  isTask(entry.item) &&
+  !taken.has(entry.item.id);
 
 /**
  * The tool call that started `agent`. The contract does not name it, so: the
@@ -329,15 +367,7 @@ function callOf(view: SessionView, event: Event, agent: Agent): string | undefin
   const named = event.parent_id === null ? undefined : view.taskStarts[event.parent_id];
   if (named !== undefined) return named;
   const taken = new Set(Object.values(view.subagentCalls));
-  const call = view.transcript.findLast(
-    (entry) =>
-      entry.kind === "item" &&
-      entry.agentId === agent.parent_agent_id &&
-      entry.item.status === "running" &&
-      entry.item.content.kind === "tool" &&
-      entry.item.content.tool_kind === "task" &&
-      !taken.has(entry.item.id),
-  );
+  const call = view.transcript.findLast((entry) => isOpenTask(entry, agent.parent_agent_id, taken));
   return call?.kind === "item" ? call.item.id : undefined;
 }
 
@@ -388,12 +418,9 @@ function askQuestion(view: SessionView, event: Event, question: Question): Sessi
     outcome: { state: "pending" },
   };
   const open: OpenQuestion = { question, agentId: event.agent_id, ts: event.ts, seq: event.seq };
-  // Ids are unique within a session; a repeat replaces the row instead of doubling it.
-  const index = view.transcript.findLastIndex((one) => one.key === key);
   return {
     ...view,
-    transcript:
-      index === -1 ? [...view.transcript, entry] : withEntry(view.transcript, index, entry),
+    transcript: putRow(view.transcript, entry),
     openQuestions: [...view.openQuestions.filter((one) => one.question.id !== question.id), open],
   };
 }
@@ -479,29 +506,34 @@ export function mergeRepos(
 
 const lapsed: PermissionOutcome = { state: "lapsed", message: null };
 
+const isPending = (asked: { outcome: PermissionOutcome }): boolean =>
+  asked.outcome.state === "pending";
+
+const isRunning = (entry: TranscriptEntry): boolean =>
+  entry.kind === "item" && entry.item.status === "running" && !entry.interrupted;
+
+const isAsking = (entry: TranscriptEntry): boolean =>
+  entry.kind === "permission"
+    ? isPending(entry)
+    : entry.kind === "item" && entry.permissions?.some(isPending) === true;
+
+/** What a turn's end changes: something still running or still asking. */
+const isOpen = (entry: TranscriptEntry): boolean => isRunning(entry) || isAsking(entry);
+
+const lapse = (asked: ToolPermission): ToolPermission =>
+  isPending(asked) ? { ...asked, outcome: lapsed } : asked;
+
+function closeEntry(entry: TranscriptEntry): TranscriptEntry {
+  if (entry.kind === "permission") return isPending(entry) ? { ...entry, outcome: lapsed } : entry;
+  if (entry.kind !== "item" || !isOpen(entry)) return entry;
+  const closed = { ...entry, interrupted: entry.interrupted || isRunning(entry) };
+  return entry.permissions ? { ...closed, permissions: entry.permissions.map(lapse) } : closed;
+}
+
 /** The turn ended: running items become interrupted, unanswered requests lapse. */
 function closeTurn(view: SessionView): SessionView {
-  const running = (entry: TranscriptEntry): boolean =>
-    entry.kind === "item" && entry.item.status === "running" && !entry.interrupted;
-  const asking = (entry: TranscriptEntry): boolean =>
-    entry.kind === "permission"
-      ? entry.outcome.state === "pending"
-      : entry.kind === "item" &&
-        entry.permissions?.some((asked) => asked.outcome.state === "pending") === true;
-  if (!view.transcript.some((entry) => running(entry) || asking(entry))) return view;
-  const transcript = view.transcript.map((entry): TranscriptEntry => {
-    if (entry.kind === "permission") return asking(entry) ? { ...entry, outcome: lapsed } : entry;
-    if (entry.kind !== "item" || !(running(entry) || asking(entry))) return entry;
-    const closed = { ...entry, interrupted: entry.interrupted || running(entry) };
-    if (!entry.permissions) return closed;
-    return {
-      ...closed,
-      permissions: entry.permissions.map((asked) =>
-        asked.outcome.state === "pending" ? { ...asked, outcome: lapsed } : asked,
-      ),
-    };
-  });
-  return { ...view, transcript, pendingPermissions: [] };
+  if (!view.transcript.some(isOpen)) return view;
+  return { ...view, transcript: view.transcript.map(closeEntry), pendingPermissions: [] };
 }
 
 function requestPermission(
@@ -534,23 +566,15 @@ function requestPermission(
       pendingPermissions,
     };
   }
-  const key = permissionKey(request.id);
   const entry: TranscriptEntry = {
     kind: "permission",
-    key,
+    key: permissionKey(request.id),
     ts: event.ts,
     agentId: event.agent_id,
     request,
     outcome: { state: "pending" },
   };
-  // Ids are unique within a session; a repeat replaces the row instead of doubling it.
-  const index = view.transcript.findLastIndex((one) => one.key === key);
-  return {
-    ...view,
-    transcript:
-      index === -1 ? [...view.transcript, entry] : withEntry(view.transcript, index, entry),
-    pendingPermissions,
-  };
+  return { ...view, transcript: putRow(view.transcript, entry), pendingPermissions };
 }
 
 function resolvePermission(
@@ -649,160 +673,163 @@ function finishIsNews(kind: string, port: string, failure: boolean): boolean {
   return kind === "gate" || (kind === "commit" && port === "nothing");
 }
 
-function applyWorkflow(
-  view: SessionView,
-  event: Event,
-  body: Extract<EventBody, { type: `workflow_${string}` }>,
-): SessionView {
-  const note = (next: WorkflowNote): TranscriptEntry => ({
-    kind: "workflow",
-    key: `workflow:${event.id}`,
-    ts: event.ts,
-    agentId: null,
-    note: next,
-  });
-  if (body.type === "workflow_started") {
-    const run = startRun(body);
-    return {
-      ...view,
-      workflow: run,
-      transcript: [...view.transcript, note({ what: "started", name: run.name })],
-    };
-  }
-  const run = view.workflow;
-  // A node or an end without a start this log showed has nothing to update.
-  if (!run) return view;
-  if (body.type === "workflow_finished") {
-    const reason = body.reason ?? null;
-    return {
-      ...view,
-      workflow: finishRun(run, { ...body, reason }),
-      transcript: [...view.transcript, note({ what: "finished", status: body.status, reason })],
-    };
-  }
-  const next = foldNode(run, body);
-  const info = run.graph.nodes.find((node) => node.id === body.node_id);
-  if (next === run || !info || info.kind === "start" || info.kind === "end") {
-    return { ...view, workflow: next };
-  }
+type EventType = EventBody["type"];
+type Body<K extends EventType> = Extract<EventBody, { type: K }>;
+
+const eventKey = (event: Event): string => `event:${event.id}`;
+
+const workflowEntry = (event: Event, note: WorkflowNote): TranscriptEntry => ({
+  kind: "workflow",
+  key: `workflow:${event.id}`,
+  ts: event.ts,
+  agentId: null,
+  note,
+});
+
+function startWorkflow(view: SessionView, event: Event, body: Body<"workflow_started">) {
+  const workflow = startRun(body);
+  const row = workflowEntry(event, { what: "started", name: workflow.name });
+  return { ...appendRow(view, row), workflow };
+}
+
+function finishWorkflow(view: SessionView, event: Event, body: Body<"workflow_finished">) {
+  // An end without a start this log showed has nothing to update.
+  if (!view.workflow) return view;
+  const reason = body.reason ?? null;
+  const workflow = finishRun(view.workflow, { ...body, reason });
+  const row = workflowEntry(event, { what: "finished", status: body.status, reason });
+  return { ...appendRow(view, row), workflow };
+}
+
+/** The node `nodeId` names, unless it is the start or the end: those are not steps of their own. */
+function stepOf(run: WorkflowRun, nodeId: string): WorkflowNodeInfo | undefined {
+  const info = run.graph.nodes.find((node) => node.id === nodeId);
+  return info && info.kind !== "start" && info.kind !== "end" ? info : undefined;
+}
+
+/** The row a step's start or end is worth, if any (see `WorkflowNote`). */
+function stepNote(
+  after: WorkflowRun,
+  info: WorkflowNodeInfo,
+  body: Body<"workflow_node">,
+): WorkflowNote | undefined {
   const common = { nodeId: info.id, nodeKind: info.kind, label: info.label };
   if (body.phase === "started") {
-    const runs = next.nodes.find((node) => node.id === info.id)?.runs ?? 1;
-    return {
-      ...view,
-      workflow: next,
-      transcript: [...view.transcript, note({ what: "node_started", ...common, run: runs })],
-    };
+    const runs = after.nodes.find((node) => node.id === info.id)?.runs ?? 1;
+    return { what: "node_started", ...common, run: runs };
   }
   const port = body.port;
-  if (port === null) return { ...view, workflow: next };
+  if (port === null) return undefined;
   const failure = isFailurePort(info, port);
-  if (!finishIsNews(info.kind, port, failure)) return { ...view, workflow: next };
-  const row = note({ what: "node_finished", ...common, port, outcome: body.outcome, failure });
-  return { ...view, workflow: next, transcript: [...view.transcript, row] };
+  if (!finishIsNews(info.kind, port, failure)) return undefined;
+  return { what: "node_finished", ...common, port, outcome: body.outcome, failure };
+}
+
+function foldWorkflowNode(view: SessionView, event: Event, body: Body<"workflow_node">) {
+  const run = view.workflow;
+  // A node without a start this log showed has nothing to update.
+  if (!run) return view;
+  const workflow = foldNode(run, body);
+  const step = workflow === run ? undefined : stepOf(run, body.node_id);
+  const note = step && stepNote(workflow, step, body);
+  const next = { ...view, workflow };
+  return note ? appendRow(next, workflowEntry(event, note)) : next;
+}
+
+function setStatus(view: SessionView, body: Body<"session_status">): SessionView {
+  const next = {
+    ...view,
+    status: body.status,
+    statusReason: body.reason,
+    // manager: the session is `running` from its first turn on, after its starting repos are attached.
+    turnStarted: view.turnStarted || body.status === "running",
+  };
+  return turnOver.includes(body.status) ? closeTurn(next) : next;
+}
+
+function attachRepo(view: SessionView, event: Event, repo: SessionRepo): SessionView {
+  const next = { ...view, repos: upsertRepo(view.repos, repo) };
+  // The starting set is not news, and neither is a repo the session already has.
+  if (!view.turnStarted || view.repos.some((one) => one.id === repo.id)) return next;
+  return appendRow(next, {
+    kind: "repo",
+    key: eventKey(event),
+    ts: event.ts,
+    repo,
+    // api.rs: an agent's own request carries its id; the reader's carries none.
+    by: event.agent_id === null ? "user" : "agent",
+    agentId: event.agent_id,
+  });
+}
+
+/** How one kind of event folds into the view. */
+type Fold<K extends EventType> = (view: SessionView, event: Event, body: Body<K>) => SessionView;
+
+/** One fold per event kind; the compiler checks that none is missing. */
+const folds: { [K in EventType]: Fold<K> } = {
+  session_status: (view, _event, body) => setStatus(view, body),
+  user_message: (view, event, body) =>
+    appendRow(view, { kind: "user", key: eventKey(event), ts: event.ts, text: body.text }),
+  agent_spawned: (view, event, body) => spawnAgent(view, event, body.agent),
+  agent_status: (view, event, body) => patchAgent(view, event.agent_id, { status: body.status }),
+  agent_session: (view, event, body) =>
+    patchAgent(view, event.agent_id, {
+      native_session_id: body.native_session_id,
+      // A runner that does not name its model leaves the one already known in place.
+      ...(body.model === null ? {} : { model: body.model }),
+    }),
+  item_started: (view, event, body) => putItem(view, event, body.item),
+  item_completed: (view, event, body) => putItem(view, event, body.item),
+  item_delta: (view, _event, body) => applyDelta(view, body.item_id, body.delta),
+  plan_updated: (view, _event, body) => ({ ...view, plan: body.entries }),
+  usage: (view, event, body) =>
+    applyUsage(view, event.agent_id, {
+      cost_usd: body.cost_usd,
+      tokens_in: body.tokens_in,
+      tokens_out: body.tokens_out,
+    }),
+  repo_attached: (view, event, body) => attachRepo(view, event, body.repo),
+  permission_requested: (view, event, body) => requestPermission(view, event, body.request),
+  permission_resolved: (view, _event, body) => resolvePermission(view, body),
+  file_changed: changeFile,
+  pull_request_opened: (view, event, body) => putPullRequest(view, event, body.pull_request, true),
+  pull_request_updated: (view, event, body) =>
+    putPullRequest(view, event, body.pull_request, false),
+  message_sent: (view, event, body) => putMessage(view, event, body.message, "sent"),
+  message_received: (view, event, body) => putMessage(view, event, body.message, "received"),
+  question_asked: (view, event, body) => askQuestion(view, event, body.question),
+  question_answered: (view, _event, body) => answerQuestion(view, body),
+  workflow_started: startWorkflow,
+  workflow_node: foldWorkflowNode,
+  workflow_finished: finishWorkflow,
+  // Not a transcript row: the store hands it to the app (integrations spec, section 1).
+  limits: (view) => view,
+  error: (view, event, body) =>
+    appendRow(view, {
+      kind: "error",
+      key: eventKey(event),
+      ts: event.ts,
+      agentId: event.agent_id,
+      message: body.message,
+    }),
+};
+
+function foldAs<K extends EventType>(
+  type: K,
+  view: SessionView,
+  event: Event,
+  body: Body<K>,
+): SessionView {
+  const fold: Fold<K> = folds[type];
+  return fold(view, event, body);
 }
 
 function applyBody(view: SessionView, event: Event): SessionView {
   // Widened on purpose: a frame without a body must not throw in the fold.
   const body = event.body as EventBody | null | undefined;
-  if (!body) return view;
-  switch (body.type) {
-    case "session_status": {
-      const next = {
-        ...view,
-        status: body.status,
-        statusReason: body.reason,
-        // manager: the session is `running` from its first turn on, after its starting repos are attached.
-        turnStarted: view.turnStarted || body.status === "running",
-      };
-      return turnOver.includes(body.status) ? closeTurn(next) : next;
-    }
-    case "user_message": {
-      const entry: TranscriptEntry = {
-        kind: "user",
-        key: `event:${event.id}`,
-        ts: event.ts,
-        text: body.text,
-      };
-      return { ...view, transcript: [...view.transcript, entry] };
-    }
-    case "agent_spawned":
-      return spawnAgent(view, event, body.agent);
-    case "agent_status":
-      return patchAgent(view, event.agent_id, { status: body.status });
-    case "agent_session":
-      return patchAgent(view, event.agent_id, {
-        native_session_id: body.native_session_id,
-        // A runner that does not name its model leaves the one already known in place.
-        ...(body.model === null ? {} : { model: body.model }),
-      });
-    case "item_started":
-    case "item_completed":
-      return putItem(view, event, body.item);
-    case "item_delta":
-      return applyDelta(view, body.item_id, body.delta);
-    case "plan_updated":
-      return { ...view, plan: body.entries };
-    case "usage":
-      return applyUsage(view, event.agent_id, {
-        cost_usd: body.cost_usd,
-        tokens_in: body.tokens_in,
-        tokens_out: body.tokens_out,
-      });
-    case "repo_attached": {
-      const next = { ...view, repos: upsertRepo(view.repos, body.repo) };
-      // The starting set is not news, and neither is a repo the session already has.
-      if (!view.turnStarted || view.repos.some((repo) => repo.id === body.repo.id)) return next;
-      const entry: TranscriptEntry = {
-        kind: "repo",
-        key: `event:${event.id}`,
-        ts: event.ts,
-        repo: body.repo,
-        // api.rs: an agent's own request carries its id; the reader's carries none.
-        by: event.agent_id === null ? "user" : "agent",
-        agentId: event.agent_id,
-      };
-      return { ...next, transcript: [...next.transcript, entry] };
-    }
-    case "permission_requested":
-      return requestPermission(view, event, body.request);
-    case "permission_resolved":
-      return resolvePermission(view, body);
-    case "file_changed":
-      return changeFile(view, event, body);
-    case "pull_request_opened":
-      return putPullRequest(view, event, body.pull_request, true);
-    case "pull_request_updated":
-      return putPullRequest(view, event, body.pull_request, false);
-    case "message_sent":
-      return putMessage(view, event, body.message, "sent");
-    case "message_received":
-      return putMessage(view, event, body.message, "received");
-    case "question_asked":
-      return askQuestion(view, event, body.question);
-    case "question_answered":
-      return answerQuestion(view, body);
-    case "workflow_started":
-    case "workflow_node":
-    case "workflow_finished":
-      return applyWorkflow(view, event, body);
-    case "limits":
-      // Not a transcript row: the store hands it to the app (integrations spec, section 1).
-      return view;
-    case "error": {
-      const entry: TranscriptEntry = {
-        kind: "error",
-        key: `event:${event.id}`,
-        ts: event.ts,
-        agentId: event.agent_id,
-        message: body.message,
-      };
-      return { ...view, transcript: [...view.transcript, entry] };
-    }
-    default:
-      // An event type from a newer server: it still takes its place in the sequence.
-      return view;
-  }
+  // An event type from a newer server: it still takes its place in the sequence.
+  if (!body || !Object.hasOwn(folds, body.type)) return view;
+  return foldAs(body.type, view, event, body);
 }
 
 /**
