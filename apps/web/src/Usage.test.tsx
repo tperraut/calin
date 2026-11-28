@@ -10,9 +10,12 @@ import { dayKey } from "./lib/usage";
 import { createAppState } from "./state/app";
 import { deferred, fakeApi, FakeSocket, immediately, settle } from "./test/fakes";
 import { makeLimits, makeUsage, makeWindow, row } from "./test/integrations";
-import { click, find, findByText, mount, unmountAll } from "./test/render";
+import { click, find, findByText, mount, pageShown, unmountAll, until } from "./test/render";
 
-afterEach(unmountAll);
+afterEach(() => {
+  unmountAll();
+  vi.useRealTimers();
+});
 
 const health: Health = {
   name: "calin",
@@ -45,18 +48,25 @@ async function open(path: string, routes: Partial<Api> = {}) {
   const host = mount(() => <App state={state} />);
   socket.setState("open");
   const main = () => find(host, "main");
-  // The page's code arrives on its first visit (router.ts).
-  const waiting = () => {
-    const shown = host.querySelector("main")?.textContent;
-    return shown === undefined || shown === "Loading…";
-  };
-  for (let i = 0; i < 50 && waiting(); i += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 5));
-    flush();
-  }
-  await settle();
-  flush();
+  await until(() => pageShown(host));
   return { host, main, getUsage };
+}
+
+/**
+ * Pins the clock, so the range asked for does not depend on when the test runs:
+ * the evening of 1 November 2026, after the autumn clock change in Europe and in North America.
+ */
+const PINNED = new Date(2026, 10, 1, 23, 30).getTime();
+function pinClock(): void {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(PINNED);
+}
+
+/** `query` asks for the pinned day and the `days - 1` before it: from local midnight to when it asked. */
+function expectLastDays(query: UsageQuery | undefined, days: number): void {
+  expect(query?.from).toBe(new Date(2026, 10, 1 - (days - 1)).getTime());
+  expect(query?.to).toBeGreaterThanOrEqual(PINNED);
+  expect(query?.to).toBeLessThanOrEqual(Date.now());
 }
 
 const bars = (root: ParentNode) => [...root.querySelectorAll<SVGElement>('[data-part="hit"]')];
@@ -67,12 +77,11 @@ const meters = (root: ParentNode) =>
 
 describe("Usage page", () => {
   it("asks for the last 30 days by default, in four breakdowns, and shows the totals", async () => {
+    pinClock();
     const { main, getUsage } = await open("/usage");
     const queries = getUsage.mock.calls.map(([query]) => query);
     expect(queries.map((query) => query?.by)).toEqual(["day", "session", "repo", "model"]);
-    const span = (queries[0]?.to ?? 0) - (queries[0]?.from ?? 0);
-    expect(span).toBeGreaterThan(29 * DAY);
-    expect(span).toBeLessThan(30 * DAY);
+    for (const query of queries) expectLastDays(query, 30);
     expect(find(main(), '[aria-label="Range"] [aria-pressed="true"]').textContent).toBe("30 days");
     const totals = find(main(), '[data-part="totals"]').textContent;
     expect(totals).toContain("$3.00");
@@ -83,17 +92,16 @@ describe("Usage page", () => {
   });
 
   it("keeps the range in the URL and reads it from there", async () => {
+    pinClock();
     const { main, getUsage } = await open("/usage?days=90");
     expect(find(main(), '[aria-label="Range"] [aria-pressed="true"]').textContent).toBe("90 days");
-    const first = getUsage.mock.calls[0]?.[0];
-    expect((first?.to ?? 0) - (first?.from ?? 0)).toBeGreaterThan(89 * DAY);
+    expectLastDays(getUsage.mock.calls[0]?.[0], 90);
 
     await click(findByText(main(), "button", "7 days"));
     await settle();
     flush();
     expect(location.search).toBe("?days=7");
-    const last = getUsage.mock.lastCall?.[0];
-    expect((last?.to ?? 0) - (last?.from ?? 0)).toBeLessThan(7 * DAY);
+    expectLastDays(getUsage.mock.lastCall?.[0], 7);
     expect(find(main(), '[aria-label="Range"] [aria-pressed="true"]').textContent).toBe("7 days");
   });
 

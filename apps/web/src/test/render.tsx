@@ -1,5 +1,6 @@
 import { render, type JSX } from "@solidjs/web";
 import { flush } from "solid-js";
+import { vi } from "vite-plus/test";
 
 const mounted: Array<() => void> = [];
 
@@ -74,11 +75,38 @@ export function choose(select: HTMLSelectElement, value: string): void {
   flush();
 }
 
+/** Lets the screen catch up, including what an already answered request then does. */
+async function catchUp(): Promise<void> {
+  for (let turn = 0; turn < 5; turn += 1) await Promise.resolve();
+  flush();
+}
+
 /** Clicks and lets the screen catch up, including what an awaited request then does. */
 export async function click(element: HTMLElement): Promise<void> {
   element.click();
-  for (let turn = 0; turn < 5; turn += 1) await Promise.resolve();
-  flush();
+  await catchUp();
+}
+
+/**
+ * Waits until `ready` holds, then lets the screen catch up. Code fetched on
+ * demand (a lazy page or list) takes as long as the machine needs to load it,
+ * so no fixed number of turns is a safe wait on a loaded machine.
+ */
+export async function until(ready: () => boolean): Promise<void> {
+  await vi.waitFor(
+    () => {
+      flush();
+      if (!ready()) throw new Error("still waiting");
+    },
+    { timeout: 4_000, interval: 5 },
+  );
+  await catchUp();
+}
+
+/** Whether `main` shows a page, not the fallback of one whose code is still on its way (router.ts). */
+export function pageShown(host: ParentNode): boolean {
+  const shown = host.querySelector("main")?.textContent;
+  return shown !== undefined && shown !== "Loading…";
 }
 
 /** The form control labelled by the `<label>` containing `text`: wrapped by it, or named by `for`. */

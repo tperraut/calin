@@ -8,7 +8,7 @@ import type { Repo } from "../gen/Repo";
 import type { RunnerLimits } from "../gen/RunnerLimits";
 import { conflict, makeRepo, settle } from "../test/fakes";
 import { makeIssue, makeLimits, makeWindow } from "../test/integrations";
-import { click, find, findByText, mount, type, unmountAll } from "../test/render";
+import { click, find, findByText, mount, type, unmountAll, until } from "../test/render";
 import { Composer, type IssueSource } from "./Composer";
 import { ISSUE_SEARCH_DELAY_MS } from "./IssueList";
 
@@ -68,12 +68,7 @@ function setup(
     details.dispatchEvent(new Event("toggle"));
     flush();
     // The list's code arrives when the disclosure first opens.
-    for (let i = 0; i < 50 && !host.querySelector('input[type="search"]'); i += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 5));
-      flush();
-    }
-    await settle();
-    flush();
+    await until(() => host.querySelector('input[type="search"]') !== null);
   }
   const prompt = () => find<HTMLTextAreaElement>(host, "textarea");
   async function start(text = ""): Promise<CreateSessionRequest | undefined> {

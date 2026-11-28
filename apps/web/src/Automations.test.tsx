@@ -18,7 +18,17 @@ import {
   settle,
 } from "./test/fakes";
 import { makeAutomation, makeRun } from "./test/integrations";
-import { click, control, find, findByText, mount, type, unmountAll } from "./test/render";
+import {
+  click,
+  control,
+  find,
+  findByText,
+  mount,
+  pageShown,
+  type,
+  unmountAll,
+  until,
+} from "./test/render";
 
 afterEach(() => {
   vi.useRealTimers();
@@ -80,16 +90,7 @@ async function open(path: string, routes: Partial<Api> = {}) {
   const state = createAppState({ api, socket, schedule: immediately });
   const host = mount(() => <App state={state} />);
   socket.setState("open");
-  const waiting = () => {
-    const shown = host.querySelector("main")?.textContent;
-    return shown === undefined || shown === "Loading…";
-  };
-  for (let i = 0; i < 50 && waiting(); i += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 5));
-    flush();
-  }
-  await settle();
-  flush();
+  await until(() => pageShown(host));
   const main = () => find(host, "main");
   return { host, main, api };
 }
