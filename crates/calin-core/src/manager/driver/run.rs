@@ -55,6 +55,38 @@ pub(super) struct Run {
     notes: Vec<String>,
 }
 
+impl Run {
+    /// The nodes the engine went through on its own since it was last
+    /// asked, each with the port it left through; `from` is the node whose
+    /// result led here, already on record. Ends with the node the run
+    /// finishes at, when `action` finishes it.
+    fn passed(
+        &mut self,
+        from: Option<&str>,
+        action: Option<&Action>,
+    ) -> Vec<(String, Option<String>)> {
+        let taken = self.state.taken_edges();
+        let mut passed: Vec<(String, Option<String>)> = taken[self.edges_seen.min(taken.len())..]
+            .iter()
+            .filter(|edge| Some(edge.from.as_str()) != from)
+            .map(|edge| (edge.from.clone(), Some(edge.port.clone())))
+            .collect();
+        self.edges_seen = taken.len();
+        let Some(Action::Finish(finish)) = action else {
+            return passed;
+        };
+        match &finish.reason {
+            // A loop left through a port nothing is wired to took no edge.
+            FinishReason::UnwiredPort { node, port } if Some(node.as_str()) != from => {
+                passed.push((node.clone(), Some(port.clone())));
+            }
+            FinishReason::EndNode { node } => passed.push((node.clone(), None)),
+            _ => {}
+        }
+        passed
+    }
+}
+
 /// What the active node waits for.
 enum Wait {
     /// Nothing: between two nodes, within one step of the driver.
@@ -286,25 +318,9 @@ impl Driver {
         let Some(run) = &mut self.run else {
             return Ok(());
         };
-        let taken = run.state.taken_edges();
-        let mut passed: Vec<(String, Option<String>)> = taken[run.edges_seen.min(taken.len())..]
-            .iter()
-            .filter(|edge| Some(edge.from.as_str()) != from)
-            .map(|edge| (edge.from.clone(), Some(edge.port.clone())))
-            .collect();
-        run.edges_seen = taken.len();
         // The engine gives one action per call.
         let action = actions.into_iter().next();
-        if let Some(Action::Finish(finish)) = &action {
-            match &finish.reason {
-                // A loop left through a port nothing is wired to took no edge.
-                FinishReason::UnwiredPort { node, port } if Some(node.as_str()) != from => {
-                    passed.push((node.clone(), Some(port.clone())));
-                }
-                FinishReason::EndNode { node } => passed.push((node.clone(), None)),
-                _ => {}
-            }
-        }
+        let passed = run.passed(from, action.as_ref());
         for (node, port) in passed {
             let outcome = self.loop_outcome(&node, port.as_deref());
             self.node_started(&node, None).await?;
@@ -398,6 +414,11 @@ impl Driver {
             }
             self.set_status(SessionStatus::Running, None).await?;
         }
+        self.begin_work(action).await
+    }
+
+    /// Begins a node that is work of the session, one call per kind.
+    async fn begin_work(&mut self, action: Action) -> Result<()> {
         match action {
             Action::RunAgent {
                 node,
@@ -414,7 +435,6 @@ impl Driver {
                 model,
                 ..
             } => {
-                let line = excerpt(&prompt);
                 let brief = Brief {
                     label: node.clone(),
                     title: node.clone(),
@@ -423,26 +443,9 @@ impl Driver {
                     runner,
                     model,
                 };
-                self.begin_children(node, line, verdicts, false, vec![brief])
-                    .await
+                self.begin_fresh(node, verdicts, brief).await
             }
-            Action::StartParallel { node, branches } => {
-                let line = format!("{} branches", branches.len());
-                let briefs = branches.into_iter().map(|branch| {
-                    let ParallelBranch { id, prompt, repos } = branch;
-                    Brief {
-                        title: format!("{node}: {id}"),
-                        label: id,
-                        prompt,
-                        repos,
-                        runner: None,
-                        model: None,
-                    }
-                });
-                let briefs = briefs.collect();
-                self.begin_children(node, line, Vec::new(), true, briefs)
-                    .await
-            }
+            Action::StartParallel { node, branches } => self.begin_parallel(node, branches).await,
             Action::RunCheck {
                 node,
                 check,
@@ -453,6 +456,37 @@ impl Driver {
             // Taken care of above.
             Action::Finish(_) | Action::AskGate { .. } | Action::AskQuestion { .. } => Ok(()),
         }
+    }
+
+    /// An `agent` node with `fresh: true`: one child session on its prompt.
+    async fn begin_fresh(
+        &mut self,
+        node: String,
+        verdicts: Vec<String>,
+        brief: Brief,
+    ) -> Result<()> {
+        let line = excerpt(&brief.prompt);
+        self.begin_children(node, line, verdicts, false, vec![brief])
+            .await
+    }
+
+    /// A `parallel` node: one child session per branch.
+    async fn begin_parallel(&mut self, node: String, branches: Vec<ParallelBranch>) -> Result<()> {
+        let line = format!("{} branches", branches.len());
+        let briefs = branches.into_iter().map(|branch| {
+            let ParallelBranch { id, prompt, repos } = branch;
+            Brief {
+                title: format!("{node}: {id}"),
+                label: id,
+                prompt,
+                repos,
+                runner: None,
+                model: None,
+            }
+        });
+        let briefs = briefs.collect();
+        self.begin_children(node, line, Vec::new(), true, briefs)
+            .await
     }
 
     fn waiting(&mut self, wait: Wait) {
@@ -672,35 +706,36 @@ impl Driver {
         let Some(run) = &mut self.run else {
             return Ok(());
         };
-        let Wait::Children { children, .. } = &mut run.wait else {
-            return Ok(());
-        };
-        let waited = children
-            .iter_mut()
-            .find(|child| child.session_id == session_id && child.report.is_none());
-        // A later report of a child the run no longer waits for.
-        let Some(child) = waited else {
-            return Ok(());
-        };
-        child.report = Some((body, ended));
-        if children.iter().any(|child| child.report.is_none()) {
-            return Ok(());
-        }
-        let Wait::Children {
+        let Some(Wait::Children {
             node,
             verdicts,
             parallel,
             children,
-        } = std::mem::replace(&mut run.wait, Wait::Nothing)
+        }) = report_child(&mut run.wait, session_id, (body, ended))
         else {
             return Ok(());
         };
+        let (reports, worked) = self.child_reports(children).await;
+        let note = briefing::workflow_children_note(&node, &worked);
+        let done = children_result(&node, &verdicts, parallel, reports);
+        if let Some(run) = &mut self.run {
+            run.notes.extend(note);
+            run.done = Some(done);
+        }
+        Ok(())
+    }
+
+    /// Each child's label, report and end, and what the lead is told of
+    /// its work: it stays on the child's own branches.
+    async fn child_reports(
+        &self,
+        children: Vec<ChildWait>,
+    ) -> (Vec<ChildReport>, Vec<briefing::WorkflowChild>) {
         let mut reports = Vec::with_capacity(children.len());
         let mut worked = Vec::with_capacity(children.len());
         for child in children {
             // Every child has reported by now.
             let (body, ended) = child.report.unwrap_or((String::new(), ChildEnd::Review));
-            // Its work stays on its own branches: the lead is told which.
             let repos = match self.inner.store.session(&child.session_id).await {
                 Ok(detail) => detail.repos,
                 Err(_) => Vec::new(),
@@ -716,36 +751,7 @@ impl Driver {
             });
             reports.push((child.label, body, ended));
         }
-        let note = briefing::workflow_children_note(&node, &worked);
-        let failed = reports
-            .iter()
-            .filter(|(_, _, ended)| *ended == ChildEnd::Failed);
-        let failed: Vec<String> = failed
-            .map(|(label, body, _)| format!("{label}: {}", excerpt(body)))
-            .collect();
-        let done = if parallel {
-            let sections = reports
-                .iter()
-                .map(|(label, body, _)| format!("## {label}\n\n{}", body.trim_end()));
-            let summary = sections.collect::<Vec<_>>().join("\n\n");
-            match failed.is_empty() {
-                true => Done::new(&node, "done", format!("{} branches done", reports.len())),
-                false => Done::new(&node, "failed", format!("failed: {}", failed.join("; "))),
-            }
-            .with("summary", summary)
-        } else {
-            let summary = reports.into_iter().next().map(|(_, body, _)| body);
-            let summary = summary.unwrap_or_default();
-            match failed.is_empty() {
-                true => agent_result(&node, &verdicts, summary),
-                false => Done::new(&node, "failed", excerpt(&summary)).with("summary", summary),
-            }
-        };
-        if let Some(run) = &mut self.run {
-            run.notes.extend(note);
-            run.done = Some(done);
-        }
-        Ok(())
+        (reports, worked)
     }
 
     /// A `check` node: its commands run one after the other, off the runtime.
@@ -1270,6 +1276,63 @@ fn agent_result(node: &str, verdicts: &[String], summary: String) -> Done {
     Done::new(node, verdict.port(), line)
         .with("summary", summary)
         .with("verdict", verdict.word())
+}
+
+/// A child's label, the body of its report, and how it ended.
+type ChildReport = (String, String, ChildEnd);
+
+/// Keeps the report of a child the active node waits for. Once every child
+/// of the node has reported, takes the node's wait: the node is over.
+/// `None` for a later report of a child nobody waits for any more.
+fn report_child(wait: &mut Wait, session_id: &str, report: (String, ChildEnd)) -> Option<Wait> {
+    let Wait::Children { children, .. } = wait else {
+        return None;
+    };
+    let waited = children
+        .iter_mut()
+        .find(|child| child.session_id == session_id && child.report.is_none())?;
+    waited.report = Some(report);
+    if children.iter().any(|child| child.report.is_none()) {
+        return None;
+    }
+    Some(std::mem::replace(wait, Wait::Nothing))
+}
+
+/// The result of a node whose children have all reported. A child that
+/// failed makes it leave through `failed`, with what its report says first.
+fn children_result(
+    node: &str,
+    verdicts: &[String],
+    parallel: bool,
+    reports: Vec<ChildReport>,
+) -> Done {
+    let failed: Vec<String> = reports
+        .iter()
+        .filter(|(_, _, ended)| *ended == ChildEnd::Failed)
+        .map(|(label, body, _)| format!("{label}: {}", excerpt(body)))
+        .collect();
+    if parallel {
+        return parallel_result(node, &reports, &failed);
+    }
+    let summary = reports.into_iter().next().map(|(_, body, _)| body);
+    let summary = summary.unwrap_or_default();
+    match failed.is_empty() {
+        true => agent_result(node, verdicts, summary),
+        false => Done::new(node, "failed", excerpt(&summary)).with("summary", summary),
+    }
+}
+
+/// The result of a `parallel` node: every branch's report under its label.
+fn parallel_result(node: &str, reports: &[ChildReport], failed: &[String]) -> Done {
+    let sections = reports
+        .iter()
+        .map(|(label, body, _)| format!("## {label}\n\n{}", body.trim_end()));
+    let summary = sections.collect::<Vec<_>>().join("\n\n");
+    match failed.is_empty() {
+        true => Done::new(node, "done", format!("{} branches done", reports.len())),
+        false => Done::new(node, "failed", format!("failed: {}", failed.join("; "))),
+    }
+    .with("summary", summary)
 }
 
 /// An amount of money in a sentence: cents, or more digits when it has them.
