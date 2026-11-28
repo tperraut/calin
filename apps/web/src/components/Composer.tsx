@@ -36,6 +36,7 @@ import { refusingWindow } from "../state/limits";
 import { Markdown } from "./Markdown";
 import { RepoPicker } from "./RepoPicker";
 import { PermissionField, RunnerOptions, WorkflowField } from "./SessionOptions";
+import { ErrorNote } from "./ErrorNote";
 
 // Only someone who opens the Issues disclosure needs the list, so it is fetched then.
 const IssueList = lazy(() => import("./IssueList"));
@@ -434,13 +435,7 @@ export function Composer(props: ComposerProps) {
           onInput={(event) => state.setPrompt(event.currentTarget.value)}
           onKeyDown={onSubmitChord(submit)}
         />
-        <Show when={state.starting.error()}>
-          {(message) => (
-            <p id={errorId} role="alert" class="text-sm text-tone-danger">
-              {message()}
-            </p>
-          )}
-        </Show>
+        <ErrorNote message={state.starting.error()} id={errorId} />
       </form>
 
       {/* Outside the form above: registering a repo is a form of its own, and forms do not nest. */}

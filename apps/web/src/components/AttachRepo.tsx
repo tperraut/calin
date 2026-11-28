@@ -9,6 +9,7 @@ import { onFormSubmit } from "../lib/submit";
 import type { RepoRegistry } from "../state/app";
 import { LoadFailure } from "./AccessSettings";
 import { RepoModeOptions } from "./RepoPicker";
+import { ErrorNote } from "./ErrorNote";
 
 /** The repos that can still join: cloned, and not attached already (one at most once, api.rs). */
 function attachable(registry: RepoRegistry, attached: readonly SessionRepo[]): readonly Repo[] {
@@ -144,13 +145,7 @@ export function AttachRepo(props: {
           />
         </Match>
       </Switch>
-      <Show when={attaching.error()}>
-        {(message) => (
-          <p role="alert" class="text-sm text-tone-danger">
-            {message()}
-          </p>
-        )}
-      </Show>
+      <ErrorNote message={attaching.error()} />
       <Show when={!props.enabled}>
         <p class="text-sm text-muted">
           A repo can be attached while the session is running, waiting or in review.

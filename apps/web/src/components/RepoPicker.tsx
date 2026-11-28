@@ -31,6 +31,7 @@ import { repoModeFrom, repoModeLabel, repoModes } from "../lib/status";
 import { onFormSubmit } from "../lib/submit";
 import type { RepoRegistry } from "../state/app";
 import { LoadFailure } from "./AccessSettings";
+import { ErrorNote } from "./ErrorNote";
 
 /** From this many repos on, the list gets a filter box. */
 const FILTER_FROM = 9;
@@ -108,13 +109,7 @@ export function RegisterRepoForm(props: {
         value={name()}
         onInput={(event) => setName(event.currentTarget.value)}
       />
-      <Show when={registering.error()}>
-        {(message) => (
-          <p id={errorId} role="alert" class="text-sm text-tone-danger">
-            {message()}
-          </p>
-        )}
-      </Show>
+      <ErrorNote message={registering.error()} id={errorId} />
       <div class="flex justify-end gap-2">
         <button type="button" class="btn" onClick={() => props.onCancel()}>
           Cancel

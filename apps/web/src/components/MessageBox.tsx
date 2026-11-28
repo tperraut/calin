@@ -1,6 +1,7 @@
-import { createEffect, createSignal, createUniqueId, Show, type Setter } from "solid-js";
+import { createEffect, createSignal, createUniqueId, type Setter } from "solid-js";
 import { createRequest } from "../lib/request";
 import { onFormSubmit, onSubmitChord } from "../lib/submit";
+import { ErrorNote } from "./ErrorNote";
 
 type Prefill = { text: string; seq: number };
 
@@ -84,13 +85,7 @@ export function MessageBox(props: MessageBoxProps) {
       class="flex flex-col gap-1.5 border-t border-line bg-surface p-3"
       onSubmit={onFormSubmit(submit)}
     >
-      <Show when={sending.error()}>
-        {(message) => (
-          <p id={errorId} role="alert" class="text-sm text-tone-danger">
-            {message()}
-          </p>
-        )}
-      </Show>
+      <ErrorNote message={sending.error()} id={errorId} />
       <div class="flex items-end gap-2">
         <label for={fieldId} class="sr-only">
           Message to the agent
