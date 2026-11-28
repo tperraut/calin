@@ -9,66 +9,85 @@ export type Refresher = {
 };
 
 /** Debounces and serializes a refresh, and holds it while its screen is out of sight. */
-export function createRefresher(run: () => Promise<void>, delayMs = 500): Refresher {
-  let visible = false;
-  let stale = false;
-  let running = false;
-  let again = false;
-  let disposed = false;
-  let timer: ReturnType<typeof setTimeout> | undefined;
+class DebouncedRefresher implements Refresher {
+  private readonly run: () => Promise<void>;
+  private readonly delayMs: number;
+  private visible = false;
+  private stale = false;
+  private running = false;
+  private again = false;
+  private disposed = false;
+  private timer: ReturnType<typeof setTimeout> | undefined;
 
-  function start(): void {
-    if (disposed) return;
-    if (running) {
-      again = true;
+  constructor(run: () => Promise<void>, delayMs: number) {
+    this.run = run;
+    this.delayMs = delayMs;
+  }
+
+  request(): void {
+    if (!this.visible) {
+      this.stale = true;
       return;
     }
-    running = true;
-    void run().finally(() => {
-      running = false;
-      if (!again) return;
-      again = false;
-      if (visible) start();
-      else stale = true;
-    });
+    this.cancel();
+    this.timer = setTimeout(() => this.fire(), this.delayMs);
   }
 
-  function cancel(): boolean {
-    if (timer === undefined) return false;
-    clearTimeout(timer);
-    timer = undefined;
+  now(): void {
+    this.cancel();
+    this.startOrHold();
+  }
+
+  setVisible(next: boolean): void {
+    this.visible = next;
+    if (!next) {
+      if (this.cancel()) this.stale = true;
+    } else if (this.stale) {
+      this.stale = false;
+      this.start();
+    }
+  }
+
+  dispose(): void {
+    this.disposed = true;
+    this.cancel();
+  }
+
+  private fire(): void {
+    this.timer = undefined;
+    this.start();
+  }
+
+  private startOrHold(): void {
+    if (this.visible) this.start();
+    else this.stale = true;
+  }
+
+  private start(): void {
+    if (this.disposed) return;
+    if (this.running) {
+      this.again = true;
+      return;
+    }
+    this.running = true;
+    void this.run().finally(() => this.finished());
+  }
+
+  private finished(): void {
+    this.running = false;
+    if (!this.again) return;
+    this.again = false;
+    this.startOrHold();
+  }
+
+  private cancel(): boolean {
+    if (this.timer === undefined) return false;
+    clearTimeout(this.timer);
+    this.timer = undefined;
     return true;
   }
+}
 
-  return {
-    request() {
-      if (!visible) {
-        stale = true;
-        return;
-      }
-      cancel();
-      timer = setTimeout(() => {
-        timer = undefined;
-        start();
-      }, delayMs);
-    },
-    now() {
-      cancel();
-      if (visible) start();
-      else stale = true;
-    },
-    setVisible(next) {
-      visible = next;
-      if (!next) {
-        if (cancel()) stale = true;
-      } else if (stale) {
-        stale = false;
-        start();
-      }
-    },
-    dispose() {
-      disposed = true;
-      cancel();
-    },
-  };
+export function createRefresher(run: () => Promise<void>, delayMs = 500): Refresher {
+  return new DebouncedRefresher(run, delayMs);
 }

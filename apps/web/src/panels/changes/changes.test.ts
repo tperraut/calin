@@ -209,6 +209,22 @@ describe("refresher", () => {
     expect(run).toHaveBeenCalledTimes(2);
   });
 
+  it("holds a refresh asked during a run that ends out of sight, for the way back", async () => {
+    const first = deferred();
+    const run = vi.fn<() => Promise<void>>().mockReturnValueOnce(first.promise);
+    run.mockResolvedValue(undefined);
+    const refresher = createRefresher(run, 500);
+    refresher.setVisible(true);
+    refresher.now();
+    refresher.now();
+    refresher.setVisible(false);
+    first.resolve();
+    await settle();
+    expect(run).toHaveBeenCalledTimes(1);
+    refresher.setVisible(true);
+    expect(run).toHaveBeenCalledTimes(2);
+  });
+
   it("goes quiet once disposed", () => {
     const run = vi.fn(() => Promise.resolve());
     const refresher = createRefresher(run, 500);
