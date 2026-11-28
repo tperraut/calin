@@ -82,6 +82,19 @@ describe("the pre-cache list", () => {
     expect(list).not.toContain("/robots.txt");
   });
 
+  it("never lists a source map or the worker, even when the entry says it loads them", () => {
+    const odd = [
+      chunk("assets/a.js", {
+        isEntry: true,
+        imports: ["sw.js"],
+        importedAssets: ["assets/a.js.map"],
+      }),
+      asset("sw.js"),
+      asset("assets/a.js.map"),
+    ];
+    expect(precacheList(odd, [])).toEqual(["/assets/a.js"]);
+  });
+
   it("lists only files the build made, the page only when there is one", () => {
     const partial = [
       chunk("assets/a.js", {
