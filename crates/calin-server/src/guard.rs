@@ -8,7 +8,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use axum::extract::{Request, State};
 use axum::http::header::{HOST, ORIGIN, UPGRADE};
-use axum::http::{HeaderMap, Method, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
@@ -49,45 +49,71 @@ fn check(
     headers: &HeaderMap,
     public: Option<PublicSite<'_>>,
 ) -> Result<(), &'static str> {
-    // DNS rebinding: a hostile page can point its own name at 127.0.0.1, but
-    // the browser still sends that name as Host. Two Host headers are two
-    // answers to "which site is this for": refused.
-    let mut hosts = headers.get_all(HOST).iter();
-    let host = match (hosts.next(), hosts.next()) {
-        (Some(host), None) => host.to_str().ok(),
-        _ => None,
-    };
-    let to_loopback = host.is_some_and(is_loopback_authority);
-    let to_public = match (host, public) {
-        (Some(host), Some(public)) => host.eq_ignore_ascii_case(public.authority),
-        _ => false,
-    };
-    let Some(host) = host.filter(|_| to_loopback || to_public) else {
-        return Err(match public {
-            Some(_) => "this server does not answer for that host",
-            None => "this server only answers on a loopback address",
-        });
-    };
-
-    // Cross-site requests: browsers attach Origin to anything that can change
-    // state and to WebSocket handshakes. Clients that are not browsers send none.
-    let reads_only = matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS);
-    if !reads_only || is_websocket_upgrade(headers) {
-        for origin in headers.get_all(ORIGIN) {
-            let allowed = origin.to_str().is_ok_and(|origin| match public {
-                None => origin_allowed(origin, host),
-                // A loopback origin only for a request to loopback itself: a
-                // page on http://localhost:1234 must not drive the public site.
-                Some(public) => {
-                    origin == public.origin || (to_loopback && is_loopback_origin(origin))
-                }
-            });
-            if !allowed {
-                return Err("requests from this origin are not allowed");
-            }
+    let host = requested_host(headers, public)?;
+    if !checks_origin(method, headers) {
+        return Ok(());
+    }
+    for origin in headers.get_all(ORIGIN) {
+        if !host.allows_origin(origin, public) {
+            return Err("requests from this origin are not allowed");
         }
     }
     Ok(())
+}
+
+/// The Host a request names, once it passed the host check.
+struct RequestedHost<'h> {
+    host: &'h str,
+    loopback: bool,
+}
+
+/// DNS rebinding: a hostile page can point its own name at 127.0.0.1, but
+/// the browser still sends that name as Host. So the Host must be loopback
+/// or, in public mode, the public authority.
+fn requested_host<'h>(
+    headers: &'h HeaderMap,
+    public: Option<PublicSite<'_>>,
+) -> Result<RequestedHost<'h>, &'static str> {
+    let host = single_host(headers);
+    let loopback = host.is_some_and(is_loopback_authority);
+    let to_public = host
+        .zip(public)
+        .is_some_and(|(host, public)| host.eq_ignore_ascii_case(public.authority));
+    match host.filter(|_| loopback || to_public) {
+        Some(host) => Ok(RequestedHost { host, loopback }),
+        None if public.is_some() => Err("this server does not answer for that host"),
+        None => Err("this server only answers on a loopback address"),
+    }
+}
+
+/// The one Host header, as text. Two Host headers are two answers to
+/// "which site is this for": none.
+fn single_host(headers: &HeaderMap) -> Option<&str> {
+    let mut hosts = headers.get_all(HOST).iter();
+    match (hosts.next(), hosts.next()) {
+        (Some(host), None) => host.to_str().ok(),
+        _ => None,
+    }
+}
+
+/// Cross-site requests: browsers attach Origin to anything that can change
+/// state and to WebSocket handshakes. Clients that are not browsers send none.
+fn checks_origin(method: &Method, headers: &HeaderMap) -> bool {
+    let reads_only = matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS);
+    !reads_only || is_websocket_upgrade(headers)
+}
+
+impl RequestedHost<'_> {
+    fn allows_origin(&self, origin: &HeaderValue, public: Option<PublicSite<'_>>) -> bool {
+        origin.to_str().is_ok_and(|origin| match public {
+            None => origin_allowed(origin, self.host),
+            // A loopback origin only for a request to loopback itself: a
+            // page on http://localhost:1234 must not drive the public site.
+            Some(public) => {
+                origin == public.origin || (self.loopback && is_loopback_origin(origin))
+            }
+        })
+    }
 }
 
 fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
@@ -326,5 +352,136 @@ mod tests {
         // No Origin at all: a client that is not a browser.
         let bare = headers(&[("host", "calin.example.com")]);
         assert_eq!(check(&Method::POST, &bare, Some(SITE)), Ok(()));
+    }
+
+    #[test]
+    fn each_refusal_says_why() {
+        use axum::http::HeaderValue;
+        const HOST: &str = "this server does not answer for that host";
+        const LOOPBACK: &str = "this server only answers on a loopback address";
+        const ORIGIN: &str = "requests from this origin are not allowed";
+        let not_utf8 = |name: &'static str, local: bool| {
+            let mut headers = HeaderMap::new();
+            if local {
+                headers.append("host", HeaderValue::from_static("localhost"));
+            }
+            headers.append(
+                name,
+                HeaderValue::from_bytes(b"http://\xfflocalhost").unwrap(),
+            );
+            headers
+        };
+        // (method, headers, public, refusal)
+        let cases = [
+            (Method::GET, HeaderMap::new(), None, Err(LOOPBACK)),
+            (Method::GET, HeaderMap::new(), Some(SITE), Err(HOST)),
+            (
+                Method::GET,
+                headers(&[("host", "evil.example")]),
+                None,
+                Err(LOOPBACK),
+            ),
+            (
+                Method::GET,
+                headers(&[("host", "calin.example.com")]),
+                None,
+                Err(LOOPBACK),
+            ),
+            (
+                Method::GET,
+                headers(&[("host", "evil.example")]),
+                Some(SITE),
+                Err(HOST),
+            ),
+            (
+                Method::GET,
+                headers(&[("host", "localhost"), ("host", "localhost")]),
+                None,
+                Err(LOOPBACK),
+            ),
+            (
+                Method::GET,
+                headers(&[("host", "localhost"), ("host", "localhost")]),
+                Some(SITE),
+                Err(HOST),
+            ),
+            (Method::GET, not_utf8("host", false), None, Err(LOOPBACK)),
+            (Method::GET, not_utf8("host", false), Some(SITE), Err(HOST)),
+            // Local mode: a foreign origin, on a write and on a handshake.
+            (
+                Method::POST,
+                headers(&[
+                    ("host", "localhost:4680"),
+                    ("origin", "https://evil.example"),
+                ]),
+                None,
+                Err(ORIGIN),
+            ),
+            (
+                Method::GET,
+                headers(&[
+                    ("host", "localhost:4680"),
+                    ("origin", "https://evil.example"),
+                    ("upgrade", "WebSocket"),
+                ]),
+                None,
+                Err(ORIGIN),
+            ),
+            (Method::POST, not_utf8("origin", true), None, Err(ORIGIN)),
+            (
+                Method::POST,
+                not_utf8("origin", true),
+                Some(SITE),
+                Err(ORIGIN),
+            ),
+            (
+                Method::POST,
+                headers(&[
+                    ("host", "calin.example.com"),
+                    ("origin", "https://evil.example"),
+                ]),
+                Some(SITE),
+                Err(ORIGIN),
+            ),
+            // Every method but GET, HEAD and OPTIONS checks the origin.
+            (
+                Method::DELETE,
+                headers(&[("host", "localhost"), ("origin", "https://evil.example")]),
+                None,
+                Err(ORIGIN),
+            ),
+            (
+                Method::PATCH,
+                headers(&[("host", "localhost"), ("origin", "https://evil.example")]),
+                None,
+                Err(ORIGIN),
+            ),
+            (
+                Method::HEAD,
+                headers(&[("host", "localhost"), ("origin", "https://evil.example")]),
+                None,
+                Ok(()),
+            ),
+            (
+                Method::OPTIONS,
+                headers(&[("host", "localhost"), ("origin", "https://evil.example")]),
+                None,
+                Ok(()),
+            ),
+            (
+                Method::POST,
+                headers(&[("host", "localhost"), ("origin", "http://localhost:5173")]),
+                None,
+                Ok(()),
+            ),
+        ];
+        for (method, headers, public, refusal) in cases {
+            assert_eq!(
+                check(&method, &headers, public),
+                refusal,
+                "{method} {headers:?} public={}",
+                public.is_some()
+            );
+        }
     }
 }
