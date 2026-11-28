@@ -26,6 +26,8 @@ export interface WebSocketLike {
   onmessage: ((event: MessageEvent) => void) | null;
   onclose: ((event: CloseEvent) => void) | null;
   onerror: ((event: Event) => void) | null;
+  /** The browser's own state: 1 is open. It moves on before `onclose` runs. */
+  readonly readyState: number;
   send(data: string): void;
   close(): void;
 }
@@ -66,6 +68,9 @@ export interface SocketClient {
   close(): void;
 }
 
+/** `WebSocket.OPEN`, which a test's stand-in does not define. */
+const OPEN = 1;
+
 type Subscriber = { handler: TopicHandler; cursor: Cursor | undefined };
 
 export function defaultSocketUrl(location: Pick<Location, "protocol" | "host">): string {
@@ -105,7 +110,9 @@ export function createSocket(options: SocketOptions = {}): SocketClient {
   }
 
   function send(msg: ClientMsg): void {
-    if (state === "open" && ws) ws.send(JSON.stringify(msg));
+    // The server may have closed it already (signing out does): a send then only
+    // makes the browser log an error.
+    if (state === "open" && ws?.readyState === OPEN) ws.send(JSON.stringify(msg));
   }
 
   function sendSubscribe(topic: string, afterSeq: number | undefined): void {

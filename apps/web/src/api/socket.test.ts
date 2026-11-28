@@ -23,6 +23,8 @@ class FakeWebSocket implements WebSocketLike {
   readonly url: string;
   readonly sent: ClientMsg[] = [];
   closed = false;
+  /** As a browser's: 0 connecting, 1 open, 2 closing, 3 closed. */
+  readyState = 0;
 
   constructor(url: string) {
     this.url = url;
@@ -39,6 +41,7 @@ class FakeWebSocket implements WebSocketLike {
 
   // What the server side of the test does.
   accept(): void {
+    this.readyState = 1;
     this.onopen?.(new Event("open"));
   }
 
@@ -51,6 +54,7 @@ class FakeWebSocket implements WebSocketLike {
   }
 
   hangUp(): void {
+    this.readyState = 3;
     this.onclose?.({} as CloseEvent);
   }
 
@@ -103,6 +107,18 @@ afterEach(() => {
 });
 
 describe("socket client", () => {
+  it("sends nothing on a socket the server is closing, before the close reaches the page", () => {
+    const client = connect();
+    const unsubscribe = client.subscribe("session:s1", () => {});
+    latest().accept();
+    latest().take();
+    // The close frame is in: the browser says CLOSING, but onclose has not run yet.
+    latest().readyState = 2;
+    unsubscribe();
+    vi.advanceTimersByTime(1000);
+    expect(latest().take()).toEqual([]);
+  });
+
   it("opens one connection, on first use, for any number of topics", () => {
     const client = connect();
     expect(FakeWebSocket.sockets).toHaveLength(0);
