@@ -1,10 +1,64 @@
 import type { JSX } from "@solidjs/web";
-import { createSignal, createUniqueId, Show, type Accessor } from "solid-js";
+import { createEffect, createSignal, createUniqueId, Show, type Accessor } from "solid-js";
+import { createMediaQuery } from "../../lib/media";
 import type { Size } from "./layout";
-import type { Scene } from "./scene";
+import { createScene, type Scene } from "./scene";
 
-// What the node canvases (the session graph and the workflow) share: pan and
-// pinch, the wheel, the keys, and the zoom buttons over the drawing.
+// What the node canvases (the session graph and the workflow) share: a scene
+// that honors reduced motion, pan and pinch, the wheel, the keys, and the zoom
+// buttons over the drawing.
+
+export const REDUCED_MOTION_QUERY = "(prefers-reduced-motion: reduce)";
+
+/** A data attribute that is there or not: the stylesheets match `[data-x]`. */
+export const flag = (on: boolean | undefined): "" | undefined => (on ? "" : undefined);
+
+/**
+ * The one node of a canvas the Tab key reaches: the one last focused while it
+ * is still drawn, else the first in `order`. The scene keeps it in the drawing.
+ */
+export function createTabStop(
+  scene: Pick<Scene, "pin" | "reveal">,
+  nodes: () => { order: readonly string[]; has: (id: string) => boolean },
+) {
+  const [wanted, setWanted] = createSignal<string>();
+  const elements = new Map<string, SVGGElement>();
+  const stop = (): string | undefined => {
+    const id = wanted();
+    const { order, has } = nodes();
+    return id !== undefined && has(id) ? id : order.at(0);
+  };
+  createEffect(stop, (id) => scene.pin(id));
+  return {
+    stop,
+    /** A node took the focus. */
+    focused: (id: string): void => {
+      setWanted(id);
+    },
+    element: (id: string, element: SVGGElement): void => {
+      elements.set(id, element);
+    },
+    /** Moves the stop and the focus to `to`, brought into view. */
+    move: (to: string | undefined): void => {
+      if (to === undefined) return;
+      setWanted(to);
+      scene.pin(to);
+      scene.reveal(to);
+      elements.get(to)?.focus({ preventScroll: true });
+    },
+  };
+}
+
+/** A scene with no tween and no pulse while the reader asks for reduced motion. */
+export function createCalmScene(onPulses: (ids: readonly string[]) => void): Scene {
+  const reducedMotion = createMediaQuery(REDUCED_MOTION_QUERY);
+  // A plain mirror: the scene asks from effects and frames, where a signal must not be read.
+  let calm = typeof matchMedia === "function" && matchMedia(REDUCED_MOTION_QUERY).matches;
+  createEffect(reducedMotion, (reduced) => {
+    calm = reduced;
+  });
+  return createScene({ reducedMotion: () => calm, onPulses });
+}
 
 /** How far a pointer moves before a press becomes a drag, in pixels. */
 const DRAG_SLOP = 4;
@@ -71,6 +125,8 @@ export type CanvasGestures = {
   onWheel: (event: WheelEvent) => void;
   /** True for a click that is a tap, false for the click that ends a drag or a pinch. Call once per click. */
   tapped: () => boolean;
+  /** True for a tap on the canvas's own background. Call once per click. */
+  tappedBackground: (event: MouseEvent) => boolean;
 };
 
 /** What a pointer's move does to the view: a pan, a zoom around a point on screen, and whether a drag starts. */
@@ -108,8 +164,8 @@ function tap(presses: Presses): boolean {
 
 /** A point on the page, from the top-left corner of `canvas`. */
 function local(canvas: Element | undefined, point: Point): Point {
-  const bounds = canvas?.getBoundingClientRect();
-  return { x: point.x - (bounds?.left ?? 0), y: point.y - (bounds?.top ?? 0) };
+  const bounds = canvas?.getBoundingClientRect() ?? { left: 0, top: 0 };
+  return { x: point.x - bounds.left, y: point.y - bounds.top };
 }
 
 /** Pan with one pointer, pinch with two, zoom with the wheel, on `canvas` (the element whose box is the viewport). */
@@ -146,18 +202,22 @@ export function createCanvasGestures(
       zoomAt(at(event), wheelFactor(event));
     },
     tapped: () => tap(presses),
+    tappedBackground: (event) => tap(presses) && event.target === event.currentTarget,
   };
 }
 
 /**
  * Tells `onSize` the canvas's size now and whenever it changes, once it has
- * one, and sends its wheel to `onWheel`. Returns what stops both.
+ * one, and sends its wheel to `onWheel`. Returns what stops both and disposes
+ * of the scene.
  */
 export function observeCanvas(
-  element: SVGSVGElement,
+  element: SVGSVGElement | undefined,
+  scene: Pick<Scene, "dispose">,
   onSize: (size: Size) => void,
   onWheel: (event: WheelEvent) => void,
 ): () => void {
+  if (!element) return () => scene.dispose();
   const measure = (): void => {
     const bounds = element.getBoundingClientRect();
     if (bounds.width > 0 && bounds.height > 0) onSize({ w: bounds.width, h: bounds.height });
@@ -169,6 +229,7 @@ export function observeCanvas(
   return () => {
     observer?.disconnect();
     element.removeEventListener("wheel", onWheel);
+    scene.dispose();
   };
 }
 

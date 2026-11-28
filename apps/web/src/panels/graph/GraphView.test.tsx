@@ -1,9 +1,10 @@
 import { createSignal } from "solid-js";
-import { afterEach } from "vite-plus/test";
-import { describeCanvasMoves } from "../../test/canvas";
+import { afterEach, describe, expect, it, vi } from "vite-plus/test";
+import { canvasView, describeCanvasMoves, nextFrame } from "../../test/canvas";
 import { makeGraph } from "../../test/orchestration";
 import { find, mount, unmountAll } from "../../test/render";
 import { GraphView, type GraphSelection } from "./GraphView";
+import type { Scene } from "./scene";
 
 afterEach(unmountAll);
 
@@ -25,5 +26,29 @@ describeCanvasMoves("GraphView", () => {
     selected: () => selection()?.id,
     sample: "agent:a1",
     step: 1.3,
+  });
+});
+
+describe("GraphView: its scene", () => {
+  it("hands its scene out once on screen, the one that pans and zooms the drawing", async () => {
+    const onScene = vi.fn<(scene: Scene) => void>();
+    const host = mount(() => (
+      <GraphView
+        graph={makeGraph()}
+        openSessionId="s1"
+        mode="columns"
+        selection={undefined}
+        onSelect={() => {}}
+        onScene={onScene}
+      />
+    ));
+    expect(onScene).toHaveBeenCalledTimes(1);
+    onScene.mock.calls[0]?.[0].panBy(25, 5);
+    await nextFrame();
+    expect(canvasView(find<SVGSVGElement>(host, "svg.graph-canvas"))).toEqual({
+      x: 25,
+      y: 5,
+      k: 1,
+    });
   });
 });

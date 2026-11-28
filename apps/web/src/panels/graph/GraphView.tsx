@@ -9,7 +9,6 @@ import {
 } from "solid-js";
 import type { EdgeKind } from "../../gen/EdgeKind";
 import type { Graph } from "../../gen/Graph";
-import { createMediaQuery } from "../../lib/media";
 import type { Tone } from "../../lib/status";
 import { layoutGraph, NODE_SIZE, sizeOf, type Layout, type LayoutMode } from "./layout";
 import {
@@ -29,17 +28,18 @@ import {
 import { routeOverlay, type RouteBox, type Routing } from "./routing";
 import {
   CanvasControls,
+  createCalmScene,
+  createTabStop,
+  flag,
   createCanvasGestures,
   observeCanvas,
   onCanvasKey,
   type KeyCommand,
 } from "./canvas";
-import { createScene, type Scene, type SceneLayout } from "./scene";
+import type { Scene, SceneLayout } from "./scene";
 
 /** What the reader picked in the graph. */
 export type GraphSelection = { kind: "node"; id: string } | { kind: "edge"; id: string };
-
-export const REDUCED_MOTION_QUERY = "(prefers-reduced-motion: reduce)";
 
 const ZOOM_STEP = 1.3;
 
@@ -197,6 +197,26 @@ const alongTree =
     return undefined;
   };
 
+type Routed = { result: Routing; pack: number; mode: LayoutMode };
+
+/** The lanes the edges keep: the last routing's, unless Fit asked for a packing or the mode changed. */
+const laneMemory = (previous: Routed | undefined, pack: number, mode: LayoutMode) =>
+  previous && previous.pack === pack && previous.mode === mode ? previous.result.memory : undefined;
+
+/**
+ * The edges whose count went up since `before`, the counts of the last graph:
+ * one pulse each. None for the first graph, and none for a link that is no edge.
+ */
+function grownEdges(
+  edges: readonly EdgeView[],
+  before: ReadonlyMap<string, number> | undefined,
+): string[] {
+  if (before === undefined) return [];
+  return edges
+    .filter((edge) => edge.edge && edge.count > (before.get(edge.id) ?? 0))
+    .map((edge) => edge.id);
+}
+
 function boxesOf(layout: Layout, model: GraphModel): Map<string, RouteBox> {
   const boxes = new Map<string, RouteBox>();
   for (const node of model.nodes) {
@@ -247,17 +267,8 @@ export function GraphView(props: {
   /** Hands out the scene, for the stress page's measurements. */
   onScene?: (scene: Scene) => void;
 }) {
-  const reducedMotion = createMediaQuery(REDUCED_MOTION_QUERY);
-  // A plain mirror: the scene asks from effects and frames, where a signal must not be read.
-  let calm = typeof matchMedia === "function" && matchMedia(REDUCED_MOTION_QUERY).matches;
-  createEffect(reducedMotion, (reduced) => {
-    calm = reduced;
-  });
   const [pulses, setPulses] = createSignal<readonly string[]>([]);
-  const scene = createScene({
-    reducedMotion: () => calm,
-    onPulses: setPulses,
-  });
+  const scene = createCalmScene(setPulses);
   const markerBase = createUniqueId();
   const model = createMemo(() => graphModel(props.graph, props.openSessionId));
   // The last layout's positions are what keeps siblings in the order they first appeared.
@@ -266,13 +277,10 @@ export function GraphView(props: {
   );
   // Fit starts the lanes over, packed; until then an edge keeps the lane it was given.
   const [packs, setPacks] = createSignal(0);
-  const routing = createMemo<{ result: Routing; pack: number; mode: LayoutMode }>((previous) => {
+  const routing = createMemo<Routed>((previous) => {
     const current = layout();
     const pack = packs();
-    const keep =
-      previous && previous.pack === pack && previous.mode === current.mode
-        ? previous.result.memory
-        : undefined;
+    const keep = laneMemory(previous, pack, current.mode);
     const overlay = model().edges.filter((edge) => edge.route === "curve");
     return {
       result: routeOverlay(current.mode, boxesOf(current, model()), overlay, keep),
@@ -281,13 +289,6 @@ export function GraphView(props: {
     };
   });
   const outline = createMemo(() => describeGraph(model(), layout()));
-  // The one tab stop among the nodes; arrows move it along the tree.
-  const [focusId, setFocusId] = createSignal<string>();
-  const tabStop = (): string | undefined => {
-    const wanted = focusId();
-    return wanted !== undefined && layout().positions.has(wanted) ? wanted : layout().order.at(0);
-  };
-
   // The node whose edges are brought out: the one picked, else the one holding the focus.
   const [focused, setFocused] = createSignal<string>();
   const emphasis = createMemo(() => edgeEmphasis(model(), props.selection, focused()));
@@ -295,46 +296,37 @@ export function GraphView(props: {
     () => model().edges.filter((edge) => edge.route === "curve").length > QUIET_ABOVE,
   );
 
-  const nodeEls = new Map<string, SVGGElement>();
-  const counts = new Map<string, number>();
-  let seenGraph = false;
+  let counts: ReadonlyMap<string, number> | undefined;
   let packed = 0;
   let canvas: SVGSVGElement | undefined;
 
   createEffect(
     () => ({ layout: layout(), model: model(), routing: routing() }),
     (next) => {
-      scene.setLayout(sceneLayout(next.layout, next.model, next.routing.result), seenGraph);
+      scene.setLayout(
+        sceneLayout(next.layout, next.model, next.routing.result),
+        counts !== undefined,
+      );
       // A packing asked for by Fit: show the drawing whole again once the lanes have moved in.
       if (next.routing.pack !== packed) {
         packed = next.routing.pack;
         scene.fit();
       }
-      // One pulse per edge whose count went up since the last graph; none for the first one.
-      for (const edge of next.model.edges) {
-        if (!edge.edge) continue;
-        if (seenGraph && edge.count > (counts.get(edge.id) ?? 0)) scene.pulse(edge.id);
-      }
-      counts.clear();
-      for (const edge of next.model.edges) counts.set(edge.id, edge.count);
-      seenGraph = true;
+      for (const id of grownEdges(next.model.edges, counts)) scene.pulse(id);
+      counts = new Map(next.model.edges.map((edge) => [edge.id, edge.count]));
     },
   );
   createEffect(
     () => props.selection,
-    (selection) => scene.setAnchor(selection?.kind === "node" ? selection.id : undefined),
+    (selection) => scene.setAnchor(picked(selection, "node")),
   );
-  createEffect(tabStop, (id) => scene.pin(id));
+  // The one tab stop among the nodes; arrows move it along the tree.
+  const tabStop = createTabStop(scene, () => ({
+    order: layout().order,
+    has: (id) => layout().positions.has(id),
+  }));
 
   const gestures = createCanvasGestures(scene, () => canvas);
-
-  function moveFocus(to: string | undefined): void {
-    if (to === undefined) return;
-    setFocusId(to);
-    scene.pin(to);
-    scene.reveal(to);
-    nodeEls.get(to)?.focus({ preventScroll: true });
-  }
 
   function onKeyDown(event: KeyboardEvent): void {
     const { order, parent, children } = layout();
@@ -350,7 +342,7 @@ export function GraphView(props: {
         zoomBy: (factor) => scene.zoomBy(factor),
         fit,
         select: (id) => props.onSelect(id === undefined ? undefined : { kind: "node", id }),
-        focus: moveFocus,
+        focus: tabStop.move,
       },
     );
   }
@@ -363,29 +355,13 @@ export function GraphView(props: {
 
   onSettled(() => {
     props.onScene?.(scene);
-    const element = canvas;
-    if (!element) return () => scene.dispose();
-    const stop = observeCanvas(element, (size) => scene.setViewport(size), gestures.onWheel);
-    return () => {
-      stop();
-      scene.dispose();
-    };
+    return observeCanvas(canvas, scene, (size) => scene.setViewport(size), gestures.onWheel);
   });
 
-  const selectedNode = (): string | undefined =>
-    props.selection?.kind === "node" ? props.selection.id : undefined;
-  const selectedEdge = (): string | undefined =>
-    props.selection?.kind === "edge" ? props.selection.id : undefined;
+  const selectedNode = (): string | undefined => picked(props.selection, "node");
   const hot = (edge: EdgeView): boolean => emphasis().hot.has(edge.id);
-  const tone = (edge: EdgeView): MarkerTone => {
-    if (edge.route === "tree" || hot(edge)) return "full";
-    if (emphasis().active) return "faint";
-    return quiet() ? "quiet" : "full";
-  };
-  const markerId = (kind: EdgeKind, which: MarkerTone): string =>
-    which === "full" ? `${markerBase}-${kind}` : `${markerBase}-${kind}-${which}`;
   const marker = (edge: EdgeView): string | undefined =>
-    edge.kind === "link" ? undefined : `url(#${markerId(edge.kind, tone(edge))})`;
+    markerUrl(markerBase, edge, markerTone(edge, hot(edge), emphasis().active, quiet()));
 
   return (
     <div class="relative min-h-0 min-w-0 flex-1">
@@ -394,7 +370,7 @@ export function GraphView(props: {
         class="graph-canvas"
         role="group"
         aria-label="Session graph"
-        data-dragging={gestures.dragging() ? "" : undefined}
+        data-dragging={flag(gestures.dragging())}
         onPointerDown={gestures.onPointerDown}
         onPointerMove={gestures.onPointerMove}
         onPointerUp={gestures.onPointerEnd}
@@ -402,113 +378,48 @@ export function GraphView(props: {
         onKeyDown={onKeyDown}
         onClick={(event) => {
           // A tap on the background lets go of the selection.
-          if (gestures.tapped() && event.target === event.currentTarget) props.onSelect(undefined);
+          if (gestures.tappedBackground(event)) props.onSelect(undefined);
         }}
       >
-        <defs>
-          <For each={markerSpecs}>
-            {(spec) => {
-              const { kind, which } = spec;
-              return (
-                <marker
-                  id={markerId(kind, which)}
-                  viewBox="0 0 8 8"
-                  refX={arrowheads[kind].refX}
-                  refY="4"
-                  markerWidth={arrowheads[kind].size * markerScale[which]}
-                  markerHeight={arrowheads[kind].size * markerScale[which]}
-                  markerUnits="userSpaceOnUse"
-                  orient="auto"
-                >
-                  <path
-                    d={arrowheads[kind].d}
-                    stroke-width="1.5"
-                    stroke-linejoin="round"
-                    stroke-linecap="round"
-                    opacity={which === "full" ? undefined : markerTones[which]}
-                    style={
-                      arrowheads[kind].open
-                        ? { fill: "none", stroke: arrowheads[kind].color }
-                        : { fill: arrowheads[kind].color }
-                    }
-                  />
-                </marker>
-              );
-            }}
-          </For>
-        </defs>
+        <GraphMarkers base={markerBase} />
         <g ref={(element) => scene.mount(element)}>
-          <g
-            class="gedges"
-            data-quiet={quiet() ? "" : undefined}
-            data-focus={emphasis().active ? "" : undefined}
-          >
+          <g class="gedges" data-quiet={flag(quiet())} data-focus={flag(emphasis().active)}>
             <For each={model().edges} keyed={(edge) => edge.id}>
               {(edge) => (
-                <g
-                  class="gedge"
-                  data-edge={edge().id}
-                  data-kind={edge().kind}
-                  data-route={edge().route}
-                  data-hot={hot(edge()) ? "" : undefined}
-                  data-selected={selectedEdge() === edge().id ? "" : undefined}
-                >
-                  <path
-                    class="gline"
-                    ref={(element) => scene.edgeRef(edge().id, "path", element)}
-                    marker-end={marker(edge())}
-                  />
-                  <Show when={edge().edge}>
-                    <path
-                      class="ghit"
-                      ref={(element) => scene.edgeRef(edge().id, "hit", element)}
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        if (gestures.tapped()) props.onSelect({ kind: "edge", id: edge().id });
-                      }}
-                    >
-                      <title>{edgeSentence(edge(), model())}</title>
-                    </path>
-                  </Show>
-                  <Show when={edge().count > 1}>
-                    <g class="gcount" ref={(element) => scene.edgeRef(edge().id, "label", element)}>
-                      <rect x="-11" y="-8" width="22" height="16" rx="8" />
-                      <text y="3.8">{edge().count > 99 ? "99+" : edge().count}</text>
-                    </g>
-                  </Show>
-                </g>
+                <GraphEdge
+                  edge={edge()}
+                  model={model()}
+                  hot={hot(edge())}
+                  selected={picked(props.selection, "edge") === edge().id}
+                  marker={marker(edge())}
+                  scene={scene}
+                  onTap={() => {
+                    if (gestures.tapped()) props.onSelect({ kind: "edge", id: edge().id });
+                  }}
+                />
               )}
             </For>
           </g>
           <g>
             <For each={model().nodes} keyed={(node) => node.id}>
               {(node) => (
-                <g
-                  ref={(element) => {
-                    nodeEls.set(node().id, element);
+                <GraphNode
+                  node={node()}
+                  selected={selectedNode() === node().id}
+                  tabStop={tabStop.stop() === node().id}
+                  onElement={(element) => {
+                    tabStop.element(node().id, element);
                     scene.nodeRef(node().id, element);
                   }}
-                  class="gnode"
-                  data-node={node().id}
-                  data-kind={node().node.kind}
-                  data-own={node().own ? "" : undefined}
-                  data-selected={selectedNode() === node().id ? "" : undefined}
-                  role="button"
-                  tabindex={tabStop() === node().id ? 0 : -1}
-                  aria-label={nodeSentence(node())}
-                  aria-pressed={selectedNode() === node().id ? "true" : "false"}
                   onFocus={() => {
-                    setFocusId(node().id);
+                    tabStop.focused(node().id);
                     setFocused(node().id);
                   }}
                   onBlur={() => setFocused(undefined)}
-                  onClick={(event) => {
-                    event.stopPropagation();
+                  onTap={() => {
                     if (gestures.tapped()) props.onSelect({ kind: "node", id: node().id });
                   }}
-                >
-                  <NodeShape node={node()} />
-                </g>
+                />
               )}
             </For>
           </g>
@@ -527,54 +438,212 @@ export function GraphView(props: {
         fit={fit}
         fitTitle="Show the whole graph (0)"
       >
-        <For each={edgeKinds}>
-          {(kind) => (
-            <li class="flex items-center gap-2">
-              <svg width="40" height="12" aria-hidden="true">
-                <g class="gedge" data-kind={kind}>
-                  <path class="gline" d="M2,6H36" marker-end={`url(#${markerBase}-${kind})`} />
-                </g>
-              </svg>
-              {edgeKindWords(kind)}
-            </li>
-          )}
-        </For>
-        <li class="flex items-center gap-2">
-          <svg width="40" height="14" aria-hidden="true">
-            <rect
-              x="9"
-              y="1"
-              width="22"
-              height="12"
-              rx="3"
-              fill="none"
-              stroke="var(--accent)"
-              stroke-width="2"
-            />
-          </svg>
-          Agent of the open session
-        </li>
-        <li class="max-w-56 text-muted">
-          Pick a card to bring out its notes, reports and changed files.
-        </li>
+        <GraphLegend markerBase={markerBase} />
       </CanvasControls>
-      {/* The drawing, as text: who is under whom, the repos, and one sentence per edge. */}
-      <div class="sr-only" data-part="graph-text">
-        <h3>Session graph as text</h3>
-        <Outline items={outline().tree} />
-        <Show when={outline().repos.length > 0}>
-          <h4>Repos</h4>
-          <ul>
-            <For each={outline().repos}>{(repo) => <li>{repo}</li>}</For>
-          </ul>
-        </Show>
-        <Show when={outline().edges.length > 0}>
-          <h4>Relations</h4>
-          <ul>
-            <For each={outline().edges}>{(edge) => <li>{edge}</li>}</For>
-          </ul>
-        </Show>
-      </div>
+      <GraphText outline={outline()} />
+    </div>
+  );
+}
+
+/** What the reader picked, when it is of `kind`. */
+const picked = (
+  selection: GraphSelection | undefined,
+  kind: GraphSelection["kind"],
+): string | undefined => (selection?.kind === kind ? selection.id : undefined);
+
+/** The id of the arrowhead of `kind` in tone `which`, under `base`. */
+const markerIdOf = (base: string, kind: EdgeKind, which: MarkerTone): string =>
+  which === "full" ? `${base}-${kind}` : `${base}-${kind}-${which}`;
+
+/** The arrowhead at the end of an edge; a link has none. */
+const markerUrl = (base: string, edge: EdgeView, which: MarkerTone): string | undefined =>
+  edge.kind === "link" ? undefined : `url(#${markerIdOf(base, edge.kind, which)})`;
+
+/**
+ * How strongly an edge's arrowhead shows: in full on the tree and on an edge
+ * brought out; faint while a card is picked; quieter when there are many.
+ */
+function markerTone(edge: EdgeView, hot: boolean, picking: boolean, quiet: boolean): MarkerTone {
+  if (edge.route === "tree" || hot) return "full";
+  if (picking) return "faint";
+  return quiet ? "quiet" : "full";
+}
+
+/** Every arrowhead, by kind and tone. */
+function GraphMarkers(props: { base: string }) {
+  return (
+    <defs>
+      <For each={markerSpecs}>
+        {(spec) => {
+          const { kind, which } = spec;
+          return (
+            <marker
+              id={markerIdOf(props.base, kind, which)}
+              viewBox="0 0 8 8"
+              refX={arrowheads[kind].refX}
+              refY="4"
+              markerWidth={arrowheads[kind].size * markerScale[which]}
+              markerHeight={arrowheads[kind].size * markerScale[which]}
+              markerUnits="userSpaceOnUse"
+              orient="auto"
+            >
+              <path
+                d={arrowheads[kind].d}
+                stroke-width="1.5"
+                stroke-linejoin="round"
+                stroke-linecap="round"
+                opacity={which === "full" ? undefined : markerTones[which]}
+                style={
+                  arrowheads[kind].open
+                    ? { fill: "none", stroke: arrowheads[kind].color }
+                    : { fill: arrowheads[kind].color }
+                }
+              />
+            </marker>
+          );
+        }}
+      </For>
+    </defs>
+  );
+}
+
+/** One edge: its line, the wider line that takes the taps, and its count past one. */
+function GraphEdge(props: {
+  edge: EdgeView;
+  model: GraphModel;
+  hot: boolean;
+  selected: boolean;
+  marker: string | undefined;
+  scene: Scene;
+  onTap: () => void;
+}) {
+  return (
+    <g
+      class="gedge"
+      data-edge={props.edge.id}
+      data-kind={props.edge.kind}
+      data-route={props.edge.route}
+      data-hot={flag(props.hot)}
+      data-selected={flag(props.selected)}
+    >
+      <path
+        class="gline"
+        ref={(element) => props.scene.edgeRef(props.edge.id, "path", element)}
+        marker-end={props.marker}
+      />
+      <Show when={props.edge.edge}>
+        <path
+          class="ghit"
+          ref={(element) => props.scene.edgeRef(props.edge.id, "hit", element)}
+          onClick={(event) => {
+            event.stopPropagation();
+            props.onTap();
+          }}
+        >
+          <title>{edgeSentence(props.edge, props.model)}</title>
+        </path>
+      </Show>
+      <Show when={props.edge.count > 1}>
+        <g class="gcount" ref={(element) => props.scene.edgeRef(props.edge.id, "label", element)}>
+          <rect x="-11" y="-8" width="22" height="16" rx="8" />
+          <text y="3.8">{props.edge.count > 99 ? "99+" : props.edge.count}</text>
+        </g>
+      </Show>
+    </g>
+  );
+}
+
+/** One node, a button: Enter or a tap selects it. */
+function GraphNode(props: {
+  node: NodeView;
+  selected: boolean;
+  /** True for the one node the Tab key reaches. */
+  tabStop: boolean;
+  onElement: (element: SVGGElement) => void;
+  onFocus: () => void;
+  onBlur: () => void;
+  onTap: () => void;
+}) {
+  return (
+    <g
+      ref={(element) => props.onElement(element)}
+      class="gnode"
+      data-node={props.node.id}
+      data-kind={props.node.node.kind}
+      data-own={flag(props.node.own)}
+      data-selected={flag(props.selected)}
+      role="button"
+      tabindex={props.tabStop ? 0 : -1}
+      aria-label={nodeSentence(props.node)}
+      aria-pressed={props.selected ? "true" : "false"}
+      onFocus={() => props.onFocus()}
+      onBlur={() => props.onBlur()}
+      onClick={(event) => {
+        event.stopPropagation();
+        props.onTap();
+      }}
+    >
+      <NodeShape node={props.node} />
+    </g>
+  );
+}
+
+/** What the arrowheads and outlines mean. */
+function GraphLegend(props: { markerBase: string }) {
+  return (
+    <>
+      <For each={edgeKinds}>
+        {(kind) => (
+          <li class="flex items-center gap-2">
+            <svg width="40" height="12" aria-hidden="true">
+              <g class="gedge" data-kind={kind}>
+                <path class="gline" d="M2,6H36" marker-end={`url(#${props.markerBase}-${kind})`} />
+              </g>
+            </svg>
+            {edgeKindWords(kind)}
+          </li>
+        )}
+      </For>
+      <li class="flex items-center gap-2">
+        <svg width="40" height="14" aria-hidden="true">
+          <rect
+            x="9"
+            y="1"
+            width="22"
+            height="12"
+            rx="3"
+            fill="none"
+            stroke="var(--accent)"
+            stroke-width="2"
+          />
+        </svg>
+        Agent of the open session
+      </li>
+      <li class="max-w-56 text-muted">
+        Pick a card to bring out its notes, reports and changed files.
+      </li>
+    </>
+  );
+}
+
+/** The drawing, as text: who is under whom, the repos, and one sentence per edge. */
+function GraphText(props: { outline: ReturnType<typeof describeGraph> }) {
+  return (
+    <div class="sr-only" data-part="graph-text">
+      <h3>Session graph as text</h3>
+      <Outline items={props.outline.tree} />
+      <Show when={props.outline.repos.length > 0}>
+        <h4>Repos</h4>
+        <ul>
+          <For each={props.outline.repos}>{(repo) => <li>{repo}</li>}</For>
+        </ul>
+      </Show>
+      <Show when={props.outline.edges.length > 0}>
+        <h4>Relations</h4>
+        <ul>
+          <For each={props.outline.edges}>{(edge) => <li>{edge}</li>}</For>
+        </ul>
+      </Show>
     </div>
   );
 }

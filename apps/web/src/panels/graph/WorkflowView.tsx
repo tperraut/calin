@@ -1,26 +1,19 @@
-import {
-  createEffect,
-  createMemo,
-  createSignal,
-  createUniqueId,
-  For,
-  onSettled,
-  Show,
-} from "solid-js";
+import { createEffect, createMemo, createUniqueId, For, onSettled, Show } from "solid-js";
 import type { WorkflowRun } from "../../gen/WorkflowRun";
-import { createMediaQuery } from "../../lib/media";
 import { dollars, kindIcon, kindWord, runStatusWords } from "../../lib/workflow";
 import { DetailsSheet } from "./Details";
 import { clip } from "./model";
-import { REDUCED_MOTION_QUERY } from "./GraphView";
 import {
   alongOrder,
+  createCalmScene,
+  createTabStop,
+  flag,
   CanvasControls,
   createCanvasGestures,
   observeCanvas,
   onCanvasKey,
 } from "./canvas";
-import { createScene } from "./scene";
+
 import { layoutWorkflow, type Orientation, type WorkflowLayout } from "./workflowLayout";
 import {
   nodeLines,
@@ -31,6 +24,7 @@ import {
   stateWords,
   takenPath,
   waitsForYou,
+  type EdgeOverlay,
   type NodeOverlay,
   type RunOverlay,
 } from "./workflowModel";
@@ -117,7 +111,7 @@ export function WorkflowNodeDetails(props: {
           <ul aria-label="Ports" class="flex flex-col">
             <For each={ports()} keyed={(one) => one.port}>
               {(target) => (
-                <li data-failure={target().failure ? "" : undefined}>
+                <li data-failure={flag(target().failure)}>
                   <Show
                     when={target().to}
                     fallback={<p class="flex min-h-11 items-center">{portSentence(target())}</p>}
@@ -203,22 +197,11 @@ export function WorkflowView(props: {
   selection: string | undefined;
   onSelect: (id: string | undefined) => void;
 }) {
-  const reducedMotion = createMediaQuery(REDUCED_MOTION_QUERY);
-  let calm = typeof matchMedia === "function" && matchMedia(REDUCED_MOTION_QUERY).matches;
-  createEffect(reducedMotion, (reduced) => {
-    calm = reduced;
-  });
-  const scene = createScene({ reducedMotion: () => calm, onPulses: () => {} });
+  const scene = createCalmScene(() => {});
   const markerBase = createUniqueId();
   // The graph is fixed for a run: only the orientation lays it out again.
   const layout = createMemo(() => layoutWorkflow(props.run.graph, props.orientation));
   const overlay = createMemo((): RunOverlay => runOverlay(props.run));
-  const [focusId, setFocusId] = createSignal<string>();
-  const tabStop = (): string | undefined => {
-    const wanted = focusId();
-    return wanted !== undefined && layout().byId.has(wanted) ? wanted : layout().order.at(0);
-  };
-  const nodeEls = new Map<string, SVGGElement>();
   let canvas: SVGSVGElement | undefined;
   let measured = false;
 
@@ -242,17 +225,12 @@ export function WorkflowView(props: {
     // A new orientation is a new drawing: show it whole.
     if (measured) scene.fit(true);
   });
-  createEffect(tabStop, (id) => scene.pin(id));
+  const tabStop = createTabStop(scene, () => ({
+    order: layout().order,
+    has: (id) => layout().byId.has(id),
+  }));
 
   const gestures = createCanvasGestures(scene, () => canvas);
-
-  function moveFocus(to: string | undefined): void {
-    if (to === undefined) return;
-    setFocusId(to);
-    scene.pin(to);
-    scene.reveal(to);
-    nodeEls.get(to)?.focus({ preventScroll: true });
-  }
 
   function onKeyDown(event: KeyboardEvent): void {
     const { order } = layout();
@@ -264,16 +242,15 @@ export function WorkflowView(props: {
         zoomBy: (factor) => scene.zoomBy(factor),
         fit: () => scene.fit(),
         select: (id) => props.onSelect(id),
-        focus: moveFocus,
+        focus: tabStop.move,
       },
     );
   }
 
-  onSettled(() => {
-    const element = canvas;
-    if (!element) return () => scene.dispose();
-    const stop = observeCanvas(
-      element,
+  onSettled(() =>
+    observeCanvas(
+      canvas,
+      scene,
       (size) => {
         scene.setViewport(size);
         // Fit on open: the whole run at a glance.
@@ -281,19 +258,8 @@ export function WorkflowView(props: {
         measured = true;
       },
       gestures.onWheel,
-    );
-    return () => {
-      stop();
-      scene.dispose();
-    };
-  });
-
-  const edgeOf = (index: number) => overlay().edges[index];
-  const marker = (index: number): string => {
-    const edge = edgeOf(index);
-    const kind = edge && edge.taken > 0 ? "taken" : "idle";
-    return `url(#${markerBase}-${kind})`;
-  };
+    ),
+  );
 
   return (
     <div class="relative min-h-0 min-w-0 flex-1">
@@ -303,98 +269,46 @@ export function WorkflowView(props: {
         role="group"
         aria-label="Workflow graph"
         data-orientation={props.orientation}
-        data-dragging={gestures.dragging() ? "" : undefined}
+        data-dragging={flag(gestures.dragging())}
         onPointerDown={gestures.onPointerDown}
         onPointerMove={gestures.onPointerMove}
         onPointerUp={gestures.onPointerEnd}
         onPointerCancel={gestures.onPointerEnd}
         onKeyDown={onKeyDown}
         onClick={(event) => {
-          if (gestures.tapped() && event.target === event.currentTarget) props.onSelect(undefined);
+          if (gestures.tappedBackground(event)) props.onSelect(undefined);
         }}
       >
-        <defs>
-          <For each={["taken", "idle"] as const}>
-            {(kind) => (
-              <marker
-                id={`${markerBase}-${kind}`}
-                viewBox="0 0 8 8"
-                refX="7"
-                refY="4"
-                markerWidth={kind === "taken" ? 9 : 7}
-                markerHeight={kind === "taken" ? 9 : 7}
-                markerUnits="userSpaceOnUse"
-                orient="auto"
-              >
-                <path
-                  d="M0,0.5L8,4L0,7.5z"
-                  style={{ fill: kind === "taken" ? "var(--fg)" : "var(--muted)" }}
-                />
-              </marker>
-            )}
-          </For>
-        </defs>
+        <WorkflowMarkers base={markerBase} />
         <g ref={(element) => scene.mount(element)}>
           <g>
             <For each={layout().edges} keyed={(edge) => `${layout().orientation}:${edge.index}`}>
               {(placed) => (
-                <g
-                  class="wedge"
-                  data-edge={placed().index}
-                  data-back={placed().back ? "" : undefined}
-                  data-failure={edgeOf(placed().index)?.failure ? "" : undefined}
-                  data-taken={(edgeOf(placed().index)?.taken ?? 0) > 0 ? "" : undefined}
-                >
-                  <path class="wline" d={placed().d} marker-end={marker(placed().index)} />
-                  <text
-                    class="wport"
-                    x={placed().label.x}
-                    y={placed().label.y}
-                    text-anchor={placed().label.anchor}
-                  >
-                    {edgeOf(placed().index)?.failure
-                      ? `✕ ${placed().edge.port}`
-                      : placed().edge.port}
-                  </text>
-                  <Show when={(edgeOf(placed().index)?.taken ?? 0) > 1}>
-                    <g
-                      class="wcount"
-                      transform={`translate(${placed().middle.x},${placed().middle.y})`}
-                    >
-                      <rect x="-13" y="-8" width="26" height="16" rx="8" />
-                      <text y="3.8">×{edgeOf(placed().index)?.taken}</text>
-                    </g>
-                  </Show>
-                </g>
+                <WorkflowEdge
+                  placed={placed()}
+                  overlay={overlay().edges[placed().index]}
+                  markerBase={markerBase}
+                />
               )}
             </For>
           </g>
           <g>
             <For each={overlay().nodes} keyed={(node) => node.id}>
               {(node) => (
-                <g
-                  ref={(element) => {
-                    nodeEls.set(node().id, element);
+                <WorkflowNode
+                  node={node()}
+                  layout={layout()}
+                  selected={props.selection === node().id}
+                  tabStop={tabStop.stop() === node().id}
+                  onElement={(element) => {
+                    tabStop.element(node().id, element);
                     scene.nodeRef(node().id, element);
                   }}
-                  class="wnode"
-                  data-node={node().id}
-                  data-kind={node().info.kind}
-                  data-state={node().state}
-                  data-failed={node().failed ? "" : undefined}
-                  data-selected={props.selection === node().id ? "" : undefined}
-                  role="button"
-                  tabindex={tabStop() === node().id ? 0 : -1}
-                  aria-label={nodeName(node())}
-                  aria-pressed={props.selection === node().id ? "true" : "false"}
-                  onFocus={() => setFocusId(node().id)}
-                  onClick={(event) => {
-                    event.stopPropagation();
+                  onFocus={() => tabStop.focused(node().id)}
+                  onTap={() => {
                     if (gestures.tapped()) props.onSelect(node().id);
                   }}
-                >
-                  <NodeCard node={node()} layout={layout()} />
-                </g>
+                />
               )}
             </For>
           </g>
@@ -406,57 +320,165 @@ export function WorkflowView(props: {
         fit={() => scene.fit()}
         fitTitle="Show the whole workflow (0)"
       >
-        <For
-          each={
-            [
-              ["active", "Running now: thick outline, “Running”"],
-              ["finished", "Finished: “→ port” it left through, “×2” when it ran twice"],
-              ["failed", "Left through a failure port: “✕ port”"],
-              ["idle", "Not run yet: faint"],
-            ] as const
-          }
-        >
-          {([state, words]) => (
-            <li class="flex items-center gap-2">
-              <svg width="40" height="16" aria-hidden="true">
-                <g
-                  class="wnode"
-                  data-state={state === "failed" ? "finished" : state}
-                  data-failed={state === "failed" ? "" : undefined}
-                >
-                  <rect class="wshape" x="4" y="2" width="32" height="12" rx="3" />
-                </g>
-              </svg>
-              {words}
-            </li>
-          )}
-        </For>
-        <For
-          each={
-            [
-              ["taken", "Taken: bold, “×3” when taken more than once"],
-              ["idle", "Never taken: faint"],
-              ["failure", "Failure port: dashed, “✕” before its name"],
-            ] as const
-          }
-        >
-          {([kind, words]) => (
-            <li class="flex items-center gap-2">
-              <svg width="40" height="12" aria-hidden="true">
-                <g
-                  class="wedge"
-                  data-taken={kind === "taken" ? "" : undefined}
-                  data-failure={kind === "failure" ? "" : undefined}
-                >
-                  <path class="wline" d="M2,6H36" />
-                </g>
-              </svg>
-              {words}
-            </li>
-          )}
-        </For>
+        <WorkflowLegend />
       </CanvasControls>
     </div>
+  );
+}
+
+/** The arrowheads: one for the edges the run took, one for those it never did. */
+function WorkflowMarkers(props: { base: string }) {
+  return (
+    <defs>
+      <For each={["taken", "idle"] as const}>
+        {(kind) => (
+          <marker
+            id={`${props.base}-${kind}`}
+            viewBox="0 0 8 8"
+            refX="7"
+            refY="4"
+            markerWidth={kind === "taken" ? 9 : 7}
+            markerHeight={kind === "taken" ? 9 : 7}
+            markerUnits="userSpaceOnUse"
+            orient="auto"
+          >
+            <path
+              d="M0,0.5L8,4L0,7.5z"
+              style={{ fill: kind === "taken" ? "var(--fg)" : "var(--muted)" }}
+            />
+          </marker>
+        )}
+      </For>
+    </defs>
+  );
+}
+
+/** One edge: its line, its port, and how often the run went through it when that is more than once. */
+function WorkflowEdge(props: {
+  placed: WorkflowLayout["edges"][number];
+  overlay: EdgeOverlay | undefined;
+  markerBase: string;
+}) {
+  const taken = (): number => props.overlay?.taken ?? 0;
+  return (
+    <g
+      class="wedge"
+      data-edge={props.placed.index}
+      data-back={flag(props.placed.back)}
+      data-failure={flag(props.overlay?.failure)}
+      data-taken={flag(taken() > 0)}
+    >
+      <path
+        class="wline"
+        d={props.placed.d}
+        marker-end={`url(#${props.markerBase}-${taken() > 0 ? "taken" : "idle"})`}
+      />
+      <text
+        class="wport"
+        x={props.placed.label.x}
+        y={props.placed.label.y}
+        text-anchor={props.placed.label.anchor}
+      >
+        {props.overlay?.failure ? `✕ ${props.placed.edge.port}` : props.placed.edge.port}
+      </text>
+      <Show when={taken() > 1}>
+        <g
+          class="wcount"
+          transform={`translate(${props.placed.middle.x},${props.placed.middle.y})`}
+        >
+          <rect x="-13" y="-8" width="26" height="16" rx="8" />
+          <text y="3.8">×{props.overlay?.taken}</text>
+        </g>
+      </Show>
+    </g>
+  );
+}
+
+/** One node, a button: Enter or a tap selects it. */
+function WorkflowNode(props: {
+  node: NodeOverlay;
+  layout: WorkflowLayout;
+  selected: boolean;
+  /** True for the one node the Tab key reaches. */
+  tabStop: boolean;
+  onElement: (element: SVGGElement) => void;
+  onFocus: () => void;
+  onTap: () => void;
+}) {
+  return (
+    <g
+      ref={(element) => props.onElement(element)}
+      class="wnode"
+      data-node={props.node.id}
+      data-kind={props.node.info.kind}
+      data-state={props.node.state}
+      data-failed={flag(props.node.failed)}
+      data-selected={flag(props.selected)}
+      role="button"
+      tabindex={props.tabStop ? 0 : -1}
+      aria-label={nodeName(props.node)}
+      aria-pressed={props.selected ? "true" : "false"}
+      onFocus={() => props.onFocus()}
+      onClick={(event) => {
+        event.stopPropagation();
+        props.onTap();
+      }}
+    >
+      <NodeCard node={props.node} layout={props.layout} />
+    </g>
+  );
+}
+
+const nodeStates = [
+  ["active", "Running now: thick outline, “Running”"],
+  ["finished", "Finished: “→ port” it left through, “×2” when it ran twice"],
+  ["failed", "Left through a failure port: “✕ port”"],
+  ["idle", "Not run yet: faint"],
+] as const;
+
+const edgeStates = [
+  ["taken", "Taken: bold, “×3” when taken more than once"],
+  ["idle", "Never taken: faint"],
+  ["failure", "Failure port: dashed, “✕” before its name"],
+] as const;
+
+/** What the node and edge styles mean. */
+function WorkflowLegend() {
+  return (
+    <>
+      <For each={nodeStates}>
+        {([state, words]) => (
+          <li class="flex items-center gap-2">
+            <svg width="40" height="16" aria-hidden="true">
+              <g
+                class="wnode"
+                data-state={state === "failed" ? "finished" : state}
+                data-failed={flag(state === "failed")}
+              >
+                <rect class="wshape" x="4" y="2" width="32" height="12" rx="3" />
+              </g>
+            </svg>
+            {words}
+          </li>
+        )}
+      </For>
+      <For each={edgeStates}>
+        {([kind, words]) => (
+          <li class="flex items-center gap-2">
+            <svg width="40" height="12" aria-hidden="true">
+              <g
+                class="wedge"
+                data-taken={flag(kind === "taken")}
+                data-failure={flag(kind === "failure")}
+              >
+                <path class="wline" d="M2,6H36" />
+              </g>
+            </svg>
+            {words}
+          </li>
+        )}
+      </For>
+    </>
   );
 }
 

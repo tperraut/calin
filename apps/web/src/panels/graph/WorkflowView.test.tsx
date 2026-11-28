@@ -1,10 +1,10 @@
 import { createSignal, flush } from "solid-js";
-import { afterEach, describe, expect, it } from "vite-plus/test";
+import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import { startRun } from "../../lib/workflow";
-import { describeCanvasMoves, press } from "../../test/canvas";
+import { canvasView, describeCanvasMoves, drag, nextFrame, press } from "../../test/canvas";
 import { find, mount, unmountAll } from "../../test/render";
 import { specGraph } from "../../test/workflows";
-import { WorkflowView } from "./WorkflowView";
+import { type Orientation, WorkflowView } from "./WorkflowView";
 
 const run = startRun({
   type: "workflow_started",
@@ -16,12 +16,13 @@ const run = startRun({
 
 afterEach(unmountAll);
 
-function setup() {
+function setup(initial: Orientation = "down") {
   const [selection, setSelection] = createSignal<string>();
+  const [orientation, setOrientation] = createSignal(initial);
   const host = mount(() => (
     <WorkflowView
       run={run}
-      orientation="down"
+      orientation={orientation()}
       selection={selection()}
       onSelect={(id) => setSelection(id)}
     />
@@ -33,6 +34,7 @@ function setup() {
     selected: selection,
     sample: "tests",
     step: 1.3,
+    setOrientation,
   };
 }
 
@@ -78,5 +80,26 @@ describe("WorkflowView: the keyboard", () => {
     toggle?.click();
     flush();
     expect(host.querySelector('ul[aria-label="Legend"]')).toBeNull();
+  });
+});
+
+describe("WorkflowView: the orientation", () => {
+  it("shows the whole run again, as a fresh view would, when it turns", async () => {
+    vi.spyOn(Element.prototype, "getBoundingClientRect").mockReturnValue(
+      DOMRect.fromRect({ x: 0, y: 0, width: 400, height: 300 }),
+    );
+    const across = setup("across");
+    await nextFrame();
+    const fresh = canvasView(across.canvas);
+    unmountAll();
+
+    const { canvas, setOrientation } = setup("down");
+    await nextFrame();
+    drag(canvas, 1, [10, 10], [90, 70]);
+    setOrientation("across");
+    flush();
+    await nextFrame();
+    expect(canvas.getAttribute("data-orientation")).toBe("across");
+    expect(canvasView(canvas)).toEqual(fresh);
   });
 });
