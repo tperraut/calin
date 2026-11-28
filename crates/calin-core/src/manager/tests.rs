@@ -832,6 +832,81 @@ async fn a_runner_that_cannot_start_fails_the_session() {
     );
 }
 
+/// An agent that no longer takes input, while its output is still open.
+async fn deaf_agent(
+    manager: &SessionManager,
+    starts: &mut Starts,
+) -> (String, mpsc::Sender<RunnerOutput>) {
+    let id = manager
+        .create_session(request("work", Some("puppet")))
+        .await
+        .unwrap()
+        .session
+        .id;
+    let (_, io) = within(starts.recv()).await.unwrap();
+    let AgentIo { outputs, inputs } = io;
+    drop(inputs);
+    (id, outputs)
+}
+
+#[tokio::test]
+async fn a_message_for_an_agent_that_takes_no_input_fails_the_session() {
+    let Fixture {
+        manager,
+        mut starts,
+        dir: _dir,
+    } = fixture().await;
+    let (id, outputs) = deaf_agent(&manager, &mut starts).await;
+    outputs.send(RunnerOutput::TurnEnded).await.unwrap();
+    let before = events_until(&manager, &id, 0, is_status(SessionStatus::Review)).await;
+
+    manager.send_message(&id, "again").await.unwrap();
+    let after = before.len() as u64;
+    let events = events_until(&manager, &id, after, is_status(SessionStatus::Failed)).await;
+    assert_eq!(
+        labels(&events),
+        [
+            "user_message:again",
+            "session_status:running",
+            "error:the agent is no longer running",
+            "agent_status:failed",
+            "session_status:failed",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_message_that_waited_for_an_agent_that_takes_no_input_fails_the_session() {
+    let Fixture {
+        manager,
+        mut starts,
+        dir: _dir,
+    } = fixture().await;
+    let (id, outputs) = deaf_agent(&manager, &mut starts).await;
+    let item = RunnerOutput::Event(EventBody::ItemStarted { item: item("i1") });
+    outputs.send(item).await.unwrap();
+    let before = events_until(&manager, &id, 0, |event| {
+        matches!(event.body, EventBody::ItemStarted { .. })
+    })
+    .await;
+    // It waits for the turn, which then ends.
+    manager.send_message(&id, "next").await.unwrap();
+    outputs.send(RunnerOutput::TurnEnded).await.unwrap();
+    let after = before.len() as u64;
+    let events = events_until(&manager, &id, after, is_status(SessionStatus::Failed)).await;
+    assert_eq!(
+        labels(&events),
+        [
+            "user_message:next",
+            "agent_status:idle",
+            "agent_status:running",
+            "error:the agent is no longer running",
+            "agent_status:failed",
+            "session_status:failed",
+        ]
+    );
+}
+
 #[tokio::test]
 async fn a_runner_gone_after_a_restart_fails_the_next_turn() {
     let dir = TempDir::new().unwrap();
