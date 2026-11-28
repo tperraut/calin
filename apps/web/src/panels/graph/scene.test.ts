@@ -510,6 +510,279 @@ describe("scene", () => {
     expect(pending()).toBe(0);
   });
 
+  it("eases a tween: fast first, slow at the end", () => {
+    const { scene, frame } = setup();
+    scene.setLayout(layout([node("a", 0, 0)]), false);
+    scene.setLayout(layout([node("a", 0, 64)]), true);
+    frame(TWEEN_MS / 2);
+    // Halfway in time is 1 - 0.5³ = 87.5% of the way.
+    expect(scene.position("a")).toEqual({ x: 0, y: 56 });
+  });
+
+  it("tweens a node that moves only sideways", () => {
+    const { scene, frame } = setup();
+    const a = g();
+    scene.nodeRef("a", a);
+    scene.setLayout(layout([node("a", 0, 0)]), false);
+    scene.setLayout(layout([node("a", 64, 0)]), true);
+    expect(a.getAttribute("transform")).toBe("translate(0,0)");
+    frame(TWEEN_MS);
+    expect(a.getAttribute("transform")).toBe("translate(64,0)");
+  });
+
+  it("places a newcomer of the first layout, or of one not animated, at once even with a parent", () => {
+    const { scene, pending } = setup();
+    const b = g();
+    const c = g();
+    scene.nodeRef("b", b);
+    scene.setLayout(layout([node("a", 0, 0), node("b", 28, 64, "a")]), true);
+    expect(b.getAttribute("transform")).toBe("translate(28,64)");
+    scene.nodeRef("c", c);
+    scene.setLayout(layout([node("a", 0, 0), node("b", 28, 64), node("c", 28, 128, "a")]), false);
+    expect(c.getAttribute("transform")).toBe("translate(28,128)");
+    expect(pending()).toBe(0);
+  });
+
+  it("gives a path element that arrives after a tween the new lanes", () => {
+    const { scene, frame } = setup();
+    scene.setLayout(layout([node("a", 0, 0), node("b", 0, 64)], [laneEdge(130)]), false);
+    scene.setLayout(layout([node("a", 0, 0), node("b", 0, 64)], [laneEdge(110)]), true);
+    frame(TWEEN_MS);
+    const line = path();
+    scene.edgeRef("o1", "path", line);
+    expect(line.getAttribute("d")).toBe("M100,20L105,20Q110,20,110,25L110,79Q110,84,105,84L100,84");
+  });
+
+  it("homes and culls on the first layout when the pane was measured before it", () => {
+    const { scene } = setup();
+    scene.setViewport({ w: 300, h: 300 });
+    const far = g();
+    const count = g();
+    scene.nodeRef("far", far);
+    scene.edgeRef("c", "label", count);
+    const edges = [
+      { id: "c", from: "a", to: "far", route: "curve" },
+      { id: "bare", from: "a", to: "far", route: "tree" },
+    ] as const;
+    scene.setLayout(
+      { ...layout([node("a", 0, 0), node("far", 0, 3000)], edges), width: 200 },
+      false,
+    );
+    expect(scene.view()).toEqual({ x: 16, y: 60, k: 1 });
+    expect(far.style.display).toBe("none");
+  });
+
+  it("hides what a shrinking pane leaves far outside", () => {
+    const { scene } = setup();
+    const far = g();
+    scene.nodeRef("far", far);
+    scene.setLayout({ ...layout([node("a", 0, 0), node("far", 0, 2000)]), width: 200 }, false);
+    scene.setViewport({ w: 300, h: 3000 });
+    expect(far.style.display).toBe("");
+    scene.setViewport({ w: 300, h: 300 });
+    expect(far.style.display).toBe("none");
+  });
+
+  it("works the kept area out again on a zoom, but not on a pan that stays inside it", () => {
+    const { scene, frame } = setup();
+    scene.mount(g());
+    const edge = g();
+    scene.nodeRef("edge", edge);
+    scene.setLayout({ ...layout([node("a", 0, 0), node("edge", 0, 370)]), width: 200 }, false);
+    scene.setViewport({ w: 300, h: 300 });
+    // Home at full size: the viewport shows y -60..240, the kept area -210..390.
+    expect(scene.view()).toEqual({ x: 16, y: 60, k: 1 });
+    expect(edge.getAttribute("transform")).toBe("translate(0,370)");
+    expect(edge.style.display).toBe("");
+    // 30 px down still lies inside the kept area: nothing is culled again.
+    scene.panBy(0, 30);
+    frame(16);
+    expect(edge.style.display).toBe("");
+    scene.reveal("a");
+    expect(edge.style.display).toBe("");
+    // Zoomed in, the kept area shrinks around the middle and leaves it out.
+    scene.zoomBy(2);
+    frame(16);
+    expect(edge.style.display).toBe("none");
+  });
+
+  it("hides what a tween took far outside once it ends", () => {
+    const { scene, frame } = setup();
+    const c = g();
+    const group = g();
+    const line = path();
+    group.append(line);
+    scene.nodeRef("c", c);
+    scene.edgeRef("cd", "path", line);
+    const edges = [{ id: "cd", from: "c", to: "d", route: "tree" }] as const;
+    const at = (y: number) => [node("a", 0, 0), node("c", 0, y), node("d", 28, y + 64)];
+    scene.setLayout({ ...layout(at(100), edges), width: 200 }, false);
+    scene.setViewport({ w: 300, h: 300 });
+    scene.setLayout({ ...layout(at(3000), edges), width: 200 }, true);
+    frame(TWEEN_MS / 2);
+    expect(c.style.display).toBe("");
+    frame(TWEEN_MS);
+    expect(c.style.display).toBe("none");
+    expect(group.style.display).toBe("none");
+  });
+
+  it("hides an edge whose element arrives while it is far outside, at the next cull", () => {
+    const { scene } = setup();
+    const edges = [{ id: "far", from: "b", to: "c", route: "tree" }] as const;
+    scene.setLayout(
+      { ...layout([node("a", 0, 0), node("b", 0, 3000), node("c", 28, 3064)], edges), width: 200 },
+      false,
+    );
+    scene.setViewport({ w: 300, h: 300 });
+    const group = g();
+    const line = path();
+    group.append(line);
+    scene.edgeRef("far", "path", line);
+    scene.pin("a");
+    expect(group.style.display).toBe("none");
+  });
+
+  it("drops the text at once only below 0.45, and on a drawing mounted after zooming out", () => {
+    const { scene, frame } = setup();
+    const view = g();
+    scene.mount(view);
+    scene.setLayout({ ...layout([node("a", 0, 0)]), width: 200 }, false);
+    scene.setViewport({ w: 300, h: 300 });
+    scene.zoomBy(0.45);
+    frame(16);
+    expect(scene.view().k).toBe(0.45);
+    expect(view.classList.contains("lod")).toBe(false);
+
+    const late = setup();
+    late.scene.setLayout({ ...layout([node("a", 0, 0)]), width: 200 }, false);
+    late.scene.setViewport({ w: 300, h: 300 });
+    late.scene.zoomBy(0.2);
+    late.frame(16);
+    const mounted = g();
+    late.scene.mount(mounted);
+    expect(mounted.classList.contains("lod")).toBe(true);
+  });
+
+  it("keeps a zoomed-in anchored node where it is on screen while a layout moves it sideways", () => {
+    const { scene, frame } = setup();
+    const view = g();
+    scene.mount(view);
+    scene.setLayout({ ...layout([node("a", 0, 0), node("b", 0, 64)]), width: 200 }, false);
+    scene.setViewport({ w: 300, h: 300 });
+    scene.zoomBy(2);
+    frame(16);
+    scene.setAnchor("b");
+    const before = scene.view();
+    scene.setLayout({ ...layout([node("a", 0, 0), node("b", 100, 64)]), width: 200 }, true);
+    frame(TWEEN_MS / 2);
+    frame(TWEEN_MS);
+    const after = scene.view();
+    expect(100 * after.k + after.x).toBeCloseTo(0 * before.k + before.x);
+    expect(after.y).toBe(before.y);
+    expect(view.getAttribute("transform")).toBe(
+      `translate(${after.x},${after.y}) scale(${after.k})`,
+    );
+  });
+
+  it("tells of a change of view once, and not on frames that change nothing of it", () => {
+    let time = 0;
+    let queued: Array<() => void> = [];
+    const onView = vi.fn<(view: { x: number; y: number; k: number }) => void>();
+    const scene = createScene({
+      reducedMotion: () => false,
+      onPulses: () => {},
+      onView,
+      now: () => time,
+      requestFrame: (run) => queued.push(() => run(time)),
+      cancelFrame: () => {},
+    });
+    const frame = (advance: number): void => {
+      time += advance;
+      const due = queued;
+      queued = [];
+      for (const run of due) run();
+    };
+    scene.mount(g());
+    scene.setLayout(
+      { ...layout([node("a", 0, 0), node("b", 0, 64)], [treeEdge]), width: 200 },
+      false,
+    );
+    scene.setViewport({ w: 300, h: 300 });
+    frame(16);
+    onView.mockClear();
+    scene.panBy(5, 0);
+    frame(16);
+    expect(onView).toHaveBeenCalledTimes(1);
+    // An anchored node that stays put, and a pulse, move the view not at all.
+    scene.setAnchor("a");
+    scene.setLayout(
+      { ...layout([node("a", 0, 0), node("b", 0, 128)], [treeEdge]), width: 200 },
+      true,
+    );
+    scene.pulse("e1");
+    frame(TWEEN_MS / 2);
+    frame(TWEEN_MS);
+    frame(PULSE_MS);
+    expect(onView).toHaveBeenCalledTimes(1);
+  });
+
+  it("ends a pulse whose edge left, even when its element arrives after", () => {
+    const { scene, frame, pulses } = setup();
+    scene.setLayout(layout([node("a", 0, 0), node("b", 0, 64)], [treeEdge]), false);
+    scene.pulse("e1");
+    scene.setLayout(layout([node("a", 0, 0), node("b", 0, 64)]), false);
+    const dot = circle();
+    scene.pulseRef("pulse-1", dot);
+    expect(dot.getAttribute("transform")).toBeNull();
+    frame(16);
+    expect(pulses).toHaveBeenLastCalledWith([]);
+  });
+
+  it("times a pulse from when it was sent", () => {
+    const { scene, frame } = setup();
+    scene.setLayout(layout([node("a", 0, 0), node("b", 0, 64)], [laneEdge(130)]), false);
+    frame(1000);
+    scene.pulse("o1");
+    const dot = circle();
+    scene.pulseRef("pulse-1", dot);
+    frame(PULSE_MS / 2);
+    expect(dot.getAttribute("transform")).toBe("translate(130,52)");
+  });
+
+  it("keeps the reader's zoom or fit when the pane changes size, and a mere reveal does not count", () => {
+    const zoomed = setup();
+    const wide = { ...layout([node("a", 0, 0)]), width: 1000, homeWidth: 500 };
+    zoomed.scene.setLayout(wide, false);
+    zoomed.scene.setViewport({ w: 432, h: 300 });
+    zoomed.scene.zoomAt(0, 0, 1.5);
+    const view = zoomed.scene.view();
+    zoomed.scene.setViewport({ w: 282, h: 300 });
+    expect(zoomed.scene.view()).toEqual(view);
+
+    const fitted = setup();
+    fitted.scene.setLayout(wide, false);
+    fitted.scene.setViewport({ w: 432, h: 300 });
+    fitted.scene.fit();
+    const fit = fitted.scene.view();
+    fitted.scene.setViewport({ w: 532, h: 300 });
+    expect(fitted.scene.view()).toEqual(fit);
+
+    const revealed = setup();
+    revealed.scene.setLayout(wide, false);
+    revealed.scene.setViewport({ w: 432, h: 300 });
+    revealed.scene.reveal("a");
+    expect(revealed.scene.view().k).toBe(0.8);
+    revealed.scene.setViewport({ w: 532, h: 300 });
+    expect(revealed.scene.view()).toEqual({ x: 16, y: 60, k: 1 });
+  });
+
+  it("reveals nothing before the pane is measured", () => {
+    const { scene } = setup();
+    scene.setLayout(layout([node("a", 0, 0), node("far", 0, 2000)]), false);
+    scene.reveal("far");
+    expect(scene.view()).toEqual({ x: 0, y: 0, k: 1 });
+  });
+
   it("cancels the frame it asked for when disposed", () => {
     const cancel = vi.fn<(handle: number) => void>();
     const scene = createScene({
@@ -559,6 +832,8 @@ describe("scene arithmetic", () => {
     // Touching is not overlapping.
     expect(overlaps(area, { x0: 10, y0: 0, x1: 20, y1: 10 })).toBe(false);
     expect(overlaps(area, { x0: 0, y0: 10, x1: 10, y1: 20 })).toBe(false);
+    expect(overlaps({ x0: 10, y0: 0, x1: 20, y1: 10 }, area)).toBe(false);
+    expect(overlaps({ x0: 0, y0: 10, x1: 10, y1: 20 }, area)).toBe(false);
   });
 
   it("finds what the viewport shows, and grows it by half on every side", () => {
@@ -569,6 +844,7 @@ describe("scene arithmetic", () => {
       y1: 90,
     });
     expect(grown({ x0: 0, y0: 0, x1: 100, y1: 40 })).toEqual({ x0: -50, y0: -20, x1: 150, y1: 60 });
+    expect(grown({ x0: 10, y0: 20, x1: 110, y1: 60 })).toEqual({ x0: -40, y0: 0, x1: 160, y1: 80 });
   });
 
   it("keeps a node in the drawing where it is, where it goes, or when it holds the tab stop", () => {
@@ -635,6 +911,11 @@ describe("scene arithmetic", () => {
     ];
     expect(cornersOf({}, card, below, at, 0.5)).toEqual(straight);
     expect(cornersOf({ points: points.slice(0, 1) }, card, below, at, 0.5)).toEqual(straight);
+    // Two corners are a route already.
+    expect(cornersOf({ points: points.slice(1) }, card, below, at, 0.5)).toEqual([
+      { x: 130, y: 30 },
+      { x: 130, y: 50 },
+    ]);
     expect(cornersOf({ points, start }, card, below, at, 0.5)).toEqual([
       { x: 100, y: 30 },
       { x: 120, y: 30 },
@@ -722,6 +1003,8 @@ describe("scene arithmetic", () => {
     expect(homeView(pane, { w: 1000, h: 400 }, 0)).toEqual({ x: 16, y: 60, k: 0.6 });
     expect(homeView(pane, { w: 100, h: 400 }, 0)).toEqual({ x: 16, y: 60, k: 1 });
     expect(homeView(pane, { w: 100, h: 400 }, 500)).toEqual({ x: 16, y: 60, k: 1 });
+    // Any home width is taken, however narrow.
+    expect(homeView(pane, { w: 1000, h: 400 }, 1)).toEqual({ x: 16, y: 60, k: 1 });
   });
 
   it("fits the drawing, legibly under the buttons when asked", () => {
@@ -734,6 +1017,7 @@ describe("scene arithmetic", () => {
   it("zooms about a point, within the zoom's bounds", () => {
     expect(zoomAbout({ x: 0, y: 0, k: 1 }, 100, 50, 2)).toEqual({ x: -100, y: -50, k: 2 });
     expect(zoomAbout({ x: 0, y: 0, k: 1 }, 100, 50, 10)).toEqual({ x: -150, y: -75, k: MAX_ZOOM });
+    expect(zoomAbout({ x: 10, y: 20, k: 1 }, 100, 50, 2)).toEqual({ x: -80, y: -10, k: 2 });
   });
 
   it("pans a box just inside the viewport's padding, on each side", () => {
@@ -742,6 +1026,11 @@ describe("scene arithmetic", () => {
     expect(revealShift(card, { x: -50, y: 0, k: 1 }, pane)).toEqual({ dx: 66, dy: 16 });
     expect(revealShift(card, { x: 250, y: 280, k: 1 }, pane)).toEqual({ dx: -66, dy: -36 });
     expect(revealShift(card, { x: 100, y: 100, k: 2 }, pane)).toEqual({ dx: -16, dy: 0 });
+    // At zoom 2 the box at (50, 140) spans 100..300 across and 280..360 down.
+    expect(revealShift({ ...card, x: 50, y: 140 }, { x: 0, y: 0, k: 2 }, pane)).toEqual({
+      dx: -16,
+      dy: -76,
+    });
   });
 
   it("starts a node where its origin is, or at its place when it has none", () => {
