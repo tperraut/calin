@@ -139,6 +139,56 @@ describe("Automations list", () => {
     expect(findByText(main(), "a", "New automation").getAttribute("href")).toBe("/automations/new");
   });
 
+  it("says when a schedule is off, and when a trigger was never checked", async () => {
+    const off = makeAutomation("a4", { name: "Weekly", enabled: false, next_run_at: null });
+    const fresh = makeAutomation("a5", {
+      name: "Fresh",
+      trigger: { kind: "issue", repo_id: "api", label: null },
+      trigger_text: "New issue in api",
+      last_poll_at: null,
+      last_poll_problem: null,
+    });
+    const { main } = await open("/automations", {
+      listAutomations: () => Promise.resolve([off, fresh]),
+    });
+    const [weekly, never] = [...main().querySelectorAll('[data-part="automation"]')].map(text);
+    expect(weekly).toContain("No run scheduled while it is off");
+    expect(never).toContain("Not checked yet");
+  });
+
+  it("says why the list could not be loaded, and tries again", async () => {
+    const listAutomations = vi
+      .fn<Api["listAutomations"]>()
+      .mockRejectedValueOnce(new Error("server busy"))
+      .mockResolvedValue([schedule]);
+    const { main } = await open("/automations", { listAutomations });
+    await until(() => main().querySelector('[role="alert"]') !== null);
+    expect(find(main(), '[role="alert"] p').textContent).toBe(
+      "The automations could not be loaded: server busy",
+    );
+    expect(main().querySelector('a[href="/automations/new"]')).toBeNull();
+    await click(findByText(main(), "button", "Try again"));
+    await until(() => main().querySelectorAll('[data-part="automation"]').length === 1);
+    expect(main().querySelector('[role="alert"]')).toBeNull();
+    expect(findByText(main(), "a", "New automation").getAttribute("href")).toBe("/automations/new");
+  });
+
+  it("sends one save while the switch is being saved", async () => {
+    const saving = deferred<Automation>();
+    const putAutomation = vi.fn(() => saving.promise);
+    const { main } = await open("/automations", { putAutomation });
+    const toggle = () => find(main(), '[aria-label="Triage enabled"]');
+    await click(toggle());
+    expect(toggle().hasAttribute("disabled")).toBe(true);
+    toggle().dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    expect(putAutomation).toHaveBeenCalledTimes(1);
+    saving.resolve({ ...issueTrigger, enabled: false });
+    await settle();
+    flush();
+    expect(toggle().getAttribute("aria-checked")).toBe("false");
+    expect(toggle().hasAttribute("disabled")).toBe(false);
+  });
+
   it("saves the switch at once with the whole automation", async () => {
     const putAutomation = vi.fn((_id: string, body: AutomationRequest) =>
       Promise.resolve({ ...issueTrigger, enabled: body.enabled }),

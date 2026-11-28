@@ -12,7 +12,7 @@ import {
 } from "solid-js";
 import { DayChart } from "../components/DayChart";
 import { LimitMeters } from "../components/LimitMeters";
-import { PageLoadFailure } from "../components/PageLoadFailure";
+import { loadFailure, PageLoadFailure } from "../components/PageLoadFailure";
 import type { Usage } from "../gen/Usage";
 import type { UsageRow } from "../gen/UsageRow";
 import type { UsageTotals } from "../gen/UsageTotals";
@@ -57,9 +57,6 @@ function fetchUsage(app: AppState, days: UsageRange, settle: (load: Load) => voi
 
 const loaded = (load: Load): Breakdowns | undefined =>
   load.status === "ready" ? load.data : undefined;
-
-const failureOf = (load: Load): string | undefined =>
-  load.status === "error" ? load.message : undefined;
 
 const endsNow = (load: Load): boolean => load.status === "ready" && load.endsNow;
 
@@ -285,7 +282,7 @@ export default function UsagePage() {
         </header>
 
         <Switch>
-          <Match when={failureOf(load())}>
+          <Match when={loadFailure(load())}>
             {(message) => (
               <PageLoadFailure
                 what="The usage"
