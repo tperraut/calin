@@ -677,7 +677,8 @@ describe("scene", () => {
     frame(TWEEN_MS / 2);
     frame(TWEEN_MS);
     const after = scene.view();
-    expect(100 * after.k + after.x).toBeCloseTo(0 * before.k + before.x);
+    // The anchor was at x 0 and is now at x 100: it stays where it was on screen.
+    expect(100 * after.k + after.x).toBeCloseTo(before.x);
     expect(after.y).toBe(before.y);
     expect(view.getAttribute("transform")).toBe(
       `translate(${after.x},${after.y}) scale(${after.k})`,
