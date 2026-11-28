@@ -2,13 +2,13 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::io::{ErrorKind, Read as _};
+use std::ops::ControlFlow;
 use std::path::Path;
 
 use calin_proto::{ChangeStatus, ChangedFile, FileDiff};
 
 use crate::cmd::{Git, require_commit, work_dir};
-use crate::content::{decode, read_capped};
+use crate::content::{decode, read_capped, read_chunks};
 use crate::error::{Error, Result};
 use crate::path::{clean, metadata_no_follow, resolve_no_follow};
 
@@ -500,27 +500,27 @@ fn untracked_stats(path: &Path) -> Option<(u32, bool)> {
     if !meta.is_file() {
         return None;
     }
-    let mut file = File::open(path).ok()?;
-    let mut buf = vec![0u8; 64 * 1024];
-    let (mut seen, mut lines, mut last) = (0usize, 0u32, b'\n');
-    loop {
-        let n = match file.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-            Err(_) => return None,
-        };
-        let chunk = &buf[..n];
-        if seen < BINARY_SNIFF {
-            let sniffed = &chunk[..n.min(BINARY_SNIFF - seen)];
-            if sniffed.contains(&0) {
-                return Some((0, true));
-            }
+    count_lines(File::open(path).ok()?)
+}
+
+/// Line count and binary flag of what `file` holds. `None` when it cannot be read.
+fn count_lines(file: File) -> Option<(u32, bool)> {
+    let (mut seen, mut lines, mut last, mut binary) = (0usize, 0u32, b'\n', false);
+    read_chunks(file, |chunk| {
+        let sniffed = &chunk[..chunk.len().min(BINARY_SNIFF.saturating_sub(seen))];
+        if sniffed.contains(&0) {
+            binary = true;
+            return ControlFlow::Break(());
         }
-        seen = seen.saturating_add(n);
+        seen = seen.saturating_add(chunk.len());
         let newlines = chunk.iter().filter(|b| **b == b'\n').count();
         lines = lines.saturating_add(u32::try_from(newlines).unwrap_or(u32::MAX));
-        last = chunk[n - 1];
+        last = chunk.last().copied().unwrap_or(last);
+        ControlFlow::Continue(())
+    })
+    .ok()?;
+    if binary {
+        return Some((0, true));
     }
     // A last line without a newline is still a line.
     if last != b'\n' {
@@ -699,6 +699,36 @@ mod tests {
             &wt,
             &base,
             vec![change("edited.txt", ChangeStatus::Modified, 1, 0)],
+        );
+    }
+
+    #[test]
+    fn untracked_files_are_counted_across_reads_and_sniffed_like_git() {
+        let sandbox = Sandbox::new();
+        let (wt, base) = session(&sandbox, &[]);
+        // Larger than one read, with a last line that has no newline.
+        let mut long = "line\n".repeat(30_000);
+        long.push_str("end");
+        write(&wt, "long.txt", &long);
+        // Git only looks for a NUL in the first 8000 bytes.
+        let mut late_nul = vec![b'a'; 8000];
+        late_nul.extend_from_slice(b"\0\n");
+        write(&wt, "late-nul.txt", &late_nul);
+        let mut early_nul = vec![b'a'; 7999];
+        early_nul.extend_from_slice(b"\0\n");
+        write(&wt, "early-nul.bin", &early_nul);
+
+        assert_changes(
+            &wt,
+            &base,
+            vec![
+                change("long.txt", ChangeStatus::Untracked, 30_001, 0),
+                change("late-nul.txt", ChangeStatus::Untracked, 1, 0),
+                ChangedFile {
+                    binary: true,
+                    ..change("early-nul.bin", ChangeStatus::Untracked, 0, 0)
+                },
+            ],
         );
     }
 

@@ -3,13 +3,13 @@
 //! changes nobody reported.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Read as _};
+use std::ops::ControlFlow;
 use std::path::Path;
 
 use sha2::{Digest as _, Sha256};
 
 use crate::cmd::work_dir;
-use crate::content::hex;
+use crate::content::{hex, read_chunks};
 use crate::error::{Error, Result};
 use crate::path::{metadata_no_follow, resolve_no_follow};
 
@@ -82,16 +82,11 @@ fn hash_file(path: &Path) -> Result<Option<(String, bool)>> {
         return Ok(None);
     }
     let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let n = match file.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-            Err(e) => return Err(Error::io(path, e)),
-        };
-        hasher.update(&buf[..n]);
-    }
+    read_chunks(&mut file, |chunk| {
+        hasher.update(chunk);
+        ControlFlow::Continue(())
+    })
+    .map_err(|e| Error::io(path, e))?;
     Ok(Some((hex(hasher.finalize().as_slice()), executable(&meta))))
 }
 
