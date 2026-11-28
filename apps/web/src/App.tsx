@@ -107,6 +107,75 @@ function SessionsPanel() {
   );
 }
 
+const isAuthorized = (app: AppState): boolean => {
+  const status = app.auth().status;
+  return status === "local" || status === "signed_in";
+};
+
+const isDryRun = (app: AppState): boolean => {
+  const health = app.health();
+  return health.status === "ready" && health.health.dry_run;
+};
+
+/** Nothing loaded and no socket: there is nothing useful to show but the reason. */
+const isUnreachable = (app: AppState): boolean =>
+  app.auth().status === "unreachable" ||
+  (isAuthorized(app) && app.health().status === "unreachable" && app.connection() !== "open");
+
+/** `aria-current` of a link to the page on screen. */
+const currentIf = (here: boolean): "page" | undefined => (here ? "page" : undefined);
+
+/** The sessions list with the app's links: the home screen on a phone, a sidebar from 1024px. */
+function Sidebar() {
+  const app = useContext(AppContext);
+  const location = useLocation();
+  return (
+    <aside
+      class={[
+        "min-h-0 flex-1 flex-col border-line lg:flex lg:w-80 lg:flex-none lg:border-r",
+        location.pathname === "/" ? "flex" : "hidden",
+      ]}
+    >
+      <header class="flex min-h-11 items-center justify-between border-b border-line px-3">
+        <a href="/" class="flex min-h-11 min-w-11 items-center text-base font-semibold">
+          Calin
+        </a>
+        <span class="flex items-center gap-4">
+          <a href="/" class="nav-link hidden lg:flex">
+            New session
+          </a>
+          <a
+            href="/settings"
+            class="nav-link min-w-11 justify-end"
+            aria-current={currentIf(location.pathname === "/settings")}
+          >
+            Settings
+          </a>
+        </span>
+      </header>
+      {/* More of the app's pages; not a landmark, so the sessions stay the one navigation here. */}
+      <div class="flex items-center gap-4 border-b border-line px-3">
+        <a
+          href="/automations"
+          class="nav-link"
+          aria-current={currentIf(location.pathname.startsWith("/automations"))}
+        >
+          Automations
+        </a>
+        <a href="/usage" class="nav-link" aria-current={currentIf(location.pathname === "/usage")}>
+          Usage
+        </a>
+      </div>
+      <HomeSummary sessions={app.sessions()} limits={app.limits()} />
+      <nav aria-label="Sessions" class="min-h-0 flex-1 overflow-y-auto overscroll-contain">
+        <SessionsPanel />
+      </nav>
+      {/* Public mode, wide screens; on a phone it is in Settings, out of the header's way. */}
+      <AccountControls class="hidden border-t border-line px-3 py-2 lg:flex" />
+    </aside>
+  );
+}
+
 /**
  * The frame around every route. On a phone the sessions list is the home
  * screen and steps aside for an open session; from 1024px it is a sidebar
@@ -116,19 +185,8 @@ function Shell(props: ParentProps) {
   const app = useContext(AppContext);
   const location = useLocation();
   const atHome = (): boolean => location.pathname === "/";
-  const dryRun = (): boolean => {
-    const health = app.health();
-    return health.status === "ready" && health.health.dry_run;
-  };
-  const authorized = (): boolean => {
-    const status = app.auth().status;
-    return status === "local" || status === "signed_in";
-  };
+  const authorized = (): boolean => isAuthorized(app);
   const signedOut = (): boolean => app.auth().status === "signed_out";
-  // Nothing loaded and no socket: there is nothing useful to show but the reason.
-  const unreachable = (): boolean =>
-    app.auth().status === "unreachable" ||
-    (authorized() && app.health().status === "unreachable" && app.connection() !== "open");
   // A page with unsaved text outlives the session, hidden, so the text is not lost with it.
   const [showUnsaved, setShowUnsaved] = createSignal(false);
   const keepPage = (): boolean => authorized() || (signedOut() && app.unsavedWork() !== undefined);
@@ -152,12 +210,12 @@ function Shell(props: ParentProps) {
       <Show when={app.updateReady()}>
         <UpdateNotice />
       </Show>
-      <Show when={authorized() && dryRun()}>
+      <Show when={authorized() && isDryRun(app)}>
         <p class="border-b border-line bg-sunken px-3 py-1 text-center text-xs text-muted">
           Dry run: agents are simulated
         </p>
       </Show>
-      <Show when={!unreachable()} fallback={<Unreachable />}>
+      <Show when={!isUnreachable(app)} fallback={<Unreachable />}>
         <Show when={signedOut()}>
           <Show
             when={showUnsaved() && app.unsavedWork() !== undefined}
@@ -172,53 +230,7 @@ function Shell(props: ParentProps) {
             hidden={pageHidden()}
             inert={pageHidden()}
           >
-            <aside
-              class={[
-                "min-h-0 flex-1 flex-col border-line lg:flex lg:w-80 lg:flex-none lg:border-r",
-                atHome() ? "flex" : "hidden",
-              ]}
-            >
-              <header class="flex min-h-11 items-center justify-between border-b border-line px-3">
-                <a href="/" class="flex min-h-11 min-w-11 items-center text-base font-semibold">
-                  Calin
-                </a>
-                <span class="flex items-center gap-4">
-                  <a href="/" class="nav-link hidden lg:flex">
-                    New session
-                  </a>
-                  <a
-                    href="/settings"
-                    class="nav-link min-w-11 justify-end"
-                    aria-current={location.pathname === "/settings" ? "page" : undefined}
-                  >
-                    Settings
-                  </a>
-                </span>
-              </header>
-              {/* More of the app's pages; not a landmark, so the sessions stay the one navigation here. */}
-              <div class="flex items-center gap-4 border-b border-line px-3">
-                <a
-                  href="/automations"
-                  class="nav-link"
-                  aria-current={location.pathname.startsWith("/automations") ? "page" : undefined}
-                >
-                  Automations
-                </a>
-                <a
-                  href="/usage"
-                  class="nav-link"
-                  aria-current={location.pathname === "/usage" ? "page" : undefined}
-                >
-                  Usage
-                </a>
-              </div>
-              <HomeSummary sessions={app.sessions()} limits={app.limits()} />
-              <nav aria-label="Sessions" class="min-h-0 flex-1 overflow-y-auto overscroll-contain">
-                <SessionsPanel />
-              </nav>
-              {/* Public mode, wide screens; on a phone it is in Settings, out of the header's way. */}
-              <AccountControls class="hidden border-t border-line px-3 py-2 lg:flex" />
-            </aside>
+            <Sidebar />
             {/* At home on a phone the composer shares the screen with the list above it. */}
             <main
               class={[
