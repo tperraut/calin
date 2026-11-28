@@ -937,6 +937,42 @@ fn a_node_of_unknown_type_raises_nothing_else() {
 }
 
 #[test]
+fn shapes_the_reader_refuses() {
+    for (node, id, fragments) in [
+        (
+            "{ id: p, type: parallel, branches: x }",
+            "p",
+            vec!["node `p`", "`branches` must be a list, found a string"],
+        ),
+        (
+            "{ id: a, type: agent, prompt: p, verdicts: yes }",
+            "a",
+            vec!["node `a`", "`verdicts` must be a list of strings"],
+        ),
+        (
+            "{ id: p, type: parallel, branches: [x, { id: b, prompt: y }] }",
+            "p",
+            vec!["node `p`: branch #1 must be a mapping, found a string"],
+        ),
+        (
+            "{ id: p, type: parallel, branches: [{ prompt: x }, { id: b, prompt: y }] }",
+            "p",
+            vec!["node `p`: branch #1", "missing required key `id`"],
+        ),
+    ] {
+        let yaml = with_node(node, id);
+        let p = problems(&yaml);
+        assert_eq!(p.len(), 1, "{p}");
+        assert_mentions(&p, &fragments, &yaml);
+    }
+    let yaml = doc(BASE_NODES, &format!("{BASE_EDGES}  - x\n"));
+    let p = problems(&yaml);
+    assert_mentions(&p, &["edge #3 must be a mapping, found a string"], &yaml);
+    let w = ok(&format!("{}budget_usd: 2.5\n", doc(BASE_NODES, BASE_EDGES)));
+    assert_eq!(w.budget_usd(), Some(2.5));
+}
+
+#[test]
 fn bad_port_does_not_cascade() {
     let p = problems(&doc(
         &format!("{BASE_NODES}  - {{ id: more, type: commit, message: m }}\n"),
