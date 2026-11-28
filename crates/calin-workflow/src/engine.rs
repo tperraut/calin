@@ -497,63 +497,84 @@ impl RunState {
     fn enter(&mut self, id: String) -> Action {
         let mut id = id;
         loop {
-            if self.steps >= MAX_STEPS {
-                return self.finish_with(
-                    EndStatus::Failed,
-                    FinishReason::StepLimit { limit: MAX_STEPS },
-                );
-            }
-            let Some(node) = self.workflow.node(&id).cloned() else {
-                return self.finish_with(
-                    EndStatus::Failed,
-                    FinishReason::Internal {
-                        message: format!("an edge leads to unknown node `{id}`"),
-                    },
-                );
-            };
-            self.steps += 1;
-            let run = self.nodes.entry(id.clone()).or_default();
-            run.runs += 1;
-            let port = match &node.kind {
-                NodeKind::Start => "next",
-                NodeKind::End { status } => {
-                    run.finished = true;
-                    run.last_port = None;
-                    return self.finish_with(*status, FinishReason::EndNode { node: id });
-                }
-                NodeKind::Loop { max } => {
-                    let port = if run.iteration < *max {
-                        run.iteration += 1;
-                        "repeat"
-                    } else {
-                        "exhausted"
-                    };
-                    let values = [
-                        ("iteration".to_owned(), run.iteration.to_string()),
-                        ("max".to_owned(), max.to_string()),
-                    ];
-                    self.outputs.record(&id, values.into());
-                    port
-                }
-                _ => {
-                    // The node needs the orchestrator; a previous finish of it stays visible
-                    // in `last_port` until this activation finishes.
-                    self.active = Some(id.clone());
-                    return match self.action_for(&node) {
-                        Some(action) => action,
-                        None => self.finish_with(
-                            EndStatus::Failed,
-                            FinishReason::Internal {
-                                message: format!("node `{id}` has no action"),
-                            },
-                        ),
-                    };
-                }
+            let port = match self.activate(&id) {
+                Ok(port) => port,
+                Err(action) => return action,
             };
             match self.follow(&id, port) {
                 Ok(next) => id = next,
                 Err(finish) => return finish,
             }
+        }
+    }
+
+    /// Activates `id`. A node the engine resolves itself gives the port it leaves through;
+    /// any other gives the action that stops the walk: the node's own, or the finish.
+    fn activate(&mut self, id: &str) -> Result<&'static str, Action> {
+        if self.steps >= MAX_STEPS {
+            return Err(self.finish_with(
+                EndStatus::Failed,
+                FinishReason::StepLimit { limit: MAX_STEPS },
+            ));
+        }
+        let Some(node) = self.workflow.node(id).cloned() else {
+            return Err(self.finish_with(
+                EndStatus::Failed,
+                FinishReason::Internal {
+                    message: format!("an edge leads to unknown node `{id}`"),
+                },
+            ));
+        };
+        self.steps += 1;
+        let run = self.nodes.entry(id.to_owned()).or_default();
+        run.runs += 1;
+        match &node.kind {
+            NodeKind::Start => Ok("next"),
+            NodeKind::End { status } => {
+                run.finished = true;
+                run.last_port = None;
+                Err(self.finish_with(
+                    *status,
+                    FinishReason::EndNode {
+                        node: id.to_owned(),
+                    },
+                ))
+            }
+            NodeKind::Loop { max } => Ok(self.count_loop(id, *max)),
+            _ => Err(self.wait_for(&node)),
+        }
+    }
+
+    /// A loop repeats while it has iterations left, else it is exhausted; either way it
+    /// records its iteration and bound.
+    fn count_loop(&mut self, id: &str, max: u32) -> &'static str {
+        let run = self.nodes.entry(id.to_owned()).or_default();
+        let port = if run.iteration < max {
+            run.iteration += 1;
+            "repeat"
+        } else {
+            "exhausted"
+        };
+        let values = [
+            ("iteration".to_owned(), run.iteration.to_string()),
+            ("max".to_owned(), max.to_string()),
+        ];
+        self.outputs.record(id, values.into());
+        port
+    }
+
+    /// Makes `node`, which needs the orchestrator, the active node and returns its action. A
+    /// previous finish of it stays visible in `last_port` until this activation finishes.
+    fn wait_for(&mut self, node: &Node) -> Action {
+        self.active = Some(node.id.clone());
+        match self.action_for(node) {
+            Some(action) => action,
+            None => self.finish_with(
+                EndStatus::Failed,
+                FinishReason::Internal {
+                    message: format!("node `{}` has no action", node.id),
+                },
+            ),
         }
     }
 
@@ -563,40 +584,19 @@ impl RunState {
         let id = node.id.clone();
         Some(match &node.kind {
             NodeKind::Start | NodeKind::End { .. } | NodeKind::Loop { .. } => return None,
-            NodeKind::Agent(AgentNode {
-                prompt,
-                fresh,
-                verdicts,
-                runner,
-                model,
-            }) => {
-                let mut prompt = render(prompt);
-                if !verdicts.is_empty() {
-                    prompt.push_str("\n\n");
-                    prompt.push_str(&verdict_instruction(verdicts));
-                }
-                Action::RunAgent {
-                    node: id,
-                    prompt,
-                    fresh: *fresh,
-                    verdicts: verdicts.clone(),
-                    runner: runner.clone(),
-                    model: model.clone(),
-                }
-            }
+            NodeKind::Agent(agent) => self.agent_action(id, agent),
             NodeKind::Check(CheckNode {
                 command,
                 repo,
                 timeout_seconds,
             }) => Action::RunCheck {
                 node: id,
-                check: match command {
-                    Some(cmd) => CheckCommand::Command {
+                check: command.as_ref().map_or(CheckCommand::RepoDefaults, |cmd| {
+                    CheckCommand::Command {
                         command: render(cmd),
                         repo: repo.clone(),
-                    },
-                    None => CheckCommand::RepoDefaults,
-                },
+                    }
+                }),
                 timeout_seconds: *timeout_seconds,
             },
             NodeKind::Gate { message } => Action::AskGate {
@@ -629,6 +629,23 @@ impl RunState {
                 draft: *draft,
             },
         })
+    }
+
+    /// With verdicts, the prompt ends with the instruction to give one.
+    fn agent_action(&self, node: String, agent: &AgentNode) -> Action {
+        let mut prompt = agent.prompt.render(&self.context, &self.outputs);
+        if !agent.verdicts.is_empty() {
+            prompt.push_str("\n\n");
+            prompt.push_str(&verdict_instruction(&agent.verdicts));
+        }
+        Action::RunAgent {
+            node,
+            prompt,
+            fresh: agent.fresh,
+            verdicts: agent.verdicts.clone(),
+            runner: agent.runner.clone(),
+            model: agent.model.clone(),
+        }
     }
 }
 
