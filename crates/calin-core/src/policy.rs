@@ -49,36 +49,45 @@ pub(crate) fn decide(mode: PermissionMode, target: &Target, repos: &[SessionRepo
         repos: placed,
         guarded,
     } = target
+        && let Some(verdict) = files_verdict(mode, *write, placed, *guarded, repos)
     {
-        let held: Vec<&SessionRepo> = placed
-            .iter()
-            .flatten()
-            .filter_map(|i| repos.get(*i))
-            .collect();
-        if let Some(read_only) = held
-            .iter()
-            .find(|repo| *write && repo.mode == RepoMode::Read)
-        {
-            return Verdict::Deny(format!(
-                "{} is attached to this session read-only: its files cannot be changed. If the \
-                 change is needed, tell the user so they can attach it in write mode.",
-                read_only.name
-            ));
-        }
-        let all_inside = !placed.is_empty() && held.len() == placed.len();
-        if all_inside && !*write {
-            return Verdict::Allow;
-        }
-        // What is inside `.git` is the repository itself, not one of its
-        // files: Calin's own file routes never write there either.
-        if all_inside && !*guarded && mode != PermissionMode::Ask {
-            return Verdict::Allow;
-        }
+        return verdict;
     }
     match (target, mode) {
         (Target::Orchestrator, _) | (_, PermissionMode::Autonomous) => Verdict::Allow,
         _ => Verdict::Ask,
     }
+}
+
+/// The verdict on a file tool from where its paths are, when that settles
+/// it: a write to a `read` repo, or paths all inside the session's repos.
+fn files_verdict(
+    mode: PermissionMode,
+    write: bool,
+    placed: &[Option<usize>],
+    guarded: bool,
+    repos: &[SessionRepo],
+) -> Option<Verdict> {
+    let held: Vec<&SessionRepo> = placed
+        .iter()
+        .flatten()
+        .filter_map(|i| repos.get(*i))
+        .collect();
+    if let Some(read_only) = held
+        .iter()
+        .find(|repo| write && repo.mode == RepoMode::Read)
+    {
+        return Some(Verdict::Deny(format!(
+            "{} is attached to this session read-only: its files cannot be changed. If the \
+             change is needed, tell the user so they can attach it in write mode.",
+            read_only.name
+        )));
+    }
+    let all_inside = !placed.is_empty() && held.len() == placed.len();
+    // What is inside `.git` is the repository itself, not one of its
+    // files: Calin's own file routes never write there either.
+    let may_write = !guarded && mode != PermissionMode::Ask;
+    (all_inside && (!write || may_write)).then_some(Verdict::Allow)
 }
 
 /// Blocking: resolves links on disk. Places what a request reaches for.
