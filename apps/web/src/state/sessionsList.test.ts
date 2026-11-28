@@ -3,6 +3,10 @@ import type { Session } from "../gen/Session";
 import { makeSession as session } from "../test/fakes";
 import {
   childrenShownByDefault,
+  countSessions,
+  firstNeedingYou,
+  needsYou,
+  needsYouFirst,
   nestSessions,
   upsertSession,
   type SessionNode,
@@ -48,6 +52,7 @@ describe("upsertSession", () => {
     const forward = [session("a", 100), session("b", 100)].reduce<Session[]>(upsertSession, []);
     const backward = [session("b", 100), session("a", 100)].reduce<Session[]>(upsertSession, []);
     expect(ids(forward)).toEqual(ids(backward));
+    expect(ids(forward)).toEqual(["b", "a"]);
   });
 
   it("does not mutate the list it is given", () => {
@@ -106,5 +111,55 @@ describe("nestSessions", () => {
     expect(childrenShownByDefault(tree("cancelled"), undefined)).toBe(false);
     expect(childrenShownByDefault(tree("review"), "c")).toBe(true);
     expect(childrenShownByDefault(tree("review"), "a")).toBe(false);
+  });
+});
+
+describe("what needs the user", () => {
+  const child = (id: string, at: number, parent: string, patch: Partial<Session> = {}) =>
+    session(id, at, { parent_session_id: parent, root_session_id: parent, ...patch });
+
+  it("is a session waiting on an answer or a review, and nothing else", () => {
+    expect(needsYou("waiting")).toBe(true);
+    expect(needsYou("review")).toBe(true);
+    for (const status of ["queued", "preparing", "running", "done", "failed"] as const) {
+      expect(needsYou(status)).toBe(false);
+    }
+  });
+
+  it("puts every tree holding such a session first, each group in its order", () => {
+    const nodes = nestSessions(
+      [
+        session("new", 500),
+        session("mid", 400, { status: "review" }),
+        session("old", 100),
+        child("deep", 300, "old", { status: "waiting" }),
+      ].reduce<Session[]>(upsertSession, []),
+    );
+    expect(needsYouFirst(nodes).map((node) => node.session.id)).toEqual(["mid", "old", "new"]);
+    expect(firstNeedingYou(nodes)?.id).toBe("mid");
+    expect(firstNeedingYou(nodes.filter((node) => node.session.id !== "mid"))?.id).toBe("deep");
+    expect(firstNeedingYou(nestSessions([session("calm", 100)]))).toBeUndefined();
+  });
+
+  it("counts the sessions that need the user, run and wait for a slot", () => {
+    const statuses: Session["status"][] = [
+      "waiting",
+      "review",
+      "running",
+      "preparing",
+      "queued",
+      "done",
+      "failed",
+    ];
+    const list = statuses.map((status, index) => session(`s${index}`, index, { status }));
+    expect(countSessions(list)).toEqual({ needYou: 2, running: 2, queued: 1 });
+    expect(countSessions([])).toEqual({ needYou: 0, running: 0, queued: 0 });
+  });
+});
+
+describe("a session that names itself as its parent", () => {
+  it("stays at the top level instead of vanishing", () => {
+    const self = session("loop", 100, { parent_session_id: "loop" });
+    expect(nestSessions([self]).map((node) => node.session.id)).toEqual(["loop"]);
   });
 });
