@@ -567,6 +567,42 @@ describe("App", () => {
     expect(toggle.textContent).toContain("3 repos");
   });
 
+  it("says when no repo or one repo is attached, and how to add one", async () => {
+    const none = await openSession("/s/s1");
+    const toggle = find<HTMLButtonElement>(find(none.main, "header"), "button[aria-controls]");
+    const details = find(none.main, `[id="${toggle.getAttribute("aria-controls")}"]`);
+    expect(toggle.textContent).toContain("· no repo");
+    expect(details.textContent).toContain("No repo attached");
+    expect(details.querySelector('ul[aria-label="Repos"]')).toBeNull();
+    const attach = findByText<HTMLButtonElement>(details, "button", "Attach repo");
+    expect([attach.disabled, attach.title]).toEqual([false, "Add a repo to this session"]);
+    unmountAll();
+
+    const one = await openSession("/s/s1", {}, "running", [makeSessionRepo("api")]);
+    expect(find(one.main, "header button[aria-controls]").textContent).toContain("· 1 repo");
+  });
+
+  it("counts the requests that need the reader, once the replay is over", async () => {
+    const { main, emit, caughtUp } = await openSession("/s/s1");
+    emit({ type: "permission_requested", request: permissionRequest("p1", "cargo test") });
+    emit({ type: "permission_requested", request: permissionRequest("p2", "git push") });
+    // Still replaying: what the log holds may already be answered further on.
+    expect(find(main, "header").textContent).not.toContain("need you");
+    caughtUp();
+    expect(find(main, "header").textContent).toContain("2 requests need you");
+  });
+
+  it("shows a stop the server refused inline", async () => {
+    const stopSession = vi
+      .fn<Api["stopSession"]>()
+      .mockRejectedValue(conflict("session is already over"));
+    const { main } = await openSession("/s/s1", { stopSession });
+    await click(findByText<HTMLButtonElement>(main, "button", "Stop"));
+    expect(find(main, '[role="alert"]').textContent).toBe(
+      "Could not stop the session: session is already over",
+    );
+  });
+
   it("interrupts a running session, and shows the server's refusal inline", async () => {
     const interruptSession = vi
       .fn<Api["interruptSession"]>()
