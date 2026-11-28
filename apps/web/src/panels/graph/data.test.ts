@@ -249,6 +249,16 @@ describe("orchestration data", () => {
     expect(data.live()).toBe(false);
   });
 
+  it("starts a replay from the beginning when frozen at the present", async () => {
+    const { data } = setup();
+    data.setVisible(true);
+    await settle();
+    data.setLive(false);
+    data.play();
+    flush();
+    expect(data.at()).toBe(T0);
+  });
+
   it("holds the replay while an answer is on its way, and while hidden", async () => {
     const slow = deferred<Graph>();
     let calls = 0;
@@ -296,6 +306,32 @@ describe("orchestration data", () => {
     data.setView("timeline");
     await settle();
     expect(timeline).toHaveBeenCalledTimes(3);
+  });
+
+  it("reads nothing more for the timeline chosen again while on screen", async () => {
+    const { data, timeline } = setup();
+    data.setVisible(true);
+    data.setView("timeline");
+    await settle();
+    data.setView("timeline");
+    await settle();
+    expect(timeline).toHaveBeenCalledTimes(1);
+  });
+
+  it("is refreshing while only the timeline is on its way", async () => {
+    const answer = deferred<Timeline>();
+    const data = createOrchestrationData({
+      graph: () => Promise.resolve(makeGraph()),
+      timeline: () => answer.promise,
+    });
+    data.setVisible(true);
+    data.setView("timeline");
+    await settle();
+    expect(data.graph()).toBeDefined();
+    expect(data.refreshing()).toBe(true);
+    answer.resolve(makeTimeline());
+    await settle();
+    expect(data.refreshing()).toBe(false);
   });
 
   it("reads nothing more once disposed", async () => {
