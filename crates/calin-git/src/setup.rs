@@ -1,7 +1,7 @@
 //! Running a shell command in a work directory: a repo's setup command in a
 //! worktree that was just created, and the commands that check a change.
 
-use std::io::Read;
+use std::io::{PipeReader, Read};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -130,10 +130,51 @@ pub fn run_check(
 }
 
 /// How a command stopped running.
-enum Ended {
+pub(crate) enum Ended {
     Exited(ExitStatus),
     TimedOut,
     Cancelled,
+}
+
+/// Waits for `child`, looking every `poll`. At `deadline`, or once `cancel`
+/// is set, it is killed with its group; so it is when waiting fails.
+pub(crate) fn wait_until(
+    child: &mut Child,
+    deadline: Instant,
+    poll: Duration,
+    cancel: Option<&AtomicBool>,
+) -> std::io::Result<Ended> {
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(Ended::Exited(status)),
+            Ok(None) => {}
+            Err(err) => {
+                kill(child);
+                return Err(err);
+            }
+        }
+        if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+            kill(child);
+            return Ok(Ended::Cancelled);
+        }
+        if Instant::now() >= deadline {
+            kill(child);
+            return Ok(Ended::TimedOut);
+        }
+        thread::sleep(poll);
+    }
+}
+
+/// Makes the command the leader of a process group of its own, so that
+/// [`kill_group`] reaches whatever it starts.
+pub(crate) fn in_own_group(cmd: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        cmd.process_group(0);
+    }
+    #[cfg(not(unix))]
+    let _ = cmd;
 }
 
 /// Runs `command` and returns the end of what it wrote: its last `cap`
@@ -151,70 +192,58 @@ fn run(
         context: format!("running {what} in {}", dir.display()),
         source,
     };
-    // One pipe for both streams keeps their lines in order.
-    let (mut reader, writer) = std::io::pipe().map_err(failed)?;
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c")
-        .arg(command)
-        .current_dir(&dir)
-        .stdin(Stdio::null())
-        .stdout(writer.try_clone().map_err(failed)?)
-        .stderr(writer);
-    // The command may run git, which must see the worktree it is in.
-    for name in INHERITED {
-        cmd.env_remove(name);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-        cmd.process_group(0);
-    }
-    let mut child = cmd.spawn().map_err(failed)?;
-    // The command holds the writing ends now; ours must close for the
-    // reader to see the end.
-    drop(cmd);
-
+    let (reader, mut child) = spawn_shell(&dir, command).map_err(failed)?;
     let tail = Arc::new(Mutex::new(Tail::new(cap)));
-    let (finished, drained) = mpsc::channel();
-    let collector = Arc::clone(&tail);
-    thread::spawn(move || {
-        let mut chunk = [0u8; 8192];
-        loop {
-            match reader.read(&mut chunk) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => lock(&collector).push(&chunk[..n]),
-            }
-        }
-        // Nobody listens when the drain was given up.
-        let _ = finished.send(());
-    });
-
-    let started = Instant::now();
-    let end = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Ended::Exited(status),
-            Ok(None) => {}
-            Err(err) => {
-                kill(&mut child);
-                return Err(failed(err));
-            }
-        }
-        if cancel.load(Ordering::Relaxed) {
-            kill(&mut child);
-            break Ended::Cancelled;
-        }
-        if started.elapsed() >= limit {
-            kill(&mut child);
-            break Ended::TimedOut;
-        }
-        thread::sleep(POLL);
-    };
+    let drained = drain(reader, Arc::clone(&tail));
+    let end = wait_until(&mut child, Instant::now() + limit, POLL, Some(cancel)).map_err(failed)?;
     // What the command left running may still hold the pipe; kill the group
     // even after a clean exit, then take what was written.
     kill_group(&child);
     let _ = drained.recv_timeout(DRAIN);
     let output = lock(&tail).text(noted);
     Ok((output, end))
+}
+
+/// Starts `command` with `sh -c` in `dir`, in a process group of its own,
+/// with no input and both output streams on the one pipe it returns.
+fn spawn_shell(dir: &Path, command: &str) -> std::io::Result<(PipeReader, Child)> {
+    // One pipe for both streams keeps their lines in order.
+    let (reader, writer) = std::io::pipe()?;
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c")
+        .arg(command)
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .stdout(writer.try_clone()?)
+        .stderr(writer);
+    // The command may run git, which must see the worktree it is in.
+    for name in INHERITED {
+        cmd.env_remove(name);
+    }
+    in_own_group(&mut cmd);
+    let child = cmd.spawn()?;
+    // The command holds the writing ends now; ours must close for the
+    // reader to see the end.
+    drop(cmd);
+    Ok((reader, child))
+}
+
+/// Reads the pipe into `tail` on a thread of its own, until its end. The
+/// receiver hears when that came.
+fn drain(mut reader: PipeReader, tail: Arc<Mutex<Tail>>) -> mpsc::Receiver<()> {
+    let (finished, drained) = mpsc::channel();
+    thread::spawn(move || {
+        let mut chunk = [0u8; 8192];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => lock(&tail).push(&chunk[..n]),
+            }
+        }
+        // Nobody listens when the drain was given up.
+        let _ = finished.send(());
+    });
+    drained
 }
 
 fn lock(tail: &Mutex<Tail>) -> std::sync::MutexGuard<'_, Tail> {

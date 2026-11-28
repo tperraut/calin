@@ -10,7 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
-use crate::setup::{kill, kill_group};
+use crate::setup::{Ended, in_own_group, kill_group, wait_until};
 
 /// How often a time-limited command is checked for its end.
 const POLL: Duration = Duration::from_millis(10);
@@ -205,31 +205,19 @@ impl Git {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt as _;
-            self.cmd.process_group(0);
-        }
+        in_own_group(&mut self.cmd);
         let mut child = self.cmd.spawn().map_err(spawn_error)?;
         let stdout = collect(child.stdout.take());
         let stderr = collect(child.stderr.take());
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) => {}
-                Err(err) => {
-                    kill(&mut child);
-                    return Err(spawn_error(err));
-                }
-            }
-            if Instant::now() >= deadline {
-                kill(&mut child);
+        let status = match wait_until(&mut child, deadline, POLL, None) {
+            Ok(Ended::Exited(status)) => status,
+            Ok(Ended::TimedOut | Ended::Cancelled) => {
                 return Err(Error::Git {
                     command,
                     stderr: format!("timed out after {}", how_long(limit)),
                 });
             }
-            thread::sleep(POLL);
+            Err(err) => return Err(spawn_error(err)),
         };
         // A hook may have left something running that holds the pipes.
         kill_group(&child);
@@ -308,22 +296,28 @@ impl Done {
     pub(crate) fn into_error(self) -> Error {
         Error::Git {
             command: self.command,
-            stderr: if self.stderr.is_empty() {
-                self.status.to_string()
-            } else {
-                self.stderr
-            },
+            stderr: failure_words(self.status, self.stderr),
         }
     }
 }
 
+/// What an error says of a failed command: its standard error, or its exit
+/// status when it wrote nothing there.
+pub(crate) fn failure_words(status: ExitStatus, stderr: String) -> String {
+    if stderr.is_empty() {
+        status.to_string()
+    } else {
+        stderr
+    }
+}
+
 /// Reads a stream to its end on a thread of its own and hands over the bytes.
-fn collect(stream: Option<impl Read + Send + 'static>) -> mpsc::Receiver<Vec<u8>> {
+pub(crate) fn collect(stream: Option<impl Read + Send + 'static>) -> mpsc::Receiver<Vec<u8>> {
     let (done, bytes) = mpsc::channel();
     if let Some(mut stream) = stream {
         thread::spawn(move || {
             let mut read = Vec::new();
-            // What was read before an error is still what git said.
+            // What was read before an error is still what the command said.
             let _ = stream.read_to_end(&mut read);
             // Nobody listens once the drain was given up.
             let _ = done.send(read);
