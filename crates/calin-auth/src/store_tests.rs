@@ -1292,7 +1292,13 @@ async fn a_write_that_fails_creates_nothing_and_revokes_anyway() {
         store.create_device_token(&alice(), "ci").await,
         Err(StoreError::Io { .. })
     ));
-    assert_eq!(store.list_sessions(&alice()).len(), 1);
+    // The session that could not be written is the one that is gone.
+    let listed: Vec<String> = store
+        .list_sessions(&alice())
+        .into_iter()
+        .map(|s| s.id)
+        .collect();
+    assert_eq!(listed, [session.info.id.as_str()]);
     assert!(store.list_device_tokens(&alice()).is_empty());
     assert_eq!(fixture.file(), before);
 
@@ -1608,6 +1614,41 @@ async fn creations_and_revocations_are_written_at_once() {
     store.set_allow_list(allow(ALLOWED)).await.unwrap();
     store.purge_expired().await.unwrap();
     assert_eq!(store.writes(), 6);
+}
+
+#[tokio::test]
+async fn a_fresh_store_owes_the_file_nothing() {
+    let fixture = Fixture::new().await;
+    let store = &fixture.store;
+    assert!(!store.revoke_session(&alice(), "no-such-id").await.unwrap());
+    assert!(
+        !store
+            .revoke_device_token(&alice(), "no-such-id")
+            .await
+            .unwrap()
+    );
+    assert_eq!(store.purge_expired().await.unwrap(), 0);
+    store.flush().await.unwrap();
+    assert_eq!(store.writes(), 0);
+    assert!(!fixture.path().exists());
+}
+
+#[tokio::test]
+async fn purging_nothing_writes_nothing_and_leaves_nothing_owed() {
+    let fixture = Fixture::new().await;
+    let store = &fixture.store;
+    let session = store.create_session(&alice(), None).await.unwrap();
+    assert_eq!(store.purge_expired().await.unwrap(), 0);
+    // Nothing changed, so a flush has nothing to write.
+    store.flush().await.unwrap();
+    assert_eq!(store.writes(), 1);
+
+    // A pending last-use update still waits for its 30 seconds.
+    fixture.clock.advance(5);
+    store.authenticate_session(session.token()).await.unwrap();
+    assert_eq!(store.purge_expired().await.unwrap(), 0);
+    assert_eq!(store.writes(), 1);
+    assert_eq!(fixture.file_json()["sessions"][0]["last_used"], START);
 }
 
 #[tokio::test]

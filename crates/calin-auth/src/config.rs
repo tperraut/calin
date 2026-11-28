@@ -762,10 +762,35 @@ mod tests {
             problems(&with(ENV_OIDC_CLIENT_ID, "a\u{7}b"), LoopbackHttp::Refuse),
             vec![invalid(ENV_OIDC_CLIENT_ID, "contains a control character")]
         );
+        let longest: &'static str = Box::leak("c".repeat(512).into_boxed_str());
+        assert_eq!(
+            public(&with(ENV_OIDC_CLIENT_ID, longest), LoopbackHttp::Refuse).client_id(),
+            longest
+        );
         let long: &'static str = Box::leak("c".repeat(513).into_boxed_str());
         assert_eq!(
             problems(&with(ENV_OIDC_CLIENT_ID, long), LoopbackHttp::Refuse),
             vec![invalid(ENV_OIDC_CLIENT_ID, "is too long")]
+        );
+    }
+
+    #[test]
+    fn a_url_of_up_to_2048_bytes_is_read() {
+        let issuer_of = |total: usize| -> &'static str {
+            let head = "https://idp.example.com/";
+            Box::leak(format!("{head}{}", "a".repeat(total - head.len())).into_boxed_str())
+        };
+        let longest = issuer_of(MAX_URL_BYTES);
+        assert_eq!(
+            public(&with(ENV_OIDC_ISSUER, longest), LoopbackHttp::Refuse).issuer(),
+            longest
+        );
+        assert_eq!(
+            problems(
+                &with(ENV_OIDC_ISSUER, issuer_of(MAX_URL_BYTES + 1)),
+                LoopbackHttp::Refuse
+            ),
+            vec![invalid(ENV_OIDC_ISSUER, "is too long")]
         );
     }
 

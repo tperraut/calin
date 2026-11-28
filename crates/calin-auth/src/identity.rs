@@ -273,8 +273,21 @@ mod tests {
         ] {
             assert!(Identity::email(good).is_ok(), "{good}");
         }
+        // The longest accepted: a 64-byte local part, 254 bytes in all.
+        let longest_local = format!("{}@example.com", "a".repeat(MAX_EMAIL_LOCAL_BYTES));
+        let longest = format!(
+            "{}@{}.com",
+            "a".repeat(MAX_EMAIL_LOCAL_BYTES),
+            "b".repeat(MAX_EMAIL_BYTES - MAX_EMAIL_LOCAL_BYTES - 5)
+        );
+        assert_eq!(longest.len(), MAX_EMAIL_BYTES);
+        for good in [&longest_local, &longest] {
+            assert!(Identity::email(good).is_ok(), "{good}");
+        }
         let too_long = format!("{}@example.com", "a".repeat(250));
         let long_local = format!("{}@example.com", "a".repeat(65));
+        // One byte over in all, with a local part that is not too long.
+        let one_over = format!("{longest}m");
         for bad in [
             "",
             "alice",
@@ -304,6 +317,7 @@ mod tests {
             "*@example.com",
             too_long.as_str(),
             long_local.as_str(),
+            one_over.as_str(),
         ] {
             assert_eq!(Identity::email(bad), Err(InvalidIdentity::Email), "{bad:?}");
         }

@@ -314,6 +314,10 @@ fn open_pull_requests_are_listed_and_viewed() {
             &format!("--json={PULL_REQUEST_FIELDS}"),
         ]
     );
+    // No limit still asks for one.
+    std::fs::remove_file(fake.bin.with_file_name("args-pr-list")).unwrap();
+    fake.github().list_open_pull_requests(&repo, 0).unwrap();
+    assert_eq!(fake.args("pr-list")[3], "--limit=1");
 
     fake.set("out-pr-view", pull(4).to_string());
     assert_eq!(fake.github().pull_request_item(&repo, 4).unwrap().number, 4);

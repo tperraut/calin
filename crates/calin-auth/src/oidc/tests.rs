@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
+use super::http::MAX_RESPONSE_BYTES;
 use super::testing::{FakeProvider, Misbehavior, Signing, SigningKey};
 use super::*;
 use crate::clock::ManualClock;
@@ -606,6 +607,32 @@ fn callback_parameters_are_decoded_and_unknown_ones_ignored() {
     assert!(CallbackParams::from_query("").code.is_none());
 }
 
+#[test]
+fn the_longest_code_and_query_are_read_and_one_byte_more_is_refused() {
+    // A caller that decoded the query itself gets the same checks.
+    let longest = "c".repeat(MAX_CODE_BYTES);
+    let params = CallbackParams::new(Some("s"), Some(&longest), None);
+    assert_eq!(params.code_for("s"), Ok(longest.as_str()));
+    let too_long = "c".repeat(MAX_CODE_BYTES + 1);
+    assert_eq!(
+        CallbackParams::new(Some("s"), Some(&too_long), None).code_for("s"),
+        Err(LoginError::NoCode)
+    );
+
+    let query = |total: usize| {
+        let head = "state=s&code=c&pad=";
+        format!("{head}{}", "p".repeat(total - head.len()))
+    };
+    assert_eq!(
+        CallbackParams::from_query(&query(MAX_QUERY_BYTES)).code_for("s"),
+        Ok("c")
+    );
+    assert_eq!(
+        CallbackParams::from_query(&query(MAX_QUERY_BYTES + 1)).code_for("s"),
+        Err(LoginError::MalformedCallback)
+    );
+}
+
 // ------------------------------------------------------------- the ID token
 
 #[tokio::test]
@@ -1183,6 +1210,20 @@ async fn token_endpoint_failures_are_refusals() {
             "it answered HTTP 302",
         ),
     ];
+    // Exactly the limit is read (and holds no token); one byte more is not.
+    let mut cases = cases;
+    for declare_length in [true, false] {
+        for (bytes, expected) in [
+            (MAX_RESPONSE_BYTES, "its answer holds no ID token"),
+            (MAX_RESPONSE_BYTES + 1, too_large),
+        ] {
+            let misbehavior = Misbehavior::Oversized {
+                bytes,
+                declare_length,
+            };
+            cases.push((misbehavior, expected));
+        }
+    }
     for (n, (misbehavior, expected)) in cases.into_iter().enumerate() {
         harness.provider.state().token = Some(misbehavior);
         assert_eq!(
@@ -1460,6 +1501,11 @@ async fn the_provider_down_at_startup_does_not_prevent_construction() {
     for _ in 0..8 {
         let before = harness.clock.now();
         loop {
+            // Bounded, so a client that never retries fails here at once.
+            assert!(
+                harness.clock.now() - before <= MAX_BACKOFF_SECS,
+                "no new attempt within the longest backoff, after {waits:?}"
+            );
             harness.clock.advance(1);
             let connections = harness.provider.state().hits.connections;
             assert!(harness.client.begin_login(address(1), None).await.is_err());

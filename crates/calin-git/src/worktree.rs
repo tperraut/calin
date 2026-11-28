@@ -479,6 +479,26 @@ mod tests {
     }
 
     #[test]
+    fn a_deleted_worktree_that_holds_neither_the_path_nor_the_branch_stays_registered() {
+        let sandbox = Sandbox::new();
+        let repo = sandbox.repo("repo");
+        let gone = sandbox.path().join("gone");
+        create_worktree(&repo, &gone, "calin/gone", None).unwrap();
+        fs::remove_dir_all(&gone).unwrap();
+        let still_listed = || {
+            let listed = git(&repo, &["worktree", "list", "--porcelain"]);
+            listed.contains("refs/heads/calin/gone") && listed.contains("prunable")
+        };
+
+        let path = sandbox.path().join("wt");
+        create_worktree(&repo, &path, "calin/s", None).unwrap();
+        assert!(still_listed());
+        let again = create_worktree(&repo, &path, "calin/s", None).unwrap();
+        assert_eq!(again.outcome, WorktreeOutcome::AlreadyPresent);
+        assert!(still_listed());
+    }
+
+    #[test]
     fn two_worktrees_of_one_clone_coexist() {
         let sandbox = Sandbox::new();
         let repo = sandbox.repo("repo");
@@ -526,6 +546,14 @@ mod tests {
             Err(Error::Conflict(_))
         ));
         assert!(occupied.join("keep.txt").is_file());
+        // A plain file at the path is in the way too.
+        let file = occupied.join("keep.txt");
+        assert!(matches!(
+            create_worktree(&repo, &file, "calin/s", None),
+            Err(Error::Conflict(_))
+        ));
+        assert_eq!(fs::read_to_string(&file).unwrap(), "keep\n");
+        assert!(!branch_exists(&repo, "calin/s"));
 
         // The clone is never its own worktree, and is never removed.
         assert!(matches!(
@@ -549,13 +577,14 @@ mod tests {
         let repo = sandbox.repo("repo");
         let path = sandbox.path().join("wt");
         for branch in ["", "a..b", "-x", "with space", "x.lock"] {
-            assert!(
-                matches!(
-                    create_worktree(&repo, &path, branch, None),
-                    Err(Error::Git { .. })
-                ),
-                "{branch:?}"
-            );
+            // Refused by the name check, before git is asked to add anything.
+            match create_worktree(&repo, &path, branch, None) {
+                Err(Error::Git { command, stderr }) => {
+                    assert_eq!(command, format!("git check-ref-format refs/heads/{branch}"));
+                    assert_eq!(stderr, format!("{branch:?} is not a valid branch name"));
+                }
+                other => panic!("{branch:?}: expected a refusal, got {other:?}"),
+            }
         }
         assert!(matches!(
             create_worktree(&repo, Path::new("relative/wt"), "calin/s", None),

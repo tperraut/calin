@@ -322,23 +322,23 @@ impl AuthStore {
 
         let now = clock.now();
         let loaded = load(&path)?;
-        let mut report = LoadReport {
-            file: loaded.file,
-            permissions_corrected: loaded.permissions_corrected,
-            revoked: 0,
-            expired: 0,
-        };
         let mut state = State {
             sessions: loaded.sessions,
             device_tokens: loaded.device_tokens,
             allow_list,
             generation: 0,
         };
-        report.expired = state.drop_expired(now);
-        report.revoked = state.drop_not_allowed();
+        let expired = state.drop_expired(now);
+        let revoked = state.drop_not_allowed();
+        let report = LoadReport {
+            file: loaded.file,
+            permissions_corrected: loaded.permissions_corrected,
+            revoked,
+            expired,
+        };
 
         // What was dropped is one change the file does not have yet.
-        let dropped = report.expired + report.revoked > 0;
+        let dropped = expired + revoked > 0;
         let store = Self {
             inner: Arc::new(Inner {
                 path,

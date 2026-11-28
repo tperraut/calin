@@ -742,6 +742,27 @@ mod tests {
     }
 
     #[test]
+    fn temporary_files_left_by_a_crash_do_not_block_a_write() {
+        let sandbox = Sandbox::new();
+        let repo = sandbox.repo("repo");
+        // The names the next writes of this process try first, as a crashed
+        // process with the same pid could have left them.
+        let next = TEMP_COUNTER.load(Ordering::Relaxed);
+        let leftovers: Vec<PathBuf> = (next..next + 8)
+            .map(|n| repo.join(format!(".calin-write-{}-{n}.tmp", process::id())))
+            .collect();
+        for leftover in &leftovers {
+            fs::write(leftover, "crashed\n").unwrap();
+        }
+
+        write_file(&repo, "new.txt", "hello\n", None).unwrap();
+        assert_eq!(fs::read_to_string(repo.join("new.txt")).unwrap(), "hello\n");
+        for leftover in &leftovers {
+            assert_eq!(fs::read_to_string(leftover).unwrap(), "crashed\n");
+        }
+    }
+
+    #[test]
     fn creates_parent_directories() {
         let sandbox = Sandbox::new();
         let repo = sandbox.repo("repo");
