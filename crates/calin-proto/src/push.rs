@@ -99,3 +99,21 @@ pub struct PushPayload {
     /// Absent for a test.
     pub session_id: Option<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_event_notifies_by_default() {
+        assert_eq!(
+            PushPreferences::default(),
+            PushPreferences {
+                waiting: true,
+                review: true,
+                failed: true,
+                merged: true,
+            }
+        );
+    }
+}

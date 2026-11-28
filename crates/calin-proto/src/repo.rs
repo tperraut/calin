@@ -215,3 +215,22 @@ pub struct WriteFileRequest {
     #[ts(optional)]
     pub expected_hash: Option<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_repo_in_the_older_shape_parses_as_an_available_clone() {
+        let repo: Repo = serde_json::from_str(
+            r#"{"id":"r1","name":"api","path":"/src/api","default_branch":"main","remote_url":null}"#,
+        )
+        .unwrap();
+        assert!(repo.available);
+        assert!(!repo.declared && !repo.home && !repo.cloning);
+        assert_eq!(repo.url, None);
+        assert_eq!(repo.setup, None);
+        assert!(repo.checks.is_empty());
+        assert_eq!(repo.problem, None);
+    }
+}
