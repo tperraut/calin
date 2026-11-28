@@ -858,10 +858,17 @@ impl Driver {
                 text: text.clone(),
             }))
             .await?;
-        self.pending.push_back(Queued {
+        let queued = Queued {
             text,
             event_id: message.id.clone(),
-        });
+        };
+        self.hand_on(queued).await
+    }
+
+    /// Queues an input for the lead, and starts a turn on it unless input
+    /// has to wait.
+    async fn hand_on(&mut self, queued: Queued) -> Result<()> {
+        self.pending.push_back(queued);
         if self.defers_input() {
             return Ok(());
         }
@@ -2591,14 +2598,11 @@ impl Driver {
         {
             return self.child_ended(&from, body, ended).await;
         }
-        self.pending.push_back(Queued {
+        let queued = Queued {
             text,
             event_id: received.id.clone(),
-        });
-        if self.defers_input() {
-            return Ok(());
-        }
-        self.run_pending().await
+        };
+        self.hand_on(queued).await
     }
 
     /// Keeps what a child's agent wants reported when its turn ends.
@@ -2698,37 +2702,40 @@ impl Driver {
             .await?
             .backlog;
         let lead = self.lead.as_ref().map(|lead| lead.id.as_str());
-        // A turn begins with the lead's `running` (or its spawn): what it was
-        // handed is on record before that.
-        let handed = events.iter().rposition(|event| match &event.body {
-            EventBody::AgentStatus {
-                status: AgentStatus::Running,
-            } => lead.is_some() && event.agent_id.as_deref() == lead,
-            EventBody::AgentSpawned { agent } => lead == Some(agent.id.as_str()),
-            _ => false,
-        });
+        let handed = last_handed(&events, lead);
         let mut notes = Vec::new();
         for event in &events[handed.map_or(0, |at| at + 1)..] {
-            let EventBody::MessageReceived { message } = &event.body else {
-                continue;
-            };
-            if message.kind != MessageKind::Report {
-                continue;
+            if let Some(note) = self.report_note(event).await {
+                notes.push(note);
             }
-            let Ok(child) = self.inner.store.session(&message.from_session_id).await else {
-                continue;
-            };
-            let branches = reported_branches(&child.repos).await;
-            let status = status_name(child.session.status);
-            let title = &child.session.title;
-            notes.push(briefing::report_text(
-                title,
-                &status,
-                &message.body,
-                &branches,
-            ));
         }
         Ok(notes)
+    }
+
+    /// The note for the lead of the report `event` received, when it is one
+    /// and its child can still be read.
+    async fn report_note(&self, event: &Event) -> Option<String> {
+        let EventBody::MessageReceived { message } = &event.body else {
+            return None;
+        };
+        if message.kind != MessageKind::Report {
+            return None;
+        }
+        let child = self
+            .inner
+            .store
+            .session(&message.from_session_id)
+            .await
+            .ok()?;
+        let branches = reported_branches(&child.repos).await;
+        let status = status_name(child.session.status);
+        let title = &child.session.title;
+        Some(briefing::report_text(
+            title,
+            &status,
+            &message.body,
+            &branches,
+        ))
     }
 
     /// Puts the agent's question to the user (the "Questions" semantics in
@@ -2771,6 +2778,34 @@ impl Driver {
         Ok(question_id)
     }
 
+    /// The open question `answer` answers, taken off the session. Refused,
+    /// with the question still open, when it is unknown, already answered,
+    /// or a gate that cannot take `answer`.
+    async fn take_question(&mut self, question_id: &str, answer: &str) -> Result<OpenQuestion> {
+        if self
+            .question
+            .as_ref()
+            .is_some_and(|open| open.question_id == question_id)
+        {
+            // Refused before anything is on record: the gate stays open.
+            self.check_answer(question_id, answer)?;
+        }
+        if let Some(open) = self
+            .question
+            .take_if(|open| open.question_id == question_id)
+        {
+            return Ok(open);
+        }
+        let answered = self
+            .inner
+            .store
+            .question_answered(&self.session_id, question_id);
+        Err(match answered.await? {
+            None => Error::Missing(format!("unknown question {question_id}")),
+            Some(_) => Error::Conflict("this question was already answered".to_owned()),
+        })
+    }
+
     /// Records the user's answer and hands it to the agent as its next
     /// input. The answer to a question of a workflow's own (a gate, an `ask`
     /// node) is that node's result instead; `comment` goes with a gate's.
@@ -2780,27 +2815,7 @@ impl Driver {
         answer: String,
         comment: Option<String>,
     ) -> Result<()> {
-        if self
-            .question
-            .as_ref()
-            .is_some_and(|open| open.question_id == question_id)
-        {
-            // Refused before anything is on record: the gate stays open.
-            self.check_answer(&question_id, &answer)?;
-        }
-        let Some(open) = self
-            .question
-            .take_if(|open| open.question_id == question_id)
-        else {
-            let answered = self
-                .inner
-                .store
-                .question_answered(&self.session_id, &question_id);
-            return Err(match answered.await? {
-                None => Error::Missing(format!("unknown question {question_id}")),
-                Some(_) => Error::Conflict("this question was already answered".to_owned()),
-            });
-        };
+        let open = self.take_question(&question_id, &answer).await?;
         let answered = EventBody::QuestionAnswered {
             question_id: question_id.clone(),
             answer: answer.clone(),
@@ -3254,6 +3269,19 @@ async fn reported_branches(repos: &[SessionRepo]) -> Vec<ReportedBranch> {
         });
     }
     branches
+}
+
+/// Where the lead was last handed an input in `events`: a turn begins with
+/// the lead's `running` (or its spawn), and what it was handed is on record
+/// before that.
+fn last_handed(events: &[Event], lead: Option<&str>) -> Option<usize> {
+    events.iter().rposition(|event| match &event.body {
+        EventBody::AgentStatus {
+            status: AgentStatus::Running,
+        } => lead.is_some() && event.agent_id.as_deref() == lead,
+        EventBody::AgentSpawned { agent } => lead == Some(agent.id.as_str()),
+        _ => false,
+    })
 }
 
 /// What a completed tool call of `kind` did to the files it names, when it
