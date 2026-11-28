@@ -179,6 +179,7 @@ fn spec_example_success() {
     let by_id = |id: &str| snap.nodes.iter().find(|n| n.id == id).unwrap().clone();
     assert_eq!(by_id("ok").state, NodeState::Finished { port: None });
     assert_eq!(by_id("fix").state, NodeState::Idle);
+    assert_eq!(by_id("fix").runs, 0);
     assert_eq!(by_id("retry").iteration, Some(0));
     assert_eq!(
         by_id("review").state,

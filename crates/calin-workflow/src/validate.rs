@@ -771,17 +771,13 @@ fn unbounded_adjacency(d: &Draft, edges: &[Resolved]) -> Vec<Vec<usize>> {
 
 fn report_cycle(d: &Draft, mut scc: Vec<usize>, c: &mut Collector) {
     scc.sort_unstable();
-    let names: Vec<String> = scc
-        .iter()
-        .map(|&i| match &d.nodes[i].id {
-            Some(id) => format!("`{id}`"),
-            None => format!("#{}", i + 1),
-        })
-        .collect();
+    // Edges resolve through ids, so every node of a cycle has one.
+    let quoted = |&i: &usize| d.nodes[i].id.as_ref().map(|id| format!("`{id}`"));
+    let names: Vec<String> = scc.iter().filter_map(quoted).collect();
     let loops: Vec<String> = scc
         .iter()
         .filter(|&&i| matches!(d.nodes[i].kind, Some(NodeKind::Loop { .. })))
-        .filter_map(|&i| d.nodes[i].id.as_ref().map(|id| format!("`{id}`")))
+        .filter_map(quoted)
         .collect();
     let detail = if loops.is_empty() {
         "it passes through no `loop` node".to_owned()
