@@ -139,8 +139,9 @@ fn validate(wanted: Settings) -> Result<Settings> {
     })
 }
 
-/// The trimmed value, or `None` when there is nothing in it.
-fn filled(value: Option<String>) -> Option<String> {
+/// The trimmed value, or `None` when there is nothing in it: how every
+/// optional text of a request or a file is read.
+pub(crate) fn filled(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())

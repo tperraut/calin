@@ -7,15 +7,15 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
 use calin_proto::{
-    AttachRepoRequest, Automation, AutomationOutcome, AutomationRequest, AutomationRun,
-    AutomationTrigger, CreateSessionRequest, CronPreview, FromIssue, IssueDetail, PermissionMode,
+    Automation, AutomationOutcome, AutomationRequest, AutomationRun, AutomationTrigger,
+    CreateSessionRequest, CronPreview, FromIssue, IssueDetail, PermissionMode,
     RunAutomationRequest, SessionStatus,
 };
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use ulid::Ulid;
 
-use super::{Inner, SessionManager, status_name};
+use super::{Inner, SessionManager, at_work, put_first, status_name};
 use crate::automations::cron::Cron;
 use crate::automations::template::{ITEM_VARS, SCHEDULE_VARS, Template, Values};
 use crate::automations::{MAX_FAILURES, MAX_NAME_CHARS, Stored, StoredRun, failures_in_a_row};
@@ -175,18 +175,6 @@ struct Firing {
     /// Asked for through the API: a session still active is a conflict,
     /// not a skip.
     manual: bool,
-}
-
-/// Queued, preparing, running or waiting: an automation's session that is
-/// still at work (integrations spec, section 3).
-fn at_work(status: SessionStatus) -> bool {
-    matches!(
-        status,
-        SessionStatus::Queued
-            | SessionStatus::Preparing
-            | SessionStatus::Running
-            | SessionStatus::Waiting
-    )
 }
 
 fn is_schedule(trigger: &AutomationTrigger) -> bool {
@@ -646,13 +634,7 @@ impl SessionManager {
                 number: item.number,
             }),
             (AutomationTrigger::PullRequest { repo_id }, Some(_)) => {
-                if !repos.iter().any(|repo| repo.repo_id == *repo_id) {
-                    let primary = AttachRepoRequest {
-                        repo_id: repo_id.clone(),
-                        mode: None,
-                    };
-                    repos.insert(0, primary);
-                }
+                put_first(&mut repos, repo_id);
                 None
             }
             _ => None,
