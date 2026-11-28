@@ -683,6 +683,28 @@ mod tests {
     }
 
     #[test]
+    fn a_token_of_exactly_the_size_limit_is_read_and_one_byte_more_is_not() {
+        // Header and a 63-byte signature, then a payload of "A"s filling the
+        // rest; "A"s decode to zero bytes at both lengths used here.
+        let header = base64url(br#"{"alg":"ES256","kid":"k1"}"#);
+        let signature = base64url(&[1; 63]);
+        let sized = |total: usize| {
+            let payload = "A".repeat(total - header.len() - signature.len() - 2);
+            let token = format!("{header}.{payload}.{signature}");
+            assert_eq!(token.len(), total);
+            token
+        };
+        let at_limit = sized(MAX_TOKEN_BYTES);
+        let token = UnverifiedToken::parse(&at_limit).unwrap();
+        assert_eq!(token.key_id, "k1");
+        assert_eq!(token.signature, vec![1; 63]);
+        assert!(matches!(
+            UnverifiedToken::parse(&sized(MAX_TOKEN_BYTES + 1)),
+            Err(IdTokenError::Malformed)
+        ));
+    }
+
+    #[test]
     fn unsupported_algorithms_and_missing_key_ids() {
         for alg in ["none", "None", "HS256", "HS512", "RS512", "PS256", ""] {
             let token = compact(&json!({"alg": alg, "kid": "k1"}), &claims(), &[]);
@@ -691,9 +713,18 @@ mod tests {
                 "{alg:?}"
             );
         }
+        // The longest key id looked up is 256 bytes.
+        let longest = "k".repeat(256);
+        let token = compact(
+            &json!({"alg": "RS256", "kid": longest}),
+            &claims(),
+            &[1; 256],
+        );
+        assert_eq!(UnverifiedToken::parse(&token).unwrap().key_id, longest);
         for header in [
             json!({"alg": "RS256"}),
             json!({"alg": "RS256", "kid": ""}),
+            json!({"alg": "RS256", "kid": "k".repeat(257)}),
             json!({"alg": "RS256", "kid": "k".repeat(300)}),
         ] {
             let token = compact(&header, &claims(), &[1; 256]);

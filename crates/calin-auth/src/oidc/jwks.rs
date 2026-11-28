@@ -251,6 +251,7 @@ mod tests {
             with(ec(), "alg", json!("ES256")),
             with(ec(), "use", json!("sig")),
             with(ec(), "x5c", json!(["ignored"])),
+            with(ec(), "kid", json!("k".repeat(MAX_KEY_ID_BYTES))),
         ] {
             assert_eq!(usable(key.clone()).len(), 1, "{key}");
         }
@@ -261,6 +262,10 @@ mod tests {
         let cases = vec![
             ("no kid", without(rsa(2048), "kid")),
             ("empty kid", with(rsa(2048), "kid", json!(""))),
+            (
+                "kid one byte too long",
+                with(rsa(2048), "kid", json!("k".repeat(MAX_KEY_ID_BYTES + 1))),
+            ),
             ("huge kid", with(rsa(2048), "kid", json!("k".repeat(300)))),
             ("kid not a string", with(rsa(2048), "kid", json!(7))),
             ("encryption use", with(rsa(2048), "use", json!("enc"))),
