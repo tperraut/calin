@@ -133,6 +133,8 @@ struct Scene {
     /// The user's prompt and the brief as the child received it.
     prompt: Arc<Event>,
     brief: Arc<Event>,
+    /// The root lead going idle: the end of its turn.
+    lead_idle: Arc<Event>,
 }
 
 const LONG_NOTE: &str = "This second note is deliberately much longer than eighty characters so that its excerpt has to be cut";
@@ -308,7 +310,7 @@ async fn scene(store: &Store) -> Scene {
     add(store, r, asked).await;
     tick().await;
     add(store, r, status(SessionStatus::Running)).await;
-    add(store, r, by_lead(agent_status(AgentStatus::Idle))).await;
+    let lead_idle = add(store, r, by_lead(agent_status(AgentStatus::Idle))).await;
     let last = add(store, r, status(SessionStatus::Review)).await;
     Scene {
         root,
@@ -316,6 +318,7 @@ async fn scene(store: &Store) -> Scene {
         moments: [first.ts, second.ts, third, fourth.ts, last.ts],
         prompt,
         brief,
+        lead_idle,
     }
 }
 
@@ -639,7 +642,7 @@ async fn the_timeline_has_a_lane_per_agent_spans_that_nest_and_arrows_between_la
     // A turn runs from the input that started it to the end of the turn.
     let turn = &lead[0];
     assert_eq!(turn.start, scene.prompt.ts);
-    assert!(turn.end.unwrap() >= scene.moments[4] - 1);
+    assert_eq!(turn.end, Some(scene.lead_idle.ts));
     assert_eq!(lead[1].tool_kind, Some(ToolKind::Edit));
     assert_eq!((turn.tool_kind, turn.status), (None, None));
     for lane in &timeline.lanes {
