@@ -6,7 +6,7 @@
 use calin_agents::RunnerInput;
 use calin_proto::{PermissionDecision, Settings};
 
-use super::orchestration::{Played, exit_on_stop, input, nothing_for, play, status};
+use super::orchestration::{Played, exit_on_stop, input, nothing_for, play, status, until_label};
 use super::*;
 use crate::manager::driver::WAITING_FOR_SLOT;
 
@@ -341,6 +341,53 @@ async fn a_session_that_runs_again_takes_a_slot_or_waits_for_one() {
     );
     emit(&played_b.io, RunnerOutput::TurnEnded).await;
     events_until(&manager, &b, head, is_status(Review)).await;
+    assert_eq!(statuses(&manager, &[&a, &b]).await, [Running, Review]);
+}
+
+#[tokio::test]
+async fn a_turn_that_ends_while_its_session_waits_for_a_slot_hands_on_the_message_with_one() {
+    let Fixture {
+        manager,
+        mut starts,
+        dir: _dir,
+    } = limited(1).await;
+    let a = create(&manager, "a").await;
+    let mut played_a = play(&mut starts).await;
+    // `a` waits on the user: its slot is free for `b`.
+    emit(&played_a.io, ask("p1", None)).await;
+    let b = create(&manager, "b").await;
+    let played_b = play(&mut starts).await;
+    assert_eq!(statuses(&manager, &[&a, &b]).await, [Waiting, Running]);
+
+    // A message for the turn in progress, then the answer it waited on:
+    // without a slot the session is queued.
+    manager.send_message(&a, "more").await.unwrap();
+    let head = manager.get(&a).await.unwrap().session.head_seq;
+    manager
+        .resolve_permission(&a, "p1", PermissionDecision::Allow, None)
+        .await
+        .unwrap();
+    assert_eq!(status(&manager, &a).await, Queued);
+    // The turn ends meanwhile: the message waits with the session.
+    emit(&played_a.io, RunnerOutput::TurnEnded).await;
+    until_label(&manager, &a, head, "agent_status:idle").await;
+    nothing_for(&mut played_a);
+    assert_eq!(status(&manager, &a).await, Queued);
+
+    // A free slot starts the next turn on it.
+    end_turn(&manager, &played_b).await;
+    assert_eq!(input(&mut played_a).await, "more");
+    let events = until_label(&manager, &a, head, "agent_status:running").await;
+    assert_eq!(
+        labels(&events),
+        [
+            "permission_resolved:allow:user",
+            "session_status:queued",
+            "agent_status:idle",
+            "session_status:running",
+            "agent_status:running",
+        ]
+    );
     assert_eq!(statuses(&manager, &[&a, &b]).await, [Running, Review]);
 }
 

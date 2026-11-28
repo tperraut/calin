@@ -833,6 +833,86 @@ async fn a_runner_that_cannot_start_fails_the_session() {
 }
 
 #[tokio::test]
+async fn a_runner_gone_after_a_restart_fails_the_next_turn() {
+    let dir = TempDir::new().unwrap();
+    let (manager, mut starts) = manager_in(&dir, false).await;
+    let id = manager
+        .create_session(request("work", Some("puppet")))
+        .await
+        .unwrap()
+        .session
+        .id;
+    let (_, io) = within(starts.recv()).await.unwrap();
+    emit(&io, RunnerOutput::TurnEnded).await;
+    let before = events_until(&manager, &id, 0, is_status(SessionStatus::Review)).await;
+    manager.store().close().await;
+    drop((manager, io, starts));
+
+    // This server has no puppet runner.
+    let store = Store::open(Home::new(dir.path())).await.unwrap();
+    let registry = RunnerRegistry::new(RegistryConfig {
+        dry_run: false,
+        mock: MockConfig {
+            delay: Duration::ZERO,
+        },
+        claude: None,
+    });
+    let manager = SessionManager::start_with(store, registry, config())
+        .await
+        .unwrap();
+    manager.send_message(&id, "again").await.unwrap();
+    let after = before.len() as u64;
+    let events = events_until(&manager, &id, after, is_status(SessionStatus::Failed)).await;
+    assert_eq!(
+        labels(&events),
+        [
+            "user_message:again",
+            "session_status:running",
+            "error:runner puppet is not available",
+            "agent_status:failed",
+            "session_status:failed",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_working_directory_that_cannot_be_made_fails_the_turn() {
+    let Fixture {
+        manager,
+        mut starts,
+        dir,
+    } = fixture().await;
+    let id = manager
+        .create_session(request("work", Some("puppet")))
+        .await
+        .unwrap()
+        .session
+        .id;
+    let (_, io) = within(starts.recv()).await.unwrap();
+    emit(&io, RunnerOutput::Exited(Exit::Ok)).await;
+    let before = events_until(&manager, &id, 0, is_status(SessionStatus::Review)).await;
+    // Something that is not a folder took the place of the session's own.
+    let work_dir = Home::new(dir.path()).work_dir(&id);
+    std::fs::remove_dir_all(&work_dir).unwrap();
+    std::fs::write(&work_dir, "not a folder").unwrap();
+
+    manager.send_message(&id, "again").await.unwrap();
+    let after = before.len() as u64;
+    let events = events_until(&manager, &id, after, is_status(SessionStatus::Failed)).await;
+    let labels = labels(&events);
+    assert_eq!(
+        labels[..2],
+        ["user_message:again", "session_status:running"]
+    );
+    assert!(
+        labels[2].starts_with("error:the working directory cannot be used: "),
+        "{labels:?}"
+    );
+    assert_eq!(labels[3..], ["session_status:failed"]);
+    assert!(starts.try_recv().is_err());
+}
+
+#[tokio::test]
 async fn an_agent_that_exits_cleanly_leaves_the_session_in_review_and_can_be_resumed() {
     let Fixture {
         manager,

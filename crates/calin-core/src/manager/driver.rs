@@ -1262,128 +1262,165 @@ impl Driver {
         let mut tracker = unreported::fresh(&self.inner.trackers, &self.session_id).await;
         unreported::baseline(&mut tracker, &self.session_id, &self.repos).await;
         drop(tracker);
-        if let Some(handle) = &self.handle {
-            let sent = handle.send_message(text);
-            if sent.is_err() {
-                return self.fail("the agent is no longer running".to_owned()).await;
-            }
-            self.set_agent_status(AgentStatus::Running).await?;
-        } else {
-            let runner = self
-                .runner
-                .clone()
-                .or_else(|| self.inner.registry.resolve(Some(&self.runner_id)));
-            let Some(runner) = runner else {
-                let message = format!("runner {} is not available", self.runner_id);
-                return self.fail(message).await;
-            };
-            let work_dir = self.inner.store.home().work_dir(&self.session_id);
-            let cwd = match working_directory(&work_dir, &self.repos).await {
-                Ok(cwd) => cwd,
-                Err(err) => {
-                    let message = format!("the working directory cannot be used: {err}");
-                    return self.fail(message).await;
-                }
-            };
-            let main = primary(&self.repos).map(|repo| repo.id.clone());
-            // A repo attached `read` is not a directory to work in: the
-            // agent asks before it touches one, and the policy answers.
-            let open: Vec<&SessionRepo> = self
-                .repos
-                .iter()
-                .filter(|repo| Some(&repo.id) == main.as_ref() || repo.mode != RepoMode::Read)
-                .collect();
-            let add_dirs = open
-                .iter()
-                .filter(|repo| Some(&repo.id) != main.as_ref())
-                .map(|repo| PathBuf::from(&repo.path))
-                .collect();
-            let granted = open.iter().map(|repo| repo.id.clone()).collect();
-            // An agent that accepts edits does not ask about the directory
-            // it works in. When that is a repo attached `read`, it has to ask
-            // about every edit, so that the policy can refuse those.
-            let read_only_home = primary(&self.repos).is_some_and(|r| r.mode == RepoMode::Read);
-            let asks = match self.permission_mode {
-                PermissionMode::AcceptEdits if read_only_home => PermissionMode::Ask,
-                mode => mode,
-            };
-            let agent_id = match (&self.lead, &self.setup.dispatch) {
-                (Some(lead), _) => Some(lead.id.clone()),
-                // The id its dispatch message was addressed to.
-                (None, Some(dispatch)) => Some(dispatch.lead_agent_id.clone()),
-                (None, None) => None,
-            };
-            let agent_id = agent_id.unwrap_or_else(|| self.lead_agent_id());
-            // A token of its own for every start; the previous one is revoked here.
-            self.token = self.inner.tool_endpoint().and_then(|_| {
-                self.inner.tokens.issue(AgentRef {
-                    session_id: self.session_id.clone(),
-                    agent_id: agent_id.clone(),
-                })
-            });
-            let tool_endpoint = match (self.inner.tool_endpoint(), &self.token) {
-                (Some(base), Some(token)) => Some(format!("{base}/{}", token.value())),
-                _ => None,
-            };
-            let parent_title = self.parent_title().await;
-            let child = self.setup.dispatch.as_ref().map(|_| ChildOf {
-                parent_title: parent_title.as_deref().unwrap_or_default(),
-            });
-            let system_prompt =
-                briefing::system_prompt(&self.repos, &cwd, tool_endpoint.is_some(), child);
-            let started = runner.start(StartParams {
-                session_id: self.session_id.clone(),
-                agent_id: agent_id.clone(),
-                prompt: text,
-                cwd,
-                add_dirs,
-                permission_mode: asks,
-                model: self.setup.model.clone(),
-                resume: self
-                    .lead
-                    .as_ref()
-                    .and_then(|lead| lead.native_session_id.clone()),
-                start_seq: self.head_seq,
-                tool_endpoint,
-                system_prompt: Some(system_prompt),
-            });
-            match started {
-                Ok(handle) => {
-                    self.handle = Some(handle);
-                    self.granted = granted;
-                }
-                Err(err) => return self.fail(err.to_string()).await,
-            }
-            if self.lead.is_some() {
-                self.set_agent_status(AgentStatus::Running).await?;
-            } else {
-                let model = self.setup.model.clone().or_else(|| runner.model());
-                let agent = Agent {
-                    id: agent_id.clone(),
-                    session_id: self.session_id.clone(),
-                    parent_agent_id: None,
-                    kind: AgentKind::Process,
-                    role: LEAD_ROLE.to_owned(),
-                    runner: runner.id().to_owned(),
-                    model: model.clone(),
-                    native_session_id: None,
-                    status: AgentStatus::Running,
-                    cost_usd: 0.0,
-                    tokens_in: 0,
-                    tokens_out: 0,
-                };
-                let spawned = EventBody::AgentSpawned { agent };
-                self.append(EventDraft::new(spawned).parent(self.cause.clone()))
-                    .await?;
-                self.lead = Some(Lead {
-                    id: agent_id,
-                    status: AgentStatus::Running,
-                    native_session_id: None,
-                    model,
-                });
-            }
+        let Some(handle) = &self.handle else {
+            return self.start_agent(text).await;
+        };
+        if handle.send_message(text).is_err() {
+            return self.fail("the agent is no longer running".to_owned()).await;
         }
+        self.set_agent_status(AgentStatus::Running).await?;
         self.in_turn = true;
+        Ok(())
+    }
+
+    /// Starts the lead agent on `text` in the session's working directory,
+    /// with what it may reach; its first start puts it on record.
+    async fn start_agent(&mut self, text: String) -> Result<()> {
+        let runner = self
+            .runner
+            .clone()
+            .or_else(|| self.inner.registry.resolve(Some(&self.runner_id)));
+        let Some(runner) = runner else {
+            let message = format!("runner {} is not available", self.runner_id);
+            return self.fail(message).await;
+        };
+        let work_dir = self.inner.store.home().work_dir(&self.session_id);
+        let cwd = match working_directory(&work_dir, &self.repos).await {
+            Ok(cwd) => cwd,
+            Err(err) => {
+                let message = format!("the working directory cannot be used: {err}");
+                return self.fail(message).await;
+            }
+        };
+        let (add_dirs, granted) = self.start_dirs();
+        let permission_mode = self.start_mode();
+        let agent_id = self.start_agent_id();
+        let tool_endpoint = self.issue_token(&agent_id);
+        let system_prompt = self.start_prompt(&cwd, tool_endpoint.is_some()).await;
+        let started = runner.start(StartParams {
+            session_id: self.session_id.clone(),
+            agent_id: agent_id.clone(),
+            prompt: text,
+            cwd,
+            add_dirs,
+            permission_mode,
+            model: self.setup.model.clone(),
+            resume: self
+                .lead
+                .as_ref()
+                .and_then(|lead| lead.native_session_id.clone()),
+            start_seq: self.head_seq,
+            tool_endpoint,
+            system_prompt: Some(system_prompt),
+        });
+        match started {
+            Ok(handle) => {
+                self.handle = Some(handle);
+                self.granted = granted;
+            }
+            Err(err) => return self.fail(err.to_string()).await,
+        }
+        self.record_lead(&runner, agent_id).await?;
+        self.in_turn = true;
+        Ok(())
+    }
+
+    /// The directories the agent gets besides its working directory, and
+    /// the ids of the repos it works in without asking. A repo attached
+    /// `read` is not a directory to work in: the agent asks before it
+    /// touches one, and the policy answers.
+    fn start_dirs(&self) -> (Vec<PathBuf>, HashSet<String>) {
+        let main = primary(&self.repos).map(|repo| repo.id.clone());
+        let open: Vec<&SessionRepo> = self
+            .repos
+            .iter()
+            .filter(|repo| Some(&repo.id) == main.as_ref() || repo.mode != RepoMode::Read)
+            .collect();
+        let add_dirs = open
+            .iter()
+            .filter(|repo| Some(&repo.id) != main.as_ref())
+            .map(|repo| PathBuf::from(&repo.path))
+            .collect();
+        let granted = open.iter().map(|repo| repo.id.clone()).collect();
+        (add_dirs, granted)
+    }
+
+    /// An agent that accepts edits does not ask about the directory it
+    /// works in. When that is a repo attached `read`, it has to ask about
+    /// every edit, so that the policy can refuse those.
+    fn start_mode(&self) -> PermissionMode {
+        let read_only_home = primary(&self.repos).is_some_and(|r| r.mode == RepoMode::Read);
+        match self.permission_mode {
+            PermissionMode::AcceptEdits if read_only_home => PermissionMode::Ask,
+            mode => mode,
+        }
+    }
+
+    /// The id the lead starts as: its own, the one its dispatch message was
+    /// addressed to, or the one kept for it.
+    fn start_agent_id(&mut self) -> String {
+        match (&self.lead, &self.setup.dispatch) {
+            (Some(lead), _) => lead.id.clone(),
+            (None, Some(dispatch)) => dispatch.lead_agent_id.clone(),
+            (None, None) => self.lead_agent_id(),
+        }
+    }
+
+    /// A token of its own for every start; the previous one is revoked
+    /// here. Returns the address of Calin's tools for it, when there is one.
+    fn issue_token(&mut self, agent_id: &str) -> Option<String> {
+        self.token = self.inner.tool_endpoint().and_then(|_| {
+            self.inner.tokens.issue(AgentRef {
+                session_id: self.session_id.clone(),
+                agent_id: agent_id.to_owned(),
+            })
+        });
+        match (self.inner.tool_endpoint(), &self.token) {
+            (Some(base), Some(token)) => Some(format!("{base}/{}", token.value())),
+            _ => None,
+        }
+    }
+
+    /// The system prompt of an agent that starts in `cwd`.
+    async fn start_prompt(&self, cwd: &Path, tools: bool) -> String {
+        let parent_title = self.parent_title().await;
+        let child = self.setup.dispatch.as_ref().map(|_| ChildOf {
+            parent_title: parent_title.as_deref().unwrap_or_default(),
+        });
+        briefing::system_prompt(&self.repos, cwd, tools, child)
+    }
+
+    /// The lead that just started runs again, or, at its first start, is
+    /// put on record.
+    async fn record_lead(&mut self, runner: &Arc<dyn Runner>, agent_id: String) -> Result<()> {
+        if self.lead.is_some() {
+            self.set_agent_status(AgentStatus::Running).await?;
+            return Ok(());
+        }
+        let model = self.setup.model.clone().or_else(|| runner.model());
+        let agent = Agent {
+            id: agent_id.clone(),
+            session_id: self.session_id.clone(),
+            parent_agent_id: None,
+            kind: AgentKind::Process,
+            role: LEAD_ROLE.to_owned(),
+            runner: runner.id().to_owned(),
+            model: model.clone(),
+            native_session_id: None,
+            status: AgentStatus::Running,
+            cost_usd: 0.0,
+            tokens_in: 0,
+            tokens_out: 0,
+        };
+        let spawned = EventBody::AgentSpawned { agent };
+        self.append(EventDraft::new(spawned).parent(self.cause.clone()))
+            .await?;
+        self.lead = Some(Lead {
+            id: agent_id,
+            status: AgentStatus::Running,
+            native_session_id: None,
+            model,
+        });
         Ok(())
     }
 
@@ -1397,43 +1434,67 @@ impl Driver {
         self.turn_items.clear();
         let interrupted = std::mem::take(&mut self.interrupted);
         self.capture_lead(interrupted);
+        // An interrupted turn holds what waits until the next message.
+        if interrupted || self.pending.is_empty() {
+            return self.rest_after_turn().await;
+        }
         // The next turn follows at once when the session may run. One that
         // may not waits for a slot, with what it was handed.
-        let follows = !interrupted && !self.pending.is_empty();
-        let runs = self.waits_on_user()
+        if !self.next_turn_runs() {
+            return self.hold_next_turn().await;
+        }
+        let Some(next) = self.pending.pop_front() else {
+            return self.rest_after_turn().await;
+        };
+        self.next_turn(next).await
+    }
+
+    /// True when a turn on what waits may begin now: the session waits on
+    /// the user (and stays `waiting`), runs already, or takes a free slot.
+    fn next_turn_runs(&self) -> bool {
+        self.waits_on_user()
             || (self.parked.is_none()
-                && (self.status == SessionStatus::Running || (follows && self.take_slot())));
-        if follows && !runs {
-            self.in_turn = false;
-            let ended = self.set_agent_status(AgentStatus::Idle).await?;
-            self.report_unreported(ended).await?;
-            if self.parked.is_none() {
-                self.park(Resume::Turn).await?;
-            }
-            return Ok(());
-        }
-        if !interrupted && let Some(next) = self.pending.pop_front() {
-            // The log has no event for the end of a turn but the agent's
-            // status: one turn ends and the next begins, each with its cause.
-            let ended = self.set_agent_status(AgentStatus::Idle).await?;
-            self.report_unreported(ended).await?;
-            self.cause = Some(next.event_id);
-            self.set_agent_status(AgentStatus::Running).await?;
-            self.resume_status().await?;
-            let text = briefing::with_notes(std::mem::take(&mut self.notes), next.text);
-            let sent = self
-                .handle
-                .as_ref()
-                .is_some_and(|handle| handle.send_message(text).is_ok());
-            if !sent {
-                return self.fail("the agent is no longer running".to_owned()).await;
-            }
-            return Ok(());
-        }
-        self.in_turn = false;
+                && (self.status == SessionStatus::Running || self.take_slot()))
+    }
+
+    /// The lead is idle, and the changes of the turn it ended are on record.
+    async fn end_lead_turn(&mut self) -> Result<()> {
         let ended = self.set_agent_status(AgentStatus::Idle).await?;
-        self.report_unreported(ended).await?;
+        self.report_unreported(ended).await
+    }
+
+    async fn rest_after_turn(&mut self) -> Result<()> {
+        self.in_turn = false;
+        self.end_lead_turn().await?;
         self.rest().await
+    }
+
+    /// Ends the turn and waits for a slot with what is to follow it.
+    async fn hold_next_turn(&mut self) -> Result<()> {
+        self.in_turn = false;
+        self.end_lead_turn().await?;
+        if self.parked.is_none() {
+            self.park(Resume::Turn).await?;
+        }
+        Ok(())
+    }
+
+    /// The log has no event for the end of a turn but the agent's status:
+    /// one turn ends and the next begins, each with its cause.
+    async fn next_turn(&mut self, next: Queued) -> Result<()> {
+        self.end_lead_turn().await?;
+        self.cause = Some(next.event_id);
+        self.set_agent_status(AgentStatus::Running).await?;
+        self.resume_status().await?;
+        let text = briefing::with_notes(std::mem::take(&mut self.notes), next.text);
+        let sent = self
+            .handle
+            .as_ref()
+            .is_some_and(|handle| handle.send_message(text).is_ok());
+        if !sent {
+            return self.fail("the agent is no longer running".to_owned()).await;
+        }
+        Ok(())
     }
 
     /// Appends a `file_changed` for each change the turn made that no tool
