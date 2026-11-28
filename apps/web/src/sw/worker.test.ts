@@ -171,6 +171,20 @@ describe("answering requests", () => {
     });
     await proxy.worker.install();
     expect(await (await proxy.worker.respond("navigate", page("/"))).text()).toBe("file");
+
+    const broken = setup({
+      fetch: () => Promise.resolve(new Response("server error", { status: 500 })),
+    });
+    await broken.worker.install();
+    expect(await (await broken.worker.respond("navigate", page("/"))).text()).toBe("file");
+  });
+
+  it("hands back any answer below 500 as it came, a 404 included", async () => {
+    const { worker } = setup({
+      fetch: () => Promise.resolve(new Response("not here", { status: 404 })),
+    });
+    await worker.install();
+    expect(await (await worker.respond("navigate", page("/nope"))).text()).toBe("not here");
   });
 
   it("hands back the proxy's answer, or the network's failure, when no shell is cached", async () => {
@@ -365,6 +379,9 @@ describe("a push", () => {
       JSON.stringify({ ...base, path: undefined }),
       JSON.stringify({ ...base, session_id: 5 }),
       JSON.stringify({ ...base, session_id: {} }),
+      // Falsy is not absent: only a missing or null session means none.
+      JSON.stringify({ ...base, session_id: false }),
+      JSON.stringify({ ...base, session_id: 0 }),
     ];
     for (const text of refused) expect(parsePushPayload(text), String(text)).toBeUndefined();
   });
