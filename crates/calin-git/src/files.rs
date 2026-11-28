@@ -26,11 +26,7 @@ use crate::path::{Resolved, is_dot_git, metadata_no_follow, resolve, resolve_no_
 /// [`Error::InvalidPath`] when `path` is not a directory.
 pub fn list_dir(dir: &Path, path: &str) -> Result<Vec<TreeEntry>> {
     let at = resolve(dir, path)?;
-    let not_a_dir = || Error::invalid_path(path, "is not a directory");
-    let read = fs::read_dir(&at.abs).map_err(|e| match e.kind() {
-        ErrorKind::NotADirectory => not_a_dir(),
-        _ => Error::io(&at.abs, e),
-    })?;
+    let read = open_dir(&at, path)?;
 
     // Git refuses to look beyond a symlink, so it is asked about the real
     // location, which differs from `at.rel` when that goes through a link.
@@ -45,35 +41,13 @@ pub fn list_dir(dir: &Path, path: &str) -> Result<Vec<TreeEntry>> {
         if is_dot_git(&name) {
             continue;
         }
-        // Neither call follows a symlink.
-        let file_type = entry.file_type().map_err(|e| Error::io(&entry.path(), e))?;
-        let (kind, size) = if file_type.is_symlink() {
-            (EntryKind::Symlink, None)
-        } else if file_type.is_dir() {
-            (EntryKind::Dir, None)
-        } else {
-            // Gone already when an agent deletes it under us; then there is no size.
-            (EntryKind::File, entry.metadata().ok().map(|m| m.len()))
-        };
         // The `./` keeps a name that starts with `:` from being read as pathspec magic.
-        queries.push(format!("./{}", real_rel.join(&name).to_string_lossy()));
-        entries.push(TreeEntry {
-            path: if at.rel.is_empty() {
-                name.clone()
-            } else {
-                format!("{}/{name}", at.rel)
-            },
-            name,
-            kind,
-            size,
-            ignored: false,
-        });
+        let query = format!("./{}", real_rel.join(&name).to_string_lossy());
+        entries.push(tree_entry(&entry, &at.rel, name)?);
+        queries.push(query);
     }
 
-    let ignored = ignored_paths(&at.root, &queries)?;
-    for (entry, query) in entries.iter_mut().zip(&queries) {
-        entry.ignored = ignored.contains(query);
-    }
+    mark_ignored(&at.root, &mut entries, &queries)?;
     entries.sort_by_cached_key(|e| {
         (
             e.kind != EntryKind::Dir,
@@ -82,6 +56,49 @@ pub fn list_dir(dir: &Path, path: &str) -> Result<Vec<TreeEntry>> {
         )
     });
     Ok(entries)
+}
+
+/// The entries of the directory `at`; `path` is how the caller named it.
+fn open_dir(at: &Resolved, path: &str) -> Result<fs::ReadDir> {
+    fs::read_dir(&at.abs).map_err(|e| match e.kind() {
+        ErrorKind::NotADirectory => Error::invalid_path(path, "is not a directory"),
+        _ => Error::io(&at.abs, e),
+    })
+}
+
+/// Sets `ignored` on each entry, from what git says of its query.
+fn mark_ignored(root: &Path, entries: &mut [TreeEntry], queries: &[String]) -> Result<()> {
+    let ignored = ignored_paths(root, queries)?;
+    for (entry, query) in entries.iter_mut().zip(queries) {
+        entry.ignored = ignored.contains(query);
+    }
+    Ok(())
+}
+
+/// The listing entry for `entry`, called `name`, in the directory `rel`.
+/// Not yet checked against the ignore rules.
+fn tree_entry(entry: &fs::DirEntry, rel: &str, name: String) -> Result<TreeEntry> {
+    // Neither call follows a symlink.
+    let file_type = entry.file_type().map_err(|e| Error::io(&entry.path(), e))?;
+    let (kind, size) = if file_type.is_symlink() {
+        (EntryKind::Symlink, None)
+    } else if file_type.is_dir() {
+        (EntryKind::Dir, None)
+    } else {
+        // Gone already when an agent deletes it under us; then there is no size.
+        (EntryKind::File, entry.metadata().ok().map(|m| m.len()))
+    };
+    Ok(TreeEntry {
+        path: if rel.is_empty() {
+            name.clone()
+        } else {
+            format!("{rel}/{name}")
+        },
+        name,
+        kind,
+        size,
+        ignored: false,
+    })
 }
 
 /// Which of `paths` (relative to `root`) git ignores, in one process. The
