@@ -240,8 +240,8 @@ export const seriesLegend: readonly { series: Series; label: string }[] = [
 export function spanLabel(title: string, width: number): string | undefined {
   if (width < LABEL_MIN_WIDTH) return undefined;
   const room = Math.floor((width - 6) / LABEL_CHAR_WIDTH);
-  if (title.length <= room) return title;
-  return room < 4 ? undefined : `${title.slice(0, room - 1).trimEnd()}…`;
+  // LABEL_MIN_WIDTH leaves room for six letters, so a cut title always keeps some.
+  return title.length <= room ? title : `${title.slice(0, room - 1).trimEnd()}…`;
 }
 
 const arrowWords: Partial<Record<EdgeKind, string>> = {
