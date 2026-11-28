@@ -698,6 +698,289 @@ describe("FilesPanel", () => {
     });
   });
 
+  describe("what the tree leaves alone or shows on the side", () => {
+    /** Presses `key` on the focused element; true when the tree took it. */
+    function taken(key: string, init: KeyboardEventInit = {}): boolean {
+      const event = new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true, ...init });
+      document.activeElement?.dispatchEvent(event);
+      return event.defaultPrevented;
+    }
+
+    it("leaves keys with a modifier, keys on a row's buttons, and keys it has no use for", async () => {
+      const { host } = await open();
+      item(host, "README.md").focus();
+      flush();
+      expect(taken("ArrowUp", { ctrlKey: true })).toBe(false);
+      expect(taken("ArrowUp", { altKey: true })).toBe(false);
+      expect(taken("ArrowUp", { metaKey: true })).toBe(false);
+      expect(document.activeElement).toBe(item(host, "README.md"));
+      // Right on a file, a letter no item starts with, a key the tree has no use for.
+      expect(taken("ArrowRight")).toBe(false);
+      expect(taken("z")).toBe(false);
+      expect(taken("F2")).toBe(false);
+      expect(document.activeElement).toBe(item(host, "README.md"));
+
+      expect(taken("ArrowUp")).toBe(true);
+      expect(document.activeElement).toBe(item(host, "target/"));
+      // At the top, Up is still the tree's, with nowhere to go.
+      item(host, "api").focus();
+      flush();
+      expect(taken("ArrowUp")).toBe(true);
+      expect(document.activeElement).toBe(item(host, "api"));
+
+      const refresh = find(host, 'button[aria-label="Refresh api"]');
+      refresh.focus();
+      flush();
+      expect(taken("ArrowDown")).toBe(false);
+      expect(document.activeElement).toBe(refresh);
+    });
+
+    it("opens a folder with Space, and opens a file with Space", async () => {
+      const { host } = await open();
+      item(host, "src/").focus();
+      flush();
+      expect(taken(" ")).toBe(true);
+      await act();
+      expect(item(host, "src/").getAttribute("aria-expanded")).toBe("true");
+      item(host, "lib.rs").focus();
+      flush();
+      expect(taken(" ")).toBe(true);
+      await act();
+      expect(tabs(host)).toEqual(["lib.rs"]);
+    });
+
+    it("marks a symbolic link", async () => {
+      const { host } = await open({
+        listTree: () => Promise.resolve([entry("current", "symlink"), entry("README.md")]),
+      });
+      expect(labels(host)).toEqual([
+        "▾apiWorktree",
+        "  README.md",
+        "  currentlink",
+        "▸docsRead only",
+      ]);
+    });
+
+    it("says why a folder could not be listed, and lists it again on Retry", async () => {
+      const server = fakeDisk();
+      let refuse = true;
+      const app = await open({
+        listTree: (id, repo, path) =>
+          refuse && path === "src"
+            ? Promise.reject(new HttpError(500, "src cannot be read", true))
+            : server.listTree(id, repo, path),
+      });
+      await click(item(app.host, "src/"));
+      await act();
+      const alert = find(find(app.host, '[role="tree"]'), '[role="alert"]');
+      expect(alert.textContent).toBe("src cannot be read");
+      refuse = false;
+      await click(findByText(app.host, "button", "Retry"));
+      await act();
+      expect(app.host.querySelector('[role="tree"] [role="alert"]')).toBeNull();
+      expect(labels(app.host)).toContain("    main.rs");
+    });
+
+    it("says a folder is loading, then that it is empty", async () => {
+      let answer: (entries: TreeEntry[]) => void = () => {};
+      const server = fakeDisk();
+      const app = await open({
+        listTree: (id, repo, path) =>
+          path === "src"
+            ? new Promise((resolve) => (answer = resolve))
+            : server.listTree(id, repo, path),
+      });
+      await click(item(app.host, "src/"));
+      await act();
+      const tree = find(app.host, '[role="tree"]');
+      expect(tree.textContent).toContain("Loading…");
+      answer([]);
+      await act();
+      expect(tree.textContent).not.toContain("Loading…");
+      expect(tree.textContent).toContain("Empty folder");
+    });
+
+    it("offers no new file in the folders of a repo attached read-only", async () => {
+      const { host } = await open({
+        listTree: () => Promise.resolve([entry("drafts", "dir")]),
+      });
+      await click(item(host, "docs"));
+      await act();
+      const newFileButtons = [...host.querySelectorAll("button")]
+        .map((button) => button.getAttribute("aria-label"))
+        .filter((label) => label?.startsWith("New file in"));
+      // The api root and its folder; nothing under docs.
+      expect(newFileButtons).toEqual(["New file in api", "New file in drafts"]);
+    });
+  });
+
+  describe("what an open file shows besides its text", () => {
+    it("says why a file could not be opened, and opens it on Try again", async () => {
+      const server = fakeDisk();
+      let refuse = true;
+      const app = await open({
+        readFile: (id, repo, path) =>
+          refuse
+            ? Promise.reject(new HttpError(500, "the disk is busy", true))
+            : server.readFile(id, repo, path),
+      });
+      await click(item(app.host, "README.md"));
+      await act();
+      const alert = find(editorPane(app.host), '[role="alert"]');
+      expect(alert.textContent).toContain("This file could not be opened: the disk is busy");
+      expect(editors).toHaveLength(0);
+      refuse = false;
+      await click(findByText(alert, "button", "Try again"));
+      await act();
+      expect(editorPane(app.host).querySelector('[role="alert"]')).toBeNull();
+      expect(editorFor("README.md").field.value).toBe("# api\n");
+    });
+
+    it("shows a save that failed for another reason in the server's words, until dismissed", async () => {
+      const app = await open({
+        writeFile: () => Promise.reject(new HttpError(500, "no space left on device", true)),
+      });
+      const editor = await openMain(app);
+      type(editor.field, "mine\n");
+      await click(saveButton(app.host));
+      await act();
+      const alert = find(editorPane(app.host), '[role="alert"]');
+      expect(alert.textContent).toContain("no space left on device");
+      expect([...alert.querySelectorAll("button")].map((button) => button.textContent)).toEqual([
+        "Dismiss",
+      ]);
+      await click(findByText(alert, "button", "Dismiss"));
+      expect(editorPane(app.host).querySelector('[role="alert"]')).toBeNull();
+      expect(editor.field.value).toBe("mine\n");
+    });
+
+    it("says a file deleted on disk is created again by saving, where it can be saved", async () => {
+      const app = await open();
+      const editor = await openMain(app);
+      app.disk.api.delete("src/main.rs");
+      app.emit({ type: "file_changed", session_repo_id: "api", path: "src/main.rs", op: "delete" });
+      await act();
+      const notice = find(editorPane(app.host), '[role="status"]');
+      expect(notice.textContent).toContain(
+        "This file was deleted on disk. Saving creates it again.",
+      );
+      expect(saveButton(app.host).disabled).toBe(false);
+      await click(saveButton(app.host));
+      await act();
+      expect(app.disk.api.get("src/main.rs")).toBe(editor.field.value);
+      expect(editorPane(app.host).querySelector('[role="status"]')).toBeNull();
+    });
+
+    it("names the repo of a restored tab whose repo left the session plainly", async () => {
+      sessionStorage.setItem(
+        "calin.files.v1:s1",
+        JSON.stringify({ tabs: [{ sessionRepoId: "gone", path: "notes.md" }], active: null }),
+      );
+      const app = await open({
+        readFile: () => Promise.reject(new HttpError(404, "no such repo", true)),
+      });
+      expect(editorPane(app.host).textContent).toContain("repo/notes.md");
+    });
+  });
+
+  describe("new file form", () => {
+    it("sends nothing for a blank name", async () => {
+      const app = await open();
+      await click(find(app.host, 'button[aria-label="New file in api"]'));
+      const form = find<HTMLFormElement>(app.host, 'form[aria-label="New file"]');
+      expect(form.textContent).toContain("api/");
+      type(find<HTMLInputElement>(form, "input"), "   ");
+      expect(findByText<HTMLButtonElement>(form, "button", "Create").disabled).toBe(true);
+      form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+      await act();
+      expect(app.writeFile).not.toHaveBeenCalled();
+    });
+
+    it("sends nothing more while a file is being created", async () => {
+      let answer: (content: FileContent) => void = () => {};
+      const writeFile = vi.fn<Api["writeFile"]>(() => new Promise((resolve) => (answer = resolve)));
+      const app = await open({ writeFile });
+      await click(find(app.host, 'button[aria-label="New file in api"]'));
+      const form = find<HTMLFormElement>(app.host, 'form[aria-label="New file"]');
+      type(find<HTMLInputElement>(form, "input"), "new.rs");
+      form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+      flush();
+      expect(findByText(form, "button", "Creating…")).toBeTruthy();
+      expect(find<HTMLInputElement>(form, "input").disabled).toBe(true);
+      form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+      expect(writeFile).toHaveBeenCalledTimes(1);
+      answer({ path: "new.rs", text: "", binary: false, too_large: false, size: 0, hash: "h" });
+      await act();
+      expect(tabs(app.host)).toEqual(["new.rs"]);
+    });
+  });
+
+  describe("on a narrow pane", () => {
+    it("shows the tree or the editor, with a way across", async () => {
+      const app = await open();
+      const treePane = find(app.host, 'section[aria-label="File tree"]');
+      expect(treePane.hidden).toBe(false);
+      expect(editorPane(app.host).hidden).toBe(true);
+      await openMain(app);
+      expect(treePane.hidden).toBe(true);
+      expect(editorPane(app.host).hidden).toBe(false);
+      await click(findByText(editorPane(app.host), "button", "Files"));
+      expect(treePane.hidden).toBe(false);
+      expect(treePane.textContent).toContain("1 open file");
+      await click(findByText(treePane, "button", "Editor"));
+      expect(editorPane(app.host).hidden).toBe(false);
+    });
+  });
+
+  describe("on a wide pane", () => {
+    afterEach(() => vi.unstubAllGlobals());
+
+    async function wide() {
+      vi.stubGlobal(
+        "ResizeObserver",
+        // Only what createWidth reads: the panel is 900 px wide as soon as it is watched.
+        class {
+          private readonly callback: (entries: { contentRect: { width: number } }[]) => void;
+          constructor(callback: (entries: { contentRect: { width: number } }[]) => void) {
+            this.callback = callback;
+          }
+          observe(): void {
+            this.callback([{ contentRect: { width: 900 } }]);
+          }
+          disconnect(): void {}
+        },
+      );
+      const app = await open();
+      await act();
+      return app;
+    }
+
+    it("shows the tree beside the editor, and compares side by side", async () => {
+      const app = await wide();
+      const treePane = find(app.host, 'section[aria-label="File tree"]');
+      const editor = await openMain(app);
+      await click(item(app.host, "lib.rs"));
+      await act();
+      expect(treePane.hidden).toBe(false);
+      expect(editorPane(app.host).hidden).toBe(false);
+      expect(treePane.className).toContain("w-72");
+      expect(treePane.textContent).not.toContain("open files");
+      expect(() => findByText(editorPane(app.host), "button", "Files")).toThrow();
+
+      await click(findByText(app.host, 'ul[aria-label="Open files"] button', "main.rs"));
+      type(editor.field, "mine\n");
+      app.disk.api.set("src/main.rs", "the agent's\n");
+      await click(saveButton(app.host));
+      await act();
+      await click(findByText(app.host, "button", "Compare"));
+      await act();
+      expect(diffs.at(-1)?.options.layout).toBe("split");
+      expect(editorPane(app.host).textContent).toContain(
+        "Left: the file on disk. Right: your text.",
+      );
+    });
+  });
+
   it("opens the file another panel asked for", async () => {
     const app = await open();
     app.requestFile({ sessionRepoId: "api", path: "src/lib.rs" });
