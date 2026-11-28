@@ -63,7 +63,8 @@ export function clockTime(ts: number): string {
 /** 850 → "0.9 s", 12_400 → "12 s", 95_000 → "1 min 35 s", 3_720_000 → "1 h 2 min". */
 export function formatDuration(ms: number): string {
   const total = Math.max(0, ms);
-  if (total < 10_000) return `${trimZero((total / 1000).toFixed(1))} s`;
+  // Rounded in tenths first: toFixed alone reads 0.85 (0.8499… as a float) as 0.8.
+  if (total < 10_000) return `${trimZero((Math.round(total / 100) / 10).toFixed(1))} s`;
   const seconds = Math.round(total / 1000);
   if (seconds < 60) return `${seconds} s`;
   const minutes = Math.floor(seconds / 60);

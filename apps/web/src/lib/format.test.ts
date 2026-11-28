@@ -57,6 +57,9 @@ describe("formatDuration", () => {
   it("keeps a tenth of a second under ten seconds, without a trailing .0", () => {
     expect(formatDuration(0)).toBe("0 s");
     expect(formatDuration(840)).toBe("0.8 s");
+    // Halves round up, as the doc says: 0.85 is 0.8499… as a float, so toFixed alone gives 0.8.
+    expect(formatDuration(850)).toBe("0.9 s");
+    expect(formatDuration(1_250)).toBe("1.3 s");
     expect(formatDuration(2000)).toBe("2 s");
     expect(formatDuration(9_949)).toBe("9.9 s");
     expect(formatDuration(-5)).toBe("0 s");
