@@ -129,6 +129,84 @@ fn graph_for_display() {
 }
 
 #[test]
+fn labels_and_templates_of_every_type() {
+    let w = ok(&doc(
+        "  - { id: start, type: start }
+  - { id: a, type: agent, prompt: \"\\n  Fix it  \\nthen test\" }
+  - { id: c, type: check, command: make test }
+  - { id: c2, type: check }
+  - { id: l, type: loop, max: 2 }
+  - { id: g, type: gate, message: Approve? }
+  - { id: q, type: ask, question: Which one? }
+  - { id: p, type: parallel, branches: [{ id: x, prompt: px }, { id: y, prompt: py }] }
+  - { id: m, type: commit, message: Save work }
+  - { id: s, type: ship, title: Add flag }
+  - { id: s2, type: ship }
+  - { id: ok, type: end }
+  - { id: bad, type: end, status: failed }
+",
+        "  - { from: start, to: a }
+  - { from: a.done, to: c }
+  - { from: c.pass, to: c2 }
+  - { from: c2.pass, to: l }
+  - { from: l.repeat, to: g }
+  - { from: l.exhausted, to: bad }
+  - { from: g.approve, to: q }
+  - { from: q, to: p }
+  - { from: p.done, to: m }
+  - { from: m.done, to: s }
+  - { from: s.done, to: s2 }
+  - { from: s2.done, to: ok }
+",
+    ));
+    let labels: Vec<(String, String)> = w
+        .graph()
+        .nodes
+        .into_iter()
+        .map(|n| (n.id, n.label))
+        .collect();
+    let expected = [
+        ("start", "Start"),
+        ("a", "Fix it"),
+        ("c", "make test"),
+        ("c2", "Repository checks"),
+        ("l", "Up to 2 times"),
+        ("g", "Approve?"),
+        ("q", "Which one?"),
+        ("p", "2 branches"),
+        ("m", "Save work"),
+        ("s", "Add flag"),
+        ("s2", "Open pull requests"),
+        ("ok", "End: success"),
+        ("bad", "End: failed"),
+    ]
+    .map(|(id, label)| (id.to_owned(), label.to_owned()));
+    assert_eq!(labels, expected);
+
+    let keys = |id: &str| -> Vec<String> {
+        w.node(id)
+            .unwrap()
+            .templates()
+            .into_iter()
+            .map(|(key, t)| format!("{key}={}", t.source()))
+            .collect()
+    };
+    assert_eq!(keys("a"), ["prompt=\n  Fix it  \nthen test"]);
+    assert_eq!(keys("c"), ["command=make test"]);
+    assert_eq!(keys("g"), ["message=Approve?"]);
+    assert_eq!(keys("q"), ["question=Which one?"]);
+    assert_eq!(
+        keys("p"),
+        ["branches[x].prompt=px", "branches[y].prompt=py"]
+    );
+    assert_eq!(keys("m"), ["message=Save work"]);
+    assert_eq!(keys("s"), ["title=Add flag"]);
+    for id in ["start", "c2", "l", "s2", "ok"] {
+        assert!(keys(id).is_empty(), "{id}");
+    }
+}
+
+#[test]
 fn ports_and_outputs_per_type() {
     for t in NodeType::ALL {
         assert_eq!(NodeType::from_name(t.as_str()), Some(t));
