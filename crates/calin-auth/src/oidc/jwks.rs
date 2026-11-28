@@ -118,49 +118,70 @@ pub(crate) fn parse_key_set(body: &[u8]) -> Result<Vec<VerificationKey>, String>
         .collect())
 }
 
-fn usable_key(jwk: Jwk) -> Option<VerificationKey> {
-    let key_id = jwk
-        .kid
-        .filter(|id| !id.is_empty() && id.len() <= MAX_KEY_ID_BYTES)?;
-    if jwk.usage.is_some_and(|usage| usage != "sig") {
+fn usable_key(mut jwk: Jwk) -> Option<VerificationKey> {
+    let key_id = usable_key_id(jwk.kid.take())?;
+    if !jwk.is_for_verifying() {
         return None;
     }
-    if jwk
-        .key_ops
-        .is_some_and(|ops| !ops.iter().any(|op| op == "verify"))
-    {
-        return None;
-    }
-    let (material, algorithm) = match jwk.kty.as_str() {
-        "RSA" => {
-            let modulus = unsigned(&jwk.n?)?;
-            let exponent = unsigned(&jwk.e?)?;
-            // Checked here so an undersized key is ignored at load, not
-            // discovered at the first sign-in.
-            if !(256..=1024).contains(&modulus.len()) {
-                return None;
-            }
-            (Material::Rsa { modulus, exponent }, "RS256")
-        }
-        "EC" if jwk.crv.as_deref() == Some("P-256") => {
-            let x = base64url_decode(&jwk.x?)?;
-            let y = base64url_decode(&jwk.y?)?;
-            if x.len() != 32 || y.len() != 32 {
-                return None;
-            }
-            let mut point = [0u8; 65];
-            point[0] = 4;
-            point[1..33].copy_from_slice(&x);
-            point[33..].copy_from_slice(&y);
-            (Material::P256 { point }, "ES256")
-        }
-        _ => return None,
-    };
+    let (material, algorithm) = jwk.material()?;
     // An RSA key declared for PS256 or RSA-OAEP is not an RS256 key.
     if jwk.alg.is_some_and(|alg| alg != algorithm) {
         return None;
     }
     Some(VerificationKey { key_id, material })
+}
+
+/// A key id this crate will look up, in a key set or a token header: not
+/// empty, and not long enough to matter in memory or in a log line.
+pub(crate) fn usable_key_id(key_id: Option<String>) -> Option<String> {
+    key_id.filter(|id| !id.is_empty() && id.len() <= MAX_KEY_ID_BYTES)
+}
+
+impl Jwk {
+    /// Nothing (`use`, `key_ops`) says the key is meant for something other
+    /// than verifying signatures.
+    fn is_for_verifying(&self) -> bool {
+        let usage_ok = self.usage.as_ref().is_none_or(|usage| usage == "sig");
+        let ops_ok = self
+            .key_ops
+            .as_ref()
+            .is_none_or(|ops| ops.iter().any(|op| op == "verify"));
+        usage_ok && ops_ok
+    }
+
+    /// The key material of a supported type, with the one algorithm it may
+    /// verify.
+    fn material(&self) -> Option<(Material, &'static str)> {
+        match self.kty.as_str() {
+            "RSA" => Some((self.rsa_material()?, "RS256")),
+            "EC" if self.crv.as_deref() == Some("P-256") => Some((self.p256_material()?, "ES256")),
+            _ => None,
+        }
+    }
+
+    fn rsa_material(&self) -> Option<Material> {
+        let modulus = unsigned(self.n.as_deref()?)?;
+        let exponent = unsigned(self.e.as_deref()?)?;
+        // Checked here so an undersized key is ignored at load, not
+        // discovered at the first sign-in.
+        if !(256..=1024).contains(&modulus.len()) {
+            return None;
+        }
+        Some(Material::Rsa { modulus, exponent })
+    }
+
+    fn p256_material(&self) -> Option<Material> {
+        let x = base64url_decode(self.x.as_deref()?)?;
+        let y = base64url_decode(self.y.as_deref()?)?;
+        if x.len() != 32 || y.len() != 32 {
+            return None;
+        }
+        let mut point = [0u8; 65];
+        point[0] = 4;
+        point[1..33].copy_from_slice(&x);
+        point[33..].copy_from_slice(&y);
+        Some(Material::P256 { point })
+    }
 }
 
 /// A big-endian unsigned integer, without the leading zero bytes some

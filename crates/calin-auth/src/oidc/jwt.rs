@@ -5,7 +5,7 @@
 
 use serde::Deserialize;
 
-use super::jwks::{Algorithm, VerificationKey};
+use super::jwks::{Algorithm, VerificationKey, usable_key_id};
 use crate::json::parse_object;
 use crate::secret::{base64url_decode, constant_time_eq, log_safe};
 
@@ -14,7 +14,6 @@ use crate::secret::{base64url_decode, constant_time_eq, log_safe};
 pub(crate) const CLOCK_SKEW_SECS: u64 = 60;
 /// No real ID token comes near this.
 const MAX_TOKEN_BYTES: usize = 64 * 1024;
-const MAX_KEY_ID_BYTES: usize = 256;
 
 /// Why an ID token was refused. Safe to log: it never contains the token.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -105,10 +104,7 @@ impl<'a> UnverifiedToken<'a> {
         if header.crit.is_some() {
             return Err(IdTokenError::Malformed);
         }
-        let key_id = header
-            .kid
-            .filter(|id| !id.is_empty() && id.len() <= MAX_KEY_ID_BYTES)
-            .ok_or(IdTokenError::NoKeyId)?;
+        let key_id = usable_key_id(header.kid).ok_or(IdTokenError::NoKeyId)?;
         // The signature is the last part, so what it covers ends one byte
         // (the dot) before it.
         let signing_input = &token.as_bytes()[..token.len() - signature.len() - 1];
