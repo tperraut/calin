@@ -1439,6 +1439,34 @@ async fn sessions_are_listed_and_revoked_by_their_owner_only() {
 }
 
 #[tokio::test]
+async fn a_device_token_name_is_checked_and_their_number_capped() {
+    let public = public_mode(ALICE).await;
+    let mut alice = Browser::signed_in(&public.app, &public.provider).await;
+    let refused = "the name must be 1 to 80 characters, without control characters";
+    let too_long = "x".repeat(81);
+    for name in ["", "   ", "a\u{7}b", "tab\tinside", too_long.as_str()] {
+        let reply = alice.post("/api/v1/tokens", json!({ "name": name })).await;
+        reply.assert_error(StatusCode::BAD_REQUEST);
+        assert_eq!(reply.json::<ApiError>().error, refused, "{name:?}");
+    }
+    // Characters, not bytes; the ends are trimmed first.
+    let longest = "é".repeat(80);
+    let created = alice.create_token(&format!(" {longest} ")).await;
+    assert_eq!(created.info.name, longest);
+    for n in 1..100 {
+        alice.create_token(&format!("token {n}")).await;
+    }
+    let reply = alice
+        .post("/api/v1/tokens", json!({ "name": "one more" }))
+        .await;
+    reply.assert_error(StatusCode::CONFLICT);
+    assert_eq!(
+        reply.json::<ApiError>().error,
+        "this identity already has 100 device tokens"
+    );
+}
+
+#[tokio::test]
 async fn device_tokens_are_created_used_and_revoked() {
     let public = public_mode(BOTH).await;
     let app = &public.app;
