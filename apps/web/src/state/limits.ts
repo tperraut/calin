@@ -1,5 +1,6 @@
 import type { LimitWindow } from "../gen/LimitWindow";
 import type { RunnerLimits } from "../gen/RunnerLimits";
+import { compareText } from "../lib/format";
 
 /**
  * Takes one runner's report into the list of the newest report per runner.
@@ -13,7 +14,7 @@ export function mergeLimits(
   const held = list.find((one) => one.runner === report.runner);
   if (held && held.reported_at > report.reported_at) return list;
   return [...list.filter((one) => one.runner !== report.runner), report].sort((a, b) =>
-    a.runner < b.runner ? -1 : a.runner > b.runner ? 1 : 0,
+    compareText(a.runner, b.runner),
   );
 }
 
@@ -42,10 +43,12 @@ export function refusingWindow(
   runner: string | undefined,
 ): LimitWindow | undefined {
   const report = list.find((one) => one.runner === runner);
-  let found: LimitWindow | undefined;
-  for (const window of report?.windows ?? []) {
-    if (!window.refused) continue;
-    if (!found || (window.resets_at ?? Infinity) > (found.resets_at ?? Infinity)) found = window;
-  }
-  return found;
+  const refused = (report?.windows ?? []).filter((window) => window.refused);
+  return refused.reduce<LimitWindow | undefined>(
+    (found, window) => (!found || resetsAt(window) > resetsAt(found) ? window : found),
+    undefined,
+  );
 }
+
+/** A window with no reset time known resets last. */
+const resetsAt = (window: LimitWindow): number => window.resets_at ?? Infinity;

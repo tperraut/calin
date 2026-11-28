@@ -4,7 +4,7 @@ import type { PullRequestState } from "../gen/PullRequestState";
 import type { RepoChanges } from "../gen/RepoChanges";
 import type { ReviewState } from "../gen/ReviewState";
 import type { SessionRepo } from "../gen/SessionRepo";
-import { filesLabel, listInWords } from "./format";
+import { counted, filesLabel, listInWords } from "./format";
 import type { Look } from "./status";
 
 // Keyed by the generated unions, so a value added to the contract fails the type-check here.
@@ -65,14 +65,17 @@ export function pullRequestHref(url: string): string | undefined {
   return url;
 }
 
-/** In the order of the session's repo set; those of a repo it does not list come after. */
-export function inRepoSetOrder(
-  pullRequests: readonly PullRequest[],
+/**
+ * In the order of the session's repo set (primary first); those of a repo it
+ * does not list keep their order, after.
+ */
+export function inRepoSetOrder<T extends { session_repo_id: string }>(
+  items: readonly T[],
   repos: readonly SessionRepo[],
-): PullRequest[] {
+): T[] {
   const rank = new Map(repos.map((repo, index) => [repo.id, index]));
-  const position = (one: PullRequest): number => rank.get(one.session_repo_id) ?? repos.length;
-  return pullRequests.toSorted((a, b) => position(a) - position(b));
+  const position = (one: T): number => rank.get(one.session_repo_id) ?? repos.length;
+  return items.toSorted((a, b) => position(a) - position(b));
 }
 
 /**
@@ -173,8 +176,51 @@ export function skippedLine(plan: ShipPlan): string {
   return `Skipped: ${each.join(", ")}`;
 }
 
-const counted = (count: number, one: string, many: string): string =>
-  `${count} ${count === 1 ? one : many}`;
+const inState = (pullRequests: readonly PullRequest[], state: PullRequestState): number =>
+  pullRequests.filter((one) => one.state === state).length;
+
+/** "the part" when `count` is above zero, nothing otherwise: for spreading into a list of parts. */
+const partIf = (count: number, part: string): string[] => (count > 0 ? [part] : []);
+
+/** "api and web": the repos of `list` by name, or by number when a repo has none. */
+const reposInWords = (list: readonly PullRequest[], nameOf: RepoNames): string =>
+  listInWords(list.map((one) => nameOf(one.session_repo_id) ?? `#${one.number}`));
+
+/** How many are merged, closed and drafts, when not all are merged. */
+function stateParts(pullRequests: readonly PullRequest[]): string[] {
+  const merged = inState(pullRequests, "merged");
+  const closed = inState(pullRequests, "closed");
+  const drafts = inState(pullRequests, "draft");
+  return [
+    ...partIf(merged, `${merged} merged`),
+    ...partIf(closed, `${closed} closed`),
+    ...partIf(drafts, counted(drafts, "draft", "drafts")),
+  ];
+}
+
+/** What needs the reader on the pull requests still in play, by repo. */
+function needParts(inPlay: readonly PullRequest[], nameOf: RepoNames): string[] {
+  const failing = inPlay.filter((one) => one.checks === "failing");
+  const contested = inPlay.filter((one) => one.review === "changes_requested");
+  return [
+    ...partIf(failing.length, `checks failing on ${reposInWords(failing, nameOf)}`),
+    ...partIf(contested.length, `changes requested on ${reposInWords(contested, nameOf)}`),
+  ];
+}
+
+/** What is merely fine, or still on its way, when nothing needs the reader. */
+function fineParts(inPlay: readonly PullRequest[], nameOf: RepoNames): string[] {
+  const pending = inPlay.filter((one) => one.checks === "pending");
+  const checks =
+    pending.length > 0
+      ? [`checks pending on ${reposInWords(pending, nameOf)}`]
+      : inPlay.some((one) => one.checks === "passing")
+        ? ["checks passing"]
+        : [];
+  const approved = inPlay.filter((one) => one.review === "approved").length;
+  const review = approved === inPlay.length ? "approved" : `${approved} approved`;
+  return [...checks, ...partIf(approved, review)];
+}
 
 /**
  * The session's pull requests in one line of plain words, for example
@@ -185,38 +231,14 @@ const counted = (count: number, one: string, many: string): string =>
 export function rollUp(pullRequests: readonly PullRequest[], nameOf: RepoNames): string {
   const total = pullRequests.length;
   if (total === 0) return "No pull request";
-  const parts = [counted(total, "pull request", "pull requests")];
-  const count = (state: PullRequestState): number =>
-    pullRequests.filter((one) => one.state === state).length;
-  const merged = count("merged");
-  const closed = count("closed");
-  const drafts = count("draft");
-  if (merged === total) {
-    parts.push(total === 1 ? "merged" : "all merged");
-    return parts.join(" · ");
+  const head = counted(total, "pull request", "pull requests");
+  if (inState(pullRequests, "merged") === total) {
+    return [head, total === 1 ? "merged" : "all merged"].join(" · ");
   }
-  if (merged > 0) parts.push(`${merged} merged`);
-  if (closed > 0) parts.push(`${closed} closed`);
-  if (drafts > 0) parts.push(counted(drafts, "draft", "drafts"));
-
   const inPlay = pullRequests.filter((one) => !isSettled(one));
-  const on = (list: readonly PullRequest[]): string =>
-    listInWords(list.map((one) => nameOf(one.session_repo_id) ?? `#${one.number}`));
-  const failing = inPlay.filter((one) => one.checks === "failing");
-  const contested = inPlay.filter((one) => one.review === "changes_requested");
-  if (failing.length > 0) parts.push(`checks failing on ${on(failing)}`);
-  if (contested.length > 0) parts.push(`changes requested on ${on(contested)}`);
-  if (failing.length > 0 || contested.length > 0) return parts.join(" · ");
-
-  const pending = inPlay.filter((one) => one.checks === "pending");
-  if (pending.length > 0) {
-    parts.push(`checks pending on ${on(pending)}`);
-  } else if (inPlay.some((one) => one.checks === "passing")) {
-    parts.push("checks passing");
-  }
-  const approved = inPlay.filter((one) => one.review === "approved").length;
-  if (approved > 0) parts.push(approved === inPlay.length ? "approved" : `${approved} approved`);
-  return parts.join(" · ");
+  const needs = needParts(inPlay, nameOf);
+  const status = needs.length > 0 ? needs : fineParts(inPlay, nameOf);
+  return [head, ...stateParts(pullRequests), ...status].join(" · ");
 }
 
 /**

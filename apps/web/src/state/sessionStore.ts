@@ -1,6 +1,6 @@
-import { createSignal, type Accessor } from "solid-js";
+import { createSignal, type Accessor, type Setter } from "solid-js";
 import { HttpError, type Api } from "../api/http";
-import { sessionTopic, type SocketClient, type TopicHandler } from "../api/socket";
+import { sessionTopic, type SocketClient, type TopicMsg } from "../api/socket";
 import type {
   OpenTerminal,
   TerminalClient,
@@ -9,6 +9,7 @@ import type {
 } from "../api/terminal";
 import type { AnswerQuestionRequest } from "../gen/AnswerQuestionRequest";
 import type { AttachRepoRequest } from "../gen/AttachRepoRequest";
+import type { Event } from "../gen/Event";
 import type { EventBody } from "../gen/EventBody";
 import type { FileContent } from "../gen/FileContent";
 import type { FileDiff } from "../gen/FileDiff";
@@ -239,159 +240,69 @@ type ShipWatch = {
   timer: ReturnType<typeof setTimeout> | undefined;
 };
 
+/** What a ship covers, as the page knows it when the ship is asked. */
+type ShipScope = { known: readonly PullRequest[]; covered: ReadonlyMap<string, string> };
+
 /** True when `message` holds `name` as a whole word, as in "could not push api: …". */
 function mentions(message: string, name: string): boolean {
   const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   return new RegExp(`(^|[^\\w-])${escaped}($|[^\\w-])`).test(message);
 }
 
-export function createSessionStore(deps: SessionStoreDeps, id: string): SessionStore {
-  const { api, socket } = deps;
-  const topic = sessionTopic(id);
+/** The id of the covered repo that `message` names, if it names one. */
+export function namedRepo(
+  covered: ReadonlyMap<string, string>,
+  message: string,
+): string | undefined {
+  // The longest name first, so `web-admin` is not taken for `web`.
+  const named = [...covered]
+    .toSorted(([, a], [, b]) => b.length - a.length)
+    .find(([, name]) => mentions(message, name));
+  return named?.[0];
+}
 
-  const [load, setLoad] = createSignal<SessionLoad>({ status: "loading" });
-  const [detail, setDetail] = createSignal<SessionDetail | undefined>(undefined);
-  const [view, setView] = createSignal<SessionView>(emptySessionView);
-  const [synced, setSynced] = createSignal(false);
-  const [stalled, setStalled] = createSignal(false);
-  const [subscriptionError, setSubscriptionError] = createSignal<string>();
+/** Trimmed, or `undefined` when there is nothing but blanks. */
+function filled(text: string | undefined): string | undefined {
+  const trimmed = text?.trim();
+  return trimmed === "" ? undefined : trimmed;
+}
 
-  // The fold runs on plain values as frames arrive; signals follow once per frame.
-  let current = emptySessionView;
-  let caughtUp = false;
-  // While a replay is on its way, frames still in flight from before it are expected.
-  let replaying = true;
-  let fruitlessResyncs = 0;
-  let refusal: string | undefined;
-  let active = false;
-  let failed = false;
-  let stopListening = (): void => {};
+function resolution(
+  decision: PermissionDecision,
+  message: string | undefined,
+): ResolvePermissionRequest {
+  const note = filled(message);
+  return note === undefined ? { decision } : { decision, message: note };
+}
 
-  // Mirrors of two signals, for what is decided outside the screen's own updates.
-  let loadedDetail: SessionDetail | undefined;
-  let loadedChanges: readonly RepoChanges[] = [];
+function answerOf(answer: string, comment: string | undefined): AnswerQuestionRequest {
+  const note = filled(comment);
+  return note === undefined ? { answer: answer.trim() } : { answer: answer.trim(), comment: note };
+}
 
-  const [changes, setChanges] = createSignal<readonly RepoChanges[]>();
-  const [changesRevision, setChangesRevision] = createSignal(0);
-  const [changesFailure, setChangesFailure] = createSignal<string>();
-  const [changesRefreshing, setChangesRefreshing] = createSignal(false);
-  // Lives from `start` to its undoing: nothing is read for a session nobody looks at.
-  let changesRefresher: Refresher | undefined;
+function blockedBy(health: Health | undefined): string | undefined {
+  // api.rs, "Dry run": nothing reaches GitHub then, so its being unusable is no obstacle.
+  if (!health || health.dry_run) return undefined;
+  return health.github_problem ?? undefined;
+}
 
-  const [servedRun, setServedRun] = createSignal<WorkflowRun>();
-  const [workflowFailure, setWorkflowFailure] = createSignal<string>();
-  let workflowRefresher: Refresher | undefined;
-  let workflowSeeded = false;
-  let workflowShown = false;
+/** Follows the ship asked from this page until every repo it covers has reported. */
+class ShipTracker {
+  readonly shipping: Accessor<"opening" | "updating" | undefined>;
+  readonly failed: Accessor<number>;
+  private readonly setShipping: Setter<"opening" | "updating" | undefined>;
+  private readonly setFailed: Setter<number>;
+  private watch: ShipWatch | undefined;
 
-  async function readWorkflow(): Promise<void> {
-    try {
-      const loaded = await api.getWorkflow(id);
-      if (!active) return;
-      setServedRun(loaded ?? undefined);
-      setWorkflowFailure(undefined);
-    } catch (error) {
-      if (active) setWorkflowFailure(errorMessage(error));
-    }
+  constructor() {
+    [this.shipping, this.setShipping] = createSignal<"opening" | "updating">();
+    [this.failed, this.setFailed] = createSignal(0);
   }
 
-  /** The first read, once the session is known to run a workflow; later ones follow the view. */
-  function seedWorkflow(): void {
-    if (workflowSeeded || !active) return;
-    workflowSeeded = true;
-    void readWorkflow();
-  }
-
-  async function readChanges(): Promise<void> {
-    // What was folded before the question is in the answer; later events may not be.
-    const revision = current.changesRevision;
-    setChangesRefreshing(true);
-    try {
-      const loaded = await api.getChanges(id);
-      loadedChanges = loaded;
-      setChanges(loaded);
-      setChangesRevision(revision);
-      setChangesFailure(undefined);
-    } catch (error) {
-      setChangesFailure(errorMessage(error));
-    } finally {
-      setChangesRefreshing(false);
-    }
-  }
-
-  const publish = coalesce(() => {
-    setView(current);
-    setSynced(caughtUp);
-    setStalled(fruitlessResyncs >= MAX_FRUITLESS_RESYNCS);
-    setSubscriptionError(refusal);
-  }, deps.schedule);
-
-  const [shipping, setShipping] = createSignal<"opening" | "updating">();
-  const [shipFailures, setShipFailures] = createSignal(0);
-  let shipWatch: ShipWatch | undefined;
-
-  function endShip(): void {
-    if (!shipWatch) return;
-    clearTimeout(shipWatch.timer);
-    shipWatch = undefined;
-    setShipping(undefined);
-  }
-
-  /** Ends the watch once every covered repo has reported; keeps waiting, for a while, otherwise. */
-  function settleShip(watch: ShipWatch): void {
-    clearTimeout(watch.timer);
-    if (watch.waiting.size <= watch.unnamedFailures) {
-      endShip();
-    } else {
-      watch.timer = setTimeout(endShip, SHIP_QUIET_MS);
-    }
-  }
-
-  /** api.rs, "Shipping": each covered repo answers with a pull request event or an `error` naming it. */
-  function watchShip(watch: ShipWatch, body: EventBody): void {
-    if (body.type === "pull_request_opened" || body.type === "pull_request_updated") {
-      watch.waiting.delete(body.pull_request.session_repo_id);
-    } else if (body.type === "error") {
-      // The longest name first, so `web-admin` is not taken for `web`.
-      const named = [...watch.covered]
-        .toSorted(([, a], [, b]) => b.length - a.length)
-        .find(([, name]) => mentions(body.message, name));
-      if (named) {
-        watch.failed.add(named[0]);
-        watch.waiting.delete(named[0]);
-      } else {
-        watch.unnamedFailures += 1;
-      }
-      setShipFailures(Math.min(watch.failed.size + watch.unnamedFailures, watch.covered.size));
-    } else if (body.type === "session_status") {
-      // The session went elsewhere (a turn began, it was stopped): the ship is no longer the news.
-      if (body.status !== "review" && body.status !== "shipping") {
-        endShip();
-        return;
-      }
-    } else {
-      return;
-    }
-    settleShip(watch);
-  }
-
-  const sessionRepos = (): readonly SessionRepo[] =>
-    mergeRepos(loadedDetail?.repos ?? [], current.repos);
-
-  async function ship(request: ShipRequest): Promise<void> {
-    if (shipWatch) return;
-    const known = mergePullRequests(
-      loadedDetail?.pull_requests ?? [],
-      current.pullRequests,
-      sessionRepos(),
-      caughtUp,
-    );
-    const covered = new Map(
-      shipPlan(sessionRepos(), loadedChanges, known).steps.map((step) => [
-        step.repo.id,
-        step.repo.name,
-      ]),
-    );
+  /** One at a time; rejects with the server's reason when `send` does. */
+  async ship(scope: () => ShipScope, send: () => Promise<void>): Promise<void> {
+    if (this.watch) return;
+    const { known, covered } = scope();
     // Watching starts before the request: the first events may beat its answer here.
     const watch: ShipWatch = {
       kind: known.length > 0 ? "updating" : "opening",
@@ -401,166 +312,506 @@ export function createSessionStore(deps: SessionStoreDeps, id: string): SessionS
       unnamedFailures: 0,
       timer: undefined,
     };
-    shipWatch = watch;
-    setShipping(watch.kind);
-    setShipFailures(0);
+    this.watch = watch;
+    this.setShipping(watch.kind);
+    this.setFailed(0);
     try {
-      await api.shipSession(id, request);
+      await send();
     } catch (error) {
-      if (shipWatch === watch) endShip();
+      if (this.watch === watch) this.end();
       throw error;
     }
-    if (shipWatch === watch) settleShip(watch);
+    if (this.watch === watch) this.settle(watch);
   }
 
-  function resync(): void {
-    if (fruitlessResyncs >= MAX_FRUITLESS_RESYNCS) {
-      // Show what arrived, flagged as incomplete, instead of asking forever.
-      replaying = false;
-      caughtUp = true;
-      publish();
+  /** api.rs, "Shipping": each covered repo answers with a pull request event or an `error` naming it. */
+  observe(body: EventBody): void {
+    const watch = this.watch;
+    if (!watch) return;
+    if (body.type === "pull_request_opened" || body.type === "pull_request_updated") {
+      watch.waiting.delete(body.pull_request.session_repo_id);
+    } else if (body.type === "error") {
+      this.fail(watch, body.message);
+    } else if (body.type === "session_status") {
+      // The session went elsewhere (a turn began, it was stopped): the ship is no longer the news.
+      if (body.status !== "review" && body.status !== "shipping") {
+        this.end();
+        return;
+      }
+    } else {
       return;
     }
-    fruitlessResyncs += 1;
-    replaying = true;
-    socket.resync(topic, current.seq);
+    this.settle(watch);
   }
 
-  function reportLimits(
-    event: { agent_id: string | null; ts: number },
-    windows: LimitWindow[],
-  ): void {
-    const agent = current.agents.find((one) => one.id === event.agent_id);
-    const runner = agent?.runner ?? session()?.runner;
-    if (runner === undefined) return;
-    deps.onLimits?.({ runner, windows, reported_at: event.ts });
+  end(): void {
+    if (!this.watch) return;
+    clearTimeout(this.watch.timer);
+    this.watch = undefined;
+    this.setShipping(undefined);
   }
 
-  const onFrame: TopicHandler = (msg) => {
-    if (msg.op === "event") {
-      const result = applyEvent(current, msg.event);
-      if (result.outcome === "applied") {
-        const before = current;
-        current = result.view;
-        fruitlessResyncs = 0;
-        // Live only: a replay passes through every past status, and the list is read after it anyway.
-        if (caughtUp && (current.status !== before.status || current.repos !== before.repos)) {
-          changesRefresher?.request();
-        }
-        // Live only as well: a replayed pull request is not this ship's.
-        if (caughtUp && shipWatch) watchShip(shipWatch, msg.event.body);
-        // Replayed ones too: the app keeps whichever report is newest.
-        if (msg.event.body.type === "limits") reportLimits(msg.event, msg.event.body.windows);
-        if (current.workflow && caughtUp) {
-          seedWorkflow();
-          const type = msg.event.body.type;
-          if (type === "workflow_node" || type === "workflow_finished" || type === "usage") {
-            workflowRefresher?.request();
-          }
-        }
-        publish();
-      } else if (result.outcome === "gap" && !replaying) {
-        resync();
-      }
-    } else if (msg.op === "error") {
-      // No replay is coming, so nothing in flight explains a later gap.
-      refusal = msg.message;
-      replaying = false;
-      publish();
-    } else if (msg.op === "subscribed") {
-      if (refusal !== undefined) {
-        refusal = undefined;
-        publish();
-      }
-      if (msg.head_seq > current.seq) {
-        // The replay ended short of the head it announced.
-        resync();
-      } else {
-        replaying = false;
-        caughtUp = true;
-        if (current.workflow) seedWorkflow();
-        publish();
-      }
+  private fail(watch: ShipWatch, message: string): void {
+    const named = namedRepo(watch.covered, message);
+    if (named === undefined) {
+      watch.unnamedFailures += 1;
+    } else {
+      watch.failed.add(named);
+      watch.waiting.delete(named);
     }
-  };
+    this.setFailed(Math.min(watch.failed.size + watch.unnamedFailures, watch.covered.size));
+  }
 
-  function fetchDetail(): void {
-    api.getSession(id).then(
-      (loaded) => {
-        if (!active) return;
-        failed = false;
-        loadedDetail = loaded;
-        setDetail(loaded);
-        if (loaded.session.workflow !== null && loaded.session.workflow !== undefined) {
-          seedWorkflow();
-        }
-        setLoad({ status: "ready" });
-      },
-      (error: unknown) => {
-        if (!active) return;
-        if (error instanceof HttpError && error.status === 404) {
-          stopListening();
-          setLoad({ status: "not_found" });
-          return;
-        }
-        failed = true;
-        setLoad({
-          status: "error",
-          message: errorMessage(error),
-          unreachable: error instanceof HttpError && error.unreachable,
-        });
-      },
+  /** Ends the watch once every covered repo has reported; keeps waiting, for a while, otherwise. */
+  private settle(watch: ShipWatch): void {
+    clearTimeout(watch.timer);
+    if (watch.waiting.size <= watch.unnamedFailures) {
+      this.end();
+    } else {
+      watch.timer = setTimeout(() => this.end(), SHIP_QUIET_MS);
+    }
+  }
+}
+
+/** The changes list (see `ChangesFeed`). Read between `start` and `stop` only: nothing is read for a session nobody looks at. */
+class ChangesReads {
+  readonly list: Accessor<readonly RepoChanges[] | undefined>;
+  readonly revision: Accessor<number>;
+  readonly failure: Accessor<string | undefined>;
+  readonly refreshing: Accessor<boolean>;
+  /** Mirrors `list`, for what is decided outside the screen's own updates. */
+  latest: readonly RepoChanges[] = [];
+  private readonly setList: Setter<readonly RepoChanges[] | undefined>;
+  private readonly setRevision: Setter<number>;
+  private readonly setFailure: Setter<string | undefined>;
+  private readonly setRefreshing: Setter<boolean>;
+  private readonly read: () => Promise<RepoChanges[]>;
+  private readonly revisionNow: () => number;
+  private refresher: Refresher | undefined;
+
+  /** `revisionNow`: the `changesRevision` folded so far. */
+  constructor(read: () => Promise<RepoChanges[]>, revisionNow: () => number) {
+    this.read = read;
+    this.revisionNow = revisionNow;
+    [this.list, this.setList] = createSignal<readonly RepoChanges[]>();
+    [this.revision, this.setRevision] = createSignal(0);
+    [this.failure, this.setFailure] = createSignal<string>();
+    [this.refreshing, this.setRefreshing] = createSignal(false);
+  }
+
+  request(): void {
+    this.refresher?.request();
+  }
+
+  now(): void {
+    this.refresher?.now();
+  }
+
+  setVisible(visible: boolean): void {
+    this.refresher?.setVisible(visible);
+  }
+
+  start(): void {
+    this.refresher = createRefresher(() => this.readOnce());
+  }
+
+  stop(): void {
+    this.refresher?.dispose();
+    this.refresher = undefined;
+  }
+
+  private async readOnce(): Promise<void> {
+    // What was folded before the question is in the answer; later events may not be.
+    const revision = this.revisionNow();
+    this.setRefreshing(true);
+    try {
+      const loaded = await this.read();
+      this.latest = loaded;
+      this.setList(loaded);
+      this.setRevision(revision);
+      this.setFailure(undefined);
+    } catch (error) {
+      this.setFailure(errorMessage(error));
+    } finally {
+      this.setRefreshing(false);
+    }
+  }
+}
+
+/** The run as `GET /sessions/{id}/workflow` tells it (see `WorkflowFeed`). Read between `start` and `stop` only. */
+class WorkflowReads {
+  readonly served: Accessor<WorkflowRun | undefined>;
+  readonly failure: Accessor<string | undefined>;
+  private readonly setServed: Setter<WorkflowRun | undefined>;
+  private readonly setFailure: Setter<string | undefined>;
+  private readonly read: () => Promise<WorkflowRun | null>;
+  private refresher: Refresher | undefined;
+  private active = false;
+  private seeded = false;
+  private shown = false;
+
+  constructor(read: () => Promise<WorkflowRun | null>) {
+    this.read = read;
+    [this.served, this.setServed] = createSignal<WorkflowRun>();
+    [this.failure, this.setFailure] = createSignal<string>();
+  }
+
+  /** The first read, once the session is known to run a workflow; later ones follow the view. */
+  seed(): void {
+    if (this.seeded || !this.active) return;
+    this.seeded = true;
+    void this.readOnce();
+  }
+
+  /** A live event of a session that runs a workflow: a node that moves, or usage, is the run's news. */
+  follow(type: EventBody["type"]): void {
+    this.seed();
+    if (type === "workflow_node" || type === "workflow_finished" || type === "usage") {
+      this.refresher?.request();
+    }
+  }
+
+  now(): void {
+    this.refresher?.now();
+  }
+
+  /** The Workflow view is on screen, or no longer is. */
+  setShown(shown: boolean): void {
+    this.shown = shown;
+    // Asked while still hidden, so becoming visible reads once rather than twice.
+    if (shown) this.refresher?.now();
+    this.refresher?.setVisible(shown && document.visibilityState === "visible");
+  }
+
+  /** The page's tab was shown or hidden. */
+  setPageVisible(visible: boolean): void {
+    this.refresher?.setVisible(visible && this.shown);
+  }
+
+  start(): void {
+    this.active = true;
+    this.refresher = createRefresher(() => this.readOnce());
+  }
+
+  stop(): void {
+    this.active = false;
+    this.refresher?.dispose();
+    this.refresher = undefined;
+  }
+
+  private async readOnce(): Promise<void> {
+    try {
+      const loaded = await this.read();
+      if (!this.active) return;
+      this.setServed(loaded ?? undefined);
+      this.setFailure(undefined);
+    } catch (error) {
+      if (this.active) this.setFailure(errorMessage(error));
+    }
+  }
+}
+
+/** One session's state and what decides it; `createSessionStore` is its public face. */
+class LiveSession {
+  readonly load: Accessor<SessionLoad>;
+  readonly detail: Accessor<SessionDetail | undefined>;
+  readonly view: Accessor<SessionView>;
+  readonly synced: Accessor<boolean>;
+  readonly stalled: Accessor<boolean>;
+  readonly subscriptionError: Accessor<string | undefined>;
+  readonly changes: ChangesReads;
+  readonly workflow: WorkflowReads;
+  readonly ship = new ShipTracker();
+  private readonly setLoad: Setter<SessionLoad>;
+  private readonly setDetail: Setter<SessionDetail | undefined>;
+  private readonly deps: SessionStoreDeps;
+  private readonly id: string;
+  private readonly topic: string;
+  private readonly publish: () => void;
+  // The fold runs on plain values as frames arrive; signals follow once per frame.
+  private current = emptySessionView;
+  private caughtUp = false;
+  // While a replay is on its way, frames still in flight from before it are expected.
+  private replaying = true;
+  private fruitlessResyncs = 0;
+  private refusal: string | undefined;
+  private active = false;
+  private failed = false;
+  private stopListening = (): void => {};
+  /** Mirrors `detail`, for what is decided outside the screen's own updates. */
+  private loadedDetail: SessionDetail | undefined;
+
+  constructor(deps: SessionStoreDeps, id: string) {
+    this.deps = deps;
+    this.id = id;
+    this.topic = sessionTopic(id);
+    [this.load, this.setLoad] = createSignal<SessionLoad>({ status: "loading" });
+    [this.detail, this.setDetail] = createSignal<SessionDetail>();
+    const [view, setView] = createSignal<SessionView>(emptySessionView);
+    const [synced, setSynced] = createSignal(false);
+    const [stalled, setStalled] = createSignal(false);
+    const [subscriptionError, setSubscriptionError] = createSignal<string>();
+    this.view = view;
+    this.synced = synced;
+    this.stalled = stalled;
+    this.subscriptionError = subscriptionError;
+    this.publish = coalesce(() => {
+      setView(this.current);
+      setSynced(this.caughtUp);
+      setStalled(this.fruitlessResyncs >= MAX_FRUITLESS_RESYNCS);
+      setSubscriptionError(this.refusal);
+    }, deps.schedule);
+    this.changes = new ChangesReads(
+      () => deps.api.getChanges(id),
+      () => this.current.changesRevision,
+    );
+    this.workflow = new WorkflowReads(() => deps.api.getWorkflow(id));
+  }
+
+  session(): Session | undefined {
+    return this.deps.listed?.(this.id) ?? this.detail()?.session;
+  }
+
+  status(): SessionStatus | undefined {
+    // Mid-replay the fold passes through every past status; the record is steadier.
+    return (this.synced() ? this.view().status : null) ?? this.session()?.status;
+  }
+
+  repos(): readonly SessionRepo[] {
+    return mergeRepos(this.detail()?.repos ?? [], this.view().repos);
+  }
+
+  pullRequests(): readonly PullRequest[] {
+    const seed = this.detail()?.pull_requests ?? [];
+    return mergePullRequests(seed, this.view().pullRequests, this.repos(), this.synced());
+  }
+
+  tree(): SessionTree {
+    return sessionTreeOf(this.deps.sessions?.() ?? NO_SESSIONS, this.session());
+  }
+
+  workflowRun(): WorkflowRun | undefined {
+    return mergeRun(this.view().workflow, this.workflow.served());
+  }
+
+  workflowKnown(): boolean {
+    return (
+      this.view().workflow !== null ||
+      this.workflow.served() !== undefined ||
+      (this.session()?.workflow ?? null) !== null
     );
   }
 
-  const session = (): Session | undefined => deps.listed?.(id) ?? detail()?.session;
-  const repos = (): readonly SessionRepo[] => mergeRepos(detail()?.repos ?? [], view().repos);
+  shipNow(request: ShipRequest): Promise<void> {
+    return this.ship.ship(
+      () => this.shipScope(),
+      () => this.deps.api.shipSession(this.id, request),
+    );
+  }
+
+  resubscribe(): void {
+    this.replaying = true;
+    this.deps.socket.resync(this.topic, this.current.seq);
+  }
+
+  reload(): void {
+    this.setLoad({ status: "loading" });
+    this.fetchDetail();
+  }
+
+  /** Subscribes and loads; returns the function that undoes both. */
+  start(): () => void {
+    const { socket } = this.deps;
+    this.active = true;
+    this.changes.start();
+    this.workflow.start();
+    // Nothing is read for a page in a background tab; what was missed is read on the way back.
+    const onVisibility = (): void => this.setPageVisible(document.visibilityState === "visible");
+    document.addEventListener("visibilitychange", onVisibility);
+    onVisibility();
+    const unsubscribe = socket.subscribe(
+      this.topic,
+      (msg) => this.onFrame(msg),
+      () => this.current.seq,
+    );
+    // A failed load is retried as soon as the server answers the socket again.
+    const offState = socket.onState((state) => {
+      if (state === "open" && this.failed) this.fetchDetail();
+    });
+    this.stopListening = () => {
+      unsubscribe();
+      offState();
+    };
+    this.fetchDetail();
+    return () => {
+      this.active = false;
+      this.stopListening();
+      document.removeEventListener("visibilitychange", onVisibility);
+      this.changes.stop();
+      this.workflow.stop();
+      this.ship.end();
+    };
+  }
+
+  private setPageVisible(visible: boolean): void {
+    this.changes.setVisible(visible);
+    this.workflow.setPageVisible(visible);
+  }
+
+  private shipScope(): ShipScope {
+    const repos = mergeRepos(this.loadedDetail?.repos ?? [], this.current.repos);
+    const seed = this.loadedDetail?.pull_requests ?? [];
+    const known = mergePullRequests(seed, this.current.pullRequests, repos, this.caughtUp);
+    const steps = shipPlan(repos, this.changes.latest, known).steps;
+    return { known, covered: new Map(steps.map((step) => [step.repo.id, step.repo.name])) };
+  }
+
+  private onFrame(msg: TopicMsg): void {
+    if (msg.op === "event") {
+      this.onEvent(msg.event);
+    } else if (msg.op === "error") {
+      this.onRefused(msg.message);
+    } else if (msg.op === "subscribed") {
+      this.onSubscribed(msg.head_seq);
+    }
+  }
+
+  private onEvent(event: Event): void {
+    const result = applyEvent(this.current, event);
+    if (result.outcome === "applied") {
+      this.onApplied(result.view, event);
+    } else if (result.outcome === "gap" && !this.replaying) {
+      this.resync();
+    }
+  }
+
+  private onApplied(view: SessionView, event: Event): void {
+    const before = this.current;
+    this.current = view;
+    this.fruitlessResyncs = 0;
+    // Live only: a replay passes through every past status and pull request; it is read after anyway.
+    if (this.caughtUp) this.liveNews(before, event.body);
+    // Replayed ones too: the app keeps whichever report is newest.
+    if (event.body.type === "limits") this.reportLimits(event, event.body.windows);
+    if (this.current.workflow && this.caughtUp) this.workflow.follow(event.body.type);
+    this.publish();
+  }
+
+  private liveNews(before: SessionView, body: EventBody): void {
+    if (this.current.status !== before.status || this.current.repos !== before.repos) {
+      this.changes.request();
+    }
+    this.ship.observe(body);
+  }
+
+  private onRefused(message: string): void {
+    // No replay is coming, so nothing in flight explains a later gap.
+    this.refusal = message;
+    this.replaying = false;
+    this.publish();
+  }
+
+  private onSubscribed(headSeq: number): void {
+    if (this.refusal !== undefined) {
+      this.refusal = undefined;
+      this.publish();
+    }
+    if (headSeq > this.current.seq) {
+      // The replay ended short of the head it announced.
+      this.resync();
+      return;
+    }
+    this.replaying = false;
+    this.caughtUp = true;
+    if (this.current.workflow) this.workflow.seed();
+    this.publish();
+  }
+
+  private resync(): void {
+    if (this.fruitlessResyncs >= MAX_FRUITLESS_RESYNCS) {
+      // Show what arrived, flagged as incomplete, instead of asking forever.
+      this.replaying = false;
+      this.caughtUp = true;
+      this.publish();
+      return;
+    }
+    this.fruitlessResyncs += 1;
+    this.replaying = true;
+    this.deps.socket.resync(this.topic, this.current.seq);
+  }
+
+  private reportLimits(event: Event, windows: LimitWindow[]): void {
+    const agent = this.current.agents.find((one) => one.id === event.agent_id);
+    const runner = agent?.runner ?? this.session()?.runner;
+    if (runner === undefined) return;
+    this.deps.onLimits?.({ runner, windows, reported_at: event.ts });
+  }
+
+  private fetchDetail(): void {
+    this.deps.api.getSession(this.id).then(
+      (loaded) => this.loaded(loaded),
+      (error: unknown) => this.loadFailed(error),
+    );
+  }
+
+  private loaded(loaded: SessionDetail): void {
+    if (!this.active) return;
+    this.failed = false;
+    this.loadedDetail = loaded;
+    this.setDetail(loaded);
+    if (loaded.session.workflow !== null && loaded.session.workflow !== undefined) {
+      this.workflow.seed();
+    }
+    this.setLoad({ status: "ready" });
+  }
+
+  private loadFailed(error: unknown): void {
+    if (!this.active) return;
+    if (error instanceof HttpError && error.status === 404) {
+      this.stopListening();
+      this.setLoad({ status: "not_found" });
+      return;
+    }
+    this.failed = true;
+    this.setLoad({
+      status: "error",
+      message: errorMessage(error),
+      unreachable: error instanceof HttpError && error.unreachable,
+    });
+  }
+}
+
+export function createSessionStore(deps: SessionStoreDeps, id: string): SessionStore {
+  const { api } = deps;
+  const live = new LiveSession(deps, id);
   const stillClock = Date.now();
 
   return {
     id,
-    load,
-    session,
-    // Mid-replay the fold passes through every past status; the record is steadier.
-    status: () => (synced() ? view().status : null) ?? session()?.status,
-    view,
-    repos,
-    synced,
-    stalled,
-    subscriptionError,
-    resubscribe() {
-      replaying = true;
-      socket.resync(topic, current.seq);
-    },
+    load: live.load,
+    session: () => live.session(),
+    status: () => live.status(),
+    view: live.view,
+    repos: () => live.repos(),
+    synced: live.synced,
+    stalled: live.stalled,
+    subscriptionError: live.subscriptionError,
+    resubscribe: () => live.resubscribe(),
     send: (text) => api.sendMessage(id, { text }),
     interrupt: () => api.interruptSession(id),
     stop: () => api.stopSession(id),
-    resolvePermission(requestId, decision, message) {
-      const body: ResolvePermissionRequest = { decision };
-      if (message !== undefined && message.trim() !== "") body.message = message.trim();
-      return api.resolvePermission(id, requestId, body);
-    },
-    answerQuestion(questionId, answer, comment) {
-      const body: AnswerQuestionRequest = { answer: answer.trim() };
-      if (comment !== undefined && comment.trim() !== "") body.comment = comment.trim();
-      return api.answerQuestion(id, questionId, body);
-    },
+    resolvePermission: (requestId, decision, message) =>
+      api.resolvePermission(id, requestId, resolution(decision, message)),
+    answerQuestion: (questionId, answer, comment) =>
+      api.answerQuestion(id, questionId, answerOf(answer, comment)),
     workflow: {
-      run: () => mergeRun(view().workflow, servedRun()),
-      known: () =>
-        view().workflow !== null ||
-        servedRun() !== undefined ||
-        (session()?.workflow ?? null) !== null,
-      failure: workflowFailure,
-      setVisible(visible) {
-        workflowShown = visible;
-        // Asked while still hidden, so becoming visible reads once rather than twice.
-        if (visible) workflowRefresher?.now();
-        workflowRefresher?.setVisible(visible && document.visibilityState === "visible");
-      },
-      now: () => workflowRefresher?.now(),
+      run: () => live.workflowRun(),
+      known: () => live.workflowKnown(),
+      failure: live.workflow.failure,
+      setVisible: (visible) => live.workflow.setShown(visible),
+      now: () => live.workflow.now(),
     },
-    tree: () => sessionTreeOf(deps.sessions?.() ?? NO_SESSIONS, session()),
+    tree: () => live.tree(),
     orchestration: {
       graph: (at) => api.getGraph(id, at),
       timeline: () => api.getTimeline(id),
@@ -569,69 +820,26 @@ export function createSessionStore(deps: SessionStoreDeps, id: string): SessionS
       await api.attachRepo(id, request);
     },
     changes: {
-      list: changes,
-      revision: changesRevision,
-      failure: changesFailure,
-      refreshing: changesRefreshing,
-      request: () => changesRefresher?.request(),
-      now: () => changesRefresher?.now(),
+      list: live.changes.list,
+      revision: live.changes.revision,
+      failure: live.changes.failure,
+      refreshing: live.changes.refreshing,
+      request: () => live.changes.request(),
+      now: () => live.changes.now(),
     },
     delivery: {
-      pullRequests: () =>
-        mergePullRequests(detail()?.pull_requests ?? [], view().pullRequests, repos(), synced()),
-      blocked() {
-        const health = deps.health?.();
-        // api.rs, "Dry run": nothing reaches GitHub then, so its being unusable is no obstacle.
-        if (!health || health.dry_run) return undefined;
-        return health.github_problem ?? undefined;
-      },
+      pullRequests: () => live.pullRequests(),
+      blocked: () => blockedBy(deps.health?.()),
       recheck: () => deps.checkHealth?.(),
       dryRun: () => deps.health?.()?.dry_run === true,
-      shipping,
-      failed: shipFailures,
-      ship,
+      shipping: live.ship.shipping,
+      failed: live.ship.failed,
+      ship: (request) => live.shipNow(request),
       refresh: () => api.refreshPullRequests(id),
       now: deps.now ?? (() => stillClock),
     },
-    reload() {
-      setLoad({ status: "loading" });
-      fetchDetail();
-    },
-    start() {
-      active = true;
-      const refresher = createRefresher(readChanges);
-      changesRefresher = refresher;
-      const workflowReads = createRefresher(readWorkflow);
-      workflowRefresher = workflowReads;
-      // Nothing is read for a page in a background tab; what was missed is read on the way back.
-      const onVisibility = (): void => {
-        const visible = document.visibilityState === "visible";
-        refresher.setVisible(visible);
-        workflowReads.setVisible(visible && workflowShown);
-      };
-      document.addEventListener("visibilitychange", onVisibility);
-      onVisibility();
-      const unsubscribe = socket.subscribe(topic, onFrame, () => current.seq);
-      // A failed load is retried as soon as the server answers the socket again.
-      const offState = socket.onState((state) => {
-        if (state === "open" && failed) fetchDetail();
-      });
-      stopListening = () => {
-        unsubscribe();
-        offState();
-      };
-      fetchDetail();
-      return () => {
-        active = false;
-        stopListening();
-        document.removeEventListener("visibilitychange", onVisibility);
-        refresher.dispose();
-        changesRefresher = undefined;
-        workflowReads.dispose();
-        workflowRefresher = undefined;
-        endShip();
-      };
-    },
+    reload: () => live.reload(),
+    start: () => live.start(),
     workspace: {
       changes: () => api.getChanges(id),
       diff: (repo, path) => api.getDiff(id, repo, path),

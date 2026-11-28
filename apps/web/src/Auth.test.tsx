@@ -281,6 +281,7 @@ describe("a session that ends", () => {
       onmessage: ((event: MessageEvent) => void) | null = null;
       onclose: ((event: CloseEvent) => void) | null = null;
       onerror: ((event: Event) => void) | null = null;
+      readonly readyState = 0;
       constructor() {
         sockets.push(this);
       }

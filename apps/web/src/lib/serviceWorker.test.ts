@@ -40,7 +40,7 @@ class FakeRegistration implements RegistrationLike {
     return Promise.resolve();
   }
   /** The browser found a newer script and starts installing it. */
-  install(worker: FakeWorker): void {
+  install(worker: FakeWorker | null): void {
     this.installing = worker;
     for (const listener of this.found) listener();
   }
@@ -161,5 +161,54 @@ describe("the service worker registration", () => {
     container.deliver({ type: "where" }, [{ postMessage: (answer) => answers.push(answer) }]);
     expect(answers).toEqual([{ path: "/s/s1/changes" }]);
     expect(heard).not.toHaveBeenCalled();
+  });
+
+  it("answers with the page's own path by default, and asks for no port", async () => {
+    const container = new FakeContainer();
+    registerWorker(container, { reload: () => {} });
+    const answers: WhereAnswer[] = [];
+    container.deliver({ type: "where" }, [{ postMessage: (answer) => answers.push(answer) }]);
+    expect(answers).toEqual([{ path: location.pathname }]);
+    expect(() => container.deliver({ type: "where" })).not.toThrow();
+  });
+
+  it("lets nothing in, nor reloads, when no build waits", async () => {
+    const container = new FakeContainer();
+    container.controller = {};
+    const { bridge, reload, ready } = await setup(container);
+    // The browser found an update but has nothing installing any more.
+    container.registration.install(null);
+    bridge.applyUpdate();
+    container.changeController();
+    expect(ready).not.toHaveBeenCalled();
+    expect(reload).not.toHaveBeenCalled();
+  });
+
+  it("keeps looking on later visits when an update check fails", async () => {
+    const { container, visible } = await setup();
+    let checks = 0;
+    container.registration.update = () => {
+      checks += 1;
+      return Promise.reject(new Error("offline"));
+    };
+    visible();
+    await settle();
+    visible();
+    await settle();
+    expect(checks).toBe(2);
+  });
+
+  it("warns when the worker cannot be registered, and carries on", async () => {
+    const container = new FakeContainer();
+    container.register = () => Promise.reject(new Error("insecure origin"));
+    const warn = vi.fn();
+    const bridge = registerWorker(container, { reload: () => {}, warn });
+    await settle();
+    expect(warn).toHaveBeenCalledWith(
+      "calin: the service worker could not be registered: Error: insecure origin",
+    );
+    registerWorker(container, { reload: () => {} });
+    await settle();
+    expect(() => bridge.applyUpdate()).not.toThrow();
   });
 });

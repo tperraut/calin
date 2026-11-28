@@ -462,6 +462,148 @@ describe("buffers", () => {
     });
   });
 
+  describe("never loses the reader's unsaved text", () => {
+    async function edited() {
+      const app = setup();
+      const buffer = await app.opened(main);
+      app.buffers.edit(buffer.key, "mine\n");
+      return { ...app, buffer };
+    }
+
+    it("when a reload fails", async () => {
+      const { buffers, buffer, look, read } = await edited();
+      read.mockRejectedValueOnce(new HttpError(500, "disk on fire", true));
+      await buffers.reload(buffer.key);
+      expect(look(buffer)).toMatchObject({ text: "mine\n", dirty: true, notice: "error" });
+      expect(buffer.notice()).toEqual({ kind: "error", message: "disk on fire" });
+    });
+
+    it("when an overwrite cannot re-read the file: nothing is written", async () => {
+      const { buffers, buffer, look, read, write } = await edited();
+      read.mockRejectedValueOnce(new HttpError(500, "disk on fire", true));
+      await buffers.overwrite(buffer.key);
+      expect(write).not.toHaveBeenCalled();
+      expect(look(buffer)).toMatchObject({ text: "mine\n", dirty: true, notice: "error" });
+    });
+
+    it("when an overwrite finds the file gone: it is created again", async () => {
+      const { buffers, buffer, look, disk, write } = await edited();
+      disk.delete(buffer.key);
+      await buffers.overwrite(buffer.key);
+      expect(write).toHaveBeenLastCalledWith(main, { text: "mine\n" });
+      expect(disk.get(buffer.key)).toBe("mine\n");
+      expect(look(buffer)).toMatchObject({ text: "mine\n", dirty: false, notice: undefined });
+    });
+
+    it("when the disk version cannot be compared", async () => {
+      const { buffers, buffer, look, read } = await edited();
+      read.mockResolvedValueOnce(content(main, null, { binary: true, size: 3 }));
+      await buffers.compare(buffer.key);
+      expect(buffer.notice()).toEqual({
+        kind: "error",
+        message: "The version on disk is not text that can be compared.",
+      });
+      read.mockRejectedValueOnce(new HttpError(500, "disk on fire", true));
+      await buffers.compare(buffer.key);
+      expect(buffer.notice()).toEqual({ kind: "error", message: "disk on fire" });
+      expect(buffer.comparing()).toBeUndefined();
+      expect(look(buffer)).toMatchObject({ text: "mine\n", dirty: true, revision: 1 });
+    });
+
+    it("when a changed file cannot be read: the buffer stays as it is", async () => {
+      const { buffers, buffer, look, read } = await edited();
+      read.mockRejectedValueOnce(new HttpError(500, "disk on fire", true));
+      await buffers.changedOnDisk(main, false);
+      expect(look(buffer)).toMatchObject({ text: "mine\n", dirty: true, notice: undefined });
+    });
+
+    it("when a changed file is found gone on read: it says it was deleted", async () => {
+      const { buffers, buffer, look, disk } = await edited();
+      disk.delete(buffer.key);
+      await buffers.changedOnDisk(main, false);
+      expect(look(buffer)).toMatchObject({ text: "mine\n", dirty: true, notice: "deleted" });
+    });
+
+    it("when a read asked before a save answers after it: the older version is dropped", async () => {
+      const { buffers, buffer, look, read, disk } = await edited();
+      const slow = deferred<FileContent>();
+      read.mockReturnValueOnce(slow.promise);
+      const changed = buffers.changedOnDisk(main, false);
+      await buffers.save(buffer.key);
+      expect(disk.get(buffer.key)).toBe("mine\n");
+      // The server read the file before the save wrote it.
+      slow.resolve(content(main, "fn main() {}\n"));
+      await changed;
+      expect(look(buffer)).toMatchObject({
+        text: "mine\n",
+        dirty: false,
+        notice: undefined,
+        revision: 1,
+      });
+    });
+
+    it("when a change event arrives while a save is in flight: it is left to the save", async () => {
+      const { buffers, buffer, read, write } = await edited();
+      const answer = deferred<FileContent>();
+      write.mockReturnValueOnce(answer.promise);
+      read.mockClear();
+      const saving = buffers.save(buffer.key);
+      await buffers.changedOnDisk(main, false);
+      expect(read).not.toHaveBeenCalled();
+      answer.resolve(content(main, "mine\n"));
+      await saving;
+    });
+  });
+
+  it("drops a read that answers after its tab was closed and opened again", async () => {
+    const { buffers, read, look, opened } = setup();
+    const slow = deferred<FileContent>();
+    read.mockReturnValueOnce(slow.promise);
+    buffers.open(main);
+    buffers.close(bufferKey(main));
+    const buffer = await opened(main);
+    slow.reject(new HttpError(500, "late", true));
+    await settle();
+    expect(look(buffer)).toMatchObject({ load: "text", text: "fn main() {}\n" });
+  });
+
+  it("ignores what is asked of a tab that is not open", async () => {
+    const { buffers, opened, read, write } = setup();
+    await opened(main);
+    read.mockClear();
+    const gone = bufferKey(lib);
+    buffers.activate(gone);
+    buffers.close(gone);
+    buffers.edit(gone, "text");
+    buffers.endCompare(gone);
+    buffers.dismiss(gone);
+    await buffers.save(gone);
+    await buffers.reload(gone);
+    await buffers.overwrite(gone);
+    await buffers.compare(gone);
+    flush();
+    expect(buffers.activeKey()).toBe(bufferKey(main));
+    expect(buffers.list()).toHaveLength(1);
+    expect(read).not.toHaveBeenCalled();
+    expect(write).not.toHaveBeenCalled();
+  });
+
+  it("closing a tab in the background keeps the active one", async () => {
+    const { buffers, opened } = setup();
+    await opened(main);
+    await opened(lib);
+    buffers.close(bufferKey(main));
+    flush();
+    expect(buffers.activeKey()).toBe(bufferKey(lib));
+  });
+
+  it("restores each tab once, and the first one when the active one is not among them", () => {
+    const { buffers } = setup({ stored: { tabs: [main, lib, main], active: "elsewhere" } });
+    flush();
+    expect(buffers.list().map((buffer) => buffer.name)).toEqual(["main.rs", "lib.rs"]);
+    expect(buffers.activeKey()).toBe(bufferKey(main));
+  });
+
   it("keeps tabs per session in sessionStorage, and survives what it finds there", () => {
     const storage = sessionTabStorage("s1");
     expect(storage.load()).toBeUndefined();
@@ -476,5 +618,26 @@ describe("buffers", () => {
       JSON.stringify({ tabs: [main, { path: 3 }, "x", { ...lib, text: "leaked" }], active: 7 }),
     );
     expect(storage.load()).toEqual({ tabs: [main, lib], active: null });
+    sessionStorage.setItem("calin.files.v1:s1", JSON.stringify({ active: bufferKey(main) }));
+    expect(storage.load()).toEqual({ tabs: [], active: bufferKey(main) });
+    sessionStorage.setItem("calin.files.v1:s1", "7");
+    expect(storage.load()).toBeUndefined();
+  });
+
+  it("restores nothing, and stores nothing, when sessionStorage is forbidden", () => {
+    const storage = sessionTabStorage("s1");
+    const getItem = vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
+      throw new DOMException("denied", "SecurityError");
+    });
+    const setItem = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new DOMException("denied", "SecurityError");
+    });
+    try {
+      expect(storage.load()).toBeUndefined();
+      expect(() => storage.save({ tabs: [main], active: null })).not.toThrow();
+    } finally {
+      getItem.mockRestore();
+      setItem.mockRestore();
+    }
   });
 });

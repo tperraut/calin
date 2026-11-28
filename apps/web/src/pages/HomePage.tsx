@@ -2,17 +2,14 @@ import { useNavigate } from "@solidjs/router";
 import { onSettled, Show, useContext } from "solid-js";
 import { Composer } from "../components/Composer";
 import { sessionPath } from "../panels/registry";
-import { AppContext } from "../state/app";
+import { AppContext, healthRunners } from "../state/app";
 
 /** `/`: the composer. The sessions list beside (or above) it belongs to the shell. */
 export default function HomePage() {
   const app = useContext(AppContext);
   const navigate = useNavigate();
 
-  const runners = (): readonly string[] => {
-    const health = app.health();
-    return health.status === "ready" ? health.health.runners : [];
-  };
+  const runners = (): readonly string[] => healthRunners(app.health());
 
   // api.rs: issues need a usable `gh`; when the server says it is not, there is nothing to list.
   const githubUsable = (): boolean =>

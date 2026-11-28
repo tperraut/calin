@@ -144,18 +144,28 @@ function loadLanguage(path: string, apply: (language: Extension) => void): void 
     });
 }
 
+const locked = (value: boolean): Extension => [
+  EditorState.readOnly.of(value),
+  // Still focusable and selectable when locked, so it can be read and searched.
+  EditorView.contentAttributes.of({ "aria-readonly": value ? "true" : "false" }),
+];
+
+const wrapping = (value: boolean): Extension => (value ? EditorView.lineWrapping : []);
+
+/** Calls `onChange` for the reader's edits only: a text set from outside is not one. */
+const reportEdits = (onChange: ((text: string) => void) | undefined): Extension =>
+  EditorView.updateListener.of((update) => {
+    if (!update.docChanged) return;
+    if (update.transactions.some((transaction) => transaction.annotation(external))) return;
+    onChange?.(update.state.doc.toString());
+  });
+
 function createEditor(parent: HTMLElement, options: EditorOptions): EditorHandle {
   const language = new Compartment();
   const readOnly = new Compartment();
   const wrap = new Compartment();
   const scheme = new Compartment();
   let destroyed = false;
-
-  const locked = (value: boolean): Extension => [
-    EditorState.readOnly.of(value),
-    // Still focusable and selectable when locked, so it can be read and searched.
-    EditorView.contentAttributes.of({ "aria-readonly": value ? "true" : "false" }),
-  ];
 
   const view = new EditorView({
     parent,
@@ -191,17 +201,13 @@ function createEditor(parent: HTMLElement, options: EditorOptions): EditorHandle
           // Tab indents here, so the way out has to be said.
           "aria-description": "Press Escape, then Tab, to leave the editor.",
         }),
-        EditorView.updateListener.of((update) => {
-          if (!update.docChanged) return;
-          if (update.transactions.some((transaction) => transaction.annotation(external))) return;
-          options.onChange?.(update.state.doc.toString());
-        }),
+        reportEdits(options.onChange),
         theme,
         syntaxHighlighting(highlight),
         scheme.of(EditorView.darkTheme.of(isDark())),
         language.of([]),
         readOnly.of(locked(options.readOnly)),
-        wrap.of(options.wrap ? EditorView.lineWrapping : []),
+        wrap.of(wrapping(options.wrap)),
       ],
     }),
   });
@@ -226,7 +232,7 @@ function createEditor(parent: HTMLElement, options: EditorOptions): EditorHandle
       view.dispatch({ effects: readOnly.reconfigure(locked(value)) });
     },
     setWrap(value) {
-      view.dispatch({ effects: wrap.reconfigure(value ? EditorView.lineWrapping : []) });
+      view.dispatch({ effects: wrap.reconfigure(wrapping(value)) });
     },
     openSearch() {
       openSearchPanel(view);

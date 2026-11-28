@@ -2,7 +2,16 @@ import { describe, expect, it } from "vite-plus/test";
 import type { WorkflowRun } from "../gen/WorkflowRun";
 import type { WorkflowNote } from "../state/sessionReducer";
 import { node, specGraph, workflowInfo } from "../test/workflows";
-import { isUsable, mergeRun, noteWords, problemLines, shapeSummary, startRun } from "./workflow";
+import {
+  isUsable,
+  mergeRun,
+  noteWords,
+  problemLines,
+  QUICK_WORKFLOW,
+  sentWorkflow,
+  shapeSummary,
+  startRun,
+} from "./workflow";
 
 const started = (nodeKind: string, nodeId: string, label: string, run = 1): WorkflowNote => ({
   what: "node_started",
@@ -75,11 +84,37 @@ describe("noteWords", () => {
     [finished("gate", "gate", "reject", "not yet", true), "Gate rejected", "danger"],
     [finished("loop", "retry", "exhausted", null, true), "Loop retry: no attempt left", "danger"],
     [finished("commit", "save", "nothing"), "Commit: nothing to commit", "neutral"],
+    [finished("commit", "save", "failed", "hook refused", true), "Commit failed: save", "danger"],
+    [finished("gate", "gate", "timeout", "nobody came", true), "Gate: timeout", "danger"],
+    [finished("gate", "gate", "later", "asked again"), "Gate: later", "neutral"],
+    [
+      finished("ship", "ship", "failed", "push refused", true),
+      "Ship ship left through failed",
+      "danger",
+    ],
+    [finished("teleport", "beam", "done", "arrived"), "teleport beam left through done", "neutral"],
   ])("finishes %#: %s", (note, text, tone) => {
     const words = noteWords(note);
     expect(words.text).toBe(text);
     expect(words.tone).toBe(tone);
     if (note.what === "node_finished") expect(words.detail).toBe(note.outcome);
+  });
+
+  it("says an outcome only when it is more than the port it left through", () => {
+    expect(noteWords(finished("agent", "review", "approve", " approve ")).detail).toBeNull();
+    expect(noteWords(finished("agent", "review", "changes", "   ")).detail).toBeNull();
+    expect(noteWords(finished("agent", "review", "changes", " typo ")).detail).toBe("typo");
+  });
+
+  it("names a step of a kind it does not know by its kind and label", () => {
+    expect(noteWords(started("teleport", "beam", ""))).toMatchObject({
+      text: "teleport: beam",
+      detail: null,
+    });
+    expect(noteWords(started("agent", "implement", "  "))).toMatchObject({
+      text: "Agent step: implement",
+      detail: null,
+    });
   });
 
   it("says the run started, succeeded and failed with its reason", () => {
@@ -127,6 +162,26 @@ describe("mergeRun", () => {
     });
   });
 
+  it("keeps the folded budget, and the server's entry count for a loop with no known limit", () => {
+    const local = folded();
+    const served: WorkflowRun = {
+      ...local,
+      budget_usd: 9,
+      nodes: local.nodes.map((one) => (one.id === "retry" ? { ...one, iteration: 1 } : one)),
+    };
+    const merged = mergeRun(local, served);
+    expect(merged?.budget_usd).toBe(5);
+    expect(merged?.nodes.find((one) => one.id === "retry")).toMatchObject({
+      runs: 2,
+      iteration: 1,
+      max: null,
+    });
+    const unbudgeted = { ...local, budget_usd: null };
+    expect(mergeRun(unbudgeted, served)?.budget_usd).toBe(9);
+    // A node the server does not list keeps what the events said.
+    expect(mergeRun(local, { ...served, nodes: [] })?.nodes).toEqual(local.nodes);
+  });
+
   it("shows the server's run when no event folded one, and ignores another workflow's", () => {
     const served = { ...folded(), cost_usd: 3 };
     expect(mergeRun(null, served)).toBe(served);
@@ -149,5 +204,11 @@ describe("workflow files", () => {
     expect(isUsable(broken)).toBe(false);
     expect(isUsable(workflowInfo("fine"))).toBe(true);
     expect(problemLines(workflowInfo("fine"))).toEqual([]);
+  });
+
+  it("sends the id of the workflow picked, and nothing for Quick or none", () => {
+    expect(sentWorkflow(workflowInfo("review"))).toBe("review");
+    expect(sentWorkflow(workflowInfo(QUICK_WORKFLOW))).toBeUndefined();
+    expect(sentWorkflow(undefined)).toBeUndefined();
   });
 });

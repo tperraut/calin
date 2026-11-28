@@ -9,6 +9,7 @@ import {
   Switch,
   useContext,
   type Accessor,
+  type Setter,
 } from "solid-js";
 import { HttpError } from "../api/http";
 import type { PushPreferences } from "../gen/PushPreferences";
@@ -272,49 +273,155 @@ type Devices =
   | { status: "ready"; items: readonly PushSubscriptionInfo[] }
   | { status: "error"; message: string };
 
-/** Everything that needs this browser to support push, in public mode. */
-function NotificationControls() {
-  const app = useContext(AppContext);
-  const devicesId = createUniqueId();
-  const preferencesId = createUniqueId();
-  const [devices, setDevices] = createSignal<Devices>({ status: "loading" });
-  // `undefined` until the browser answered; `null` when it holds no subscription.
-  const [mine, setMine] = createSignal<DeviceSubscription | null>();
-  const [permission, setPermission] = createSignal<Permission>(app.device.permission());
-  const [busy, setBusy] = createSignal(false);
-  const [problem, setProblem] = createSignal<string>();
-  const [notice, setNotice] = createSignal<string>();
+/** What to tell the user when the browser's answer is not yes. */
+function permissionProblem(answer: Permission): string | undefined {
+  if (answer === "denied") return PROBLEMS.denied;
+  return answer === "granted" ? undefined : PROBLEMS.dismissed;
+}
 
-  const listed = (): readonly PushSubscriptionInfo[] | undefined => {
-    const state = devices();
+/** Stopping has two halves, the browser's and the server's: says which one failed. */
+function stopProblem(unsubscribed: boolean, serverError: string | undefined): string | undefined {
+  if (!unsubscribed && serverError !== undefined) {
+    return `Nothing changed: this browser could not unsubscribe, and the server refused to remove this device: ${serverError}`;
+  }
+  if (!unsubscribed) {
+    return "The server no longer notifies this device, but this browser could not unsubscribe. Block notifications for this site in the browser's settings to be sure.";
+  }
+  if (serverError !== undefined) {
+    return `This browser unsubscribed, but the server still lists this device: ${serverError}`;
+  }
+  return undefined;
+}
+
+/** The server's entry for `current`, matched by the hash of its endpoint. */
+function entryFor(
+  items: readonly PushSubscriptionInfo[] | undefined,
+  current: DeviceSubscription | null | undefined,
+): PushSubscriptionInfo | undefined {
+  if (!current) return undefined;
+  return items?.find((one) => one.endpoint_sha256 === current.endpointSha256);
+}
+
+/** This browser's subscription and the server's list of notified devices, kept in step. */
+class PushControls {
+  readonly devices: Accessor<Devices>;
+  /** `undefined` until the browser answered; `null` when it holds no subscription. */
+  readonly mine: Accessor<DeviceSubscription | null | undefined>;
+  readonly permission: Accessor<Permission>;
+  readonly busy: Accessor<boolean>;
+  readonly problem: Accessor<string | undefined>;
+  readonly notice: Accessor<string | undefined>;
+  /** The server's entry for this browser. */
+  readonly thisDevice: Accessor<PushSubscriptionInfo | undefined>;
+  private readonly setDevices: Setter<Devices>;
+  private readonly setMine: Setter<DeviceSubscription | null | undefined>;
+  private readonly setPermission: Setter<Permission>;
+  private readonly setBusy: Setter<boolean>;
+  private readonly setProblem: Setter<string | undefined>;
+  private readonly setNotice: Setter<string | undefined>;
+  private readonly app: AppState;
+
+  constructor(app: AppState) {
+    this.app = app;
+    [this.devices, this.setDevices] = createSignal<Devices>({ status: "loading" });
+    [this.mine, this.setMine] = createSignal<DeviceSubscription | null>();
+    [this.permission, this.setPermission] = createSignal<Permission>(app.device.permission());
+    [this.busy, this.setBusy] = createSignal(false);
+    [this.problem, this.setProblem] = createSignal<string>();
+    [this.notice, this.setNotice] = createSignal<string>();
+    this.thisDevice = createMemo(() => entryFor(this.listed(), this.mine()));
+  }
+
+  listed(): readonly PushSubscriptionInfo[] | undefined {
+    const state = this.devices();
     return state.status === "ready" ? state.items : undefined;
-  };
-  const devicesError = (): string | undefined => {
-    const state = devices();
-    return state.status === "error" ? state.message : undefined;
-  };
-  /** The server's entry for this browser, matched by the hash of its endpoint. */
-  const thisDevice = createMemo((): PushSubscriptionInfo | undefined => {
-    const current = mine();
-    if (!current) return undefined;
-    return listed()?.find((one) => one.endpoint_sha256 === current.endpointSha256);
-  });
-  const known = (): boolean => mine() !== undefined && listed() !== undefined;
+  }
 
-  async function loadDevices(): Promise<readonly PushSubscriptionInfo[] | undefined> {
+  devicesError(): string | undefined {
+    const state = this.devices();
+    return state.status === "error" ? state.message : undefined;
+  }
+
+  known(): boolean {
+    return this.mine() !== undefined && this.listed() !== undefined;
+  }
+
+  isThisDevice(device: PushSubscriptionInfo): boolean {
+    return device.id === this.thisDevice()?.id;
+  }
+
+  async load(): Promise<void> {
+    const [items, current] = await Promise.all([this.loadDevices(), this.readSubscription()]);
+    this.setMine(current);
+    await this.renewIfKeyChanged(current, items);
+  }
+
+  async loadDevices(): Promise<readonly PushSubscriptionInfo[] | undefined> {
     try {
-      const items = await app.listPushSubscriptions();
-      setDevices({ status: "ready", items });
+      const items = await this.app.listPushSubscriptions();
+      this.setDevices({ status: "ready", items });
       return items;
     } catch (error) {
-      if (listed() === undefined) setDevices({ status: "error", message: errorMessage(error) });
+      if (this.listed() === undefined) {
+        this.setDevices({ status: "error", message: errorMessage(error) });
+      }
       return undefined;
     }
   }
 
-  async function readSubscription(): Promise<DeviceSubscription | null> {
+  async notify(): Promise<void> {
+    if (this.busy()) return;
+    this.begin();
     try {
-      return await app.device.subscription();
+      const problem = await this.enable();
+      if (problem !== undefined) {
+        this.setProblem(problem);
+        return;
+      }
+      await this.loadDevices();
+      this.setNotice("This device will be notified.");
+    } finally {
+      this.setBusy(false);
+    }
+  }
+
+  /** Both halves: the browser's subscription and the server's entry. */
+  async stop(): Promise<string | undefined> {
+    if (this.busy()) return undefined;
+    this.begin();
+    const current = this.mine();
+    const entry = this.thisDevice();
+    try {
+      const unsubscribed = current ? await current.unsubscribe() : true;
+      const serverError = entry ? await removeQuietly(this.app, entry.id) : undefined;
+      if (unsubscribed) this.setMine(null);
+      await this.loadDevices();
+      const problem = stopProblem(unsubscribed, serverError);
+      if (problem === undefined) this.setNotice("This device is no longer notified.");
+      else this.setProblem(problem);
+      return undefined;
+    } finally {
+      this.setBusy(false);
+    }
+  }
+
+  async removeDevice(device: PushSubscriptionInfo): Promise<string | undefined> {
+    if (this.isThisDevice(device)) return this.stop();
+    const problem = await removeQuietly(this.app, device.id);
+    if (problem !== undefined) return `Could not remove it: ${problem}`;
+    await this.loadDevices();
+    return undefined;
+  }
+
+  private begin(): void {
+    this.setBusy(true);
+    this.setProblem(undefined);
+    this.setNotice(undefined);
+  }
+
+  private async readSubscription(): Promise<DeviceSubscription | null> {
+    try {
+      return await this.app.device.subscription();
     } catch {
       return null;
     }
@@ -324,219 +431,197 @@ function NotificationControls() {
    * The server's key changed since this browser subscribed: the old
    * subscription can no longer be used, so it is replaced without asking.
    */
-  async function renewIfKeyChanged(
+  private async renewIfKeyChanged(
     current: DeviceSubscription | null,
     items: readonly PushSubscriptionInfo[] | undefined,
   ): Promise<void> {
-    if (!current || current.publicKey === null || permission() !== "granted" || !items) return;
-    const old = items.find((one) => one.endpoint_sha256 === current.endpointSha256);
+    if (!current || current.publicKey === null || this.permission() !== "granted") return;
+    const old = entryFor(items, current);
     // Removed from the server (from another device, say): not this page's to bring back.
     if (!old) return;
     try {
-      const key = await app.pushKey();
+      const key = await this.app.pushKey();
       if (sameKey(current.publicKey, key)) return;
       await current.unsubscribe();
-      const renewed = await app.device.subscribe(key);
-      await app.registerPushSubscription(renewed.request);
-      await removeQuietly(app, old.id);
-      setMine(renewed);
-      await loadDevices();
+      const renewed = await this.app.device.subscribe(key);
+      await this.app.registerPushSubscription(renewed.request);
+      await removeQuietly(this.app, old.id);
+      this.setMine(renewed);
+      await this.loadDevices();
     } catch (error) {
-      setMine(await readSubscription());
-      setProblem(
+      this.setMine(await this.readSubscription());
+      this.setProblem(
         `Could not renew this device after the server's key changed: ${errorMessage(error)}`,
       );
     }
   }
 
-  async function load(): Promise<void> {
-    const [items, current] = await Promise.all([loadDevices(), readSubscription()]);
-    setMine(current);
-    await renewIfKeyChanged(current, items);
-  }
-  onSettled(() => void load());
-
-  async function notify(): Promise<void> {
-    if (busy()) return;
-    setBusy(true);
-    setProblem(undefined);
-    setNotice(undefined);
+  /** Asks, subscribes and registers; what went wrong, if anything. */
+  private async enable(): Promise<string | undefined> {
+    // First, while the click still counts as the user's: browsers only ask then.
+    const answer = await this.askPermission();
+    this.setPermission(answer);
+    const refused = permissionProblem(answer);
+    if (refused !== undefined) return refused;
+    let key: string;
     try {
-      // First, while the click still counts as the user's: browsers only ask then.
-      let answer: Permission;
-      try {
-        answer = await app.device.requestPermission();
-      } catch {
-        answer = app.device.permission();
-      }
-      setPermission(answer);
-      if (answer === "denied") {
-        setProblem(PROBLEMS.denied);
-        return;
-      }
-      if (answer !== "granted") {
-        setProblem(PROBLEMS.dismissed);
-        return;
-      }
-      let key: string;
-      try {
-        key = await app.pushKey();
-      } catch (error) {
-        setProblem(`The server did not give its notification key: ${errorMessage(error)}`);
-        return;
-      }
-      let subscription: DeviceSubscription;
-      try {
-        // A subscription made with another key cannot be reused for this one.
-        const existing = mine();
-        if (existing?.publicKey && !sameKey(existing.publicKey, key)) await existing.unsubscribe();
-        subscription = await app.device.subscribe(key);
-      } catch (error) {
-        setProblem(`This browser could not subscribe to notifications: ${errorMessage(error)}`);
-        return;
-      }
-      setMine(subscription);
-      try {
-        await app.registerPushSubscription(subscription.request);
-      } catch (error) {
-        setProblem(`The server did not accept this device: ${errorMessage(error)}`);
-        return;
-      }
-      await loadDevices();
-      setNotice("This device will be notified.");
-    } finally {
-      setBusy(false);
+      key = await this.app.pushKey();
+    } catch (error) {
+      return `The server did not give its notification key: ${errorMessage(error)}`;
     }
-  }
-
-  /** Both halves: the browser's subscription and the server's entry. Says which one failed. */
-  async function stop(): Promise<string | undefined> {
-    if (busy()) return undefined;
-    setBusy(true);
-    setProblem(undefined);
-    setNotice(undefined);
-    const current = mine();
-    const entry = thisDevice();
+    let subscription: DeviceSubscription;
     try {
-      const unsubscribed = current ? await current.unsubscribe() : true;
-      const serverError = entry ? await removeQuietly(app, entry.id) : undefined;
-      if (unsubscribed) setMine(null);
-      await loadDevices();
-      let message: string | undefined;
-      if (!unsubscribed && serverError !== undefined) {
-        message = `Nothing changed: this browser could not unsubscribe, and the server refused to remove this device: ${serverError}`;
-      } else if (!unsubscribed) {
-        message =
-          "The server no longer notifies this device, but this browser could not unsubscribe. Block notifications for this site in the browser's settings to be sure.";
-      } else if (serverError !== undefined) {
-        message = `This browser unsubscribed, but the server still lists this device: ${serverError}`;
-      }
-      if (message === undefined) setNotice("This device is no longer notified.");
-      else setProblem(message);
-      return undefined;
-    } finally {
-      setBusy(false);
+      subscription = await this.subscribeWith(key);
+    } catch (error) {
+      return `This browser could not subscribe to notifications: ${errorMessage(error)}`;
     }
-  }
-
-  async function removeDevice(device: PushSubscriptionInfo): Promise<string | undefined> {
-    if (device.id === thisDevice()?.id) return stop();
-    const problem = await removeQuietly(app, device.id);
-    if (problem !== undefined) return `Could not remove it: ${problem}`;
-    await loadDevices();
+    this.setMine(subscription);
+    try {
+      await this.app.registerPushSubscription(subscription.request);
+    } catch (error) {
+      return `The server did not accept this device: ${errorMessage(error)}`;
+    }
     return undefined;
   }
 
+  private async askPermission(): Promise<Permission> {
+    try {
+      return await this.app.device.requestPermission();
+    } catch {
+      return this.app.device.permission();
+    }
+  }
+
+  private async subscribeWith(key: string): Promise<DeviceSubscription> {
+    // A subscription made with another key cannot be reused for this one.
+    const existing = this.mine();
+    if (existing?.publicKey && !sameKey(existing.publicKey, key)) await existing.unsubscribe();
+    return this.app.device.subscribe(key);
+  }
+}
+
+function NotifyThisDevice(props: { controls: PushControls }) {
   return (
     <>
-      <div class="flex flex-col gap-2">
-        <Switch>
-          <Match when={!known()}>
-            <p class="text-sm text-muted">Checking this device…</p>
-          </Match>
-          <Match when={thisDevice()}>
-            <div class="flex flex-wrap items-center justify-between gap-2">
-              <p class="text-sm font-medium text-tone-success">This device is notified</p>
-              <button type="button" class="btn" disabled={busy()} onClick={() => void stop()}>
-                {busy() ? "Stopping…" : "Stop notifying this device"}
-              </button>
-            </div>
-          </Match>
-          <Match when={true}>
-            <p class="text-sm">
-              Get a notification on this device when a session needs you, even with Calin closed.
-            </p>
-            <div>
-              <button
-                type="button"
-                class="btn btn-primary"
-                disabled={busy()}
-                onClick={() => void notify()}
-              >
-                {busy() ? "Asking…" : "Notify this device"}
-              </button>
-            </div>
-            <Show when={permission() === "denied" && problem() === undefined}>
-              <p class={hint}>{PROBLEMS.denied}</p>
-            </Show>
-          </Match>
-        </Switch>
-        <Show when={problem()}>
-          {(message) => (
-            <p role="alert" class={fieldError}>
-              {message()}
-            </p>
-          )}
-        </Show>
-        <p role="status" class="text-sm text-tone-success empty:hidden">
-          {notice() ?? ""}
-        </p>
+      <p class="text-sm">
+        Get a notification on this device when a session needs you, even with Calin closed.
+      </p>
+      <div>
+        <button
+          type="button"
+          class="btn btn-primary"
+          disabled={props.controls.busy()}
+          onClick={() => void props.controls.notify()}
+        >
+          {props.controls.busy() ? "Asking…" : "Notify this device"}
+        </button>
       </div>
+      <Show
+        when={props.controls.permission() === "denied" && props.controls.problem() === undefined}
+      >
+        <p class={hint}>{PROBLEMS.denied}</p>
+      </Show>
+    </>
+  );
+}
 
-      <section aria-labelledby={devicesId} class="flex flex-col gap-2">
-        <h3 id={devicesId} class="text-sm font-medium">
-          Notified devices
-        </h3>
-        <Switch>
-          <Match when={devicesError()}>
-            {(message) => (
-              <LoadFailure
-                what="The notified devices"
-                message={message()}
-                onRetry={() => void loadDevices()}
-              />
-            )}
-          </Match>
-          <Match when={listed()}>
-            {(items) => (
-              <Show
-                when={items().length > 0}
-                fallback={<p class="text-sm text-muted">No device is notified yet.</p>}
+function ThisDevice(props: { controls: PushControls }) {
+  return (
+    <div class="flex flex-col gap-2">
+      <Switch>
+        <Match when={!props.controls.known()}>
+          <p class="text-sm text-muted">Checking this device…</p>
+        </Match>
+        <Match when={props.controls.thisDevice()}>
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <p class="text-sm font-medium text-tone-success">This device is notified</p>
+            <button
+              type="button"
+              class="btn"
+              disabled={props.controls.busy()}
+              onClick={() => void props.controls.stop()}
+            >
+              {props.controls.busy() ? "Stopping…" : "Stop notifying this device"}
+            </button>
+          </div>
+        </Match>
+        <Match when={true}>
+          <NotifyThisDevice controls={props.controls} />
+        </Match>
+      </Switch>
+      <Show when={props.controls.problem()}>
+        {(message) => (
+          <p role="alert" class={fieldError}>
+            {message()}
+          </p>
+        )}
+      </Show>
+      <p role="status" class="text-sm text-tone-success empty:hidden">
+        {props.controls.notice() ?? ""}
+      </p>
+    </div>
+  );
+}
+
+function NotifiedDevices(props: { controls: PushControls }) {
+  const app = useContext(AppContext);
+  const headingId = createUniqueId();
+  return (
+    <section aria-labelledby={headingId} class="flex flex-col gap-2">
+      <h3 id={headingId} class="text-sm font-medium">
+        Notified devices
+      </h3>
+      <Switch>
+        <Match when={props.controls.devicesError()}>
+          {(message) => (
+            <LoadFailure
+              what="The notified devices"
+              message={message()}
+              onRetry={() => void props.controls.loadDevices()}
+            />
+          )}
+        </Match>
+        <Match when={props.controls.listed()}>
+          {(items) => (
+            <Show
+              when={items().length > 0}
+              fallback={<p class="text-sm text-muted">No device is notified yet.</p>}
+            >
+              <ul
+                aria-label="Notified devices"
+                class="divide-y divide-line rounded-md border border-line"
               >
-                <ul
-                  aria-label="Notified devices"
-                  class="divide-y divide-line rounded-md border border-line"
-                >
-                  <For each={items()} keyed={(device) => device.id}>
-                    {(device) => (
-                      <DeviceRow
-                        device={device}
-                        mine={device().id === thisDevice()?.id}
-                        now={app.now()}
-                        onRemove={() => removeDevice(device())}
-                      />
-                    )}
-                  </For>
-                </ul>
-              </Show>
-            )}
-          </Match>
-          <Match when={true}>
-            <p class="text-sm text-muted">Reading the notified devices…</p>
-          </Match>
-        </Switch>
-      </section>
+                <For each={items()} keyed={(device) => device.id}>
+                  {(device) => (
+                    <DeviceRow
+                      device={device}
+                      mine={props.controls.isThisDevice(device())}
+                      now={app.now()}
+                      onRemove={() => props.controls.removeDevice(device())}
+                    />
+                  )}
+                </For>
+              </ul>
+            </Show>
+          )}
+        </Match>
+        <Match when={true}>
+          <p class="text-sm text-muted">Reading the notified devices…</p>
+        </Match>
+      </Switch>
+    </section>
+  );
+}
 
+/** Everything that needs this browser to support push, in public mode. */
+function NotificationControls() {
+  const controls = new PushControls(useContext(AppContext));
+  const preferencesId = createUniqueId();
+  onSettled(() => void controls.load());
+  return (
+    <>
+      <ThisDevice controls={controls} />
+      <NotifiedDevices controls={controls} />
       <Preferences headingId={preferencesId} />
       <TestNotification />
     </>

@@ -1,6 +1,9 @@
 import { For, Show, type ParentProps } from "solid-js";
 import type { JSX } from "@solidjs/web";
 import { SessionStatusBadge } from "../../components/Badge";
+import type { Agent } from "../../gen/Agent";
+import type { GraphNode } from "../../gen/GraphNode";
+import type { SessionStatus } from "../../gen/SessionStatus";
 import type { TimelineArrow } from "../../gen/TimelineArrow";
 import type { TimelineSpan } from "../../gen/TimelineSpan";
 import {
@@ -20,6 +23,7 @@ import {
   edgeSentence,
   edgesOf,
   repoChangers,
+  sessionLead,
   type EdgeView,
   type GraphModel,
   type NodeView,
@@ -110,6 +114,30 @@ function Relations(props: {
   );
 }
 
+/** A session's status as its badge; nothing when the session has none. */
+const statusBadge = (status: SessionStatus | null | undefined): JSX.Element | undefined =>
+  status ? <SessionStatusBadge status={status} /> : undefined;
+
+function AgentFacts(props: { agent: Agent; lead: GraphNode | undefined }) {
+  return (
+    <Facts
+      rows={[
+        ["Role", props.agent.role],
+        ["Status", agentLook(props.agent.status).label],
+        ["Runner", <span class="font-mono">{props.agent.runner}</span>],
+        ["Model", props.agent.model ?? undefined],
+        ["Cost", formatCost(props.agent.cost_usd)],
+        [
+          "Tokens",
+          `${compactCount(props.agent.tokens_in)} in · ${compactCount(props.agent.tokens_out)} out`,
+        ],
+        ["Session", props.lead?.session_title ?? undefined],
+        ["Session status", statusBadge(props.lead?.session_status)],
+      ]}
+    />
+  );
+}
+
 function AgentDetails(props: {
   node: NodeView;
   model: GraphModel;
@@ -118,39 +146,11 @@ function AgentDetails(props: {
   onShowAgent: (agentId: string) => void;
 }) {
   const agent = () => props.node.node.agent;
-  // A subagent's node does not carry its session's title: its session's lead does.
-  const lead = () =>
-    props.model.nodes.find(
-      (one) =>
-        one.node.session_id === props.node.node.session_id &&
-        one.node.session_id !== null &&
-        one.node.session_title !== null,
-    )?.node;
   return (
     <>
       <Show when={agent()}>
         {(known) => (
-          <Facts
-            rows={[
-              ["Role", known().role],
-              ["Status", agentLook(known().status).label],
-              ["Runner", <span class="font-mono">{known().runner}</span>],
-              ["Model", known().model ?? undefined],
-              ["Cost", formatCost(known().cost_usd)],
-              [
-                "Tokens",
-                `${compactCount(known().tokens_in)} in · ${compactCount(known().tokens_out)} out`,
-              ],
-              ["Session", lead()?.session_title ?? undefined],
-              [
-                "Session status",
-                (() => {
-                  const status = lead()?.session_status;
-                  return status ? <SessionStatusBadge status={status} /> : undefined;
-                })(),
-              ],
-            ]}
-          />
+          <AgentFacts agent={known()} lead={sessionLead(props.node.node.session_id, props.model)} />
         )}
       </Show>
       <div class="flex flex-wrap gap-2">

@@ -235,45 +235,89 @@ function isPublicHealth(value: Health | PublicHealth): value is PublicHealth {
 
 export const SIGNED_OUT_MESSAGE = "Not signed in";
 
-export function createApi(
-  fetchFn: FetchLike = (input, init) => fetch(input, init),
-  base: string = API_BASE,
-): Api {
-  const unauthorizedListeners = new Set<() => void>();
+const sessionPath = (id: string) => `/sessions/${encodeURIComponent(id)}`;
+const repoPath = (id: string) => `/repos/${encodeURIComponent(id)}`;
+const automationPath = (id: string) => `/automations/${encodeURIComponent(id)}`;
+const tokenPath = (id: string) => `/tokens/${encodeURIComponent(id)}`;
 
-  function notifyUnauthorized(): void {
-    for (const listener of unauthorizedListeners) listener();
+// A path is one query value: `/` and every awkward character in it travel percent-encoded.
+function inRepoPath(id: string, sessionRepoId: string, route: string, path: string): string {
+  return (
+    `${sessionPath(id)}/repos/${encodeURIComponent(sessionRepoId)}/${route}` +
+    (path === "" ? "" : `?path=${encodeURIComponent(path)}`)
+  );
+}
+
+/** `?a=1&b=2` from the entries that are set, each value percent-encoded; empty when none is. */
+function queryString(params: Record<string, string | number | undefined>): string {
+  const parts = Object.entries(params).flatMap(([key, value]) =>
+    value === undefined ? [] : [`${key}=${encodeURIComponent(String(value))}`],
+  );
+  return parts.length === 0 ? "" : `?${parts.join("&")}`;
+}
+
+function issuesPath(repoId: string, wanted: IssueQuery = {}): string {
+  const q = wanted.q === "" ? undefined : wanted.q;
+  return `${repoPath(repoId)}/issues${queryString({ state: wanted.state, q })}`;
+}
+
+const rounded = (value: number | undefined) =>
+  value === undefined ? undefined : Math.round(value);
+
+function usagePath(wanted: UsageQuery = {}): string {
+  return `/usage${queryString({ from: rounded(wanted.from), to: rounded(wanted.to), by: wanted.by })}`;
+}
+
+function graphPath(id: string, at: number | undefined): string {
+  return `${sessionPath(id)}/graph${at === undefined ? "" : `?at=${Math.round(at)}`}`;
+}
+
+/** api.rs: 404 is "this session runs no workflow", an answer rather than a failure. */
+function isNoWorkflow(error: unknown): boolean {
+  return error instanceof HttpError && error.status === 404 && error.fromServer;
+}
+
+function requestInit(method: Method, body: unknown): RequestInit {
+  const headers: Record<string, string> = { Accept: "application/json" };
+  // The session cookie travels on its own (same origin): it is HttpOnly and the app never holds it.
+  const init: RequestInit = { method, headers };
+  if (body !== undefined) {
+    headers["Content-Type"] = "application/json";
+    init.body = JSON.stringify(body);
+  }
+  return init;
+}
+
+/** Sends requests and turns every failure into an `HttpError`; 401s also reach the listeners. */
+class Transport {
+  private readonly unauthorizedListeners = new Set<() => void>();
+  private readonly fetchFn: FetchLike;
+  private readonly base: string;
+
+  constructor(fetchFn: FetchLike, base: string) {
+    this.fetchFn = fetchFn;
+    this.base = base;
   }
 
-  /** `url` is absolute on this origin; `base` applies only through `send`. */
-  async function sendTo(url: string, method: Method, body?: unknown): Promise<Response> {
-    const headers: Record<string, string> = { Accept: "application/json" };
-    // The session cookie travels on its own (same origin): it is HttpOnly and the app never holds it.
-    const init: RequestInit = { method, headers };
-    if (body !== undefined) {
-      headers["Content-Type"] = "application/json";
-      init.body = JSON.stringify(body);
-    }
-    let response: Response;
-    try {
-      response = await fetchFn(url, init);
-    } catch {
-      throw new HttpError(0, UNREACHABLE_MESSAGE, false);
-    }
-    if (response.status === 401) {
-      const refusal = await failure(response);
-      notifyUnauthorized();
-      throw refusal.fromServer ? refusal : new HttpError(401, SIGNED_OUT_MESSAGE, false);
-    }
+  onUnauthorized(listener: () => void): () => void {
+    this.unauthorizedListeners.add(listener);
+    return () => this.unauthorizedListeners.delete(listener);
+  }
+
+  notifyUnauthorized(): void {
+    for (const listener of this.unauthorizedListeners) listener();
+  }
+
+  /** `url` is absolute on this origin; `base` applies only through `json` and `empty`. */
+  async sendTo(url: string, method: Method, body?: unknown): Promise<Response> {
+    const response = await this.fetchOrUnreachable(url, requestInit(method, body));
+    if (response.status === 401) throw await this.signedOut(response);
     if (!response.ok) throw await failure(response);
     return response;
   }
 
-  const send = (method: Method, path: string, body?: unknown): Promise<Response> =>
-    sendTo(base + path, method, body);
-
-  async function json<T>(method: Method, path: string, body?: unknown): Promise<T> {
-    const response = await send(method, path, body);
+  async json<T>(method: Method, path: string, body?: unknown): Promise<T> {
+    const response = await this.sendTo(this.base + path, method, body);
     try {
       // The generated types are the contract; the server is trusted to honor it.
       return (await response.json()) as T;
@@ -282,48 +326,50 @@ export function createApi(
     }
   }
 
-  async function empty(method: Method, path: string, body?: unknown): Promise<void> {
-    await send(method, path, body);
+  async empty(method: Method, path: string, body?: unknown): Promise<void> {
+    await this.sendTo(this.base + path, method, body);
   }
 
-  const session = (id: string) => `/sessions/${encodeURIComponent(id)}`;
-  // A path is one query value: `/` and every awkward character in it travel percent-encoded.
-  const inRepo = (id: string, sessionRepoId: string, route: string, path: string) =>
-    `${session(id)}/repos/${encodeURIComponent(sessionRepoId)}/${route}` +
-    (path === "" ? "" : `?path=${encodeURIComponent(path)}`);
+  private async fetchOrUnreachable(url: string, init: RequestInit): Promise<Response> {
+    try {
+      return await this.fetchFn(url, init);
+    } catch {
+      throw new HttpError(0, UNREACHABLE_MESSAGE, false);
+    }
+  }
 
-  /** `?a=1&b=2` from the entries that are set, each value percent-encoded; empty when none is. */
-  const query = (params: Record<string, string | number | undefined>): string => {
-    const parts = Object.entries(params).flatMap(([key, value]) =>
-      value === undefined ? [] : [`${key}=${encodeURIComponent(String(value))}`],
-    );
-    return parts.length === 0 ? "" : `?${parts.join("&")}`;
-  };
-  const repo = (id: string) => `/repos/${encodeURIComponent(id)}`;
-  const automation = (id: string) => `/automations/${encodeURIComponent(id)}`;
+  private async signedOut(response: Response): Promise<HttpError> {
+    const refusal = await failure(response);
+    this.notifyUnauthorized();
+    return refusal.fromServer ? refusal : new HttpError(401, SIGNED_OUT_MESSAGE, false);
+  }
+}
 
-  const tokens = (id: string) => `/tokens/${encodeURIComponent(id)}`;
+const browserFetch: FetchLike = (input, init) => fetch(input, init);
+
+export function createApi(fetchFn: FetchLike = browserFetch, base: string = API_BASE): Api {
+  const http = new Transport(fetchFn, base);
+  const json = <T>(method: Method, path: string, body?: unknown) =>
+    http.json<T>(method, path, body);
+  const empty = (method: Method, path: string, body?: unknown) => http.empty(method, path, body);
 
   return {
     me: () => json<Me>("GET", "/me"),
     async logout() {
-      await sendTo(AUTH_LOGOUT_PATH, "POST");
+      await http.sendTo(AUTH_LOGOUT_PATH, "POST");
     },
-    onUnauthorized(listener) {
-      unauthorizedListeners.add(listener);
-      return () => unauthorizedListeners.delete(listener);
-    },
+    onUnauthorized: (listener) => http.onUnauthorized(listener),
     async health() {
       const loaded = await json<Health | PublicHealth>("GET", "/health");
       if (!isPublicHealth(loaded)) return loaded;
-      notifyUnauthorized();
+      http.notifyUnauthorized();
       throw new HttpError(401, SIGNED_OUT_MESSAGE, false);
     },
     listAuthSessions: () => json<AuthSessionInfo[]>("GET", "/auth/sessions"),
     revokeAuthSession: (id) => empty("DELETE", `/auth/sessions/${encodeURIComponent(id)}`),
     listDeviceTokens: () => json<DeviceTokenInfo[]>("GET", "/tokens"),
     createDeviceToken: (body) => json<CreatedDeviceToken>("POST", "/tokens", body),
-    revokeDeviceToken: (id) => empty("DELETE", tokens(id)),
+    revokeDeviceToken: (id) => empty("DELETE", tokenPath(id)),
     getPushKey: () => json<PushKey>("GET", "/push/key"),
     listPushSubscriptions: () => json<PushSubscriptionInfo[]>("GET", "/push/subscriptions"),
     createPushSubscription: (body) =>
@@ -338,65 +384,51 @@ export function createApi(
     listRepos: () => json<Repo[]>("GET", "/repos"),
     registerRepo: (body) => json<Repo>("POST", "/repos", body),
     refreshRepos: () => json<Repo[]>("POST", "/repos/refresh"),
-    cloneRepo: (id) => empty("POST", `/repos/${encodeURIComponent(id)}/clone`),
-    removeRepo: (id) => empty("DELETE", `/repos/${encodeURIComponent(id)}`),
+    cloneRepo: (id) => empty("POST", `${repoPath(id)}/clone`),
+    removeRepo: (id) => empty("DELETE", repoPath(id)),
     listRepoSets: () => json<RepoSet[]>("GET", "/repo-sets"),
-    listIssues: (repoId, wanted = {}) =>
-      json<Issue[]>(
-        "GET",
-        `${repo(repoId)}/issues${query({ state: wanted.state, q: wanted.q === "" ? undefined : wanted.q })}`,
-      ),
+    listIssues: (repoId, wanted) => json<Issue[]>("GET", issuesPath(repoId, wanted)),
     getIssue: (repoId, number) =>
-      json<IssueDetail>("GET", `${repo(repoId)}/issues/${encodeURIComponent(String(number))}`),
-    getUsage: (wanted = {}) =>
-      json<Usage>(
-        "GET",
-        `/usage${query({
-          from: wanted.from === undefined ? undefined : Math.round(wanted.from),
-          to: wanted.to === undefined ? undefined : Math.round(wanted.to),
-          by: wanted.by,
-        })}`,
-      ),
+      json<IssueDetail>("GET", `${repoPath(repoId)}/issues/${encodeURIComponent(String(number))}`),
+    getUsage: (wanted) => json<Usage>("GET", usagePath(wanted)),
     getUsageLimits: () => json<RunnerLimits[]>("GET", "/usage/limits"),
     listAutomations: () => json<Automation[]>("GET", "/automations"),
     createAutomation: (body) => json<Automation>("POST", "/automations", body),
-    previewCron: (expr) => json<CronPreview>("GET", `/automations/cron${query({ expr })}`),
-    getAutomation: (id) => json<Automation>("GET", automation(id)),
-    putAutomation: (id, body) => json<Automation>("PUT", automation(id), body),
-    deleteAutomation: (id) => empty("DELETE", automation(id)),
-    runAutomation: (id, body) => json<AutomationRun>("POST", `${automation(id)}/run`, body),
-    listAutomationRuns: (id) => json<AutomationRun[]>("GET", `${automation(id)}/runs`),
+    previewCron: (expr) => json<CronPreview>("GET", `/automations/cron${queryString({ expr })}`),
+    getAutomation: (id) => json<Automation>("GET", automationPath(id)),
+    putAutomation: (id, body) => json<Automation>("PUT", automationPath(id), body),
+    deleteAutomation: (id) => empty("DELETE", automationPath(id)),
+    runAutomation: (id, body) => json<AutomationRun>("POST", `${automationPath(id)}/run`, body),
+    listAutomationRuns: (id) => json<AutomationRun[]>("GET", `${automationPath(id)}/runs`),
     listWorkflows: () => json<WorkflowInfo[]>("GET", "/workflows"),
     listSessions: () => json<Session[]>("GET", "/sessions"),
     createSession: (body) => json<SessionDetail>("POST", "/sessions", body),
-    getSession: (id) => json<SessionDetail>("GET", session(id)),
-    sendMessage: (id, body) => empty("POST", `${session(id)}/messages`, body),
-    interruptSession: (id) => empty("POST", `${session(id)}/interrupt`),
-    stopSession: (id) => empty("POST", `${session(id)}/stop`),
+    getSession: (id) => json<SessionDetail>("GET", sessionPath(id)),
+    sendMessage: (id, body) => empty("POST", `${sessionPath(id)}/messages`, body),
+    interruptSession: (id) => empty("POST", `${sessionPath(id)}/interrupt`),
+    stopSession: (id) => empty("POST", `${sessionPath(id)}/stop`),
     resolvePermission: (id, requestId, body) =>
-      empty("POST", `${session(id)}/permissions/${encodeURIComponent(requestId)}`, body),
+      empty("POST", `${sessionPath(id)}/permissions/${encodeURIComponent(requestId)}`, body),
     answerQuestion: (id, questionId, body) =>
-      empty("POST", `${session(id)}/questions/${encodeURIComponent(questionId)}`, body),
-    getGraph: (id, at) =>
-      json<Graph>("GET", `${session(id)}/graph${at === undefined ? "" : `?at=${Math.round(at)}`}`),
-    getTimeline: (id) => json<Timeline>("GET", `${session(id)}/timeline`),
+      empty("POST", `${sessionPath(id)}/questions/${encodeURIComponent(questionId)}`, body),
+    getGraph: (id, at) => json<Graph>("GET", graphPath(id, at)),
+    getTimeline: (id) => json<Timeline>("GET", `${sessionPath(id)}/timeline`),
     async getWorkflow(id) {
       try {
-        return await json<WorkflowRun>("GET", `${session(id)}/workflow`);
+        return await json<WorkflowRun>("GET", `${sessionPath(id)}/workflow`);
       } catch (error) {
-        // api.rs: 404 is "this session runs no workflow", an answer rather than a failure.
-        if (error instanceof HttpError && error.status === 404 && error.fromServer) return null;
+        if (isNoWorkflow(error)) return null;
         throw error;
       }
     },
-    attachRepo: (id, body) => json<SessionRepo>("POST", `${session(id)}/repos`, body),
-    shipSession: (id, body) => empty("POST", `${session(id)}/ship`, body),
-    refreshPullRequests: (id) => empty("POST", `${session(id)}/pull-requests/refresh`),
-    getChanges: (id) => json<RepoChanges[]>("GET", `${session(id)}/changes`),
-    getDiff: (id, repo, path) => json<FileDiff>("GET", inRepo(id, repo, "diff", path)),
-    listTree: (id, repo, path) => json<TreeEntry[]>("GET", inRepo(id, repo, "tree", path)),
-    readFile: (id, repo, path) => json<FileContent>("GET", inRepo(id, repo, "file", path)),
+    attachRepo: (id, body) => json<SessionRepo>("POST", `${sessionPath(id)}/repos`, body),
+    shipSession: (id, body) => empty("POST", `${sessionPath(id)}/ship`, body),
+    refreshPullRequests: (id) => empty("POST", `${sessionPath(id)}/pull-requests/refresh`),
+    getChanges: (id) => json<RepoChanges[]>("GET", `${sessionPath(id)}/changes`),
+    getDiff: (id, repo, path) => json<FileDiff>("GET", inRepoPath(id, repo, "diff", path)),
+    listTree: (id, repo, path) => json<TreeEntry[]>("GET", inRepoPath(id, repo, "tree", path)),
+    readFile: (id, repo, path) => json<FileContent>("GET", inRepoPath(id, repo, "file", path)),
     writeFile: (id, repo, path, body) =>
-      json<FileContent>("PUT", inRepo(id, repo, "file", path), body),
+      json<FileContent>("PUT", inRepoPath(id, repo, "file", path), body),
   };
 }

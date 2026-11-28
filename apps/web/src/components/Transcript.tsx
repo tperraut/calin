@@ -11,6 +11,8 @@ import {
   Switch,
   untrack,
   useContext,
+  type Accessor,
+  type Setter,
 } from "solid-js";
 import type { Agent } from "../gen/Agent";
 import type { AgentMessage } from "../gen/AgentMessage";
@@ -45,6 +47,7 @@ import type {
 import { Badge, ItemStatusBadge } from "./Badge";
 import { Markdown } from "./Markdown";
 import { PullRequestLink } from "./PullRequests";
+import { WaitingNote } from "./WaitingNote";
 
 type ToolContent = Extract<ItemContent, { kind: "tool" }>;
 
@@ -178,11 +181,12 @@ function ToolPermissionLine(props: { asked: ToolPermission }) {
         <Show when={around.answers()}>
           {(answers) => (
             <span class="ml-auto flex flex-wrap items-center justify-end gap-2">
-              <Show when={waiting()}>
-                <span class="text-xs text-muted">
-                  {answers().sending(id()) ? "Sending…" : "Sent, waiting for the agent…"}
-                </span>
-              </Show>
+              <WaitingNote
+                waiting={waiting()}
+                sending={answers().sending(id())}
+                asker="agent"
+                class="text-xs text-muted"
+              />
               {/* Named after the call, so each button says what it answers; the bar's are the plain ones. */}
               <button
                 type="button"
@@ -706,6 +710,92 @@ function agentOptions(agents: readonly Agent[]): { id: string; label: string }[]
 /** A request to bring one item into view; `seq` tells apart two requests for the same item. */
 export type RevealRequest = { itemId: string; seq: number };
 
+/** The item a reveal asks for, and the agent whose group holds it; undefined when it is not here. */
+function revealTarget(
+  request: RevealRequest | undefined,
+  entries: readonly TranscriptEntry[],
+): { itemId: string; owner: string | null } | undefined {
+  if (!request) return undefined;
+  const entry = entries.find((one) => itemIdOf(one) === request.itemId);
+  return entry ? { itemId: request.itemId, owner: entryAgent(entry) } : undefined;
+}
+
+/** The filter in force: one naming an agent that is not (or no longer) in the session shows everything. */
+const knownFilter = (wanted: string | null, agents: readonly Agent[]): string | null =>
+  wanted !== null && agents.some((agent) => agent.id === wanted) ? wanted : null;
+
+function emptyNote(synced: boolean, filtered: boolean): string {
+  if (!synced) return "Loading transcript…";
+  return filtered ? "Nothing from this agent yet." : "Nothing has happened in this session yet.";
+}
+
+/**
+ * Whether the transcript follows new content: while the reader is at the
+ * bottom. Once they scroll up it stays put, until they jump back.
+ */
+class Following {
+  scroller: HTMLDivElement | undefined;
+  readonly pinned: Accessor<boolean>;
+  private readonly setPinned: Setter<boolean>;
+  // Mirrors `pinned` for the effects, which must not re-run when it flips.
+  private follow = true;
+
+  constructor() {
+    [this.pinned, this.setPinned] = createSignal(true);
+  }
+
+  pin(value: boolean): void {
+    this.follow = value;
+    this.setPinned(value);
+  }
+
+  toBottom(): void {
+    if (this.scroller) this.scroller.scrollTop = this.scroller.scrollHeight;
+  }
+
+  /** New content, or a viewport that changed (a rotation, the on-screen keyboard): keep the end in view. */
+  keepUp(): void {
+    if (this.follow) this.toBottom();
+  }
+
+  measure(): void {
+    const box = this.scroller;
+    // Nothing to learn while the transcript is hidden behind another panel.
+    if (!box || box.clientHeight === 0) return;
+    this.pin(box.scrollHeight - box.scrollTop - box.clientHeight <= PIN_SLACK);
+  }
+
+  jump(): void {
+    this.pin(true);
+    this.toBottom();
+  }
+
+  /** Brings the row of `itemId` into view, when it is there. */
+  scrollToRow(itemId: string): void {
+    const row = [...(this.scroller?.querySelectorAll<HTMLElement>("[data-item]") ?? [])].find(
+      (one) => one.dataset.item === itemId,
+    );
+    row?.scrollIntoView?.({ block: "center" });
+  }
+
+  /** Follows resizes of the viewport and of the content; the returned function stops. */
+  observe(content: HTMLElement | undefined): (() => void) | undefined {
+    const box = this.scroller;
+    if (!box || !content || typeof ResizeObserver === "undefined") return undefined;
+    const observer = new ResizeObserver((changes) => {
+      // The content changed height without a new entry, for example a card
+      // was opened: the reader may no longer be at the end, so measure again.
+      for (const change of changes) {
+        if (change.target === box) this.keepUp();
+        else this.measure();
+      }
+    });
+    observer.observe(box);
+    observer.observe(content);
+    return () => observer.disconnect();
+  }
+}
+
 /**
  * The scrolling transcript. It follows new content while the reader is at the
  * bottom; once they scroll up it stays put and offers "Jump to latest".
@@ -734,11 +824,7 @@ export function Transcript(props: {
   loopLimit?: (nodeId: string) => number | null;
 }) {
   const agents = () => props.agents ?? NO_AGENTS;
-  // A filter naming an agent that is not (or no longer) in the session shows everything.
-  const filter = (): string | null => {
-    const wanted = props.filter ?? null;
-    return wanted !== null && agents().some((agent) => agent.id === wanted) ? wanted : null;
-  };
+  const filter = (): string | null => knownFilter(props.filter ?? null, agents());
   const rows = createMemo(() =>
     transcriptRows(
       props.entries.filter(hasRow),
@@ -747,8 +833,103 @@ export function Transcript(props: {
       filter(),
     ),
   );
-  const options = createMemo(() => agentOptions(agents()));
-  const surroundings: Surroundings = {
+  // Which subagent groups the reader opened or closed; the others follow their agent's status.
+  const [groups, setGroups] = createSignal<ReadonlyMap<string, boolean>>(new Map());
+  const [revealed, setRevealed] = createSignal<string>();
+  const surroundings = surroundingsOf(props);
+  const following = new Following();
+  let content: HTMLDivElement | undefined;
+
+  createEffect(
+    () => props.entries,
+    () => following.keepUp(),
+  );
+
+  createEffect(
+    // Only a new request runs this: what the transcript holds is read without following it.
+    () =>
+      revealTarget(
+        props.reveal,
+        untrack(() => props.entries),
+      ),
+    (found) => {
+      if (!found) return;
+      const { itemId, owner } = found;
+      if (owner !== null) setGroups((all) => new Map(all).set(owner, true));
+      setRevealed(itemId);
+      following.pin(false);
+      // Once the group has opened and the row exists.
+      const timer = setTimeout(() => following.scrollToRow(itemId), 0);
+      return () => clearTimeout(timer);
+    },
+  );
+
+  onSettled(() => following.observe(content));
+
+  return (
+    <div class="relative flex min-h-0 flex-1 flex-col">
+      <Show when={props.onFilter !== undefined && (agents().length > 1 || filter() !== null)}>
+        <AgentFilter
+          agents={agents()}
+          value={filter()}
+          onFilter={(agentId) => props.onFilter?.(agentId)}
+        />
+      </Show>
+      <div class="relative min-h-0 flex-1">
+        <div
+          ref={(element) => (following.scroller = element)}
+          // Deltas would be read out one by one; the screen announces whole messages instead.
+          role="log"
+          aria-live="off"
+          aria-label="Transcript"
+          tabindex="0"
+          class="h-full overflow-y-auto overscroll-contain px-3 py-3"
+          onScroll={() => following.measure()}
+        >
+          <div ref={(element) => (content = element)}>
+            <Show
+              when={rows().length > 0}
+              fallback={
+                <p class="py-8 text-center text-sm text-muted">
+                  {emptyNote(props.synced, filter() !== null)}
+                </p>
+              }
+            >
+              <SurroundingsContext value={surroundings}>
+                <RowList
+                  rows={rows()}
+                  groups={groups()}
+                  revealed={revealed()}
+                  onToggle={(agentId, open) => setGroups((all) => new Map(all).set(agentId, open))}
+                />
+              </SurroundingsContext>
+            </Show>
+          </div>
+        </div>
+        <Show when={!following.pinned()}>
+          <button
+            type="button"
+            class="btn absolute bottom-3 left-1/2 -translate-x-1/2 shadow-md"
+            onClick={() => following.jump()}
+          >
+            Jump to latest ↓
+          </button>
+        </Show>
+      </div>
+    </div>
+  );
+}
+
+/** What the rows may need from the session around the transcript; read when used. */
+function surroundingsOf(props: {
+  synced: boolean;
+  repos?: readonly SessionRepo[];
+  answers?: PermissionAnswers;
+  onOpenFile?: (target: FileTarget) => void;
+  speaker?: Speaker;
+  loopLimit?: (nodeId: string) => number | null;
+}): Surroundings {
+  return {
     repos: () => props.repos ?? NO_REPOS,
     // A replay passes through every request ever made; only the caught-up ones can be answered.
     answers: () => (props.synced ? props.answers : undefined),
@@ -756,172 +937,66 @@ export function Transcript(props: {
     speaker: () => props.speaker ?? plainSpeaker,
     loopLimit: (nodeId) => props.loopLimit?.(nodeId) ?? null,
   };
-  // Which subagent groups the reader opened or closed; the others follow their agent's status.
-  const [groups, setGroups] = createSignal<ReadonlyMap<string, boolean>>(new Map());
-  const [revealed, setRevealed] = createSignal<string>();
+}
+
+/** Shows all agents' rows, or one agent's. */
+function AgentFilter(props: {
+  agents: readonly Agent[];
+  value: string | null;
+  onFilter: (agentId: string | null) => void;
+}) {
   const filterId = createUniqueId();
-  let scroller: HTMLDivElement | undefined;
-  let content: HTMLDivElement | undefined;
-  const [pinned, setPinned] = createSignal(true);
-  // Mirrors `pinned` for the effect below, which must not re-run when it flips.
-  let follow = true;
-
-  function pin(value: boolean): void {
-    follow = value;
-    setPinned(value);
-  }
-
-  function toBottom(): void {
-    if (scroller) scroller.scrollTop = scroller.scrollHeight;
-  }
-
-  function measure(): void {
-    // Nothing to learn while the transcript is hidden behind another panel.
-    if (!scroller || scroller.clientHeight === 0) return;
-    pin(scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight <= PIN_SLACK);
-  }
-
-  createEffect(
-    () => props.entries,
-    () => {
-      if (follow) toBottom();
-    },
-  );
-
-  createEffect(
-    // Only a new request runs this: what the transcript holds is read without following it.
-    () => {
-      const request = props.reveal;
-      if (!request) return undefined;
-      const entry = untrack(() => props.entries.find((one) => itemIdOf(one) === request.itemId));
-      return entry ? { itemId: request.itemId, owner: entryAgent(entry) } : undefined;
-    },
-    (found) => {
-      if (!found) return;
-      const { itemId, owner } = found;
-      if (owner !== null) setGroups((all) => new Map(all).set(owner, true));
-      setRevealed(itemId);
-      pin(false);
-      // Once the group has opened and the row exists.
-      const timer = setTimeout(() => {
-        const row = [...(scroller?.querySelectorAll<HTMLElement>("[data-item]") ?? [])].find(
-          (one) => one.dataset.item === itemId,
-        );
-        row?.scrollIntoView?.({ block: "center" });
-      }, 0);
-      return () => clearTimeout(timer);
-    },
-  );
-
-  onSettled(() => {
-    if (!scroller || !content || typeof ResizeObserver === "undefined") return;
-    const box = scroller;
-    const observer = new ResizeObserver((changes) => {
-      for (const change of changes) {
-        if (change.target === box) {
-          // The viewport changed (a rotation, the on-screen keyboard): keep the end in view.
-          if (follow) toBottom();
-        } else {
-          // The content changed height without a new entry, for example a card
-          // was opened: the reader may no longer be at the end, so stop following.
-          measure();
-        }
-      }
-    });
-    observer.observe(box);
-    observer.observe(content);
-    return () => observer.disconnect();
-  });
-
+  const options = createMemo(() => agentOptions(props.agents));
   return (
-    <div class="relative flex min-h-0 flex-1 flex-col">
-      <Show when={props.onFilter !== undefined && (agents().length > 1 || filter() !== null)}>
-        <div class="flex shrink-0 items-center gap-2 border-b border-line bg-surface px-3 text-sm">
-          <label for={filterId} class="shrink-0 text-muted">
-            Show
-          </label>
-          <select
-            id={filterId}
-            aria-label="Agent filter"
-            class="field h-11 min-w-0 flex-1 border-transparent bg-transparent px-1 lg:max-w-xs"
-            value={filter() ?? ""}
-            onChange={(event) =>
-              props.onFilter?.(event.currentTarget.value === "" ? null : event.currentTarget.value)
-            }
-          >
-            <option value="">All agents</option>
-            <For each={options()} keyed={(option) => option.id}>
-              {(option) => <option value={option().id}>{option().label}</option>}
-            </For>
-          </select>
-        </div>
-      </Show>
-      <div class="relative min-h-0 flex-1">
-        <div
-          ref={(element) => (scroller = element)}
-          // Deltas would be read out one by one; the screen announces whole messages instead.
-          role="log"
-          aria-live="off"
-          aria-label="Transcript"
-          tabindex="0"
-          class="h-full overflow-y-auto overscroll-contain px-3 py-3"
-          onScroll={measure}
-        >
-          <div ref={(element) => (content = element)}>
-            <Show
-              when={rows().length > 0}
-              fallback={
-                <p class="py-8 text-center text-sm text-muted">
-                  {!props.synced
-                    ? "Loading transcript…"
-                    : filter() !== null
-                      ? "Nothing from this agent yet."
-                      : "Nothing has happened in this session yet."}
-                </p>
-              }
-            >
-              <SurroundingsContext value={surroundings}>
-                <ol class="mx-auto flex max-w-3xl flex-col gap-3">
-                  <For each={rows()} keyed={(row) => row.key}>
-                    {(row) => (
-                      <Show
-                        when={subagentRow(row())}
-                        fallback={<EntryItem entry={entryOf(row())} revealed={revealed()} />}
-                      >
-                        {(group) => (
-                          <li>
-                            <SubagentGroup
-                              row={group()}
-                              chosen={groups().get(group().agentId)}
-                              revealed={revealed()}
-                              onToggle={(open) =>
-                                setGroups((all) => new Map(all).set(group().agentId, open))
-                              }
-                            />
-                          </li>
-                        )}
-                      </Show>
-                    )}
-                  </For>
-                </ol>
-              </SurroundingsContext>
-            </Show>
-          </div>
-        </div>
-        <Show when={!pinned()}>
-          <button
-            type="button"
-            class="btn absolute bottom-3 left-1/2 -translate-x-1/2 shadow-md"
-            onClick={() => {
-              pin(true);
-              toBottom();
-            }}
-          >
-            Jump to latest ↓
-          </button>
-        </Show>
-      </div>
+    <div class="flex shrink-0 items-center gap-2 border-b border-line bg-surface px-3 text-sm">
+      <label for={filterId} class="shrink-0 text-muted">
+        Show
+      </label>
+      <select
+        id={filterId}
+        aria-label="Agent filter"
+        class="field h-11 min-w-0 flex-1 border-transparent bg-transparent px-1 lg:max-w-xs"
+        value={props.value ?? ""}
+        onChange={(event) => props.onFilter(event.currentTarget.value || null)}
+      >
+        <option value="">All agents</option>
+        <For each={options()} keyed={(option) => option.id}>
+          {(option) => <option value={option().id}>{option().label}</option>}
+        </For>
+      </select>
     </div>
+  );
+}
+
+/** The rows, a subagent's gathered into its group. */
+function RowList(props: {
+  rows: readonly TranscriptRow[];
+  groups: ReadonlyMap<string, boolean>;
+  revealed: string | undefined;
+  onToggle: (agentId: string, open: boolean) => void;
+}) {
+  return (
+    <ol class="mx-auto flex max-w-3xl flex-col gap-3">
+      <For each={props.rows} keyed={(row) => row.key}>
+        {(row) => (
+          <Show
+            when={subagentRow(row())}
+            fallback={<EntryItem entry={entryOf(row())} revealed={props.revealed} />}
+          >
+            {(group) => (
+              <li>
+                <SubagentGroup
+                  row={group()}
+                  chosen={props.groups.get(group().agentId)}
+                  revealed={props.revealed}
+                  onToggle={(open) => props.onToggle(group().agentId, open)}
+                />
+              </li>
+            )}
+          </Show>
+        )}
+      </For>
+    </ol>
   );
 }
 

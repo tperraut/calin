@@ -37,7 +37,17 @@ export function compactCount(count: number): string {
   return `${trimZero((count / 1_000_000).toFixed(1))}M`;
 }
 
-export const filesLabel = (count: number): string => `${count} ${count === 1 ? "file" : "files"}`;
+/** "1 repo", "3 repos": the count with the word that goes with it. */
+export const counted = (count: number, one: string, many: string): string =>
+  `${count} ${count === 1 ? one : many}`;
+
+export const filesLabel = (count: number): string => counted(count, "file", "files");
+
+/** Code-point order of two strings, for a sort that must not depend on the locale. */
+export const compareText = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
+
+/** Text typed in an optional field, trimmed; `null` when nothing is left, which the server reads as "not set". */
+export const blankAsNull = (typed: string): string | null => typed.trim() || null;
 
 /** "api", "api and web", "api, web and docs". */
 export function listInWords(items: readonly string[]): string {
@@ -63,7 +73,8 @@ export function clockTime(ts: number): string {
 /** 850 → "0.9 s", 12_400 → "12 s", 95_000 → "1 min 35 s", 3_720_000 → "1 h 2 min". */
 export function formatDuration(ms: number): string {
   const total = Math.max(0, ms);
-  if (total < 10_000) return `${trimZero((total / 1000).toFixed(1))} s`;
+  // Rounded in tenths first: toFixed alone reads 0.85 (0.8499… as a float) as 0.8.
+  if (total < 10_000) return `${trimZero((Math.round(total / 100) / 10).toFixed(1))} s`;
   const seconds = Math.round(total / 1000);
   if (seconds < 60) return `${seconds} s`;
   const minutes = Math.floor(seconds / 60);

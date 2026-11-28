@@ -88,6 +88,21 @@ describe("terminal client", () => {
     });
   });
 
+  it("uses the browser's WebSocket and the page's own address by default", () => {
+    FakeWebSocket.instances = [];
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    try {
+      createTerminalOpener()({ sessionId: "s1", cols: 80, rows: 24 }, { onData() {}, onEnd() {} });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+    const [socket] = FakeWebSocket.instances;
+    const url = new URL(socket.url);
+    expect(url.host).toBe(location.host);
+    expect(url.protocol).toBe(location.protocol === "https:" ? "wss:" : "ws:");
+    expect(url.pathname).toBe("/api/v1/sessions/s1/terminals/ws");
+  });
+
   it("relays output bytes in and typed input out as binary frames", () => {
     const { client, socket, output, onOpen } = connect();
     socket.open();

@@ -27,8 +27,13 @@ export type FakeTerminalView = {
 
 export const views: FakeTerminalView[] = [];
 
+const LAID_OUT: TerminalSize = { cols: 100, rows: 30 };
+/** What `fit()` answers for the next view made; `undefined`: its element is not laid out yet. */
+export const nextView: { size: TerminalSize | undefined } = { size: LAID_OUT };
+
 export function resetFakeTerminals(): void {
   views.length = 0;
+  nextView.size = LAID_OUT;
 }
 
 function createTerminalView(parent: HTMLElement, options: TerminalViewOptions): TerminalView {
@@ -40,7 +45,7 @@ function createTerminalView(parent: HTMLElement, options: TerminalViewOptions): 
     options,
     element,
     screen: "",
-    size: { cols: 100, rows: 30 },
+    size: nextView.size,
     pasted: [],
     applicationCursorKeys: false,
     focused: 0,

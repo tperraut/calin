@@ -1,7 +1,13 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import type { SessionRepo } from "../gen/SessionRepo";
 import { makeSessionRepo } from "../test/fakes";
-import { fakeTerminals, resetFakeTerminals, views, type FakeShell } from "../test/fakeTerminal";
+import {
+  fakeTerminals,
+  nextView,
+  resetFakeTerminals,
+  views,
+  type FakeShell,
+} from "../test/fakeTerminal";
 import {
   choose,
   click,
@@ -12,6 +18,7 @@ import {
   setViewportWidth,
   type,
   unmountAll,
+  until,
 } from "../test/render";
 import { act, openWorkspace, type Workspace } from "../test/workspace";
 import { loadTerminalModule } from "./terminal/load";
@@ -20,6 +27,11 @@ import TerminalPanel from "./TerminalPanel";
 vi.mock("./terminal/xterm", async () => ({
   default: (await import("../test/fakeTerminal")).fakeTerminalModule,
 }));
+// Real by default; a test makes one load fail, as a chunk lost to the network would.
+vi.mock("./terminal/load", async (importOriginal) => {
+  const real = await importOriginal<typeof import("./terminal/load")>();
+  return { loadTerminalModule: vi.fn(real.loadTerminalModule) };
+});
 
 const bytes = (text: string): Uint8Array => new TextEncoder().encode(text);
 
@@ -95,6 +107,32 @@ describe("TerminalPanel", () => {
     shells[0].handlers.onOpen?.();
     await act();
     expect(host.textContent).not.toContain("Starting a shell…");
+  });
+
+  it("starts the shell at 80 by 24 when the grid is not laid out yet", async () => {
+    nextView.size = undefined;
+    const { shells } = await open();
+    expect(shells[0].request).toMatchObject({ cols: 80, rows: 24 });
+  });
+
+  it("says so when the terminal's code cannot be loaded, and opens no socket", async () => {
+    vi.mocked(loadTerminalModule).mockRejectedValueOnce(new Error("chunk lost"));
+    const { host, shells } = await open();
+    expect(find(host, '[role="alert"]').textContent).toBe(
+      "The terminal could not be loaded: chunk lost",
+    );
+    expect(shells).toHaveLength(0);
+  });
+
+  it("refits a tab that comes back on screen, since the pane may have changed meanwhile", async () => {
+    const { host, shells } = await open();
+    await click(newTerminal(host));
+    await act();
+    views[0].size = { cols: 90, rows: 20 };
+    await click(findByText(host, 'ul[aria-label="Terminals"] button', "api 1"));
+    await until(() => shells[0].resizes.length > 0);
+    expect(shells[0].resizes).toEqual([{ cols: 90, rows: 20 }]);
+    expect(shells[1].resizes).toEqual([]);
   });
 
   it("starts in the session's own folder when no repo is attached", async () => {
@@ -207,6 +245,13 @@ describe("TerminalPanel", () => {
     expect(shells[1].input).toBe("x");
   });
 
+  it("says the shell exited without a code when it has none", async () => {
+    const { host, shells } = await open();
+    shells[0].handlers.onEnd({ kind: "exit", code: null });
+    await act();
+    expect(find(host, '[role="status"] p').textContent).toBe("The shell exited.");
+  });
+
   it("says the shell was lost when the socket drops, and that it cannot be resumed", async () => {
     const { host, shells } = await open();
     shells[0].handlers.onOpen?.();
@@ -280,6 +325,28 @@ describe("TerminalPanel", () => {
     expect(tabs(host)).toEqual([]);
     expect(host.textContent).toContain("No terminal is open.");
     expect(newTerminal(host).disabled).toBe(false);
+  });
+
+  it("shows the next tab when the one on screen closes, or the one before when it was last", async () => {
+    const { host, shells } = await open();
+    for (let more = 0; more < 3; more += 1) await click(newTerminal(host));
+    await act();
+    for (const shell of shells) shell.handlers.onEnd({ kind: "exit", code: 0 });
+    await act();
+    const current = (): string | undefined =>
+      host.querySelector('ul[aria-label="Terminals"] button[aria-current="true"]')?.textContent;
+
+    await click(findByText(host, 'ul[aria-label="Terminals"] button', "api 2"));
+    await click(find(host, 'button[aria-label="Close api 2"]'));
+    expect(current()).toBe("api 3");
+    await click(findByText(host, 'ul[aria-label="Terminals"] button', "api 4"));
+    await click(find(host, 'button[aria-label="Close api 4"]'));
+    expect(current()).toBe("api 3");
+    // Another tab than the one on screen: the screen stays.
+    await click(find(host, 'button[aria-label="Close api 1"]'));
+    expect(current()).toBe("api 3");
+    await click(find(host, 'button[aria-label="Close api 3"]'));
+    expect(current()).toBeUndefined();
   });
 
   it("closes every socket when the panel goes away", async () => {
@@ -367,6 +434,12 @@ describe("TerminalPanel", () => {
       await click(ctrl);
       await click(key(host, "Dash"));
       expect(shell.input).toBe("\x03cd\x1f");
+
+      // Ctrl does nothing to a tilde: it goes out as typed, and Ctrl is spent.
+      await click(ctrl);
+      await click(key(host, "Tilde"));
+      expect(shell.input).toBe("\x03cd\x1f~");
+      expect(ctrl.getAttribute("aria-pressed")).toBe("false");
     });
 
     it("pastes from the clipboard, or through a field when the clipboard is out of reach", async () => {
@@ -389,6 +462,35 @@ describe("TerminalPanel", () => {
       await click(findByText(form, "button", "Send"));
       expect(views[0].pasted).toEqual(["echo pasted", "ls -la"]);
       expect(host.querySelector('form[aria-label="Paste into the terminal"]')).toBeNull();
+    });
+
+    it("pastes nothing from an empty clipboard or an empty field, and gives the terminal the focus back", async () => {
+      const { host, shells } = await open();
+      shells[0].handlers.onOpen?.();
+      const readText = vi.fn().mockResolvedValue("");
+      vi.stubGlobal("navigator", { clipboard: { readText } });
+      await click(key(host, "Paste"));
+      await act();
+      expect(views[0].pasted).toEqual([]);
+      expect(views[0].focused).toBe(1);
+
+      readText.mockRejectedValue(new Error("denied"));
+      await click(key(host, "Paste"));
+      await act();
+      const form = find<HTMLFormElement>(host, 'form[aria-label="Paste into the terminal"]');
+      expect(document.activeElement).toBe(find(form, "input"));
+      await click(findByText(form, "button", "Send"));
+      expect(views[0].pasted).toEqual([]);
+      expect(views[0].focused).toBe(2);
+      expect(host.querySelector('form[aria-label="Paste into the terminal"]')).toBeNull();
+
+      await click(key(host, "Paste"));
+      await act();
+      type(find<HTMLInputElement>(host, 'input[aria-label="Text to paste"]'), "kept out");
+      await click(findByText(host, "button", "Cancel"));
+      expect(host.querySelector('form[aria-label="Paste into the terminal"]')).toBeNull();
+      expect(views[0].pasted).toEqual([]);
+      expect(shells[0].input).toBe("");
     });
 
     it("keeps 80 columns by letting the grid scroll sideways instead of shrinking the text", async () => {

@@ -10,9 +10,12 @@ import { dayKey } from "./lib/usage";
 import { createAppState } from "./state/app";
 import { deferred, fakeApi, FakeSocket, immediately, settle } from "./test/fakes";
 import { makeLimits, makeUsage, makeWindow, row } from "./test/integrations";
-import { click, find, findByText, mount, unmountAll } from "./test/render";
+import { click, find, findByText, mount, pageShown, unmountAll, until } from "./test/render";
 
-afterEach(unmountAll);
+afterEach(() => {
+  unmountAll();
+  vi.useRealTimers();
+});
 
 const health: Health = {
   name: "calin",
@@ -45,18 +48,25 @@ async function open(path: string, routes: Partial<Api> = {}) {
   const host = mount(() => <App state={state} />);
   socket.setState("open");
   const main = () => find(host, "main");
-  // The page's code arrives on its first visit (router.ts).
-  const waiting = () => {
-    const shown = host.querySelector("main")?.textContent;
-    return shown === undefined || shown === "Loading…";
-  };
-  for (let i = 0; i < 50 && waiting(); i += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 5));
-    flush();
-  }
-  await settle();
-  flush();
+  await until(() => pageShown(host));
   return { host, main, getUsage };
+}
+
+/**
+ * Pins the clock, so the range asked for does not depend on when the test runs:
+ * the evening of 1 November 2026, after the autumn clock change in Europe and in North America.
+ */
+const PINNED = new Date(2026, 10, 1, 23, 30).getTime();
+function pinClock(): void {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(PINNED);
+}
+
+/** `query` asks for the pinned day and the `days - 1` before it: from local midnight to when it asked. */
+function expectLastDays(query: UsageQuery | undefined, days: number): void {
+  expect(query?.from).toBe(new Date(2026, 10, 1 - (days - 1)).getTime());
+  expect(query?.to).toBeGreaterThanOrEqual(PINNED);
+  expect(query?.to).toBeLessThanOrEqual(Date.now());
 }
 
 const bars = (root: ParentNode) => [...root.querySelectorAll<SVGElement>('[data-part="hit"]')];
@@ -67,12 +77,11 @@ const meters = (root: ParentNode) =>
 
 describe("Usage page", () => {
   it("asks for the last 30 days by default, in four breakdowns, and shows the totals", async () => {
+    pinClock();
     const { main, getUsage } = await open("/usage");
     const queries = getUsage.mock.calls.map(([query]) => query);
     expect(queries.map((query) => query?.by)).toEqual(["day", "session", "repo", "model"]);
-    const span = (queries[0]?.to ?? 0) - (queries[0]?.from ?? 0);
-    expect(span).toBeGreaterThan(29 * DAY);
-    expect(span).toBeLessThan(30 * DAY);
+    for (const query of queries) expectLastDays(query, 30);
     expect(find(main(), '[aria-label="Range"] [aria-pressed="true"]').textContent).toBe("30 days");
     const totals = find(main(), '[data-part="totals"]').textContent;
     expect(totals).toContain("$3.00");
@@ -83,17 +92,16 @@ describe("Usage page", () => {
   });
 
   it("keeps the range in the URL and reads it from there", async () => {
+    pinClock();
     const { main, getUsage } = await open("/usage?days=90");
     expect(find(main(), '[aria-label="Range"] [aria-pressed="true"]').textContent).toBe("90 days");
-    const first = getUsage.mock.calls[0]?.[0];
-    expect((first?.to ?? 0) - (first?.from ?? 0)).toBeGreaterThan(89 * DAY);
+    expectLastDays(getUsage.mock.calls[0]?.[0], 90);
 
     await click(findByText(main(), "button", "7 days"));
     await settle();
     flush();
     expect(location.search).toBe("?days=7");
-    const last = getUsage.mock.lastCall?.[0];
-    expect((last?.to ?? 0) - (last?.from ?? 0)).toBeLessThan(7 * DAY);
+    expectLastDays(getUsage.mock.lastCall?.[0], 7);
     expect(find(main(), '[aria-label="Range"] [aria-pressed="true"]').textContent).toBe("7 days");
   });
 
@@ -162,6 +170,67 @@ describe("Usage page", () => {
     expect(find(main(), '[data-part="day-detail"]').textContent).toContain("$2.00");
   });
 
+  it("goes to either end and back with the keys, and ignores other keys", () => {
+    const days = ["2026-11-23", "2026-11-24", "2026-11-25", "2026-11-26", "2026-11-27"];
+    const host = mount(() => (
+      <DayChart days={days.map((key, i) => row(key, i + 1))} today={undefined} />
+    ));
+    const hits = bars(host);
+    const stop = () => hits.findIndex((hit) => hit.getAttribute("tabindex") === "0");
+    // Without a today, the last day is the way in.
+    expect(stop()).toBe(4);
+    const press = (key: string) => {
+      const event = new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true });
+      hits[stop()]?.dispatchEvent(event);
+      flush();
+      return event.defaultPrevented;
+    };
+    expect(press("Home")).toBe(true);
+    expect(stop()).toBe(0);
+    expect(press("ArrowLeft")).toBe(true);
+    expect(stop()).toBe(0);
+    expect(press("ArrowRight")).toBe(true);
+    expect(stop()).toBe(1);
+    expect(press("End")).toBe(true);
+    expect(stop()).toBe(4);
+    expect(press("ArrowRight")).toBe(true);
+    expect(stop()).toBe(4);
+    expect(press("a")).toBe(false);
+    expect(stop()).toBe(4);
+  });
+
+  it("says the day pointed at, then the one focused, and labels both ends of the axis", () => {
+    const days = ["2026-11-25", "2026-11-26", "2026-11-27"];
+    const host = mount(() => (
+      <DayChart days={days.map((key, i) => row(key, i + 1))} today="2026-11-26" />
+    ));
+    const detail = () => find(host, '[data-part="day-detail"]').textContent;
+    expect(detail()).toBe("Point at a bar, or focus one and use the arrow keys.");
+    const [first, today, last] = bars(host);
+    last?.dispatchEvent(new FocusEvent("focus"));
+    first?.dispatchEvent(new PointerEvent("pointerenter"));
+    flush();
+    expect(detail()).toContain("$1.00");
+    find(host, '[role="group"]').dispatchEvent(new PointerEvent("pointerleave"));
+    flush();
+    expect(detail()).toContain("$3.00");
+    last?.dispatchEvent(new FocusEvent("blur"));
+    flush();
+    expect(detail()).toBe("Point at a bar, or focus one and use the arrow keys.");
+    expect(today?.getAttribute("aria-label")).toContain("(today)");
+
+    const labels = [...host.querySelectorAll('[data-part="day-label"]')].map((label) => [
+      label.getAttribute("x"),
+      label.getAttribute("text-anchor"),
+      label.getAttribute("font-weight"),
+    ]);
+    expect(labels).toEqual([
+      ["0", "start", null],
+      ["50%", "middle", "600"],
+      ["100%", "end", null],
+    ]);
+  });
+
   it("lists the most expensive sessions with links, and notes the server's cap", async () => {
     const sessions = Array.from({ length: 200 }, (_, i) => row(`s${i}`, 200 - i, `Task ${i}`));
     const { main } = await open("/usage", {
@@ -183,6 +252,65 @@ describe("Usage page", () => {
     );
     expect(repoRows).toEqual(["api$3.003k / 300", "No repo$1.001k / 100"]);
     expect(find(main(), '[data-part="by-model"]').textContent).toContain("opus$2.00");
+  });
+
+  it("names a session with no title by its id, and draws no share when nothing was spent", async () => {
+    const { main } = await open("/usage", {
+      getUsage: answers([row(daysAgo(0), 1)], {
+        session: [row("s7", 1, "")],
+        repo: [row("api", 0, "api")],
+      }),
+    });
+    expect(find(main(), '[data-part="by-session"] a').textContent).toBe("s7");
+    const share = find<HTMLElement>(main(), '[data-part="by-repo"] .bg-accent');
+    expect(share.style.width).toBe("0%");
+  });
+
+  /** The default 30 days wait on `first`; a shorter range is answered at once. */
+  const slowLongRange = (first: Promise<Usage>) => (query?: UsageQuery) =>
+    (query?.to ?? 0) - (query?.from ?? 0) > 10 * DAY
+      ? first
+      : Promise.resolve(makeUsage(query?.by ?? "day", [row(daysAgo(0), 7)]));
+
+  it("shows only the answer for the range picked last", async () => {
+    const first = deferred<Usage>();
+    const { main } = await open("/usage", { getUsage: slowLongRange(first.promise) });
+    expect(main().textContent).toContain("Loading usage…");
+    await click(findByText(main(), "button", "7 days"));
+    await until(() => main().querySelector('[data-part="totals"]') !== null);
+    first.resolve(makeUsage("day", [row(daysAgo(0), 99)]));
+    await settle();
+    flush();
+    expect(find(main(), '[data-part="totals"]').textContent).toContain("$7.00");
+    expect(main().textContent).not.toContain("$99.00");
+  });
+
+  it("drops a failure that comes after a newer range was picked", async () => {
+    const first = deferred<Usage>();
+    const { main } = await open("/usage", { getUsage: slowLongRange(first.promise) });
+    await click(findByText(main(), "button", "7 days"));
+    await until(() => main().querySelector('[data-part="totals"]') !== null);
+    first.reject(new Error("too late"));
+    await settle();
+    flush();
+    expect(main().querySelector('[role="alert"]')).toBeNull();
+    expect(find(main(), '[data-part="totals"]').textContent).toContain("$7.00");
+  });
+
+  it("tries again on request after a failure", async () => {
+    let calls = 0;
+    const { main } = await open("/usage", {
+      getUsage: (query?: UsageQuery) => {
+        calls += 1;
+        return calls <= 4
+          ? Promise.reject(new Error("server busy"))
+          : Promise.resolve(makeUsage(query?.by ?? "day", [row(daysAgo(0), 2)]));
+      },
+    });
+    await until(() => main().querySelector('[role="alert"]') !== null);
+    await click(findByText(main(), "button", "Try again"));
+    await until(() => main().querySelector('[data-part="totals"]') !== null);
+    expect(main().querySelector('[role="alert"]')).toBeNull();
   });
 
   it("shows no cap note below the cap", async () => {

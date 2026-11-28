@@ -10,38 +10,50 @@ import {
   Show,
   Switch,
   useContext,
+  type Accessor,
 } from "solid-js";
-import { HttpError } from "../api/http";
 import { SessionStatusBadge } from "../components/Badge";
-import { chosenWorkflow } from "../components/Composer";
+import { chosenWorkflow, offeredRunner } from "../components/Composer";
 import { RepoPicker } from "../components/RepoPicker";
 import { PermissionField, RunnerOptions, WorkflowField } from "../components/SessionOptions";
 import type { Automation } from "../gen/Automation";
 import type { AutomationRequest } from "../gen/AutomationRequest";
 import type { AutomationRun } from "../gen/AutomationRun";
-import type { AutomationTrigger } from "../gen/AutomationTrigger";
 import type { CronPreview } from "../gen/CronPreview";
 import type { PermissionMode } from "../gen/PermissionMode";
 import type { Repo } from "../gen/Repo";
-import type { WorkflowInfo } from "../gen/WorkflowInfo";
 import {
+  automationDraft,
   automationModes,
-  blameField,
   causeText,
   cronPresets,
+  messageAt,
   outcomeText,
   placeholders,
   runNumberLabel,
+  runWanted,
+  saveFailure,
+  sessionOf,
   triggerKinds,
+  triggerOf,
+  watchedRepo,
   type BlamedField,
+  type SaveFailure,
   type TriggerKind,
 } from "../lib/automations";
 import { errorMessage } from "../lib/errors";
 import { absoluteTime, listInWords, relativeTime } from "../lib/format";
 import type { RepoChoice } from "../lib/prefs";
-import { QUICK_WORKFLOW } from "../lib/workflow";
+import { onFormSubmit } from "../lib/submit";
+import { sentWorkflow } from "../lib/workflow";
 import { sessionPath } from "../panels/registry";
-import { AppContext } from "../state/app";
+import {
+  AppContext,
+  catalogWorkflows,
+  healthRunners,
+  type AppState,
+  type RepoRegistry,
+} from "../state/app";
 
 /** How long typing in the cron field must pause before the server is asked what it means. */
 export const CRON_PREVIEW_DELAY_MS = 400;
@@ -53,6 +65,11 @@ type Preview =
   | { status: "loading" }
   | { status: "ready"; preview: CronPreview }
   | { status: "error"; message: string };
+
+const previewError = (state: Preview): string | undefined =>
+  state.status === "error" ? state.message : undefined;
+const previewAnswer = (state: Preview): CronPreview | undefined =>
+  state.status === "ready" ? state.preview : undefined;
 
 const weekdayTime = (ts: number): string =>
   new Date(ts).toLocaleString(undefined, {
@@ -72,205 +89,150 @@ function placeholderNote(kind: TriggerKind): string {
   return `You can use ${date}, the local date, and ${listInWords(item)}, which describe ${what}.`;
 }
 
-/** The new-or-edit form. `stored` is absent for a new automation. */
-function AutomationEditor(props: {
-  stored: Automation | undefined;
-  onSaved: (automation: Automation, created: boolean) => void;
-}) {
-  const app = useContext(AppContext);
-  const navigate = useNavigate();
-  const stored = props.stored;
-  const [name, setName] = createSignal(stored?.name ?? "");
-  const [enabled, setEnabled] = createSignal(stored?.enabled ?? false);
-  const [kind, setKind] = createSignal<TriggerKind>(stored?.trigger.kind ?? "schedule");
-  const [cron, setCron] = createSignal(
-    stored?.trigger.kind === "schedule" ? stored.trigger.cron : "0 8 * * 1-5",
-  );
-  const [triggerRepo, setTriggerRepo] = createSignal(
-    stored && stored.trigger.kind !== "schedule" ? stored.trigger.repo_id : "",
-  );
-  const [label, setLabel] = createSignal(
-    stored?.trigger.kind === "issue" ? (stored.trigger.label ?? "") : "",
-  );
-  const [prompt, setPrompt] = createSignal(stored?.session.prompt ?? "");
-  const [choices, setChoices] = createSignal<readonly RepoChoice[]>(
-    (stored?.session.repos ?? []).map((repo) => ({
-      repoId: repo.repo_id,
-      // Absent means a worktree (repo.rs); every other mode is kept as it was saved.
-      mode: repo.mode ?? "write",
-    })),
-  );
-  const [workflow, setWorkflow] = createSignal<string | undefined>(
-    stored?.session.workflow ?? undefined,
-  );
-  const [runner, setRunner] = createSignal(stored?.session.runner ?? "");
-  const [model, setModel] = createSignal(stored?.session.model ?? "");
-  const [mode, setMode] = createSignal<PermissionMode>(
-    stored && automationModes.includes(stored.session.permission_mode)
-      ? stored.session.permission_mode
-      : "accept_edits",
-  );
-  const [busy, setBusy] = createSignal(false);
-  const [saved, setSaved] = createSignal(false);
-  const [failure, setFailure] = createSignal<{ message: string; field?: BlamedField }>();
-  const [preview, setPreview] = createSignal<Preview>({ status: "idle" });
-  const [confirmDelete, setConfirmDelete] = createSignal(false);
-  const [deleting, setDeleting] = createSignal(false);
-  const [deleteError, setDeleteError] = createSignal<string>();
+const watchNote = (kind: TriggerKind): string =>
+  kind === "issue"
+    ? "Fires once for each new open issue of this repo. Issues that exist when it is switched on are not started on."
+    : "Fires once for each new open pull request of this repo. Pull requests that exist when it is switched on are not started on.";
 
-  const nameId = createUniqueId();
-  const cronId = createUniqueId();
-  const cronNoteId = createUniqueId();
-  const triggerRepoId = createUniqueId();
-  const labelId = createUniqueId();
-  const promptId = createUniqueId();
-  const promptNoteId = createUniqueId();
-  const enabledId = createUniqueId();
+const registeredRepos = (registry: RepoRegistry): readonly Repo[] =>
+  registry.status === "ready" ? registry.repos : [];
+
+/** The fields a refused save can focus, and the message itself for a refusal about none. */
+type FocusTargets = Partial<Record<BlamedField | "message", HTMLElement>>;
+
+const focusTarget = (
+  field: BlamedField | undefined,
+  targets: FocusTargets,
+): HTMLElement | undefined => (field === undefined ? undefined : targets[field]) ?? targets.message;
+
+/** A field's `aria-describedby`: its own note, then the refusal when it is about this field. */
+const describedBy = (own: string | undefined, error: string | undefined): string | undefined =>
+  [own, error].filter(Boolean).join(" ") || undefined;
+
+/** The editor's drafts, what the server offers for them, and the last refusal; shared by its field groups. */
+function createAutomationForm(app: AppState, stored: Automation | undefined) {
+  const start = automationDraft(stored);
+  const [name, setName] = createSignal(start.name);
+  const [enabled, setEnabled] = createSignal(start.enabled);
+  const [kind, setKind] = createSignal<TriggerKind>(start.trigger.kind);
+  const [cron, setCron] = createSignal(start.trigger.cron);
+  const [triggerRepo, setTriggerRepo] = createSignal(start.trigger.repo);
+  const [label, setLabel] = createSignal(start.trigger.label);
+  const [prompt, setPrompt] = createSignal(start.session.prompt);
+  const [choices, setChoices] = createSignal<readonly RepoChoice[]>(start.session.choices);
+  const [workflow, setWorkflow] = createSignal<string | undefined>(start.session.workflow);
+  const [runner, setRunner] = createSignal(start.session.runner);
+  const [model, setModel] = createSignal(start.session.model);
+  const [mode, setMode] = createSignal<PermissionMode>(start.session.mode);
+  const [failure, setFailure] = createSignal<SaveFailure>();
   const errorId = createUniqueId();
-  const kindGroup = createUniqueId();
+  const targets: FocusTargets = {};
 
-  const refs: Partial<Record<BlamedField, HTMLElement>> = {};
-  let errorBox: HTMLElement | undefined;
-
-  const runners = (): readonly string[] => {
-    const health = app.health();
-    return health.status === "ready" ? health.health.runners : [];
-  };
-  const selectedRunner = (): string | undefined =>
-    runners().includes(runner()) ? runner() : runners()[0];
-  const repos = (): readonly Repo[] => {
-    const registry = app.repos();
-    return registry.status === "ready" ? registry.repos : [];
-  };
-  const workflowList = (): readonly WorkflowInfo[] => {
-    const state = app.workflows();
-    return state.status === "ready" ? state.workflows : [];
-  };
-  const pickedWorkflow = createMemo(() => chosenWorkflow(workflow(), workflowList()));
-  /** The repo a trigger watches: the chosen one, else the first that can be used. */
-  const watchedRepo = (): string =>
-    triggerRepo() !== ""
-      ? triggerRepo()
-      : (repos().find((repo) => repo.available)?.id ?? repos()[0]?.id ?? "");
-
-  // The server says what an expression means, once typing pauses.
-  let previewTimer: ReturnType<typeof setTimeout> | undefined;
-  let previewAsked = 0;
-  createEffect(
-    () => (kind() === "schedule" ? cron().trim() : ""),
-    (expr) => {
-      clearTimeout(previewTimer);
-      previewAsked += 1;
-      if (expr === "") {
-        setPreview({ status: "idle" });
-        return;
-      }
-      const mine = previewAsked;
-      setPreview({ status: "loading" });
-      previewTimer = setTimeout(() => {
-        app.previewCron(expr).then(
-          (answer) => {
-            if (mine === previewAsked) setPreview({ status: "ready", preview: answer });
-          },
-          (error: unknown) => {
-            if (mine === previewAsked)
-              setPreview({ status: "error", message: errorMessage(error) });
-          },
-        );
-      }, CRON_PREVIEW_DELAY_MS);
-    },
-  );
-  onSettled(() => () => clearTimeout(previewTimer));
-
-  const previewError = (): string | undefined => {
-    const state = preview();
-    return state.status === "error" ? state.message : undefined;
-  };
-  const previewAnswer = (): CronPreview | undefined => {
-    const state = preview();
-    return state.status === "ready" ? state.preview : undefined;
-  };
-
-  function trigger(): AutomationTrigger {
-    switch (kind()) {
-      case "schedule":
-        return { kind: "schedule", cron: cron().trim() };
-      case "issue":
-        return {
-          kind: "issue",
-          repo_id: watchedRepo(),
-          label: label().trim() === "" ? null : label().trim(),
-        };
-      case "pull_request":
-        return { kind: "pull_request", repo_id: watchedRepo() };
-    }
-  }
-
-  function request(): AutomationRequest {
-    const id = pickedWorkflow()?.id;
-    return {
-      name: name().trim(),
-      enabled: enabled(),
-      trigger: trigger(),
-      session: {
-        prompt: prompt(),
-        workflow: id === undefined || id === QUICK_WORKFLOW ? null : id,
-        repos: choices().map((choice) => ({ repo_id: choice.repoId, mode: choice.mode })),
-        // Never chosen: the server's default runner, whichever it is then.
-        runner: runner() === "" ? null : (selectedRunner() ?? null),
-        model: model().trim() === "" ? null : model().trim(),
-        permission_mode: mode(),
-      },
-    };
-  }
-
-  async function save(): Promise<void> {
-    if (busy()) return;
-    setBusy(true);
-    setSaved(false);
-    setFailure(undefined);
-    try {
-      const result = await app.saveAutomation(stored?.id, request());
-      setSaved(true);
-      props.onSaved(result, stored === undefined);
-    } catch (reason) {
-      const message = errorMessage(reason);
-      const invalid = reason instanceof HttpError && reason.status === 400;
-      const field = invalid ? blameField(message, kind()) : undefined;
-      setFailure({ message, field });
-      // The message is in the page by the next frame; then the field it is about takes focus.
-      queueMicrotask(() => {
-        const target = field === undefined ? undefined : refs[field];
-        (target ?? errorBox)?.focus();
-      });
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function remove(): Promise<void> {
-    if (!stored || deleting()) return;
-    setDeleting(true);
-    setDeleteError(undefined);
-    try {
-      await app.deleteAutomation(stored.id);
-      navigate("/automations");
-    } catch (reason) {
-      setDeleteError(errorMessage(reason));
-    } finally {
-      setDeleting(false);
-    }
-  }
-
+  const runners = (): readonly string[] => healthRunners(app.health());
+  const repos = (): readonly Repo[] => registeredRepos(app.repos());
+  const workflows = () => catalogWorkflows(app.workflows());
+  const picked = createMemo(() => chosenWorkflow(workflow(), workflows()));
+  const selectedRunner = (): string | undefined => offeredRunner(runner(), runners());
   const blamed = (field: BlamedField): boolean => failure()?.field === field;
-  /** The server's message, shown at the field it is about, or by Save when it is about none. */
-  const FieldError = (where: { field?: BlamedField }) => (
-    <Show when={failure()?.field === where.field ? failure()?.message : undefined}>
+
+  const request = (): AutomationRequest => ({
+    name: name().trim(),
+    enabled: enabled(),
+    trigger: triggerOf(
+      { kind: kind(), cron: cron(), repo: triggerRepo(), label: label() },
+      repos(),
+    ),
+    session: sessionOf(
+      {
+        prompt: prompt(),
+        choices: choices(),
+        workflow: workflow(),
+        runner: runner(),
+        model: model(),
+        mode: mode(),
+      },
+      { workflow: sentWorkflow(picked()), runner: selectedRunner() },
+    ),
+  });
+
+  return {
+    name,
+    setName,
+    enabled,
+    setEnabled,
+    kind,
+    setKind,
+    cron,
+    setCron,
+    setTriggerRepo,
+    label,
+    setLabel,
+    prompt,
+    setPrompt,
+    choices,
+    setChoices,
+    setWorkflow,
+    setRunner,
+    model,
+    setModel,
+    mode,
+    setMode,
+    failure,
+    setFailure,
+    errorId,
+    targets,
+    runners,
+    repos,
+    workflows,
+    picked,
+    selectedRunner,
+    request,
+    watchedRepo: () => watchedRepo(triggerRepo(), repos()),
+    invalid: (field: BlamedField) => (blamed(field) ? "true" : undefined),
+    describe: (field: BlamedField, own?: string) =>
+      describedBy(own, blamed(field) ? errorId : undefined),
+  };
+}
+
+type AutomationForm = ReturnType<typeof createAutomationForm>;
+
+/** What the server says the expression means, asked once typing pauses; the last ask wins. */
+function createCronPreview(app: AppState, expression: () => string): Accessor<Preview> {
+  const [preview, setPreview] = createSignal<Preview>({ status: "idle" });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let asked = 0;
+  createEffect(expression, (expr) => {
+    clearTimeout(timer);
+    asked += 1;
+    if (expr === "") {
+      setPreview({ status: "idle" });
+      return;
+    }
+    const mine = asked;
+    const answer = (state: Preview) => {
+      if (mine === asked) setPreview(state);
+    };
+    setPreview({ status: "loading" });
+    timer = setTimeout(() => {
+      app.previewCron(expr).then(
+        (preview) => answer({ status: "ready", preview }),
+        (error: unknown) => answer({ status: "error", message: errorMessage(error) }),
+      );
+    }, CRON_PREVIEW_DELAY_MS);
+  });
+  onSettled(() => () => clearTimeout(timer));
+  return preview;
+}
+
+/** The server's message, shown at the field it is about, or by Save when it is about none. */
+function FieldError(props: { form: AutomationForm; field?: BlamedField }) {
+  return (
+    <Show when={messageAt(props.form.failure(), props.field)}>
       {(message) => (
         <p
-          id={errorId}
+          id={props.form.errorId}
           ref={(element) => {
-            errorBox = element;
+            props.form.targets.message = element;
           }}
           tabindex="-1"
           role="alert"
@@ -281,332 +243,466 @@ function AutomationEditor(props: {
       )}
     </Show>
   );
-  const describe = (field: BlamedField, own?: string): string | undefined =>
-    [own, blamed(field) ? errorId : undefined].filter(Boolean).join(" ") || undefined;
+}
+
+function NameField(props: { form: AutomationForm }) {
+  const nameId = createUniqueId();
+  return (
+    <div class="flex flex-col gap-1.5">
+      <label for={nameId} class="text-sm font-medium">
+        Name
+      </label>
+      <input
+        id={nameId}
+        ref={(element) => {
+          props.form.targets.name = element;
+        }}
+        type="text"
+        class="field h-11 px-3"
+        maxlength={80}
+        autocomplete="off"
+        value={props.form.name()}
+        aria-invalid={props.form.invalid("name")}
+        aria-describedby={props.form.describe("name")}
+        onInput={(event) => props.form.setName(event.currentTarget.value)}
+      />
+      <FieldError form={props.form} field="name" />
+    </div>
+  );
+}
+
+function EnabledField(props: { form: AutomationForm }) {
+  const enabledId = createUniqueId();
+  return (
+    <label class="flex min-h-11 cursor-pointer items-center gap-3">
+      <input
+        id={enabledId}
+        type="checkbox"
+        class="size-5 accent-accent"
+        checked={props.form.enabled()}
+        onChange={(event) => props.form.setEnabled(event.currentTarget.checked)}
+      />
+      <span>
+        <span class="block font-medium">Enabled</span>
+        <span class="block text-xs text-muted">
+          When off, it never fires by itself; Run now still works.
+        </span>
+      </span>
+    </label>
+  );
+}
+
+function TriggerFields(props: { form: AutomationForm; preview: Preview }) {
+  const kindGroup = createUniqueId();
+  return (
+    <fieldset class="flex flex-col gap-2">
+      <legend class="mb-1.5 text-sm font-medium">Trigger</legend>
+      <div class="flex flex-wrap gap-2">
+        <For each={triggerKinds}>
+          {(one) => (
+            <label class="choice items-center gap-2">
+              <input
+                type="radio"
+                name={kindGroup}
+                value={one.kind}
+                class="size-5 accent-accent"
+                checked={props.form.kind() === one.kind}
+                onChange={() => props.form.setKind(one.kind)}
+              />
+              {one.label}
+            </label>
+          )}
+        </For>
+      </div>
+
+      <Show when={props.form.kind() === "schedule"}>
+        <ScheduleFields form={props.form} preview={props.preview} />
+      </Show>
+
+      <Show when={props.form.kind() !== "schedule"}>
+        <WatchFields form={props.form} />
+      </Show>
+    </fieldset>
+  );
+}
+
+function ScheduleFields(props: { form: AutomationForm; preview: Preview }) {
+  const cronId = createUniqueId();
+  const cronNoteId = createUniqueId();
+  return (
+    <div class="flex flex-col gap-1.5">
+      <label for={cronId} class="text-sm font-medium">
+        Cron expression
+      </label>
+      <input
+        id={cronId}
+        ref={(element) => {
+          props.form.targets.cron = element;
+        }}
+        type="text"
+        class="field h-11 px-3 font-mono"
+        autocomplete="off"
+        autocapitalize="off"
+        spellcheck={false}
+        value={props.form.cron()}
+        aria-invalid={props.form.invalid("cron")}
+        aria-describedby={props.form.describe("cron", cronNoteId)}
+        onInput={(event) => props.form.setCron(event.currentTarget.value)}
+      />
+      <FieldError form={props.form} field="cron" />
+      <div role="group" aria-label="Cron presets" class="flex flex-wrap gap-2">
+        <For each={cronPresets}>
+          {(preset) => (
+            <button
+              type="button"
+              class="btn px-3 text-sm"
+              aria-pressed={props.form.cron().trim() === preset.expr ? "true" : "false"}
+              onClick={() => props.form.setCron(preset.expr)}
+            >
+              {preset.label}
+            </button>
+          )}
+        </For>
+      </div>
+      <CronPreviewNote id={cronNoteId} preview={props.preview} />
+    </div>
+  );
+}
+
+function CronPreviewNote(props: { id: string; preview: Preview }) {
+  return (
+    <div id={props.id} aria-live="polite" class="text-sm" data-part="cron-preview">
+      <Switch>
+        <Match when={props.preview.status === "loading"}>
+          <p class="text-muted">Checking the expression…</p>
+        </Match>
+        <Match when={previewError(props.preview)}>
+          {(message) => <p class={fieldError}>The expression could not be checked: {message()}</p>}
+        </Match>
+        <Match when={previewAnswer(props.preview)}>
+          {(answer) => <CronAnswer answer={answer()} />}
+        </Match>
+      </Switch>
+    </div>
+  );
+}
+
+function CronAnswer(props: { answer: CronPreview }) {
+  return (
+    <Show
+      when={props.answer.text}
+      fallback={
+        <p class={fieldError}>{props.answer.problem ?? "This is not a valid cron expression."}</p>
+      }
+    >
+      {(text) => (
+        <div class="flex flex-col gap-1">
+          <p class="font-medium">{text()}</p>
+          <Show when={props.answer.next.length > 0}>
+            <p class="text-xs text-muted">Next times, in your local time:</p>
+            <ul class="text-xs">
+              <For each={props.answer.next}>
+                {(ts) => (
+                  <li>
+                    <time datetime={new Date(ts).toISOString()}>{weekdayTime(ts)}</time>
+                  </li>
+                )}
+              </For>
+            </ul>
+          </Show>
+        </div>
+      )}
+    </Show>
+  );
+}
+
+/** The repo an issue or pull request trigger watches, and an issue trigger's label. */
+function WatchFields(props: { form: AutomationForm }) {
+  const triggerRepoId = createUniqueId();
+  const labelId = createUniqueId();
+  return (
+    <>
+      <div class="flex flex-col gap-1.5">
+        <label for={triggerRepoId} class="text-sm font-medium">
+          Repo
+        </label>
+        <select
+          id={triggerRepoId}
+          ref={(element) => {
+            props.form.targets["trigger-repo"] = element;
+          }}
+          class="field h-11 px-2"
+          aria-invalid={props.form.invalid("trigger-repo")}
+          aria-describedby={props.form.describe("trigger-repo")}
+          onChange={(event) => props.form.setTriggerRepo(event.currentTarget.value)}
+        >
+          <Show when={props.form.repos().length === 0}>
+            <option value="">No repo is registered</option>
+          </Show>
+          <For each={props.form.repos()} keyed={(repo) => repo.id}>
+            {(repo) => (
+              <option value={repo().id} selected={repo().id === props.form.watchedRepo()}>
+                {repo().name}
+              </option>
+            )}
+          </For>
+        </select>
+        <FieldError form={props.form} field="trigger-repo" />
+        <p class="text-xs text-muted">{watchNote(props.form.kind())}</p>
+      </div>
+      <Show when={props.form.kind() === "issue"}>
+        <div class="flex flex-col gap-1.5">
+          <label for={labelId} class="text-sm font-medium">
+            Label <span class="font-normal text-muted">(optional)</span>
+          </label>
+          <input
+            id={labelId}
+            type="text"
+            class="field h-11 px-3"
+            autocomplete="off"
+            autocapitalize="off"
+            spellcheck={false}
+            placeholder="any label"
+            value={props.form.label()}
+            onInput={(event) => props.form.setLabel(event.currentTarget.value)}
+          />
+        </div>
+      </Show>
+    </>
+  );
+}
+
+function SessionFields(props: { form: AutomationForm }) {
+  const app = useContext(AppContext);
+  const promptId = createUniqueId();
+  const promptNoteId = createUniqueId();
+  return (
+    <section aria-label="Session to start" class="flex flex-col gap-3">
+      <h2 class="font-semibold">Session to start</h2>
+      <div class="flex flex-col gap-1.5">
+        <label for={promptId} class="text-sm font-medium">
+          Prompt
+        </label>
+        <textarea
+          id={promptId}
+          ref={(element) => {
+            props.form.targets.prompt = element;
+          }}
+          class="field min-h-28 resize-y px-3 py-2"
+          rows="5"
+          value={props.form.prompt()}
+          aria-invalid={props.form.invalid("prompt")}
+          aria-describedby={props.form.describe("prompt", promptNoteId)}
+          onInput={(event) => props.form.setPrompt(event.currentTarget.value)}
+        />
+        <FieldError form={props.form} field="prompt" />
+        <p id={promptNoteId} class="text-xs text-muted" data-part="placeholders">
+          {placeholderNote(props.form.kind())}
+        </p>
+      </div>
+
+      <RepoPicker
+        registry={app.repos()}
+        sets={app.repoSets()}
+        choices={props.form.choices()}
+        onChange={(choices) => props.form.setChoices(choices)}
+        onRegister={(body) => app.registerRepo(body)}
+        onRemove={(id) => app.removeRepo(id)}
+        onClone={(id) => app.cloneRepo(id)}
+        onRetry={() => app.loadRepos()}
+      />
+      <FieldError form={props.form} field="repos" />
+
+      <WorkflowField
+        workflows={props.form.workflows()}
+        picked={props.form.picked()}
+        onChange={(id) => props.form.setWorkflow(id)}
+        ref={(element) => {
+          props.form.targets.workflow = element;
+        }}
+      />
+      <FieldError form={props.form} field="workflow" />
+
+      <PermissionField
+        modes={automationModes}
+        value={props.form.mode()}
+        onChange={(mode) => props.form.setMode(mode)}
+        note="An automated session runs unattended, so Ask is not offered."
+        ref={(element) => {
+          props.form.targets.permission = element;
+        }}
+      />
+      <FieldError form={props.form} field="permission" />
+
+      <RunnerOptions
+        runners={props.form.runners()}
+        runner={props.form.selectedRunner()}
+        model={props.form.model()}
+        onRunner={(runner) => props.form.setRunner(runner)}
+        onModel={(model) => props.form.setModel(model)}
+      />
+    </section>
+  );
+}
+
+const saveLabel = (busy: boolean, stored: boolean): string =>
+  busy ? "Saving…" : stored ? "Save" : "Create automation";
+
+/** The bar under the form: Delete for a saved automation, then Saved and the submit button. */
+function FormActions(props: {
+  stored: boolean;
+  confirming: boolean;
+  onDelete: () => void;
+  saved: boolean;
+  busy: boolean;
+}) {
+  return (
+    <div class="sticky bottom-0 flex flex-wrap items-center justify-between gap-3 border-t border-line bg-bg py-3">
+      <Show when={props.stored}>
+        <button
+          type="button"
+          class="btn text-tone-danger"
+          aria-expanded={props.confirming ? "true" : "false"}
+          onClick={() => props.onDelete()}
+        >
+          Delete
+        </button>
+      </Show>
+      <span class="ml-auto flex items-center gap-3">
+        <Show when={props.saved}>
+          <span role="status" class="text-sm text-tone-success">
+            Saved
+          </span>
+        </Show>
+        <button type="submit" class="btn btn-primary" disabled={props.busy}>
+          {saveLabel(props.busy, props.stored)}
+        </button>
+      </span>
+    </div>
+  );
+}
+
+/** Deleting asks first; what went wrong stays shown until the next try. */
+function createDeletion(app: AppState, stored: Automation | undefined, onDeleted: () => void) {
+  const [confirming, setConfirming] = createSignal(false);
+  const [deleting, setDeleting] = createSignal(false);
+  const [error, setError] = createSignal<string>();
+
+  async function remove(): Promise<void> {
+    if (!stored || deleting()) return;
+    setDeleting(true);
+    setError(undefined);
+    try {
+      await app.deleteAutomation(stored.id);
+      onDeleted();
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setDeleting(false);
+    }
+  }
+
+  return { confirming, setConfirming, deleting, error, remove };
+}
+
+function DeleteConfirm(props: { name: string; deletion: ReturnType<typeof createDeletion> }) {
+  return (
+    <div
+      role="group"
+      aria-label="Delete this automation"
+      class="flex flex-col gap-2 rounded-md border border-line bg-sunken p-3 text-sm"
+    >
+      <p>
+        Delete <span class="font-medium">{props.name}</span>? It stops firing. The sessions it
+        started are kept.
+      </p>
+      <Show when={props.deletion.error()}>
+        {(message) => (
+          <p role="alert" class={fieldError}>
+            {message()}
+          </p>
+        )}
+      </Show>
+      <div class="flex justify-end gap-2">
+        <button type="button" class="btn" onClick={() => props.deletion.setConfirming(false)}>
+          Keep
+        </button>
+        <button
+          type="button"
+          class="btn"
+          disabled={props.deletion.deleting()}
+          onClick={() => void props.deletion.remove()}
+        >
+          {props.deletion.deleting() ? "Deleting…" : "Delete automation"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/** The new-or-edit form. `stored` is absent for a new automation. */
+function AutomationEditor(props: {
+  stored: Automation | undefined;
+  onSaved: (automation: Automation, created: boolean) => void;
+}) {
+  const app = useContext(AppContext);
+  const navigate = useNavigate();
+  const stored = props.stored;
+  const form = createAutomationForm(app, stored);
+  const preview = createCronPreview(app, () =>
+    form.kind() === "schedule" ? form.cron().trim() : "",
+  );
+  const deletion = createDeletion(app, stored, () => navigate("/automations"));
+  const [busy, setBusy] = createSignal(false);
+  const [saved, setSaved] = createSignal(false);
+
+  async function save(): Promise<void> {
+    if (busy()) return;
+    setBusy(true);
+    setSaved(false);
+    form.setFailure(undefined);
+    try {
+      const result = await app.saveAutomation(stored?.id, form.request());
+      setSaved(true);
+      props.onSaved(result, stored === undefined);
+    } catch (reason) {
+      const failure = saveFailure(reason, form.kind());
+      form.setFailure(failure);
+      // The message is in the page by the next frame; then the field it is about takes focus.
+      queueMicrotask(() => focusTarget(failure.field, form.targets)?.focus());
+    } finally {
+      setBusy(false);
+    }
+  }
 
   return (
     <form
       aria-label={stored ? `Edit ${stored.name}` : "New automation"}
       class="flex flex-col gap-5"
       novalidate
-      onSubmit={(event) => {
-        event.preventDefault();
-        void save();
-      }}
+      onSubmit={onFormSubmit(save)}
       onInput={() => setSaved(false)}
     >
-      <div class="flex flex-col gap-1.5">
-        <label for={nameId} class="text-sm font-medium">
-          Name
-        </label>
-        <input
-          id={nameId}
-          ref={(element) => {
-            refs.name = element;
-          }}
-          type="text"
-          class="field h-11 px-3"
-          maxlength={80}
-          autocomplete="off"
-          value={name()}
-          aria-invalid={blamed("name") ? "true" : undefined}
-          aria-describedby={describe("name")}
-          onInput={(event) => setName(event.currentTarget.value)}
-        />
-        <FieldError field="name" />
-      </div>
+      <NameField form={form} />
 
-      <label class="flex min-h-11 cursor-pointer items-center gap-3">
-        <input
-          id={enabledId}
-          type="checkbox"
-          class="size-5 accent-accent"
-          checked={enabled()}
-          onChange={(event) => setEnabled(event.currentTarget.checked)}
-        />
-        <span>
-          <span class="block font-medium">Enabled</span>
-          <span class="block text-xs text-muted">
-            When off, it never fires by itself; Run now still works.
-          </span>
-        </span>
-      </label>
+      <EnabledField form={form} />
 
-      <fieldset class="flex flex-col gap-2">
-        <legend class="mb-1.5 text-sm font-medium">Trigger</legend>
-        <div class="flex flex-wrap gap-2">
-          <For each={triggerKinds}>
-            {(one) => (
-              <label class="choice items-center gap-2">
-                <input
-                  type="radio"
-                  name={kindGroup}
-                  value={one.kind}
-                  class="size-5 accent-accent"
-                  checked={kind() === one.kind}
-                  onChange={() => setKind(one.kind)}
-                />
-                {one.label}
-              </label>
-            )}
-          </For>
-        </div>
+      <TriggerFields form={form} preview={preview()} />
 
-        <Show when={kind() === "schedule"}>
-          <div class="flex flex-col gap-1.5">
-            <label for={cronId} class="text-sm font-medium">
-              Cron expression
-            </label>
-            <input
-              id={cronId}
-              ref={(element) => {
-                refs.cron = element;
-              }}
-              type="text"
-              class="field h-11 px-3 font-mono"
-              autocomplete="off"
-              autocapitalize="off"
-              spellcheck={false}
-              value={cron()}
-              aria-invalid={blamed("cron") ? "true" : undefined}
-              aria-describedby={describe("cron", cronNoteId)}
-              onInput={(event) => setCron(event.currentTarget.value)}
-            />
-            <FieldError field="cron" />
-            <div role="group" aria-label="Cron presets" class="flex flex-wrap gap-2">
-              <For each={cronPresets}>
-                {(preset) => (
-                  <button
-                    type="button"
-                    class="btn px-3 text-sm"
-                    aria-pressed={cron().trim() === preset.expr ? "true" : "false"}
-                    onClick={() => setCron(preset.expr)}
-                  >
-                    {preset.label}
-                  </button>
-                )}
-              </For>
-            </div>
-            <div id={cronNoteId} aria-live="polite" class="text-sm" data-part="cron-preview">
-              <Switch>
-                <Match when={preview().status === "loading"}>
-                  <p class="text-muted">Checking the expression…</p>
-                </Match>
-                <Match when={previewError()}>
-                  {(message) => (
-                    <p class={fieldError}>The expression could not be checked: {message()}</p>
-                  )}
-                </Match>
-                <Match when={previewAnswer()}>
-                  {(answer) => {
-                    return (
-                      <Show
-                        when={answer().text}
-                        fallback={
-                          <p class={fieldError}>
-                            {answer().problem ?? "This is not a valid cron expression."}
-                          </p>
-                        }
-                      >
-                        {(text) => (
-                          <div class="flex flex-col gap-1">
-                            <p class="font-medium">{text()}</p>
-                            <Show when={answer().next.length > 0}>
-                              <p class="text-xs text-muted">Next times, in your local time:</p>
-                              <ul class="text-xs">
-                                <For each={answer().next}>
-                                  {(ts) => (
-                                    <li>
-                                      <time datetime={new Date(ts).toISOString()}>
-                                        {weekdayTime(ts)}
-                                      </time>
-                                    </li>
-                                  )}
-                                </For>
-                              </ul>
-                            </Show>
-                          </div>
-                        )}
-                      </Show>
-                    );
-                  }}
-                </Match>
-              </Switch>
-            </div>
-          </div>
-        </Show>
+      <SessionFields form={form} />
 
-        <Show when={kind() !== "schedule"}>
-          <div class="flex flex-col gap-1.5">
-            <label for={triggerRepoId} class="text-sm font-medium">
-              Repo
-            </label>
-            <select
-              id={triggerRepoId}
-              ref={(element) => {
-                refs["trigger-repo"] = element;
-              }}
-              class="field h-11 px-2"
-              aria-invalid={blamed("trigger-repo") ? "true" : undefined}
-              aria-describedby={describe("trigger-repo")}
-              onChange={(event) => setTriggerRepo(event.currentTarget.value)}
-            >
-              <Show when={repos().length === 0}>
-                <option value="">No repo is registered</option>
-              </Show>
-              <For each={repos()} keyed={(repo) => repo.id}>
-                {(repo) => (
-                  <option value={repo().id} selected={repo().id === watchedRepo()}>
-                    {repo().name}
-                  </option>
-                )}
-              </For>
-            </select>
-            <FieldError field="trigger-repo" />
-            <p class="text-xs text-muted">
-              {kind() === "issue"
-                ? "Fires once for each new open issue of this repo. Issues that exist when it is switched on are not started on."
-                : "Fires once for each new open pull request of this repo. Pull requests that exist when it is switched on are not started on."}
-            </p>
-          </div>
-          <Show when={kind() === "issue"}>
-            <div class="flex flex-col gap-1.5">
-              <label for={labelId} class="text-sm font-medium">
-                Label <span class="font-normal text-muted">(optional)</span>
-              </label>
-              <input
-                id={labelId}
-                type="text"
-                class="field h-11 px-3"
-                autocomplete="off"
-                autocapitalize="off"
-                spellcheck={false}
-                placeholder="any label"
-                value={label()}
-                onInput={(event) => setLabel(event.currentTarget.value)}
-              />
-            </div>
-          </Show>
-        </Show>
-      </fieldset>
+      <FieldError form={form} />
 
-      <section aria-label="Session to start" class="flex flex-col gap-3">
-        <h2 class="font-semibold">Session to start</h2>
-        <div class="flex flex-col gap-1.5">
-          <label for={promptId} class="text-sm font-medium">
-            Prompt
-          </label>
-          <textarea
-            id={promptId}
-            ref={(element) => {
-              refs.prompt = element;
-            }}
-            class="field min-h-28 resize-y px-3 py-2"
-            rows="5"
-            value={prompt()}
-            aria-invalid={blamed("prompt") ? "true" : undefined}
-            aria-describedby={describe("prompt", promptNoteId)}
-            onInput={(event) => setPrompt(event.currentTarget.value)}
-          />
-          <FieldError field="prompt" />
-          <p id={promptNoteId} class="text-xs text-muted" data-part="placeholders">
-            {placeholderNote(kind())}
-          </p>
-        </div>
+      <FormActions
+        stored={stored !== undefined}
+        confirming={deletion.confirming()}
+        onDelete={() => deletion.setConfirming((open) => !open)}
+        saved={saved()}
+        busy={busy()}
+      />
 
-        <RepoPicker
-          registry={app.repos()}
-          sets={app.repoSets()}
-          choices={choices()}
-          onChange={setChoices}
-          onRegister={(body) => app.registerRepo(body)}
-          onRemove={(id) => app.removeRepo(id)}
-          onClone={(id) => app.cloneRepo(id)}
-          onRetry={() => app.loadRepos()}
-        />
-        <FieldError field="repos" />
-
-        <WorkflowField
-          workflows={workflowList()}
-          picked={pickedWorkflow()}
-          onChange={setWorkflow}
-          ref={(element) => {
-            refs.workflow = element;
-          }}
-        />
-        <FieldError field="workflow" />
-
-        <PermissionField
-          modes={automationModes}
-          value={mode()}
-          onChange={setMode}
-          note="An automated session runs unattended, so Ask is not offered."
-          ref={(element) => {
-            refs.permission = element;
-          }}
-        />
-        <FieldError field="permission" />
-
-        <RunnerOptions
-          runners={runners()}
-          runner={selectedRunner()}
-          model={model()}
-          onRunner={setRunner}
-          onModel={setModel}
-        />
-      </section>
-
-      <FieldError />
-
-      <div class="sticky bottom-0 flex flex-wrap items-center justify-between gap-3 border-t border-line bg-bg py-3">
-        <Show when={stored}>
-          <button
-            type="button"
-            class="btn text-tone-danger"
-            aria-expanded={confirmDelete() ? "true" : "false"}
-            onClick={() => setConfirmDelete((open) => !open)}
-          >
-            Delete
-          </button>
-        </Show>
-        <span class="ml-auto flex items-center gap-3">
-          <Show when={saved()}>
-            <span role="status" class="text-sm text-tone-success">
-              Saved
-            </span>
-          </Show>
-          <button type="submit" class="btn btn-primary" disabled={busy()}>
-            {busy() ? "Saving…" : stored ? "Save" : "Create automation"}
-          </button>
-        </span>
-      </div>
-
-      <Show when={stored && confirmDelete()}>
-        <div
-          role="group"
-          aria-label="Delete this automation"
-          class="flex flex-col gap-2 rounded-md border border-line bg-sunken p-3 text-sm"
-        >
-          <p>
-            Delete <span class="font-medium">{name()}</span>? It stops firing. The sessions it
-            started are kept.
-          </p>
-          <Show when={deleteError()}>
-            {(message) => (
-              <p role="alert" class={fieldError}>
-                {message()}
-              </p>
-            )}
-          </Show>
-          <div class="flex justify-end gap-2">
-            <button type="button" class="btn" onClick={() => setConfirmDelete(false)}>
-              Keep
-            </button>
-            <button type="button" class="btn" disabled={deleting()} onClick={() => void remove()}>
-              {deleting() ? "Deleting…" : "Delete automation"}
-            </button>
-          </div>
-        </div>
+      <Show when={stored && deletion.confirming()}>
+        <DeleteConfirm name={form.name()} deletion={deletion} />
       </Show>
     </form>
   );
@@ -620,24 +716,20 @@ function RunNow(props: { automation: Automation; onRan: (run: AutomationRun) => 
   const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal<string>();
   const [result, setResult] = createSignal<AutomationRun>();
-  const numberId = createUniqueId();
   const numberLabel = (): string | undefined => runNumberLabel(props.automation.trigger);
 
   async function run(): Promise<void> {
     if (busy()) return;
-    let wanted: number | undefined;
-    if (numberLabel() !== undefined) {
-      wanted = Number(number().trim().replace(/^#/, ""));
-      if (!Number.isInteger(wanted) || wanted <= 0) {
-        setError(`Give the ${numberLabel()?.toLowerCase()}, a whole number such as 12.`);
-        return;
-      }
+    const wanted = runWanted(props.automation.trigger, number());
+    if ("problem" in wanted) {
+      setError(wanted.problem);
+      return;
     }
     setBusy(true);
     setError(undefined);
     setResult(undefined);
     try {
-      const ran = await app.runAutomation(props.automation.id, wanted);
+      const ran = await app.runAutomation(props.automation.id, wanted.number);
       setResult(ran);
       setAsking(false);
       setNumber("");
@@ -649,59 +741,34 @@ function RunNow(props: { automation: Automation; onRan: (run: AutomationRun) => 
     }
   }
 
+  function start(): void {
+    setResult(undefined);
+    setError(undefined);
+    if (numberLabel() === undefined) void run();
+    else setAsking(true);
+  }
+
   return (
     <section aria-label="Run now" class="flex flex-col gap-2">
       <Show
         when={asking() && numberLabel()}
         fallback={
           <div>
-            <button
-              type="button"
-              class="btn"
-              disabled={busy()}
-              onClick={() => {
-                setResult(undefined);
-                setError(undefined);
-                if (numberLabel() === undefined) void run();
-                else setAsking(true);
-              }}
-            >
-              {busy() ? "Starting…" : "Run now"}
+            <button type="button" class="btn" disabled={busy()} onClick={() => start()}>
+              {startLabel(busy(), "Run now")}
             </button>
           </div>
         }
       >
         {(label) => (
-          <form
-            aria-label="Run now"
-            class="flex flex-wrap items-end gap-2"
-            onSubmit={(event) => {
-              event.preventDefault();
-              void run();
-            }}
-          >
-            <div class="flex flex-col gap-1">
-              <label for={numberId} class="text-sm font-medium">
-                {label()}
-              </label>
-              <input
-                id={numberId}
-                ref={(element) => queueMicrotask(() => element.focus())}
-                type="text"
-                inputmode="numeric"
-                class="field h-11 w-32 px-3 font-mono"
-                autocomplete="off"
-                value={number()}
-                onInput={(event) => setNumber(event.currentTarget.value)}
-              />
-            </div>
-            <button type="submit" class="btn btn-primary" disabled={busy()}>
-              {busy() ? "Starting…" : "Run"}
-            </button>
-            <button type="button" class="btn" onClick={() => setAsking(false)}>
-              Cancel
-            </button>
-          </form>
+          <RunNumberForm
+            label={label()}
+            number={number()}
+            busy={busy()}
+            onNumber={(typed) => setNumber(typed)}
+            onRun={() => void run()}
+            onCancel={() => setAsking(false)}
+          />
         )}
       </Show>
       <Show when={error()}>
@@ -711,24 +778,72 @@ function RunNow(props: { automation: Automation; onRan: (run: AutomationRun) => 
           </p>
         )}
       </Show>
-      <Show when={result()}>
-        {(ran) => (
-          <p role="status" class="flex flex-wrap items-center gap-x-2 text-sm">
-            <span>{outcomeText(ran())}.</span>
-            <Show when={ran().session_id}>
-              {(id) => (
-                <a
-                  href={sessionPath(id())}
-                  class="inline-flex min-h-11 items-center text-accent underline"
-                >
-                  Open the started session
-                </a>
-              )}
-            </Show>
-          </p>
+      <Show when={result()}>{(ran) => <RunResult run={ran()} />}</Show>
+    </section>
+  );
+}
+
+const startLabel = (busy: boolean, idle: string): string => (busy ? "Starting…" : idle);
+
+/** Asks which issue or pull request a trigger is run for; the field takes focus as it opens. */
+function RunNumberForm(props: {
+  label: string;
+  number: string;
+  busy: boolean;
+  onNumber: (typed: string) => void;
+  onRun: () => void;
+  onCancel: () => void;
+}) {
+  const numberId = createUniqueId();
+  return (
+    <form
+      aria-label="Run now"
+      class="flex flex-wrap items-end gap-2"
+      onSubmit={(event) => {
+        event.preventDefault();
+        props.onRun();
+      }}
+    >
+      <div class="flex flex-col gap-1">
+        <label for={numberId} class="text-sm font-medium">
+          {props.label}
+        </label>
+        <input
+          id={numberId}
+          ref={(element) => queueMicrotask(() => element.focus())}
+          type="text"
+          inputmode="numeric"
+          class="field h-11 w-32 px-3 font-mono"
+          autocomplete="off"
+          value={props.number}
+          onInput={(event) => props.onNumber(event.currentTarget.value)}
+        />
+      </div>
+      <button type="submit" class="btn btn-primary" disabled={props.busy}>
+        {startLabel(props.busy, "Run")}
+      </button>
+      <button type="button" class="btn" onClick={() => props.onCancel()}>
+        Cancel
+      </button>
+    </form>
+  );
+}
+
+function RunResult(props: { run: AutomationRun }) {
+  return (
+    <p role="status" class="flex flex-wrap items-center gap-x-2 text-sm">
+      <span>{outcomeText(props.run)}.</span>
+      <Show when={props.run.session_id}>
+        {(id) => (
+          <a
+            href={sessionPath(id())}
+            class="inline-flex min-h-11 items-center text-accent underline"
+          >
+            Open the started session
+          </a>
         )}
       </Show>
-    </section>
+    </p>
   );
 }
 
@@ -811,22 +926,20 @@ type Load =
   | { status: "ready"; automation: Automation | undefined }
   | { status: "error"; message: string };
 
-/** `/automations/new` and `/automations/:id`: the editor, and for one that exists, Run now and its history. */
-export default function AutomationPage() {
-  const app = useContext(AppContext);
-  const params = useParams<{ id?: string }>();
-  const navigate = useNavigate();
+const loadedOf = (load: Load) => (load.status === "ready" ? load : undefined);
+const loadError = (load: Load): string | undefined =>
+  load.status === "error" ? load.message : undefined;
+const pageTitle = (latest: Automation | undefined, id: string | undefined): string =>
+  latest?.name ?? (id ? "Automation" : "New automation");
+
+/** The automation `id` names, read again each time it changes, and its run history. */
+function createAutomationRead(app: AppState, automationId: () => string | undefined) {
   const [load, setLoad] = createSignal<Load>({ status: "loading" });
   const [runs, setRuns] = createSignal<readonly AutomationRun[]>();
   const [runsError, setRunsError] = createSignal<string>();
   // The automation as last saved or read; the editor keeps its own drafts from the first read.
   const [latest, setLatest] = createSignal<Automation>();
   let asked = 0;
-
-  onSettled(() => {
-    app.loadRepos();
-    app.loadWorkflows();
-  });
 
   function readRuns(id: string): void {
     app.automationRuns(id).then(
@@ -838,41 +951,58 @@ export default function AutomationPage() {
     );
   }
 
-  createEffect(
-    () => params.id,
-    (id) => {
-      asked += 1;
-      const mine = asked;
-      setRuns(undefined);
-      setLatest(undefined);
-      if (id === undefined) {
-        setLoad({ status: "ready", automation: undefined });
-        return;
-      }
-      setLoad({ status: "loading" });
-      app.getAutomation(id).then(
-        (automation) => {
-          if (mine !== asked) return;
-          setLatest(automation);
-          setLoad({ status: "ready", automation });
-        },
-        (error: unknown) => {
-          if (mine === asked) setLoad({ status: "error", message: errorMessage(error) });
-        },
-      );
-      readRuns(id);
-    },
-  );
+  createEffect(automationId, (id) => {
+    asked += 1;
+    const mine = asked;
+    setRuns(undefined);
+    setLatest(undefined);
+    if (id === undefined) {
+      setLoad({ status: "ready", automation: undefined });
+      return;
+    }
+    setLoad({ status: "loading" });
+    app.getAutomation(id).then(
+      (automation) => {
+        if (mine !== asked) return;
+        setLatest(automation);
+        setLoad({ status: "ready", automation });
+      },
+      (error: unknown) => {
+        if (mine === asked) setLoad({ status: "error", message: errorMessage(error) });
+      },
+    );
+    readRuns(id);
+  });
 
-  const ready = () => {
-    const current = load();
-    return current.status === "ready" ? current : undefined;
-  };
-  const failure = (): string | undefined => {
-    const current = load();
-    return current.status === "error" ? current.message : undefined;
-  };
-  const title = (): string => latest()?.name ?? (params.id ? "Automation" : "New automation");
+  return { load, runs, runsError, latest, setLatest, readRuns };
+}
+
+/** What fires a saved automation, why Calin switched it off if it did, and Run now. */
+function AutomationSummary(props: { automation: Automation; onRan: () => void }) {
+  return (
+    <>
+      <p class="text-sm">{props.automation.trigger_text}</p>
+      <Show when={props.automation.disabled_reason}>
+        {(reason) => (
+          <p class="text-sm wrap-break-word text-tone-danger">Switched off by Calin: {reason()}</p>
+        )}
+      </Show>
+      <RunNow automation={props.automation} onRan={() => props.onRan()} />
+    </>
+  );
+}
+
+/** `/automations/new` and `/automations/:id`: the editor, and for one that exists, Run now and its history. */
+export default function AutomationPage() {
+  const app = useContext(AppContext);
+  const params = useParams<{ id?: string }>();
+  const navigate = useNavigate();
+  const read = createAutomationRead(app, () => params.id);
+
+  onSettled(() => {
+    app.loadRepos();
+    app.loadWorkflows();
+  });
 
   return (
     <section class="min-h-0 flex-1 overflow-y-auto overscroll-contain">
@@ -881,32 +1011,27 @@ export default function AutomationPage() {
           <a href="/automations" aria-label="Back to automations" class="btn btn-ghost px-0">
             <span aria-hidden="true">←</span>
           </a>
-          <h1 class="min-w-0 flex-1 truncate text-xl font-semibold">{title()}</h1>
+          <h1 class="min-w-0 flex-1 truncate text-xl font-semibold">
+            {pageTitle(read.latest(), params.id)}
+          </h1>
         </header>
         <Switch>
-          <Match when={failure()}>
+          <Match when={loadError(read.load())}>
             {(message) => (
               <p role="alert" class="text-sm wrap-break-word">
                 The automation could not be loaded: {message()}
               </p>
             )}
           </Match>
-          <Match when={ready()}>
+          <Match when={loadedOf(read.load())}>
             {(loaded) => (
               <>
-                <Show when={latest()}>
+                <Show when={read.latest()}>
                   {(automation) => (
-                    <>
-                      <p class="text-sm">{automation().trigger_text}</p>
-                      <Show when={automation().disabled_reason}>
-                        {(reason) => (
-                          <p class="text-sm wrap-break-word text-tone-danger">
-                            Switched off by Calin: {reason()}
-                          </p>
-                        )}
-                      </Show>
-                      <RunNow automation={automation()} onRan={() => readRuns(automation().id)} />
-                    </>
+                    <AutomationSummary
+                      automation={automation()}
+                      onRan={() => read.readRuns(automation().id)}
+                    />
                   )}
                 </Show>
                 {/* Keyed on the read: another automation starts the drafts over, a save does not. */}
@@ -916,13 +1041,13 @@ export default function AutomationPage() {
                       stored={current.automation}
                       onSaved={(automation, created) => {
                         if (created) navigate(`/automations/${encodeURIComponent(automation.id)}`);
-                        else setLatest(automation);
+                        else read.setLatest(automation);
                       }}
                     />
                   )}
                 </Show>
-                <Show when={latest()}>
-                  <RunHistory runs={runs()} error={runsError()} now={app.now()} />
+                <Show when={read.latest()}>
+                  <RunHistory runs={read.runs()} error={read.runsError()} now={app.now()} />
                 </Show>
               </>
             )}

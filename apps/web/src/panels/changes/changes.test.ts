@@ -2,12 +2,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test"
 import type { ChangedFile } from "../../gen/ChangedFile";
 import type { FileDiff } from "../../gen/FileDiff";
 import type { RepoChanges } from "../../gen/RepoChanges";
+import { inRepoSetOrder } from "../../lib/delivery";
 import { deferred, makeSessionRepo, settle } from "../../test/fakes";
 import {
   createRefresher,
   diffContent,
   findFile,
-  inRepoOrder,
   repoTotals,
   sameDiff,
   sessionTotals,
@@ -73,7 +73,7 @@ describe("changes", () => {
 
   it("orders repos like the session's repo set, primary first, unknown ones last", () => {
     const known = [makeSessionRepo("web", { primary: true }), makeSessionRepo("api")];
-    const ordered = inRepoOrder([repo("ghost", []), repo("api", []), repo("web", [])], known);
+    const ordered = inRepoSetOrder([repo("ghost", []), repo("api", []), repo("web", [])], known);
     expect(ordered.map((one) => one.session_repo_id)).toEqual(["web", "api", "ghost"]);
   });
 
@@ -206,6 +206,22 @@ describe("refresher", () => {
     expect(run).toHaveBeenCalledTimes(1);
     first.resolve();
     await settle();
+    expect(run).toHaveBeenCalledTimes(2);
+  });
+
+  it("holds a refresh asked during a run that ends out of sight, for the way back", async () => {
+    const first = deferred();
+    const run = vi.fn<() => Promise<void>>().mockReturnValueOnce(first.promise);
+    run.mockResolvedValue(undefined);
+    const refresher = createRefresher(run, 500);
+    refresher.setVisible(true);
+    refresher.now();
+    refresher.now();
+    refresher.setVisible(false);
+    first.resolve();
+    await settle();
+    expect(run).toHaveBeenCalledTimes(1);
+    refresher.setVisible(true);
     expect(run).toHaveBeenCalledTimes(2);
   });
 

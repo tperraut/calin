@@ -80,8 +80,29 @@ beforeAll(() => loadEditorModule());
 beforeEach(resetFakeEditors);
 afterEach(() => {
   vi.useRealTimers();
+  vi.unstubAllGlobals();
   unmountAll();
 });
+
+/** The panel's width as its resize observer reports it. */
+function panelWidth(width: number): void {
+  type Report = (entries: { contentRect: { width: number } }[]) => void;
+  vi.stubGlobal(
+    "ResizeObserver",
+    class {
+      private readonly report: Report;
+      constructor(report: Report) {
+        this.report = report;
+      }
+      observe(): void {
+        queueMicrotask(() => this.report([{ contentRect: { width } }]));
+      }
+      disconnect(): void {}
+    },
+  );
+}
+
+const liveDiffs = () => diffs.filter((one) => !one.destroyed);
 
 describe("ChangesPanel", () => {
   it("says so while loading, then when there is nothing", async () => {
@@ -509,6 +530,112 @@ describe("ChangesPanel", () => {
     expect(find(host, 'section[aria-label="Diff"] [role="alert"]').textContent).toContain(
       "a.txt is not among the changes",
     );
+  });
+
+  it("says there is nothing to compare for a file with no content on either side", async () => {
+    const { host } = await open({
+      getChanges: () => Promise.resolve([repo("api", [file("empty.txt", { added: 0 })])]),
+      getDiff: (_id, _repo, path) => Promise.resolve(diffOf(path, { old: null, new: null })),
+    });
+    await click(fileButton(host, "empty.txt"));
+    await act();
+    expect(find(host, 'section[aria-label="Diff"]').textContent).toContain(
+      "There is no content to compare for this file.",
+    );
+    expect(diffs).toHaveLength(0);
+    expect(editors).toHaveLength(0);
+  });
+
+  it("asks for the diff again after it failed", async () => {
+    const getDiff = vi
+      .fn<Api["getDiff"]>()
+      .mockRejectedValueOnce(conflict("the index is locked"))
+      .mockResolvedValue(diffOf("a.txt"));
+    const { host } = await open({
+      getChanges: () => Promise.resolve([repo("api", [file("a.txt")])]),
+      getDiff,
+    });
+    await click(fileButton(host, "a.txt"));
+    await act();
+    const pane = find(host, 'section[aria-label="Diff"]');
+    await click(findByText(pane, "button", "Try again"));
+    await act();
+    expect(getDiff).toHaveBeenCalledTimes(2);
+    expect(pane.querySelector('[role="alert"]')).toBeNull();
+    expect(liveDiffs()).toHaveLength(1);
+  });
+
+  it("shows the file picked last, whatever the earlier requests answer late", async () => {
+    const slowA = deferred<FileDiff>();
+    const slowB = deferred<FileDiff>();
+    const { host } = await open({
+      getChanges: () =>
+        Promise.resolve([repo("api", [file("a.txt"), file("b.txt"), file("c.txt")])]),
+      getDiff: (_id, _repo, path) => {
+        if (path === "a.txt") return slowA.promise;
+        if (path === "b.txt") return slowB.promise;
+        return Promise.resolve(diffOf(path, { new: "c after\n" }));
+      },
+    });
+    await click(fileButton(host, "a.txt"));
+    await act();
+    const pane = find(host, 'section[aria-label="Diff"]');
+    expect(pane.textContent).toContain("Loading the diff…");
+    await click(fileButton(host, "b.txt"));
+    await click(fileButton(host, "c.txt"));
+    await act();
+    slowA.resolve(diffOf("a.txt"));
+    slowB.reject(conflict("b.txt is gone"));
+    await act();
+    expect(liveDiffs().map((one) => one.options.path)).toEqual(["c.txt"]);
+    expect(pane.querySelector('[role="alert"]')).toBeNull();
+  });
+
+  it("keeps the inline choice for the next time the panel opens", async () => {
+    const routes: Partial<Api> = {
+      getChanges: () => Promise.resolve([repo("api", [file("a.txt")])]),
+      getDiff: () => Promise.resolve(diffOf("a.txt")),
+    };
+    const first = await open(routes);
+    await click(fileButton(first.host, "a.txt"));
+    await act();
+    await click(findByText(first.host, "button", "Side by side"));
+    unmountAll();
+
+    const again = await open(routes);
+    await click(fileButton(again.host, "a.txt"));
+    await act();
+    expect(diffs.at(-1)?.options.layout).toBe("unified");
+    const toggle = findByText(again.host, "button", "Side by side");
+    expect(toggle.getAttribute("aria-pressed")).toBe("false");
+  });
+
+  it("puts the diff under the list on a narrow panel, and beside it on a wide one", async () => {
+    const routes: Partial<Api> = {
+      getChanges: () => Promise.resolve([repo("api", [file("a.txt")])]),
+      getDiff: () => Promise.resolve(diffOf("a.txt")),
+    };
+    const stacked = await open(routes);
+    const list = () => find(stacked.host, 'section[aria-label="Changed files"]');
+    expect(stacked.host.firstElementChild?.classList.contains("flex-col")).toBe(true);
+    expect(list().classList.contains("flex-1")).toBe(true);
+    await click(fileButton(stacked.host, "a.txt"));
+    await act();
+    expect(list().hidden).toBe(false);
+    expect(list().classList.contains("max-h-[40%]")).toBe(true);
+    expect(stacked.host.textContent).not.toContain("‹ Changes");
+    unmountAll();
+
+    panelWidth(800);
+    const columns = await open(routes);
+    const side = find(columns.host, 'section[aria-label="Changed files"]');
+    expect(columns.host.firstElementChild?.classList.contains("flex-row")).toBe(true);
+    expect(side.classList.contains("w-80")).toBe(true);
+    await click(fileButton(columns.host, "a.txt"));
+    await act();
+    expect(side.hidden).toBe(false);
+    expect(side.classList.contains("w-80")).toBe(true);
+    expect(columns.host.querySelector('section[aria-label="Diff"]')).not.toBeNull();
   });
 
   it("hands a file over to the Files panel", async () => {

@@ -80,89 +80,129 @@ export function layoutGraph(
   previous: ReadonlyMap<string, Point> | undefined,
   mode: LayoutMode,
 ): Layout {
+  const { kids, roots, repos } = groupNodes(nodes, byPrevious(previous));
+  const placement = new Placement(kids, mode);
+  for (const root of roots) placement.placeTree(root);
+  // Members of a cycle hang under nothing reachable: they still get a row.
+  for (const node of nodes) {
+    if (node.kind !== "repo" && !placement.holds(node.id)) placement.placeTree(node);
+  }
+  repos.forEach((repo, index) => placement.placeRepo(repo, index));
+  return placement.layout();
+}
+
+/** The node a node hangs under, when the graph holds it. */
+function heldParent(node: GraphNode, ids: ReadonlySet<string>): string | undefined {
+  const parent = node.parent_id;
+  return parent !== null && parent !== node.id && ids.has(parent) ? parent : undefined;
+}
+
+/** The children of each node, the roots of the tree and the repos, each in the order they show. */
+function groupNodes(
+  nodes: readonly GraphNode[],
+  earlier: (a: GraphNode, b: GraphNode) => number,
+): { kids: ReadonlyMap<string, readonly GraphNode[]>; roots: GraphNode[]; repos: GraphNode[] } {
   const ids = new Set(nodes.map((node) => node.id));
-  const earlier = byPrevious(previous);
   const kids = new Map<string, GraphNode[]>();
   const roots: GraphNode[] = [];
-  const repos: GraphNode[] = [];
+  const repos = nodes.filter((node) => node.kind === "repo");
   for (const node of nodes) {
-    if (node.kind === "repo") {
-      repos.push(node);
-    } else if (node.parent_id !== null && node.parent_id !== node.id && ids.has(node.parent_id)) {
-      const list = kids.get(node.parent_id);
-      if (list) list.push(node);
-      else kids.set(node.parent_id, [node]);
-    } else {
-      // The user, or an agent whose parent this graph does not hold.
-      roots.push(node);
-    }
+    if (node.kind === "repo") continue;
+    const parent = heldParent(node, ids);
+    // The user, or an agent whose parent this graph does not hold, starts a tree.
+    if (parent === undefined) roots.push(node);
+    else kids.set(parent, [...(kids.get(parent) ?? []), node]);
   }
   // `sort` is stable: equal ranks keep the input order.
   for (const list of kids.values()) list.sort(earlier);
   roots.sort((a, b) => Number(b.kind === "user") - Number(a.kind === "user") || earlier(a, b));
   repos.sort(earlier);
+  return { kids, roots, repos };
+}
 
-  const positions = new Map<string, Point>();
-  const order: string[] = [];
-  const parent = new Map<string, string>();
-  const children = new Map<string, readonly string[]>();
-  const step = mode === "indented" ? INDENT : COLUMN_STEP;
-  // Rows a node takes before its first child: its own, or none when the child sits beside it.
-  const own = mode === "indented" ? 1 : 0;
-  let depthCount = 0;
-  let treeWidth = 0;
-  const seen = new Set<string>();
+/** Where a repo of the band sits: under the tree on a phone, in a column of its own when wide. */
+function repoSpot(mode: LayoutMode, index: number, treeRows: number, depthCount: number): Point {
+  const size = NODE_SIZE.repo;
+  if (mode === "indented") {
+    return {
+      x: (index % REPOS_PER_ROW) * (size.w + REPO_GAP),
+      y: treeRows * SLOT + BAND_GAP + Math.floor(index / REPOS_PER_ROW) * (size.h + REPO_GAP),
+    };
+  }
+  return { x: Math.max(MIN_COLUMNS, depthCount) * COLUMN_STEP, y: index * (size.h + REPO_GAP) };
+}
 
-  const place = (node: GraphNode, depth: number, top: number): number => {
+/** The layout as it is built: the trees one under the other, then the repo band. */
+class Placement {
+  private readonly positions = new Map<string, Point>();
+  private readonly order: string[] = [];
+  private readonly parent = new Map<string, string>();
+  private readonly children = new Map<string, readonly string[]>();
+  private readonly seen = new Set<string>();
+  private readonly kids: ReadonlyMap<string, readonly GraphNode[]>;
+  private readonly mode: LayoutMode;
+  private readonly step: number;
+  /** Rows a node takes before its first child: its own, or none when the child sits beside it. */
+  private readonly own: number;
+  private depthCount = 0;
+  private treeRows = 0;
+  private width = 0;
+  private height = 0;
+
+  constructor(kids: ReadonlyMap<string, readonly GraphNode[]>, mode: LayoutMode) {
+    this.kids = kids;
+    this.mode = mode;
+    this.step = mode === "indented" ? INDENT : COLUMN_STEP;
+    this.own = mode === "indented" ? 1 : 0;
+  }
+
+  holds(id: string): boolean {
+    return this.seen.has(id);
+  }
+
+  /** A tree under the ones already placed. */
+  placeTree(root: GraphNode): void {
+    this.treeRows += this.place(root, 0, this.treeRows);
+    this.height = Math.max(0, this.treeRows * SLOT - (SLOT - NODE_SIZE.agent.h));
+  }
+
+  /** A node and everything under it from row `top`; the rows they take. */
+  private place(node: GraphNode, depth: number, top: number): number {
     // A cycle in `parent_id` would otherwise never end.
-    if (seen.has(node.id)) return 0;
-    seen.add(node.id);
-    order.push(node.id);
-    positions.set(node.id, { x: depth * step, y: top * SLOT });
-    depthCount = Math.max(depthCount, depth + 1);
-    treeWidth = Math.max(treeWidth, depth * step + sizeOf(node).w);
-    const mine = kids.get(node.id) ?? [];
-    children.set(
+    if (this.seen.has(node.id)) return 0;
+    this.seen.add(node.id);
+    this.put(node.id, { x: depth * this.step, y: top * SLOT });
+    this.depthCount = Math.max(this.depthCount, depth + 1);
+    this.width = Math.max(this.width, depth * this.step + sizeOf(node).w);
+    const mine = this.kids.get(node.id) ?? [];
+    this.children.set(
       node.id,
       mine.map((child) => child.id),
     );
-    let rows = own;
+    let rows = this.own;
     for (const child of mine) {
-      parent.set(child.id, node.id);
-      rows += place(child, depth + 1, top + rows);
+      this.parent.set(child.id, node.id);
+      rows += this.place(child, depth + 1, top + rows);
     }
     return Math.max(rows, 1);
-  };
-  let treeRows = 0;
-  for (const root of roots) treeRows += place(root, 0, treeRows);
-  // Members of a cycle hang under nothing reachable: they still get a row.
-  for (const node of nodes) {
-    if (node.kind !== "repo" && !seen.has(node.id)) treeRows += place(node, 0, treeRows);
   }
 
-  const repoSize = NODE_SIZE.repo;
-  let width = treeWidth;
-  let height = Math.max(0, treeRows * SLOT - (SLOT - NODE_SIZE.agent.h));
-  repos.forEach((repo, index) => {
-    let at: Point;
-    if (mode === "indented") {
-      at = {
-        x: (index % REPOS_PER_ROW) * (repoSize.w + REPO_GAP),
-        y: treeRows * SLOT + BAND_GAP + Math.floor(index / REPOS_PER_ROW) * (repoSize.h + REPO_GAP),
-      };
-    } else {
-      at = {
-        x: Math.max(MIN_COLUMNS, depthCount) * COLUMN_STEP,
-        y: index * (repoSize.h + REPO_GAP),
-      };
-    }
-    positions.set(repo.id, at);
-    order.push(repo.id);
-    width = Math.max(width, at.x + repoSize.w);
-    height = Math.max(height, at.y + repoSize.h);
-  });
+  placeRepo(repo: GraphNode, index: number): void {
+    const at = repoSpot(this.mode, index, this.treeRows, this.depthCount);
+    this.put(repo.id, at);
+    this.width = Math.max(this.width, at.x + NODE_SIZE.repo.w);
+    this.height = Math.max(this.height, at.y + NODE_SIZE.repo.h);
+  }
 
-  return { mode, positions, order, parent, children, width, height };
+  private put(id: string, at: Point): void {
+    this.positions.set(id, at);
+    this.order.push(id);
+  }
+
+  layout(): Layout {
+    const { mode, positions, order, parent, children, width, height } = this;
+    return { mode, positions, order, parent, children, width, height };
+  }
 }
 
 /** How far each node that both layouts hold moved, in pixels. */

@@ -1,6 +1,11 @@
-import { createContext, createSignal, type Accessor } from "solid-js";
+import { createContext, createSignal, type Accessor, type Setter } from "solid-js";
 import { HttpError, type Api, type IssueQuery, type UsageQuery } from "../api/http";
-import { TOPIC_SESSIONS, type ConnectionState, type SocketClient } from "../api/socket";
+import {
+  TOPIC_SESSIONS,
+  type ConnectionState,
+  type SocketClient,
+  type TopicMsg,
+} from "../api/socket";
 import type { OpenTerminal } from "../api/terminal";
 import type { WorkerMessage } from "../sw/protocol";
 import type { AuthSessionInfo } from "../gen/AuthSessionInfo";
@@ -14,6 +19,7 @@ import type { DeviceTokenInfo } from "../gen/DeviceTokenInfo";
 import type { Health } from "../gen/Health";
 import type { Issue } from "../gen/Issue";
 import type { IssueDetail } from "../gen/IssueDetail";
+import type { Me } from "../gen/Me";
 import type { PushPreferences } from "../gen/PushPreferences";
 import type { PushSubscriptionInfo } from "../gen/PushSubscriptionInfo";
 import type { PushSubscriptionRequest } from "../gen/PushSubscriptionRequest";
@@ -30,15 +36,20 @@ import { NO_DEVICE, type Device } from "../lib/device";
 import type { WorkerBridge } from "../lib/serviceWorker";
 import { errorMessage } from "../lib/errors";
 import { coalesce, type Schedule } from "../lib/schedule";
-import { createCatalog, type RepoRegistry } from "./catalog";
+import { createCatalog, type Catalog, type RepoRegistry } from "./catalog";
 import { mergeAllLimits, mergeLimits } from "./limits";
 import { createSessionStore, type SessionStore } from "./sessionStore";
+import { RemoteValue } from "./remote";
 import { upsertSession } from "./sessionsList";
 
 export type HealthState =
   | { status: "loading" }
   | { status: "ready"; health: Health }
   | { status: "unreachable" };
+
+/** The runners the server offers, default first; none until it has answered. */
+export const healthRunners = (health: HealthState): readonly string[] =>
+  health.status === "ready" ? health.health.runners : [];
 
 export type { RepoRegistry } from "./catalog";
 
@@ -66,6 +77,10 @@ export type WorkflowCatalog =
   | { status: "loading" }
   | { status: "ready"; workflows: readonly WorkflowInfo[] }
   | { status: "error"; message: string };
+
+/** The workflows listed; none until the list is read. */
+export const catalogWorkflows = (catalog: WorkflowCatalog | undefined): readonly WorkflowInfo[] =>
+  catalog?.status === "ready" ? catalog.workflows : [];
 
 export type AppServices = {
   api: Api;
@@ -191,181 +206,449 @@ const CLOCK_TICK_MS = 60_000;
 const ME_RETRY_BASE_MS = 1000;
 const ME_RETRY_MAX_MS = 15_000;
 
-export function createAppState(services: AppServices): AppState {
-  const { api, socket } = services;
-  const device = services.device ?? NO_DEVICE;
+/** The sign-in state `/me` answered. Pure. */
+export const meAuth = (me: Me): AuthState =>
+  me.mode === "local" ? { status: "local" } : { status: "signed_in", identity: me.identity ?? "" };
 
-  const [connection, setConnection] = createSignal<ConnectionState>(socket.state());
-  const [health, setHealth] = createSignal<HealthState>({ status: "loading" });
-  const [sessions, setSessions] = createSignal<readonly Session[]>([]);
-  const [sessionsLoaded, setSessionsLoaded] = createSignal(false);
-  const [sessionsError, setSessionsError] = createSignal<string>();
-  const [settings, setSettings] = createSignal<SettingsState>({ status: "loading" });
-  const [now, setNow] = createSignal(Date.now());
-  const [auth, setAuth] = createSignal<AuthState>({ status: "checking" });
-  const [unsavedWork, setUnsavedWork] = createSignal<string>();
-  const [online, setOnline] = createSignal(typeof navigator === "undefined" || navigator.onLine);
-  const [updateReady, setUpdateReady] = createSignal(false);
-  const navigateListeners = new Set<(path: string) => void>();
-  // Signals apply later; decisions made in the same turn read this.
-  let authNow: AuthState = { status: "checking" };
-  function changeAuth(next: AuthState): void {
-    authNow = next;
-    setAuth(next);
+const isStatus = (error: unknown, status: number): boolean =>
+  error instanceof HttpError && error.status === status;
+
+/**
+ * What a failed `/me` means. `handled`: a 401, which went to `endSession` through
+ * the http layer already. `local`: a server from before sign-in existed, which
+ * knows no `/me` and no sign-in either. `unreachable` otherwise. Pure.
+ */
+export function meFailure(error: unknown): "handled" | "local" | "unreachable" {
+  if (isStatus(error, 401)) return "handled";
+  if (error instanceof HttpError && error.status === 404 && error.fromServer) return "local";
+  return "unreachable";
+}
+
+/** How long to wait before asking `/me` again after `attempt` failures. Pure. */
+export const meRetryDelay = (attempt: number): number =>
+  Math.min(ME_RETRY_MAX_MS, ME_RETRY_BASE_MS * 2 ** attempt);
+
+/** `/me` has not answered as Calin yet: nobody is signed in, so nothing has ended. Pure. */
+export const authPending = (auth: AuthState): boolean =>
+  auth.status === "checking" || auth.status === "unreachable";
+
+const identityOf = (auth: AuthState): string | undefined =>
+  auth.status === "signed_in" ? auth.identity : undefined;
+
+const healthOf = (state: HealthState): Health | undefined =>
+  state.status === "ready" ? state.health : undefined;
+
+const githubProblemOf = (health: Health | undefined): string | undefined =>
+  health?.github_problem ?? undefined;
+
+/** Waits for `request`; a refusal with `status` counts as done. */
+async function tolerating(request: Promise<void>, status: number): Promise<void> {
+  try {
+    await request;
+  } catch (error) {
+    if (!isStatus(error, status)) throw error;
+  }
+}
+
+/**
+ * The worker renewed this browser's push subscription while no page could
+ * tell the server (see `sw/worker.ts`): tell it now.
+ */
+async function reportRenewal(device: Device, api: Api): Promise<void> {
+  try {
+    if (!(await device.takeRenewal())) return;
+    const current = await device.subscription();
+    if (current) await api.createPushSubscription(current.request);
+  } catch {
+    // Settings offers "Notify this device" again if this did not reach the server.
+  }
+}
+
+const assignLocation = (url: string): void => window.location.assign(url);
+
+/** The routes components call as they are, with no state of the app's own. */
+function serverCalls(api: Api) {
+  return {
+    listAuthSessions: () => api.listAuthSessions(),
+    // api.rs: an unknown id is a 404, which here means it ended some other way already.
+    revokeAuthSession: (id: string) => tolerating(api.revokeAuthSession(id), 404),
+    listDeviceTokens: () => api.listDeviceTokens(),
+    createDeviceToken: (name: string) => api.createDeviceToken({ name }),
+    revokeDeviceToken: (id: string) => api.revokeDeviceToken(id),
+    listIssues: (repoId: string, query: IssueQuery) => api.listIssues(repoId, query),
+    getIssue: (repoId: string, number: number) => api.getIssue(repoId, number),
+    usage: (query: UsageQuery) => api.getUsage(query),
+    listAutomations: () => api.listAutomations(),
+    getAutomation: (id: string) => api.getAutomation(id),
+    saveAutomation: (id: string | undefined, request: AutomationRequest) =>
+      id === undefined ? api.createAutomation(request) : api.putAutomation(id, request),
+    deleteAutomation: (id: string) => api.deleteAutomation(id),
+    previewCron: (expr: string) => api.previewCron(expr),
+    runAutomation: (id: string, number?: number) =>
+      api.runAutomation(id, number === undefined ? {} : { number }),
+    automationRuns: (id: string) => api.listAutomationRuns(id),
+    pushKey: async () => (await api.getPushKey()).public_key,
+    listPushSubscriptions: () => api.listPushSubscriptions(),
+    registerPushSubscription: (request: PushSubscriptionRequest) =>
+      api.createPushSubscription(request),
+    removePushSubscription: (id: string) => api.deletePushSubscription(id),
+    pushPreferences: () => api.getPushPreferences(),
+    savePushPreferences: (preferences: PushPreferences) => api.putPushPreferences(preferences),
+    sendTestPush: () => api.sendTestPush(),
+  } satisfies Partial<AppState>;
+}
+
+/** The sessions list as the `sessions` topic sends it, published once per scheduled slot. */
+class SessionsFeed {
+  readonly list: Accessor<readonly Session[]>;
+  readonly loaded: Accessor<boolean>;
+  readonly error: Accessor<string | undefined>;
+  private readonly setList: Setter<readonly Session[]>;
+  private readonly setLoaded: Setter<boolean>;
+  private readonly setError: Setter<string | undefined>;
+  private readonly publish: () => void;
+  private current: readonly Session[] = [];
+  private complete = false;
+
+  constructor(schedule: Schedule | undefined) {
+    [this.list, this.setList] = createSignal<readonly Session[]>([]);
+    [this.loaded, this.setLoaded] = createSignal(false);
+    [this.error, this.setError] = createSignal<string>();
+    this.publish = coalesce(() => {
+      this.setList(this.current);
+      this.setLoaded(this.complete);
+    }, schedule);
   }
 
-  let list: readonly Session[] = [];
-  let listComplete = false;
-  const publishSessions = coalesce(() => {
-    setSessions(list);
-    setSessionsLoaded(listComplete);
-  }, services.schedule);
-
-  function upsert(session: Session): void {
-    list = upsertSession(list, session);
-    publishSessions();
+  upsert(session: Session): void {
+    this.current = upsertSession(this.current, session);
+    this.publish();
   }
 
-  const catalog = createCatalog(api);
-
-  const [limits, setLimits] = createSignal<readonly RunnerLimits[]>([]);
-  let limitsNow: readonly RunnerLimits[] = [];
-  function takeLimits(next: readonly RunnerLimits[]): void {
-    if (next === limitsNow) return;
-    limitsNow = next;
-    setLimits(next);
+  receive(msg: TopicMsg): void {
+    if (msg.op === "session_upserted") {
+      this.upsert(msg.session);
+    } else if (msg.op === "subscribed") {
+      this.complete = true;
+      this.setError(undefined);
+      this.publish();
+    } else if (msg.op === "error") {
+      this.setError(msg.message);
+    }
   }
-  let limitsInFlight = false;
-  function loadLimits(): void {
-    if (limitsInFlight) return;
-    limitsInFlight = true;
-    api.getUsageLimits().then(
+
+  reset(): void {
+    this.current = [];
+    this.complete = false;
+    this.publish();
+    this.setError(undefined);
+  }
+}
+
+/** The newest limit windows per runner: `GET /usage/limits`, then each `limits` event. */
+class LimitsFeed {
+  readonly list: Accessor<readonly RunnerLimits[]>;
+  private readonly setList: Setter<readonly RunnerLimits[]>;
+  private readonly api: Api;
+  private current: readonly RunnerLimits[] = [];
+  private inFlight = false;
+
+  constructor(api: Api) {
+    this.api = api;
+    [this.list, this.setList] = createSignal<readonly RunnerLimits[]>([]);
+  }
+
+  take(next: readonly RunnerLimits[]): void {
+    if (next === this.current) return;
+    this.current = next;
+    this.setList(next);
+  }
+
+  report(report: RunnerLimits): void {
+    this.take(mergeLimits(this.current, report));
+  }
+
+  load(): void {
+    if (this.inFlight) return;
+    this.inFlight = true;
+    this.api.getUsageLimits().then(
       (loaded) => {
-        limitsInFlight = false;
-        takeLimits(mergeAllLimits(limitsNow, loaded));
+        this.inFlight = false;
+        this.take(mergeAllLimits(this.current, loaded));
       },
       () => {
         // Limits are a hint wherever they show: without them the screens simply say nothing.
-        limitsInFlight = false;
+        this.inFlight = false;
       },
     );
   }
+}
 
-  let settingsKnown = false;
-  let settingsWanted = false;
-  let settingsInFlight = false;
-  function loadSettings(): void {
-    if (settingsInFlight) return;
-    settingsInFlight = true;
-    api.getSettings().then(
-      (loaded) => {
-        settingsInFlight = false;
-        settingsKnown = true;
-        setSettings({ status: "ready", settings: loaded });
+// A class rather than a closure of methods: each method then stands, and is measured, on its own.
+// `private`, not `#`: the complexity report does not see `#` methods.
+class AppCore {
+  readonly auth: Accessor<AuthState>;
+  readonly connection: Accessor<ConnectionState>;
+  readonly now: Accessor<number>;
+  readonly online: Accessor<boolean>;
+  readonly updateReady: Accessor<boolean>;
+  readonly sessions: SessionsFeed;
+  readonly limits: LimitsFeed;
+  readonly catalog: Catalog;
+  readonly settings: RemoteValue<Settings, SettingsState>;
+  readonly workflows: RemoteValue<readonly WorkflowInfo[], WorkflowCatalog>;
+  readonly health: RemoteValue<Health, HealthState>;
+  readonly device: Device;
+  readonly navigateListeners = new Set<(path: string) => void>();
+  private readonly setAuth: Setter<AuthState>;
+  private readonly setConnection: Setter<ConnectionState>;
+  private readonly setNow: Setter<number>;
+  private readonly setOnline: Setter<boolean>;
+  private readonly setUpdateReady: Setter<boolean>;
+  private readonly services: AppServices;
+  private readonly api: Api;
+  private readonly socket: SocketClient;
+  // Signals apply later; decisions made in the same turn read this.
+  private authNow: AuthState = { status: "checking" };
+  private running = false;
+  private disconnect: (() => void) | undefined;
+  private meInFlight = false;
+  private meAttempt = 0;
+  private meTimer: ReturnType<typeof setTimeout> | undefined;
+  private opens = 0;
+  private probing = false;
+
+  constructor(services: AppServices) {
+    this.services = services;
+    this.api = services.api;
+    this.socket = services.socket;
+    this.device = services.device ?? NO_DEVICE;
+    [this.auth, this.setAuth] = createSignal<AuthState>(this.authNow);
+    [this.connection, this.setConnection] = createSignal<ConnectionState>(this.socket.state());
+    [this.now, this.setNow] = createSignal(Date.now());
+    [this.online, this.setOnline] = createSignal(
+      typeof navigator === "undefined" || navigator.onLine,
+    );
+    [this.updateReady, this.setUpdateReady] = createSignal(false);
+    this.sessions = new SessionsFeed(services.schedule);
+    this.limits = new LimitsFeed(this.api);
+    this.catalog = createCatalog(this.api);
+    this.settings = new RemoteValue<Settings, SettingsState>({
+      read: () => this.api.getSettings(),
+      ready: (settings) => ({ status: "ready", settings }),
+      failed: (error) => ({ status: "error", message: errorMessage(error) }),
+    });
+    this.workflows = new RemoteValue<readonly WorkflowInfo[], WorkflowCatalog>({
+      read: () => this.api.listWorkflows(),
+      ready: (workflows) => ({ status: "ready", workflows }),
+      failed: (error) => ({ status: "error", message: errorMessage(error) }),
+    });
+    // A health that was read once stays on screen; the connection indicator covers outages.
+    this.health = new RemoteValue<Health, HealthState>({
+      read: () => this.api.health(),
+      ready: (health) => ({ status: "ready", health }),
+      failed: () => ({ status: "unreachable" }),
+    });
+  }
+
+  knownHealth(): Health | undefined {
+    return healthOf(this.health.state());
+  }
+
+  signIn(): void {
+    (this.services.leave ?? assignLocation)(signInUrl(window.location));
+  }
+
+  async saveSettings(next: Settings): Promise<Settings> {
+    const stored = await this.api.putSettings(next);
+    this.settings.take(stored);
+    // api.rs: a change re-reads the home repo and rescans, so the repo list is another one now.
+    this.catalog.invalidate();
+    // The workflows live in the home repo, which may be another one now.
+    this.workflows.refresh(true);
+    return stored;
+  }
+
+  openSession(id: string): SessionStore {
+    const sessions = this.sessions.list;
+    return createSessionStore(
+      {
+        api: this.api,
+        socket: this.socket,
+        listed: (wanted) => sessions().find((session) => session.id === wanted),
+        sessions,
+        schedule: this.services.schedule,
+        openTerminal: this.services.openTerminal,
+        health: () => this.knownHealth(),
+        checkHealth: () => this.health.read(),
+        now: this.now,
+        onLimits: (report) => this.limits.report(report),
       },
-      (error: unknown) => {
-        settingsInFlight = false;
-        // Settings that were read once stay on screen through an outage.
-        if (!settingsKnown) setSettings({ status: "error", message: errorMessage(error) });
-      },
+      id,
     );
   }
 
-  const [workflows, setWorkflows] = createSignal<WorkflowCatalog>({ status: "loading" });
-  let workflowsKnown = false;
-  let workflowsWanted = false;
-  let workflowsInFlight = false;
-  function loadWorkflows(): void {
-    if (workflowsInFlight) return;
-    workflowsInFlight = true;
-    api.listWorkflows().then(
-      (loaded) => {
-        workflowsInFlight = false;
-        workflowsKnown = true;
-        setWorkflows({ status: "ready", workflows: loaded });
-      },
-      (error: unknown) => {
-        workflowsInFlight = false;
-        // A list that was read once stays usable through an outage.
-        if (!workflowsKnown) setWorkflows({ status: "error", message: errorMessage(error) });
-      },
+  retry(): void {
+    if (authPending(this.authNow)) {
+      this.askMeNow();
+      return;
+    }
+    if (this.disconnect === undefined) return;
+    this.health.showLoading();
+    this.health.read();
+    this.catalog.reload({ missingOnly: true });
+    this.settings.refresh(false);
+    this.workflows.refresh(false);
+    if (this.sessions.error() !== undefined) this.socket.resync(TOPIC_SESSIONS, 0);
+    this.socket.reconnectNow();
+  }
+
+  /** The one reaction to a 401 anywhere (see `Api.onUnauthorized`): stop, forget, ask to sign in. */
+  endSession(ended: boolean): void {
+    if (this.authNow.status === "signed_out") return;
+    this.changeAuth({ status: "signed_out", ended });
+    clearTimeout(this.meTimer);
+    this.disconnectNow();
+    // For good: signing in again is a full navigation, which starts a new app.
+    this.socket.close();
+    this.sessions.reset();
+    this.catalog.forget();
+    this.settings.reset();
+    this.workflows.reset();
+    this.health.reset();
+    this.limits.take([]);
+  }
+
+  start(): () => void {
+    this.running = true;
+    // A 401 before anyone was signed in is a sign-in to do, not one that ended.
+    const offUnauthorized = this.api.onUnauthorized(() =>
+      this.endSession(!authPending(this.authNow)),
+    );
+    const wentOnline = (): void => this.wentOnline();
+    const wentOffline = (): void => {
+      this.setOnline(false);
+    };
+    window.addEventListener("online", wentOnline);
+    window.addEventListener("offline", wentOffline);
+    const offWorker = this.listenToWorker();
+    this.checkMe();
+    return () => {
+      this.running = false;
+      window.removeEventListener("online", wentOnline);
+      window.removeEventListener("offline", wentOffline);
+      offWorker();
+      offUnauthorized();
+      clearTimeout(this.meTimer);
+      this.disconnectNow();
+    };
+  }
+
+  private changeAuth(next: AuthState): void {
+    this.authNow = next;
+    this.setAuth(next);
+  }
+
+  private disconnectNow(): void {
+    this.disconnect?.();
+    this.disconnect = undefined;
+  }
+
+  private listenToWorker(): () => void {
+    const worker = this.services.worker;
+    if (!worker) return () => {};
+    const offReady = worker.onUpdateReady(() => this.setUpdateReady(true));
+    const offMessages = worker.onMessage((message) => this.workerSaid(message));
+    return () => {
+      offReady();
+      offMessages();
+    };
+  }
+
+  /** Back online: ask for the server now rather than at the end of the backoff. */
+  private wentOnline(): void {
+    this.setOnline(true);
+    if (this.authNow.status === "unreachable") this.askMeNow();
+  }
+
+  private askMeNow(): void {
+    this.meAttempt = 0;
+    this.checkMe();
+  }
+
+  private checkMe(): void {
+    if (this.meInFlight || !this.running) return;
+    clearTimeout(this.meTimer);
+    this.meTimer = undefined;
+    this.meInFlight = true;
+    this.api.me().then(
+      (me) => this.meAnswered(me),
+      (error: unknown) => this.meFailed(error),
     );
   }
 
-  let healthKnown = false;
-  let healthInFlight = false;
-  function loadHealth(): void {
-    if (healthInFlight) return;
-    healthInFlight = true;
-    api.health().then(
-      (loaded) => {
-        healthInFlight = false;
-        healthKnown = true;
-        setHealth({ status: "ready", health: loaded });
-      },
-      () => {
-        healthInFlight = false;
-        // A health that was read once stays on screen; the connection indicator covers outages.
-        if (!healthKnown) setHealth({ status: "unreachable" });
-      },
-    );
+  private meAnswered(me: Me): void {
+    this.meInFlight = false;
+    if (!this.running || this.authNow.status === "signed_out") return;
+    this.allowed(meAuth(me));
   }
 
-  const knownHealth = (): Health | undefined => {
-    const state = health();
-    return state.status === "ready" ? state.health : undefined;
-  };
+  private meFailed(error: unknown): void {
+    this.meInFlight = false;
+    if (!this.running) return;
+    const failure = meFailure(error);
+    if (failure === "local") this.allowed({ status: "local" });
+    else if (failure === "unreachable") this.unreachable();
+  }
+
+  private unreachable(): void {
+    this.changeAuth({ status: "unreachable" });
+    // The "offline" event may have fired before this page listened.
+    this.setOnline(navigator.onLine);
+    const delay = meRetryDelay(this.meAttempt);
+    this.meAttempt += 1;
+    this.meTimer = setTimeout(() => this.checkMe(), delay);
+  }
+
+  private allowed(next: AuthState): void {
+    this.meAttempt = 0;
+    this.changeAuth(next);
+    this.disconnect ??= this.connect();
+    if (next.status === "signed_in") this.reportRenewedSubscription();
+  }
+
+  /** Push exists in public mode only. */
+  private reportRenewedSubscription(): void {
+    if (this.device.pushSupport() === "supported") void reportRenewal(this.device, this.api);
+  }
+
+  private workerSaid(message: WorkerMessage): void {
+    if (message.type === "navigate") {
+      for (const listener of this.navigateListeners) listener(message.path);
+    } else if (message.type === "refresh") {
+      // The session is live over the socket; after a phone's sleep the socket may not be.
+      this.socket.reconnectNow();
+    } else if (message.type === "subscription-changed" && this.authNow.status === "signed_in") {
+      this.reportRenewedSubscription();
+    }
+  }
 
   /** Subscribes and listens; returns the function that undoes it. Only once `/me` allowed it. */
-  function connect(): () => void {
-    catalog.setActive(true);
-    let opens = 0;
-    const offState = socket.onState((state) => {
-      setConnection(state);
-      if (state !== "open") return;
-      opens += 1;
-      // After a reconnect the server may be another build with other runners.
-      if (opens > 1 || !healthKnown) loadHealth();
-      catalog.reload({ missingOnly: opens === 1 });
-      loadLimits();
-      if (settingsWanted && !settingsKnown) loadSettings();
-      // After a reconnect the home repo's files may have changed.
-      if (workflowsWanted && (opens > 1 || !workflowsKnown)) loadWorkflows();
-    });
-    // A refused upgrade looks like any failed connection: `/me` tells, and its 401 ends the session.
-    let probing = false;
-    const offRefused = socket.onRefused(() => {
-      if (probing) return;
-      probing = true;
-      const done = (): void => {
-        probing = false;
-      };
-      api.me().then(done, done);
-    });
-    const unsubscribe = socket.subscribe(TOPIC_SESSIONS, (msg) => {
-      if (msg.op === "session_upserted") {
-        upsert(msg.session);
-      } else if (msg.op === "subscribed") {
-        listComplete = true;
-        setSessionsError(undefined);
-        publishSessions();
-      } else if (msg.op === "error") {
-        setSessionsError(msg.message);
-      }
-    });
-    setConnection(socket.state());
-    loadHealth();
-
-    const clock = setInterval(() => setNow(Date.now()), CLOCK_TICK_MS);
-    // Phones drop the socket in the background; do not sit out the backoff on return.
-    const wake = (): void => {
-      if (document.visibilityState === "visible") socket.reconnectNow();
-    };
+  private connect(): () => void {
+    this.catalog.setActive(true);
+    this.opens = 0;
+    this.probing = false;
+    const offState = this.socket.onState((state) => this.socketState(state));
+    const offRefused = this.socket.onRefused(() => this.probeMe());
+    const unsubscribe = this.socket.subscribe(TOPIC_SESSIONS, (msg) => this.sessions.receive(msg));
+    this.setConnection(this.socket.state());
+    this.health.read();
+    const clock = setInterval(() => this.setNow(Date.now()), CLOCK_TICK_MS);
+    const wake = (): void => this.wake();
     document.addEventListener("visibilitychange", wake);
     window.addEventListener("online", wake);
-
     return () => {
-      catalog.setActive(false);
+      this.catalog.setActive(false);
       offState();
       offRefused();
       unsubscribe();
@@ -375,147 +658,62 @@ export function createAppState(services: AppServices): AppState {
     };
   }
 
-  let running = false;
-  let disconnect: (() => void) | undefined;
-  let meInFlight = false;
-  let meAttempt = 0;
-  let meTimer: ReturnType<typeof setTimeout> | undefined;
-
-  function allowed(next: AuthState): void {
-    meAttempt = 0;
-    changeAuth(next);
-    disconnect ??= connect();
-    if (next.status === "signed_in") reportRenewedSubscription();
+  private socketState(state: ConnectionState): void {
+    this.setConnection(state);
+    if (state === "open") this.opened();
   }
 
-  /**
-   * The worker renewed this browser's push subscription while no page could
-   * tell the server (see `sw/worker.ts`): tell it now. Push exists in public mode only.
-   */
-  function reportRenewedSubscription(): void {
-    if (device.pushSupport() !== "supported") return;
-    void (async () => {
-      try {
-        if (!(await device.takeRenewal())) return;
-        const current = await device.subscription();
-        if (current) await api.createPushSubscription(current.request);
-      } catch {
-        // Settings offers "Notify this device" again if this did not reach the server.
-      }
-    })();
+  private opened(): void {
+    this.opens += 1;
+    const again = this.opens > 1;
+    // After a reconnect the server may be another build with other runners.
+    if (again || !this.health.known) this.health.read();
+    this.catalog.reload({ missingOnly: !again });
+    this.limits.load();
+    this.settings.refresh(false);
+    // After a reconnect the home repo's files may have changed.
+    this.workflows.refresh(again);
   }
 
-  function onWorkerMessage(message: WorkerMessage): void {
-    if (message.type === "navigate") {
-      for (const listener of navigateListeners) listener(message.path);
-    } else if (message.type === "refresh") {
-      // The session is live over the socket; after a phone's sleep the socket may not be.
-      socket.reconnectNow();
-    } else if (message.type === "subscription-changed" && authNow.status === "signed_in") {
-      reportRenewedSubscription();
-    }
+  /** A refused upgrade looks like any failed connection: `/me` tells, and its 401 ends the session. */
+  private probeMe(): void {
+    if (this.probing) return;
+    this.probing = true;
+    const done = (): void => {
+      this.probing = false;
+    };
+    this.api.me().then(done, done);
   }
 
-  function checkMe(): void {
-    if (meInFlight || !running) return;
-    clearTimeout(meTimer);
-    meTimer = undefined;
-    meInFlight = true;
-    api.me().then(
-      (me) => {
-        meInFlight = false;
-        if (!running || authNow.status === "signed_out") return;
-        allowed(
-          me.mode === "local"
-            ? { status: "local" }
-            : { status: "signed_in", identity: me.identity ?? "" },
-        );
-      },
-      (error: unknown) => {
-        meInFlight = false;
-        if (!running) return;
-        // A 401 went to `endSession` through the http layer already.
-        if (error instanceof HttpError && error.status === 401) return;
-        // A server from before sign-in existed knows no `/me`, and no sign-in either.
-        if (error instanceof HttpError && error.status === 404 && error.fromServer) {
-          allowed({ status: "local" });
-          return;
-        }
-        changeAuth({ status: "unreachable" });
-        // The "offline" event may have fired before this page listened.
-        setOnline(navigator.onLine);
-        const delay = Math.min(ME_RETRY_MAX_MS, ME_RETRY_BASE_MS * 2 ** meAttempt);
-        meAttempt += 1;
-        meTimer = setTimeout(checkMe, delay);
-      },
-    );
+  /** Phones drop the socket in the background; do not sit out the backoff on return. */
+  private wake(): void {
+    if (document.visibilityState === "visible") this.socket.reconnectNow();
   }
+}
 
-  /** The one reaction to a 401 anywhere (see `Api.onUnauthorized`): stop, forget, ask to sign in. */
-  function endSession(ended: boolean): void {
-    if (authNow.status === "signed_out") return;
-    changeAuth({ status: "signed_out", ended });
-    clearTimeout(meTimer);
-    disconnect?.();
-    disconnect = undefined;
-    // For good: signing in again is a full navigation, which starts a new app.
-    socket.close();
-    list = [];
-    listComplete = false;
-    publishSessions();
-    setSessionsError(undefined);
-    catalog.forget();
-    settingsKnown = settingsWanted = false;
-    setSettings({ status: "loading" });
-    workflowsKnown = workflowsWanted = false;
-    setWorkflows({ status: "loading" });
-    healthKnown = false;
-    setHealth({ status: "loading" });
-    takeLimits([]);
-  }
-
-  const identity = (): string | undefined => {
-    const state = auth();
-    return state.status === "signed_in" ? state.identity : undefined;
-  };
-
+export function createAppState(services: AppServices): AppState {
+  const core = new AppCore(services);
+  const { api, worker } = services;
+  const { catalog, sessions, settings, workflows, health, limits } = core;
+  const [unsavedWork, setUnsavedWork] = createSignal<string>();
   return {
-    auth,
-    identity,
-    signIn() {
-      const url = signInUrl(window.location);
-      if (services.leave) services.leave(url);
-      else window.location.assign(url);
-    },
+    ...serverCalls(api),
+    auth: core.auth,
+    identity: () => identityOf(core.auth()),
+    signIn: () => core.signIn(),
     async signOut() {
-      try {
-        await api.logout();
-      } catch (error) {
-        // Already signed out on the server: the screen only has to catch up.
-        if (!(error instanceof HttpError && error.status === 401)) throw error;
-      }
-      endSession(false);
+      // Already signed out on the server: the screen only has to catch up.
+      await tolerating(api.logout(), 401);
+      core.endSession(false);
     },
     unsavedWork,
     setUnsavedWork: (description) => setUnsavedWork(description),
-    listAuthSessions: () => api.listAuthSessions(),
-    async revokeAuthSession(id) {
-      try {
-        await api.revokeAuthSession(id);
-      } catch (error) {
-        // api.rs: an unknown id is a 404, which here means it ended some other way already.
-        if (!(error instanceof HttpError && error.status === 404)) throw error;
-      }
-    },
-    listDeviceTokens: () => api.listDeviceTokens(),
-    createDeviceToken: (name) => api.createDeviceToken({ name }),
-    revokeDeviceToken: (id) => api.revokeDeviceToken(id),
-    connection,
-    health,
-    githubProblem: () => knownHealth()?.github_problem ?? undefined,
-    sessions,
-    sessionsLoaded,
-    sessionsError,
+    connection: core.connection,
+    health: health.state,
+    githubProblem: () => githubProblemOf(core.knownHealth()),
+    sessions: sessions.list,
+    sessionsLoaded: sessions.loaded,
+    sessionsError: sessions.error,
     repos: catalog.repos,
     repoSets: catalog.sets,
     loadRepos: () => catalog.load(),
@@ -523,125 +721,32 @@ export function createAppState(services: AppServices): AppState {
     removeRepo: (id) => catalog.remove(id),
     cloneRepo: (id) => catalog.clone(id),
     rescanRepos: () => catalog.rescan(),
-    workflows,
-    loadWorkflows() {
-      workflowsWanted = true;
-      loadWorkflows();
-    },
-    settings,
+    workflows: workflows.state,
+    loadWorkflows: () => workflows.want(),
+    settings: settings.state,
     loadSettings() {
-      settingsWanted = true;
-      if (!settingsKnown) setSettings({ status: "loading" });
-      loadSettings();
+      settings.showLoading();
+      settings.want();
     },
-    async saveSettings(next) {
-      const stored = await api.putSettings(next);
-      settingsKnown = true;
-      setSettings({ status: "ready", settings: stored });
-      // api.rs: a change re-reads the home repo and rescans, so the repo list is another one now.
-      catalog.invalidate();
-      // The workflows live in the home repo, which may be another one now.
-      if (workflowsWanted) loadWorkflows();
-      return stored;
-    },
-    now,
-    limits,
-    loadLimits,
-    listIssues: (repoId, query) => api.listIssues(repoId, query),
-    getIssue: (repoId, number) => api.getIssue(repoId, number),
-    usage: (query) => api.getUsage(query),
-    listAutomations: () => api.listAutomations(),
-    getAutomation: (id) => api.getAutomation(id),
-    saveAutomation: (id, request) =>
-      id === undefined ? api.createAutomation(request) : api.putAutomation(id, request),
-    deleteAutomation: (id) => api.deleteAutomation(id),
-    previewCron: (expr) => api.previewCron(expr),
-    runAutomation: (id, number) => api.runAutomation(id, number === undefined ? {} : { number }),
-    automationRuns: (id) => api.listAutomationRuns(id),
+    saveSettings: (next) => core.saveSettings(next),
+    now: core.now,
+    limits: limits.list,
+    loadLimits: () => limits.load(),
     async createSession(request) {
       const { session } = await api.createSession(request);
-      upsert(session);
+      sessions.upsert(session);
       return session;
     },
-    openSession: (id) =>
-      createSessionStore(
-        {
-          api,
-          socket,
-          listed: (wanted) => sessions().find((session) => session.id === wanted),
-          sessions,
-          schedule: services.schedule,
-          openTerminal: services.openTerminal,
-          health: knownHealth,
-          checkHealth: loadHealth,
-          now,
-          onLimits: (report) => takeLimits(mergeLimits(limitsNow, report)),
-        },
-        id,
-      ),
-    retry() {
-      if (authNow.status === "unreachable" || authNow.status === "checking") {
-        meAttempt = 0;
-        checkMe();
-        return;
-      }
-      if (disconnect === undefined) return;
-      if (!healthKnown) setHealth({ status: "loading" });
-      loadHealth();
-      catalog.reload({ missingOnly: true });
-      if (settingsWanted && !settingsKnown) loadSettings();
-      if (workflowsWanted && !workflowsKnown) loadWorkflows();
-      if (sessionsError() !== undefined) socket.resync(TOPIC_SESSIONS, 0);
-      socket.reconnectNow();
-    },
-    online,
-    updateReady,
-    applyUpdate: () => services.worker?.applyUpdate(),
+    openSession: (id) => core.openSession(id),
+    retry: () => core.retry(),
+    online: core.online,
+    updateReady: core.updateReady,
+    applyUpdate: () => worker?.applyUpdate(),
     onNavigateRequest(listener) {
-      navigateListeners.add(listener);
-      return () => navigateListeners.delete(listener);
+      core.navigateListeners.add(listener);
+      return () => core.navigateListeners.delete(listener);
     },
-    device,
-    pushKey: async () => (await api.getPushKey()).public_key,
-    listPushSubscriptions: () => api.listPushSubscriptions(),
-    registerPushSubscription: (request) => api.createPushSubscription(request),
-    removePushSubscription: (id) => api.deletePushSubscription(id),
-    pushPreferences: () => api.getPushPreferences(),
-    savePushPreferences: (preferences) => api.putPushPreferences(preferences),
-    sendTestPush: () => api.sendTestPush(),
-    start() {
-      running = true;
-      // A 401 before anyone was signed in is a sign-in to do, not one that ended.
-      const offUnauthorized = api.onUnauthorized(() =>
-        endSession(authNow.status !== "checking" && authNow.status !== "unreachable"),
-      );
-      // Back online: ask for the server now rather than at the end of the backoff.
-      const wentOnline = (): void => {
-        setOnline(true);
-        if (authNow.status === "unreachable") {
-          meAttempt = 0;
-          checkMe();
-        }
-      };
-      const wentOffline = (): void => {
-        setOnline(false);
-      };
-      window.addEventListener("online", wentOnline);
-      window.addEventListener("offline", wentOffline);
-      const offReady = services.worker?.onUpdateReady(() => setUpdateReady(true));
-      const offMessages = services.worker?.onMessage(onWorkerMessage);
-      checkMe();
-      return () => {
-        running = false;
-        window.removeEventListener("online", wentOnline);
-        window.removeEventListener("offline", wentOffline);
-        offReady?.();
-        offMessages?.();
-        offUnauthorized();
-        clearTimeout(meTimer);
-        disconnect?.();
-        disconnect = undefined;
-      };
-    },
+    device: core.device,
+    start: () => core.start(),
   };
 }

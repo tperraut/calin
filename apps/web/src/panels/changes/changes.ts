@@ -2,7 +2,6 @@ import type { ChangedFile } from "../../gen/ChangedFile";
 import type { ChangeStatus } from "../../gen/ChangeStatus";
 import type { FileDiff } from "../../gen/FileDiff";
 import type { RepoChanges } from "../../gen/RepoChanges";
-import type { SessionRepo } from "../../gen/SessionRepo";
 import type { Tone } from "../../lib/status";
 import type { FileTarget } from "../registry";
 
@@ -25,16 +24,6 @@ export function sessionTotals(repos: readonly RepoChanges[]): Totals & { changed
     if (repo.files.length > 0) total.changedRepos += 1;
   }
   return total;
-}
-
-/** In the order of the session's repo set (primary first); repos it does not list keep the server's order, after. */
-export function inRepoOrder(
-  changes: readonly RepoChanges[],
-  known: readonly SessionRepo[],
-): RepoChanges[] {
-  const rank = new Map(known.map((repo, index) => [repo.id, index]));
-  const position = (repo: RepoChanges): number => rank.get(repo.session_repo_id) ?? known.length;
-  return changes.toSorted((a, b) => position(a) - position(b));
 }
 
 export function findFile(

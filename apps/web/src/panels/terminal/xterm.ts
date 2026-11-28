@@ -9,6 +9,7 @@ import {
   TERMINAL_FONT,
   TERMINAL_FONT_SIZE,
   type TerminalModule,
+  type TerminalSize,
   type TerminalView,
   type TerminalViewOptions,
 } from "./types";
@@ -43,6 +44,11 @@ function theme(): ITheme {
   };
 }
 
+/** Whether the fit addon proposed a grid: it has none, or NaN, while the element is not laid out. */
+export function isProposedGrid(proposed: Partial<TerminalSize> | undefined): boolean {
+  return Number.isFinite(proposed?.cols) && Number.isFinite(proposed?.rows);
+}
+
 function createTerminalView(parent: HTMLElement, options: TerminalViewOptions): TerminalView {
   const terminal = new Terminal({
     fontFamily: TERMINAL_FONT,
@@ -71,10 +77,7 @@ function createTerminalView(parent: HTMLElement, options: TerminalViewOptions): 
       terminal.write(data);
     },
     fit() {
-      const proposed = fit.proposeDimensions();
-      if (!proposed || !Number.isFinite(proposed.cols) || !Number.isFinite(proposed.rows)) {
-        return undefined;
-      }
+      if (!isProposedGrid(fit.proposeDimensions())) return undefined;
       fit.fit();
       return { cols: terminal.cols, rows: terminal.rows };
     },

@@ -267,6 +267,26 @@ describe("shipping from review", () => {
     escape(control<HTMLTextAreaElement>(shown, "Description"));
     expect(form(main)).toBe(shown);
     expect(control<HTMLTextAreaElement>(shown, "Description").value).toBe("Closes #4");
+    unmountAll();
+
+    // A title edited back to the session's own is still an edit.
+    const again = await openSession();
+    const edited = await openForm(again.main);
+    type(control(edited, "Pull request title"), "Add a health check");
+    escape(control(edited, "Pull request title"));
+    expect(form(again.main)).toBe(edited);
+  });
+
+  it("ships on Ctrl+Enter from the description, leaving out one that is only blank", async () => {
+    const { main, shipSession } = await openSession();
+    const shown = await openForm(main);
+    const description = control<HTMLTextAreaElement>(shown, "Description");
+    type(description, "  \n ");
+    description.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Enter", ctrlKey: true, bubbles: true }),
+    );
+    await act();
+    expect(shipSession).toHaveBeenCalledWith("s1", { title: "Add a health check", draft: true });
   });
 
   it("says which pull requests are updated, and asks about drafts only when one is opened", async () => {
@@ -421,7 +441,11 @@ describe("shipping from review", () => {
     type(control(shown, "Pull request title"), "Health endpoint");
     await click(submit(shown));
 
-    expect(find(shown, '[role="alert"]').textContent).toBe("the session is not in review");
+    const alert = find(shown, '[role="alert"]');
+    expect(alert.textContent).toBe("the session is not in review");
+    expect(
+      control<HTMLTextAreaElement>(shown, "Description").getAttribute("aria-describedby"),
+    ).toBe(alert.id);
     // Nothing was lost, and nothing claims to be shipping.
     expect(control(shown, "Pull request title").value).toBe("Health endpoint");
     expect(submit(shown).disabled).toBe(false);
@@ -455,6 +479,16 @@ describe("shipping from review", () => {
     await click(submit(await openForm(main)));
     expect(header.querySelector('[data-part="ship-failures"]')).toBeNull();
     expect(action(header).textContent).toBe("Updating pull requests…");
+  });
+
+  it("counts several repos that failed in the last ship", async () => {
+    const { main, emit } = await openSession();
+    await click(submit(await openForm(main)));
+    emit({ type: "error", message: "api: the push was rejected" });
+    emit({ type: "error", message: "web: the push was rejected" });
+    expect(find(main, '[role="status"][aria-live="polite"]').textContent).toContain(
+      "2 repos could not be shipped. The transcript says why.",
+    );
   });
 
   it("closes the form when the session leaves review, and does not bring it back by itself", async () => {

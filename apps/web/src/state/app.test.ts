@@ -1,7 +1,8 @@
 import { flush } from "solid-js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
-import type { Api } from "../api/http";
+import { HttpError, type Api } from "../api/http";
 import type { Health } from "../gen/Health";
+import type { Me } from "../gen/Me";
 import type { Repo } from "../gen/Repo";
 import type { RepoSet } from "../gen/RepoSet";
 import type { Settings } from "../gen/Settings";
@@ -10,17 +11,28 @@ import {
   conflict,
   deferred,
   fakeApi,
+  FakeDevice,
   FakeSocket,
   immediately,
   makeDetail,
+  makeDeviceSubscription,
   makeMissingRepo,
   makeRepo,
   makeSession,
   settle,
+  signedOut,
   unreachable,
 } from "../test/fakes";
+import { makeIssue } from "../test/integrations";
 import { workflowInfo } from "../test/workflows";
-import { createAppState } from "./app";
+import {
+  authPending,
+  createAppState,
+  meAuth,
+  meFailure,
+  meRetryDelay,
+  type AppServices,
+} from "./app";
 
 const health: Health = {
   name: "calin",
@@ -32,10 +44,10 @@ const health: Health = {
 
 const stops: Array<() => void> = [];
 
-function setup(routes: Partial<Api> = {}) {
+function setup(routes: Partial<Api> = {}, services: Partial<AppServices> = {}) {
   const socket = new FakeSocket();
   const api = fakeApi({ health: () => Promise.resolve(health), ...routes });
-  const app = createAppState({ api, socket, schedule: immediately });
+  const app = createAppState({ api, socket, schedule: immediately, ...services });
   stops.push(app.start());
   const upsert = (...args: Parameters<typeof makeSession>) =>
     socket.emit("sessions", { op: "session_upserted", session: makeSession(...args) });
@@ -599,5 +611,237 @@ describe("app state: workflows", () => {
     await settle();
     flush();
     expect(app.workflows()).toMatchObject({ status: "ready" });
+  });
+});
+
+describe("app state: reads on their way", () => {
+  it("asks once for settings, workflows and health while a read is on its way", async () => {
+    const settingsRead = deferred<Settings>();
+    const getSettings = vi.fn<Api["getSettings"]>().mockReturnValue(settingsRead.promise);
+    const listWorkflows = vi.fn<Api["listWorkflows"]>().mockReturnValue(new Promise(() => {}));
+    const read = vi.fn<Api["health"]>().mockReturnValue(new Promise(() => {}));
+    const { app, socket } = setup({ getSettings, listWorkflows, health: read });
+    await settle();
+
+    app.loadSettings();
+    app.loadSettings();
+    app.loadWorkflows();
+    app.loadWorkflows();
+    // Opening the socket before health has answered would read it again.
+    socket.setState("open");
+    await settle();
+
+    expect(getSettings).toHaveBeenCalledTimes(1);
+    expect(listWorkflows).toHaveBeenCalledTimes(1);
+    expect(read).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps settings read once on screen when a later read fails", async () => {
+    const stored: Settings = { home_repo: null, scan_roots: [], clone_root: null, max_parallel: 1 };
+    const getSettings = vi
+      .fn<Api["getSettings"]>()
+      .mockResolvedValueOnce(stored)
+      .mockRejectedValue(unreachable());
+    const { app } = setup({ getSettings });
+    app.loadSettings();
+    await settle();
+
+    app.loadSettings();
+    flush();
+    expect(app.settings()).toEqual({ status: "ready", settings: stored });
+    await settle();
+    flush();
+    expect(getSettings).toHaveBeenCalledTimes(2);
+    expect(app.settings()).toEqual({ status: "ready", settings: stored });
+  });
+
+  it("reads on retry the settings that never arrived", async () => {
+    const stored: Settings = { home_repo: null, scan_roots: [], clone_root: null, max_parallel: 1 };
+    const getSettings = vi
+      .fn<Api["getSettings"]>()
+      .mockRejectedValueOnce(unreachable())
+      .mockResolvedValue(stored);
+    const { app } = setup({ getSettings });
+    await settle();
+    app.loadSettings();
+    await settle();
+    flush();
+    expect(app.settings()).toMatchObject({ status: "error" });
+
+    app.retry();
+    await settle();
+    flush();
+    expect(app.settings()).toEqual({ status: "ready", settings: stored });
+  });
+
+  it("passes a repo's issues and one issue through from the server", async () => {
+    const issues = [makeIssue(7)];
+    const issue = { issue: makeIssue(7), body: "Steps to reproduce" };
+    const listIssues = vi.fn<Api["listIssues"]>().mockResolvedValue(issues);
+    const getIssue = vi.fn<Api["getIssue"]>().mockResolvedValue(issue);
+    const { app } = setup({ listIssues, getIssue });
+
+    await expect(app.listIssues("web", { state: "open" })).resolves.toBe(issues);
+    await expect(app.getIssue("web", 7)).resolves.toBe(issue);
+    expect(listIssues).toHaveBeenCalledWith("web", { state: "open" });
+    expect(getIssue).toHaveBeenCalledWith("web", 7);
+  });
+});
+
+describe("app state: sign-in and the browser", () => {
+  const publicMe: Me = { mode: "public", identity: "ada@example.org", device_token: false };
+
+  afterEach(() => {
+    Reflect.deleteProperty(navigator, "onLine");
+    vi.useRealTimers();
+  });
+
+  it("asks the socket to reconnect when the page is shown again or the browser is back online", async () => {
+    const { socket } = setup();
+    await settle();
+    const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
+    document.dispatchEvent(new Event("visibilitychange"));
+    expect(socket.reconnects).toBe(0);
+
+    visibility.mockReturnValue("visible");
+    document.dispatchEvent(new Event("visibilitychange"));
+    expect(socket.reconnects).toBe(1);
+    window.dispatchEvent(new Event("online"));
+    expect(socket.reconnects).toBe(2);
+    visibility.mockRestore();
+  });
+
+  it("follows the browser's network, and asks /me again only when the server was unreachable", async () => {
+    const me = vi.fn<Api["me"]>().mockResolvedValue(publicMe);
+    const { app } = setup({ me });
+    await settle();
+    expect(app.auth()).toEqual({ status: "signed_in", identity: "ada@example.org" });
+
+    window.dispatchEvent(new Event("offline"));
+    flush();
+    expect(app.online()).toBe(false);
+    window.dispatchEvent(new Event("online"));
+    flush();
+    expect(app.online()).toBe(true);
+    expect(me).toHaveBeenCalledTimes(1);
+  });
+
+  it("takes a public answer without an identity as signed in with no name", async () => {
+    const { app } = setup({ me: () => Promise.resolve({ ...publicMe, identity: null }) });
+    await settle();
+    flush();
+    expect(app.auth()).toEqual({ status: "signed_in", identity: "" });
+    expect(app.identity()).toBe("");
+  });
+
+  it("asks /me once while it is on its way, however often it is asked", async () => {
+    const answer = deferred<Me>();
+    const me = vi.fn<Api["me"]>().mockReturnValueOnce(answer.promise).mockResolvedValue(publicMe);
+    const { app, socket } = setup({ me });
+    app.retry();
+    expect(me).toHaveBeenCalledTimes(1);
+
+    answer.resolve(publicMe);
+    await settle();
+    // A refused upgrade asks /me once, and not again while that answer is on its way.
+    const probe = deferred<Me>();
+    me.mockReturnValueOnce(probe.promise);
+    socket.refuse();
+    socket.refuse();
+    expect(me).toHaveBeenCalledTimes(2);
+    probe.resolve(publicMe);
+    await settle();
+    socket.refuse();
+    expect(me).toHaveBeenCalledTimes(3);
+  });
+
+  it("asks nothing more once stopped while /me was on its way", async () => {
+    vi.useFakeTimers();
+    const answer = deferred<Me>();
+    const me = vi.fn<Api["me"]>().mockReturnValue(answer.promise);
+    const { app, socket } = setup({ me });
+    for (const stop of stops.splice(0)) stop();
+
+    answer.reject(unreachable());
+    await vi.advanceTimersByTimeAsync(60_000);
+    flush();
+    expect(me).toHaveBeenCalledTimes(1);
+    expect(app.auth()).toEqual({ status: "checking" });
+    expect(socket.subscriberCount("sessions")).toBe(0);
+  });
+
+  it("keeps a sign-out as it was when a later call is refused too, and retries nothing", async () => {
+    const read = vi.fn<Api["health"]>().mockResolvedValue(health);
+    const { app, socket } = setup({
+      me: () => Promise.resolve(publicMe),
+      health: read,
+      logout: () => Promise.resolve(),
+      listAuthSessions: () => Promise.reject(signedOut()),
+    });
+    await settle();
+    await app.signOut();
+    flush();
+    expect(app.auth()).toEqual({ status: "signed_out", ended: false });
+
+    await expect(app.listAuthSessions()).rejects.toThrow("Not signed in");
+    flush();
+    expect(app.auth()).toEqual({ status: "signed_out", ended: false });
+
+    const reads = read.mock.calls.length;
+    app.retry();
+    expect(read).toHaveBeenCalledTimes(reads);
+    expect(socket.reconnects).toBe(0);
+  });
+
+  it("reports nothing when the worker renewed a subscription this browser no longer has", async () => {
+    const device = new FakeDevice();
+    device.renewed = true;
+    const createPushSubscription = vi.fn<Api["createPushSubscription"]>();
+    setup({ me: () => Promise.resolve(publicMe), createPushSubscription }, { device });
+    await settle();
+    expect(device.renewed).toBe(false);
+    expect(createPushSubscription).not.toHaveBeenCalled();
+  });
+
+  it("reports a renewed subscription in public mode only", async () => {
+    const device = new FakeDevice();
+    device.renewed = true;
+    device.current = makeDeviceSubscription("hash-renewed");
+    const createPushSubscription = vi.fn<Api["createPushSubscription"]>();
+    setup({ createPushSubscription }, { device });
+    await settle();
+    expect(device.renewed).toBe(true);
+    expect(createPushSubscription).not.toHaveBeenCalled();
+  });
+});
+
+describe("what /me says", () => {
+  it("is local mode, or signed in under the identity it names", () => {
+    expect(meAuth({ mode: "local", identity: null, device_token: false })).toEqual({
+      status: "local",
+    });
+    expect(meAuth({ mode: "public", identity: "ada@example.org", device_token: true })).toEqual({
+      status: "signed_in",
+      identity: "ada@example.org",
+    });
+  });
+
+  it("leaves a 401 to the http layer, takes a server's 404 as local mode, and retries the rest", () => {
+    expect(meFailure(signedOut())).toBe("handled");
+    expect(meFailure(new HttpError(404, "not found", true))).toBe("local");
+    expect(meFailure(new HttpError(404, "not found", false))).toBe("unreachable");
+    expect(meFailure(unreachable())).toBe("unreachable");
+    expect(meFailure(new Error("boom"))).toBe("unreachable");
+  });
+
+  it("waits twice as long after each failure, up to fifteen seconds", () => {
+    expect([0, 1, 2, 3, 4, 10].map(meRetryDelay)).toEqual([1000, 2000, 4000, 8000, 15_000, 15_000]);
+  });
+
+  it("is pending until it has answered as Calin", () => {
+    expect(authPending({ status: "checking" })).toBe(true);
+    expect(authPending({ status: "unreachable" })).toBe(true);
+    expect(authPending({ status: "local" })).toBe(false);
+    expect(authPending({ status: "signed_out", ended: true })).toBe(false);
   });
 });

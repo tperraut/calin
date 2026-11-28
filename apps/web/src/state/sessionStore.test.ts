@@ -23,7 +23,7 @@ import {
 } from "../test/fakes";
 import type { WorkflowRun } from "../gen/WorkflowRun";
 import { specGraph } from "../test/workflows";
-import { createSessionStore, SHIP_QUIET_MS } from "./sessionStore";
+import { createSessionStore, namedRepo, SHIP_QUIET_MS } from "./sessionStore";
 
 const TOPIC = "session:s1";
 
@@ -466,6 +466,123 @@ describe("session store", () => {
     flush();
     expect(store.load()).toEqual({ status: "loading" });
   });
+
+  it("ignores a failed load that answers once stopped", async () => {
+    const { store, stop } = setup({ getSession: () => Promise.reject(unreachable()) });
+    stop();
+    await settle();
+    flush();
+    expect(store.load()).toEqual({ status: "loading" });
+  });
+
+  it("loads the record again on reload, saying it is loading meanwhile", async () => {
+    const getSession = vi
+      .fn<Api["getSession"]>()
+      .mockResolvedValueOnce(makeDetail(makeSession("s1", 1000, { title: "Before" })))
+      .mockResolvedValue(makeDetail(makeSession("s1", 1000, { title: "After" })));
+    const { store } = setup({ getSession });
+    await settle();
+    flush();
+    expect(store.session()?.title).toBe("Before");
+
+    store.reload();
+    flush();
+    expect(store.load()).toEqual({ status: "loading" });
+    await settle();
+    flush();
+    expect(store.load()).toEqual({ status: "ready" });
+    expect(store.session()?.title).toBe("After");
+    expect(getSession).toHaveBeenCalledTimes(2);
+  });
+
+  it("changes nothing for a frame that is not the session's own news", () => {
+    const { socket, store, message } = setup();
+    message(1);
+    flush();
+    const before = store.view();
+    socket.emit(TOPIC, { op: "session_upserted", session: makeSession("s1") });
+    flush();
+    expect(store.view()).toBe(before);
+    expect(store.synced()).toBe(false);
+    expect(socket.resyncs).toEqual([]);
+  });
+
+  it("reports no limits when neither the agent nor the session names a runner", () => {
+    const onLimits = vi.fn();
+    const socket = new FakeSocket();
+    const api = fakeApi({ getSession: () => new Promise(() => {}) });
+    const store = createSessionStore({ api, socket, schedule: immediately, onLimits }, "s1");
+    store.start();
+    socket.emit(TOPIC, {
+      op: "event",
+      topic: TOPIC,
+      event: makeEvent(1, { type: "limits", windows: [] }, "ghost"),
+    });
+    expect(onLimits).not.toHaveBeenCalled();
+    flush();
+    expect(store.view().seq).toBe(1);
+  });
+
+  it("is alone in its tree until the sessions list is given", async () => {
+    const { store } = setup();
+    expect(store.tree().sessions).toEqual([]);
+    await settle();
+    flush();
+    expect(store.tree().sessions.map((one) => one.id)).toEqual(["s1"]);
+  });
+
+  it("reads and writes its repos through its own session's routes", async () => {
+    const getChanges = vi.fn<Api["getChanges"]>().mockResolvedValue([]);
+    const getDiff = vi.fn<Api["getDiff"]>().mockRejectedValue(notFound());
+    const listTree = vi.fn<Api["listTree"]>().mockResolvedValue([]);
+    const readFile = vi.fn<Api["readFile"]>().mockRejectedValue(notFound());
+    const writeFile = vi.fn<Api["writeFile"]>().mockRejectedValue(conflict("changed on disk"));
+    const { store } = setup({ getChanges, getDiff, listTree, readFile, writeFile });
+    const body = { text: "x", expected_hash: "h1" };
+
+    await expect(store.workspace.changes()).resolves.toEqual([]);
+    await expect(store.workspace.diff("api", "a.rs")).rejects.toMatchObject({ status: 404 });
+    await expect(store.workspace.tree("api", "")).resolves.toEqual([]);
+    await expect(store.workspace.readFile("api", "a.rs")).rejects.toMatchObject({ status: 404 });
+    await expect(store.workspace.writeFile("api", "a.rs", body)).rejects.toThrow("changed on disk");
+    expect(getChanges).toHaveBeenCalledWith("s1");
+    expect(getDiff).toHaveBeenCalledWith("s1", "api", "a.rs");
+    expect(listTree).toHaveBeenCalledWith("s1", "api", "");
+    expect(readFile).toHaveBeenCalledWith("s1", "api", "a.rs");
+    expect(writeFile).toHaveBeenCalledWith("s1", "api", "a.rs", body);
+  });
+
+  it("says a terminal cannot be opened where none can, after the caller has its client", async () => {
+    const { store } = setup();
+    const onEnd = vi.fn();
+    const client = store.workspace.openTerminal({ cols: 80, rows: 24 }, { onData() {}, onEnd });
+    expect(onEnd).not.toHaveBeenCalled();
+    client.write("ls\n");
+    await settle();
+    expect(onEnd.mock.calls).toEqual([
+      [{ kind: "error", message: "Terminals are not available here." }],
+    ]);
+  });
+});
+
+describe("namedRepo", () => {
+  const covered = new Map([
+    ["r1", "web"],
+    ["r2", "web-admin"],
+    ["r3", "api.v2"],
+  ]);
+
+  it.each([
+    ["web: the push was rejected", "r1"],
+    ["could not push web-admin: protected branch", "r2"],
+    ["api.v2 has no remote", "r3"],
+    // A name inside a longer word is not that repo.
+    ["webhook failed", undefined],
+    ["apixv2 has no remote", undefined],
+    ["GitHub answered 502", undefined],
+  ])("reads %j as naming %s", (message, id) => {
+    expect(namedRepo(covered, message)).toBe(id);
+  });
 });
 
 describe("session store: delivery", () => {
@@ -690,6 +807,76 @@ describe("session store: delivery", () => {
     expect(store.delivery.shipping()).toBeUndefined();
   });
 
+  it("does not wait longer for events that are not the ship's news", async () => {
+    vi.useFakeTimers();
+    const { store, emit, caughtUp } = await inReview();
+    caughtUp();
+    await store.delivery.ship({});
+    vi.advanceTimersByTime(SHIP_QUIET_MS / 2);
+    emit({ type: "user_message", text: "meanwhile" });
+    emit({ type: "file_changed", session_repo_id: "api", path: "a.rs", op: "edit" });
+    vi.advanceTimersByTime(SHIP_QUIET_MS / 2 - 1);
+    flush();
+    expect(store.delivery.shipping()).toBe("opening");
+    expect(store.delivery.failed()).toBe(0);
+    vi.advanceTimersByTime(1);
+    flush();
+    expect(store.delivery.shipping()).toBeUndefined();
+  });
+
+  it("covers no repo when asked before the record has loaded, and stops once answered", async () => {
+    const answer = deferred();
+    const shipSession = vi.fn<Api["shipSession"]>().mockReturnValue(answer.promise);
+    const socket = new FakeSocket();
+    const api = fakeApi({ getSession: () => new Promise(() => {}), shipSession });
+    const store = createSessionStore({ api, socket, schedule: immediately }, "s1");
+    store.start();
+    socket.emit(TOPIC, { op: "subscribed", topic: TOPIC, head_seq: 0 });
+    const shipped = store.delivery.ship({});
+    flush();
+    expect(store.delivery.shipping()).toBe("opening");
+    answer.resolve();
+    await shipped;
+    flush();
+    expect(shipSession).toHaveBeenCalledWith("s1", {});
+    expect(store.delivery.shipping()).toBeUndefined();
+  });
+
+  it("does not let a late refusal of an earlier ship end the one under way", async () => {
+    const first = deferred();
+    const second = deferred();
+    const shipSession = vi
+      .fn<Api["shipSession"]>()
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValueOnce(second.promise);
+    const { store, emit, caughtUp } = await inReview({ shipSession });
+    caughtUp();
+    const earlier = store.delivery.ship({});
+    emit(opened("api", 12));
+    emit(opened("web", 7));
+    expect(store.delivery.shipping()).toBeUndefined();
+
+    void store.delivery.ship({});
+    flush();
+    expect(store.delivery.shipping()).toBe("updating");
+    first.reject(conflict("too late"));
+    await expect(earlier).rejects.toThrow("too late");
+    flush();
+    expect(store.delivery.shipping()).toBe("updating");
+    expect(shipSession).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps one still clock when the app gives none", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(123_000);
+    const store = createSessionStore({ api: fakeApi(), socket: new FakeSocket() }, "s1");
+    vi.setSystemTime(456_000);
+    expect(store.delivery.now()).toBe(123_000);
+    expect(store.delivery.blocked()).toBeUndefined();
+    expect(store.delivery.dryRun()).toBe(false);
+    store.delivery.recheck();
+  });
+
   it("says why pull requests cannot be opened, unless the server only pretends to open them", async () => {
     let current: Health | undefined;
     const { store, checkHealth } = await inReview({}, { health: () => current });
@@ -853,6 +1040,30 @@ describe("session store: the workflow run", () => {
     emit(node("tests", "started"));
     vi.advanceTimersByTime(5000);
     expect(getWorkflow).toHaveBeenCalledTimes(seeded + 2);
+  });
+
+  it.each([
+    [
+      "a run",
+      (answer: ReturnType<typeof deferred<WorkflowRun | null>>) => answer.resolve(served(2)),
+    ],
+    [
+      "a refusal",
+      (answer: ReturnType<typeof deferred<WorkflowRun | null>>) =>
+        answer.reject(conflict("store busy")),
+    ],
+  ])("ignores %s that answers once the store is stopped", async (_name, settleWith) => {
+    const answer = deferred<WorkflowRun | null>();
+    const getWorkflow = vi.fn<Api["getWorkflow"]>().mockReturnValue(answer.promise);
+    const { store, stop } = live(getWorkflow);
+    await settle();
+    expect(getWorkflow).toHaveBeenCalledTimes(1);
+    stop();
+    settleWith(answer);
+    await settle();
+    flush();
+    expect(store.workflow.run()).toBeUndefined();
+    expect(store.workflow.failure()).toBeUndefined();
   });
 
   it("keeps the server's reason when a read fails", async () => {

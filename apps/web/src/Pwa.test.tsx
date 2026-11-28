@@ -179,6 +179,20 @@ describe("the worker's messages", () => {
     expect(createPushSubscription).toHaveBeenCalledWith(device.current.request);
   });
 
+  it("leave a renewed subscription alone in local mode, which has no push", async () => {
+    const worker = new FakeWorkerBridge();
+    const device = new FakeDevice();
+    device.current = makeDeviceSubscription("hash-renewed");
+    const createPushSubscription = vi.fn<Api["createPushSubscription"]>();
+    await start("/", { worker, device, routes: { createPushSubscription } });
+
+    device.renewed = true;
+    worker.say({ type: "subscription-changed" });
+    await act();
+    expect(device.renewed).toBe(true);
+    expect(createPushSubscription).not.toHaveBeenCalled();
+  });
+
   it("are reported on the next start when no page was open", async () => {
     const device = new FakeDevice();
     device.renewed = true;

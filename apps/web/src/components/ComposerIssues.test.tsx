@@ -6,9 +6,9 @@ import type { Issue } from "../gen/Issue";
 import type { IssueDetail } from "../gen/IssueDetail";
 import type { Repo } from "../gen/Repo";
 import type { RunnerLimits } from "../gen/RunnerLimits";
-import { conflict, makeRepo, settle } from "../test/fakes";
+import { conflict, deferred, makeRepo, settle } from "../test/fakes";
 import { makeIssue, makeLimits, makeWindow } from "../test/integrations";
-import { click, find, findByText, mount, type, unmountAll } from "../test/render";
+import { click, find, findByText, mount, type, unmountAll, until } from "../test/render";
 import { Composer, type IssueSource } from "./Composer";
 import { ISSUE_SEARCH_DELAY_MS } from "./IssueList";
 
@@ -68,12 +68,7 @@ function setup(
     details.dispatchEvent(new Event("toggle"));
     flush();
     // The list's code arrives when the disclosure first opens.
-    for (let i = 0; i < 50 && !host.querySelector('input[type="search"]'); i += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 5));
-      flush();
-    }
-    await settle();
-    flush();
+    await until(() => host.querySelector('input[type="search"]') !== null);
   }
   const prompt = () => find<HTMLTextAreaElement>(host, "textarea");
   async function start(text = ""): Promise<CreateSessionRequest | undefined> {
@@ -144,6 +139,129 @@ describe("Composer: starting from an issue", () => {
     expect(status).toHaveLength(1);
     expect(host.querySelector('input[type="search"]')).toBeNull();
     expect(host.querySelector('ul[aria-label="Issues of notes"]')).toBeNull();
+  });
+
+  it("says when the issues could not be listed, and lists them on Retry", async () => {
+    const list = vi
+      .fn<(repoId: string, query: IssueQuery) => Promise<Issue[]>>()
+      .mockRejectedValueOnce(new Error("Cannot reach the server"))
+      .mockResolvedValue(issues);
+    const { host, openIssues } = setup({ source: { list } });
+    await openIssues();
+    await settle();
+    flush();
+    expect(find(host, '[role="alert"]').textContent).toContain(
+      "The issues could not be loaded: Cannot reach the server",
+    );
+    expect(host.querySelector('ul[aria-label="Issues of notes"]')).toBeNull();
+
+    await click(findByText(find(host, '[role="alert"]'), "button", "Retry"));
+    expect(list).toHaveBeenCalledTimes(2);
+    expect(host.querySelector('[role="alert"]')).toBeNull();
+    expect(host.querySelectorAll('ul[aria-label="Issues of notes"] > li')).toHaveLength(2);
+  });
+
+  it("says when there is no issue, or none matches the search", async () => {
+    const { host, openIssues } = setup({ source: { list: () => Promise.resolve([]) } });
+    await openIssues();
+    await settle();
+    flush();
+    expect(host.textContent).toContain("No open issues in notes.");
+
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    type(find<HTMLInputElement>(host, 'input[type="search"]'), " flaky ");
+    vi.advanceTimersByTime(ISSUE_SEARCH_DELAY_MS);
+    vi.useRealTimers();
+    await settle();
+    flush();
+    expect(host.textContent).toContain('No open issue matches "flaky".');
+  });
+
+  it("keeps the list it has while a new one loads, and drops an answer a newer request overtook", async () => {
+    const first = deferred<Issue[]>();
+    const closed = [makeIssue(3, { title: "Old crash", state: "closed" })];
+    const list = vi
+      .fn<(repoId: string, query: IssueQuery) => Promise<Issue[]>>()
+      .mockResolvedValueOnce(issues)
+      .mockReturnValueOnce(first.promise)
+      .mockResolvedValueOnce(issues)
+      .mockResolvedValueOnce(closed);
+    const { host, openIssues } = setup({ source: { list } });
+    await openIssues();
+    await settle();
+    flush();
+    const titles = () =>
+      [...host.querySelectorAll('ul[aria-label="Issues of notes"] > li')].map(
+        (li) => li.textContent,
+      );
+    expect(titles()).toHaveLength(2);
+
+    await click(findByText(host, "button", "Closed"));
+    // The open list stays on screen while the closed one is asked for.
+    expect(host.textContent).not.toContain("Loading issues…");
+    expect(titles()).toHaveLength(2);
+
+    await click(findByText(host, "button", "Open"));
+    await click(findByText(host, "button", "Closed"));
+    expect(titles()).toEqual([expect.stringContaining("#3Old crash")]);
+    first.resolve(issues);
+    await settle();
+    flush();
+    expect(titles()).toEqual([expect.stringContaining("#3Old crash")]);
+  });
+
+  it("does not ask again for the state already shown", async () => {
+    const { host, list, openIssues } = setup();
+    await openIssues();
+    list.mockClear();
+    await click(findByText(host, "button", "Open"));
+    await settle();
+    expect(list).not.toHaveBeenCalled();
+  });
+
+  it("says when the picked issue's text could not be read, or that it has none", async () => {
+    const failing = setup({ source: { get: () => Promise.reject(new Error("rate limited")) } });
+    await failing.openIssues();
+    await click(findByText(failing.host, "button", "Add retry to the uploader"));
+    await settle();
+    flush();
+    expect(failing.host.textContent).toContain("The issue could not be loaded: rate limited");
+    unmountAll();
+
+    const pending = deferred<IssueDetail>();
+    const empty = setup({ source: { get: () => pending.promise } });
+    await empty.openIssues();
+    await click(findByText(empty.host, "button", "Add retry to the uploader"));
+    expect(empty.host.textContent).toContain("Loading the issue…");
+    pending.resolve({ issue: issues[0], body: "  \n" });
+    await settle();
+    flush();
+    expect(empty.host.textContent).toContain("The issue has no description.");
+  });
+
+  it("drops the text of an issue that was replaced before it arrived", async () => {
+    const bodies = new Map([
+      [12, deferred<IssueDetail>()],
+      [15, deferred<IssueDetail>()],
+    ]);
+    const { host, openIssues } = setup({
+      source: {
+        get: (_repo, number) => bodies.get(number)?.promise ?? Promise.reject(new Error("unknown")),
+      },
+    });
+    await openIssues();
+    await click(findByText(host, "button", "Add retry to the uploader"));
+    await openIssues();
+    await click(findByText(host, "button", "Document the rate limiter"));
+    bodies.get(12)?.resolve({ issue: issues[0], body: "Text of twelve" });
+    await settle();
+    flush();
+    expect(host.textContent).not.toContain("Text of twelve");
+    expect(host.textContent).toContain("Loading the issue…");
+    bodies.get(15)?.resolve({ issue: issues[1], body: "Text of fifteen" });
+    await settle();
+    flush();
+    expect(host.textContent).toContain("Text of fifteen");
   });
 
   it("keeps the default placeholder until an issue is picked", () => {

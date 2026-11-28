@@ -6,19 +6,34 @@ import type { Automation } from "./gen/Automation";
 import type { AutomationRequest } from "./gen/AutomationRequest";
 import type { CronPreview } from "./gen/CronPreview";
 import type { Health } from "./gen/Health";
+import { QUICK_WORKFLOW } from "./lib/workflow";
 import { CRON_PREVIEW_DELAY_MS } from "./pages/AutomationPage";
 import { createAppState } from "./state/app";
 import {
   badRequest,
   conflict,
+  deferred,
   fakeApi,
   FakeSocket,
   immediately,
   makeRepo,
+  quickWorkflow,
   settle,
 } from "./test/fakes";
 import { makeAutomation, makeRun } from "./test/integrations";
-import { click, control, find, findByText, mount, type, unmountAll } from "./test/render";
+import { workflowInfo } from "./test/workflows";
+import {
+  choose,
+  click,
+  control,
+  find,
+  findByText,
+  mount,
+  pageShown,
+  type,
+  unmountAll,
+  until,
+} from "./test/render";
 
 afterEach(() => {
   vi.useRealTimers();
@@ -80,16 +95,7 @@ async function open(path: string, routes: Partial<Api> = {}) {
   const state = createAppState({ api, socket, schedule: immediately });
   const host = mount(() => <App state={state} />);
   socket.setState("open");
-  const waiting = () => {
-    const shown = host.querySelector("main")?.textContent;
-    return shown === undefined || shown === "Loading…";
-  };
-  for (let i = 0; i < 50 && waiting(); i += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 5));
-    flush();
-  }
-  await settle();
-  flush();
+  await until(() => pageShown(host));
   const main = () => find(host, "main");
   return { host, main, api };
 }
@@ -131,6 +137,56 @@ describe("Automations list", () => {
       "An automation starts a session by itself, on a schedule or when a new issue or pull request appears on GitHub.",
     );
     expect(findByText(main(), "a", "New automation").getAttribute("href")).toBe("/automations/new");
+  });
+
+  it("says when a schedule is off, and when a trigger was never checked", async () => {
+    const off = makeAutomation("a4", { name: "Weekly", enabled: false, next_run_at: null });
+    const fresh = makeAutomation("a5", {
+      name: "Fresh",
+      trigger: { kind: "issue", repo_id: "api", label: null },
+      trigger_text: "New issue in api",
+      last_poll_at: null,
+      last_poll_problem: null,
+    });
+    const { main } = await open("/automations", {
+      listAutomations: () => Promise.resolve([off, fresh]),
+    });
+    const [weekly, never] = [...main().querySelectorAll('[data-part="automation"]')].map(text);
+    expect(weekly).toContain("No run scheduled while it is off");
+    expect(never).toContain("Not checked yet");
+  });
+
+  it("says why the list could not be loaded, and tries again", async () => {
+    const listAutomations = vi
+      .fn<Api["listAutomations"]>()
+      .mockRejectedValueOnce(new Error("server busy"))
+      .mockResolvedValue([schedule]);
+    const { main } = await open("/automations", { listAutomations });
+    await until(() => main().querySelector('[role="alert"]') !== null);
+    expect(find(main(), '[role="alert"] p').textContent).toBe(
+      "The automations could not be loaded: server busy",
+    );
+    expect(main().querySelector('a[href="/automations/new"]')).toBeNull();
+    await click(findByText(main(), "button", "Try again"));
+    await until(() => main().querySelectorAll('[data-part="automation"]').length === 1);
+    expect(main().querySelector('[role="alert"]')).toBeNull();
+    expect(findByText(main(), "a", "New automation").getAttribute("href")).toBe("/automations/new");
+  });
+
+  it("sends one save while the switch is being saved", async () => {
+    const saving = deferred<Automation>();
+    const putAutomation = vi.fn(() => saving.promise);
+    const { main } = await open("/automations", { putAutomation });
+    const toggle = () => find(main(), '[aria-label="Triage enabled"]');
+    await click(toggle());
+    expect(toggle().hasAttribute("disabled")).toBe(true);
+    toggle().dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    expect(putAutomation).toHaveBeenCalledTimes(1);
+    saving.resolve({ ...issueTrigger, enabled: false });
+    await settle();
+    flush();
+    expect(toggle().getAttribute("aria-checked")).toBe("false");
+    expect(toggle().hasAttribute("disabled")).toBe(false);
   });
 
   it("saves the switch at once with the whole automation", async () => {
@@ -365,6 +421,225 @@ describe("Automation editor", () => {
     expect(document.activeElement).toBe(alert);
   });
 
+  it("opens to the new automation once it is created", async () => {
+    const { main } = await create(() => undefined);
+    expect(location.pathname).toBe("/automations/a9");
+    await until(() => main().querySelector('[aria-label="Run now"]') !== null);
+  });
+
+  it("edits a trigger as it was saved, and sends no label once the label is cleared", async () => {
+    const putAutomation = vi.fn((_id: string, body: AutomationRequest) =>
+      Promise.resolve({ ...issueTrigger, ...body }),
+    );
+    const { main } = await open("/automations/a2", { putAutomation });
+    expect(control<HTMLSelectElement>(main(), "Repo").value).toBe("api");
+    expect(control(main(), "Label").value).toBe("agent");
+    expect(text(find(main(), '[data-part="placeholders"]'))).toContain("which describe the issue.");
+    expect(main().querySelector('[data-part="cron-preview"]')).toBeNull();
+    type(control(main(), "Label"), "  ");
+    await click(findByText(main(), "button", "Save"));
+    await settle();
+    expect(putAutomation.mock.lastCall?.[1].trigger).toEqual({
+      kind: "issue",
+      repo_id: "api",
+      label: null,
+    });
+  });
+
+  it("keeps a saved workflow, runner and model, and puts an unattended-unsafe mode back to Accept edits", async () => {
+    const stored = makeAutomation("a6", {
+      name: "Reviewer",
+      session: {
+        ...schedule.session,
+        workflow: "review",
+        runner: "mock",
+        model: "opus",
+        permission_mode: "ask",
+      },
+    });
+    const putAutomation = vi.fn((_id: string, body: AutomationRequest) =>
+      Promise.resolve({ ...stored, ...body }),
+    );
+    const { main } = await open("/automations/a6", {
+      getAutomation: () => Promise.resolve(stored),
+      listWorkflows: () => Promise.resolve([quickWorkflow, workflowInfo("review")]),
+      putAutomation,
+    });
+    expect(control<HTMLInputElement>(main(), "Accept edits").checked).toBe(true);
+    await click(findByText(main(), "button", "Save"));
+    await settle();
+    expect(putAutomation.mock.lastCall?.[1].session).toMatchObject({
+      workflow: "review",
+      runner: "mock",
+      model: "opus",
+      permission_mode: "accept_edits",
+    });
+    choose(control<HTMLSelectElement>(main(), "Workflow"), QUICK_WORKFLOW);
+    await click(findByText(main(), "button", "Save"));
+    await settle();
+    expect(putAutomation.mock.lastCall?.[1].session.workflow).toBeNull();
+  });
+
+  it("says Saved and renames the page after a save, until the form changes again", async () => {
+    const { main } = await open("/automations/a1", {
+      putAutomation: (_id, body) => Promise.resolve({ ...schedule, ...body }),
+    });
+    type(control(main(), "Name"), "Morning check");
+    await click(findByText(main(), "button", "Save"));
+    await settle();
+    flush();
+    expect(text(find(main(), '[role="status"]'))).toBe("Saved");
+    expect(text(find(main(), "h1"))).toBe("Morning check");
+    type(control(main(), "Name"), "Morning check!");
+    expect(main().querySelector('[role="status"]')).toBeNull();
+  });
+
+  it("sends one request while a save is under way, and says so on the button", async () => {
+    const createAutomation = vi.fn(() => new Promise<Automation>(() => undefined));
+    const { main } = await open("/automations/new", { createAutomation });
+    const form = find<HTMLFormElement>(main(), 'form[aria-label="New automation"]');
+    form.requestSubmit();
+    flush();
+    form.requestSubmit();
+    flush();
+    expect(createAutomation).toHaveBeenCalledTimes(1);
+    const button = findByText<HTMLButtonElement>(main(), "button", "Saving…");
+    expect(button.disabled).toBe(true);
+  });
+
+  it("offers no repo to watch when none is registered", async () => {
+    const { main } = await open("/automations/new", { listRepos: () => Promise.resolve([]) });
+    await click(control(main(), "New pull request"));
+    const repo = control<HTMLSelectElement>(main(), "Repo");
+    expect([...repo.options].map((one) => [one.value, one.textContent])).toEqual([
+      ["", "No repo is registered"],
+    ]);
+    expect(text(repo.parentElement)).toContain("Fires once for each new open pull request");
+  });
+
+  it("says an expression is not valid when the server gives no reason", async () => {
+    const { main } = await open("/automations/new", {
+      previewCron: () => Promise.resolve({ text: null, next: [], problem: null }),
+    });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    type(control(main(), "Cron expression"), "nonsense");
+    vi.advanceTimersByTime(CRON_PREVIEW_DELAY_MS);
+    await settle();
+    flush();
+    expect(text(find(main(), '[data-part="cron-preview"]'))).toBe(
+      "This is not a valid cron expression.",
+    );
+  });
+
+  it("shows only the answer about the expression last typed, and nothing for an empty one", async () => {
+    const pending = new Map<string, ReturnType<typeof deferred<CronPreview>>>();
+    const previewCron = vi.fn((expr: string) => {
+      const answer = deferred<CronPreview>();
+      pending.set(expr, answer);
+      return answer.promise;
+    });
+    const { main } = await open("/automations/new", { previewCron });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const preview = () => text(find(main(), '[data-part="cron-preview"]'));
+    for (const expr of ["1 * * * *", "2 * * * *", "3 * * * *"]) {
+      type(control(main(), "Cron expression"), expr);
+      vi.advanceTimersByTime(CRON_PREVIEW_DELAY_MS);
+    }
+    pending.get("3 * * * *")?.resolve({ text: "Third", next: [], problem: null });
+    await settle();
+    flush();
+    expect(preview()).toBe("Third");
+    pending.get("1 * * * *")?.resolve({ text: "First", next: [], problem: null });
+    pending.get("2 * * * *")?.reject(new Error("too late"));
+    await settle();
+    flush();
+    expect(preview()).toBe("Third");
+
+    previewCron.mockClear();
+    type(control(main(), "Cron expression"), "  ");
+    vi.advanceTimersByTime(CRON_PREVIEW_DELAY_MS);
+    expect(preview()).toBe("");
+    expect(previewCron).not.toHaveBeenCalled();
+  });
+
+  const focused = (selector: string) => () => document.activeElement?.matches(selector) === true;
+  it.each([
+    ["the name", "name is already used", "schedule", focused("input[maxlength='80']")],
+    ["the prompt", "unknown placeholder {{foo}}", "schedule", focused("textarea")],
+    [
+      "the permission",
+      "ask is refused: it runs unattended",
+      "schedule",
+      focused("[value=accept_edits]"),
+    ],
+    [
+      "the workflow",
+      "unknown workflow nope",
+      "schedule",
+      focused("select:has(option[value=review])"),
+    ],
+    [
+      "the watched repo",
+      "repo web is not available",
+      "issue",
+      focused("select:has(option[value=web])"),
+    ],
+  ])(
+    "shows a 400 about %s at that field and focuses it",
+    async (_what, message, kind, isFocused) => {
+      const { main } = await open("/automations/new", {
+        listWorkflows: () => Promise.resolve([quickWorkflow, workflowInfo("review")]),
+        createAutomation: () => Promise.reject(badRequest(message)),
+      });
+      if (kind === "issue") await click(control(main(), "New issue"));
+      await click(findByText(main(), "button", "Create automation"));
+      await settle();
+      flush();
+      expect(isFocused()).toBe(true);
+      expect(text(find(main(), '[role="alert"]'))).toBe(message);
+    },
+  );
+
+  it("shows a 400 about the session's repos by the repo picker, and focuses the message", async () => {
+    const { main } = await open("/automations/new", {
+      createAutomation: () => Promise.reject(badRequest("repo web is not available")),
+    });
+    await click(findByText(main(), "button", "Create automation"));
+    await settle();
+    flush();
+    const alert = find(main(), '[role="alert"]');
+    expect(text(alert)).toBe("repo web is not available");
+    expect(document.activeElement).toBe(alert);
+    expect(alert.closest('section[aria-label="Session to start"]')).not.toBeNull();
+  });
+
+  it("shows a refusal that is not a 400 by Save, even when it names a field", async () => {
+    const { main } = await open("/automations/new", {
+      createAutomation: () => Promise.reject(conflict("name is already used")),
+    });
+    await click(findByText(main(), "button", "Create automation"));
+    await settle();
+    flush();
+    const alert = find(main(), '[role="alert"]');
+    expect(text(alert)).toBe("name is already used");
+    expect(document.activeElement).toBe(alert);
+    expect(control(main(), "Name").getAttribute("aria-invalid")).toBeNull();
+    expect(alert.closest('section[aria-label="Session to start"]')).toBeNull();
+  });
+
+  it("keeps the confirmation open with the reason when the delete fails", async () => {
+    const { main } = await open("/automations/a1", {
+      deleteAutomation: () => Promise.reject(conflict("it is running")),
+    });
+    await click(findByText(main(), "button", "Delete"));
+    await click(findByText(main(), "button", "Delete automation"));
+    await settle();
+    flush();
+    const confirm = find(main(), '[aria-label="Delete this automation"]');
+    expect(text(find(confirm, '[role="alert"]'))).toBe("it is running");
+    expect(location.pathname).toBe("/automations/a1");
+  });
+
   it("deletes only after a confirmation that says the sessions are kept", async () => {
     const deleteAutomation = vi.fn(() => Promise.resolve());
     const { main } = await open("/automations/a1", { deleteAutomation });
@@ -416,6 +691,90 @@ describe("Run now and the history", () => {
     const { main } = await open("/automations/a3");
     await click(findByText(main(), "button", "Run now"));
     expect(control(main(), "Pull request number")).toBeTruthy();
+  });
+
+  it.each(["", "twelve", "0", "1.5"])(
+    "refuses %j as a number, saying what it needs",
+    async (typed) => {
+      const runAutomation = vi.fn<Api["runAutomation"]>();
+      const { main } = await open("/automations/a2", { runAutomation });
+      await click(findByText(main(), "button", "Run now"));
+      type(control(main(), "Issue number"), typed);
+      await click(findByText(main(), "button", "Run"));
+      expect(runAutomation).not.toHaveBeenCalled();
+      expect(text(find(main(), '[aria-label="Run now"] [role="alert"]'))).toBe(
+        "Give the issue number, a whole number such as 12.",
+      );
+    },
+  );
+
+  it("goes back to the Run now button on Cancel", async () => {
+    const { main } = await open("/automations/a2");
+    await click(findByText(main(), "button", "Run now"));
+    await click(findByText(main(), "button", "Cancel"));
+    expect(main().querySelector('form[aria-label="Run now"]')).toBeNull();
+    expect(findByText(main(), "button", "Run now")).toBeTruthy();
+  });
+
+  it("reads the history again after a run", async () => {
+    const listAutomationRuns = vi.fn(() => Promise.resolve([]));
+    const { main } = await open("/automations/a1", {
+      listAutomationRuns,
+      runAutomation: () => Promise.resolve(makeRun("r9", { session_id: null, outcome: "skipped" })),
+    });
+    expect(listAutomationRuns).toHaveBeenCalledTimes(1);
+    await click(findByText(main(), "button", "Run now"));
+    expect(listAutomationRuns).toHaveBeenCalledTimes(2);
+    expect(text(find(main(), '[aria-label="Run now"] [role="status"]'))).toBe("Skipped.");
+  });
+
+  it("says why the history could not be read, and while it is being read", async () => {
+    const failed = await open("/automations/a1", {
+      listAutomationRuns: () => Promise.reject(new Error("Cannot reach the server")),
+    });
+    expect(text(find(failed.main(), '[role="alert"]'))).toBe(
+      "The run history could not be loaded: Cannot reach the server",
+    );
+    unmountAll();
+    const reading = await open("/automations/a1", {
+      listAutomationRuns: () => new Promise(() => undefined),
+    });
+    expect(reading.main().textContent).toContain("Loading the run history…");
+  });
+});
+
+describe("Automation page", () => {
+  it("says why an automation could not be loaded", async () => {
+    const { main } = await open("/automations/a1", {
+      getAutomation: () => Promise.reject(new Error("automation not found")),
+    });
+    expect(text(find(main(), "h1"))).toBe("Automation");
+    expect(text(find(main(), '[role="alert"]'))).toBe(
+      "The automation could not be loaded: automation not found",
+    );
+    expect(main().querySelector("form")).toBeNull();
+  });
+
+  it("says it is loading until the automation is read", async () => {
+    const { main } = await open("/automations/a1", {
+      getAutomation: () => new Promise(() => undefined),
+    });
+    expect(main().textContent).toContain("Loading the automation…");
+  });
+
+  it("names a new automation and offers neither Run now nor a history", async () => {
+    const { main } = await open("/automations/new");
+    expect(text(find(main(), "h1"))).toBe("New automation");
+    expect(main().querySelector('[aria-label="Run now"]')).toBeNull();
+    expect(main().textContent).not.toContain("Run history");
+    expect(main().textContent).not.toContain("Delete");
+  });
+
+  it("shows what fires it and why Calin switched it off", async () => {
+    const { main } = await open("/automations/a3");
+    expect(text(find(main(), "h1"))).toBe("Review PRs");
+    expect(main().textContent).toContain("New pull request in web");
+    expect(main().textContent).toContain("Switched off by Calin: 3 runs in a row failed");
   });
 
   it("says what each past fire did", async () => {

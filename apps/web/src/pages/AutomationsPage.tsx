@@ -1,5 +1,6 @@
 import { createSignal, For, Match, onSettled, Show, Switch, useContext } from "solid-js";
 import { SessionStatusBadge } from "../components/Badge";
+import { loadFailure, PageLoadFailure } from "../components/PageLoadFailure";
 import type { Automation } from "../gen/Automation";
 import { outcomeText, requestOf } from "../lib/automations";
 import { errorMessage } from "../lib/errors";
@@ -180,13 +181,28 @@ function AutomationRow(props: {
   );
 }
 
+const listOf = (load: Load): readonly Automation[] | undefined =>
+  load.status === "ready" ? load.automations : undefined;
+
+/** A list already on screen stays there while it is read again. */
+const reloading = (load: Load): Load => (load.status === "ready" ? load : { status: "loading" });
+
+/** The list with `next` in place of the automation it replaces; a list not loaded yet stays as it is. */
+function withSaved(load: Load, next: Automation): Load {
+  if (load.status !== "ready") return load;
+  return {
+    status: "ready",
+    automations: load.automations.map((one) => (one.id === next.id ? next : one)),
+  };
+}
+
 /** `/automations`: every automation, with its switch and what it did last. */
 export default function AutomationsPage() {
   const app = useContext(AppContext);
   const [load, setLoad] = createSignal<Load>({ status: "loading" });
 
   function read(): void {
-    setLoad((current) => (current.status === "ready" ? current : { status: "loading" }));
+    setLoad(reloading);
     app.listAutomations().then(
       (automations) => setLoad({ status: "ready", automations }),
       (error: unknown) => setLoad({ status: "error", message: errorMessage(error) }),
@@ -194,24 +210,10 @@ export default function AutomationsPage() {
   }
   onSettled(() => read());
 
-  const list = (): readonly Automation[] | undefined => {
-    const current = load();
-    return current.status === "ready" ? current.automations : undefined;
+  const list = (): readonly Automation[] | undefined => listOf(load());
+  const saved = (next: Automation): void => {
+    setLoad((current) => withSaved(current, next));
   };
-  const failure = (): string | undefined => {
-    const current = load();
-    return current.status === "error" ? current.message : undefined;
-  };
-  function saved(next: Automation): void {
-    setLoad((current) =>
-      current.status === "ready"
-        ? {
-            status: "ready",
-            automations: current.automations.map((one) => (one.id === next.id ? next : one)),
-          }
-        : current,
-    );
-  }
 
   return (
     <section class="min-h-0 flex-1 overflow-y-auto overscroll-contain">
@@ -228,14 +230,9 @@ export default function AutomationsPage() {
           </Show>
         </header>
         <Switch>
-          <Match when={failure()}>
+          <Match when={loadFailure(load())}>
             {(message) => (
-              <div role="alert" class="flex flex-col items-start gap-2 text-sm">
-                <p class="wrap-break-word">The automations could not be loaded: {message()}</p>
-                <button type="button" class="btn" onClick={() => read()}>
-                  Try again
-                </button>
-              </div>
+              <PageLoadFailure what="The automations" message={message()} onRetry={read} />
             )}
           </Match>
           <Match when={load().status === "loading"}>

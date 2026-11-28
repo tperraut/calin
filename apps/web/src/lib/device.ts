@@ -106,51 +106,71 @@ async function describe(subscription: PushSubscription): Promise<DeviceSubscript
 }
 
 /** The real browser. `workerEnabled` is false under the development server. */
-export function browserDevice(workerEnabled: boolean): Device {
-  const standalone = (): boolean =>
-    window.matchMedia("(display-mode: standalone)").matches ||
-    // Safari's own flag, from before display-mode.
-    ("standalone" in navigator && navigator.standalone === true);
+class BrowserDevice implements Device {
+  private readonly workerEnabled: boolean;
 
-  const registration = (): Promise<ServiceWorkerRegistration> => navigator.serviceWorker.ready;
-
-  async function stateCache(): Promise<Cache> {
-    return caches.open(STATE_CACHE);
+  constructor(workerEnabled: boolean) {
+    this.workerEnabled = workerEnabled;
   }
 
-  return {
-    standalone,
-    pushSupport() {
-      if (isIos(navigator.userAgent, navigator.maxTouchPoints) && !standalone()) {
-        return "needs-install";
-      }
-      const capable =
-        "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
-      if (!capable) return "unsupported";
-      return workerEnabled ? "supported" : "no-worker";
-    },
-    permission: () => Notification.permission,
-    requestPermission: () => Notification.requestPermission(),
-    async subscription() {
-      const current = await (await registration()).pushManager.getSubscription();
-      return current ? describe(current) : null;
-    },
-    async subscribe(publicKey) {
-      const manager = (await registration()).pushManager;
-      const created = await withTimeout(
-        manager.subscribe({
-          userVisibleOnly: true,
-          applicationServerKey: base64UrlToBytes(publicKey),
-        }),
-        SUBSCRIBE_TIMEOUT_MS,
-        "the browser's push service did not answer",
-      );
-      await (await stateCache()).put(PUSH_KEY_ENTRY, new Response(publicKey));
-      return describe(created);
-    },
-    async takeRenewal() {
-      const cache = await stateCache();
-      return cache.delete(RECONCILE_ENTRY);
-    },
-  };
+  standalone(): boolean {
+    return (
+      window.matchMedia("(display-mode: standalone)").matches ||
+      // Safari's own flag, from before display-mode.
+      ("standalone" in navigator && navigator.standalone === true)
+    );
+  }
+
+  pushSupport(): PushSupport {
+    if (isIos(navigator.userAgent, navigator.maxTouchPoints) && !this.standalone()) {
+      return "needs-install";
+    }
+    const capable =
+      "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
+    if (!capable) return "unsupported";
+    return this.workerEnabled ? "supported" : "no-worker";
+  }
+
+  permission(): Permission {
+    return Notification.permission;
+  }
+
+  requestPermission(): Promise<Permission> {
+    return Notification.requestPermission();
+  }
+
+  async subscription(): Promise<DeviceSubscription | null> {
+    const current = await (await this.registration()).pushManager.getSubscription();
+    return current ? describe(current) : null;
+  }
+
+  async subscribe(publicKey: string): Promise<DeviceSubscription> {
+    const manager = (await this.registration()).pushManager;
+    const created = await withTimeout(
+      manager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: base64UrlToBytes(publicKey),
+      }),
+      SUBSCRIBE_TIMEOUT_MS,
+      "the browser's push service did not answer",
+    );
+    await (await this.stateCache()).put(PUSH_KEY_ENTRY, new Response(publicKey));
+    return describe(created);
+  }
+
+  async takeRenewal(): Promise<boolean> {
+    return (await this.stateCache()).delete(RECONCILE_ENTRY);
+  }
+
+  private registration(): Promise<ServiceWorkerRegistration> {
+    return navigator.serviceWorker.ready;
+  }
+
+  private stateCache(): Promise<Cache> {
+    return caches.open(STATE_CACHE);
+  }
+}
+
+export function browserDevice(workerEnabled: boolean): Device {
+  return new BrowserDevice(workerEnabled);
 }

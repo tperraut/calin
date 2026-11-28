@@ -414,6 +414,37 @@ describe("Composer", () => {
     expect(host.querySelector('form[aria-label="Register a repo"]')).toBeNull();
   });
 
+  it("closes the register form on Cancel, and offers it again", async () => {
+    const { host, onRegisterRepo } = setup();
+    await click(findByText(host, "button", "Register a repo"));
+    const form = find<HTMLFormElement>(host, 'form[aria-label="Register a repo"]');
+    await click(findByText(form, "button", "Cancel"));
+    expect(host.querySelector('form[aria-label="Register a repo"]')).toBeNull();
+    expect(onRegisterRepo).not.toHaveBeenCalled();
+    expect(findByText(host, "button", "Register a repo")).toBeTruthy();
+  });
+
+  it("starts the session on Ctrl+Enter or Cmd+Enter, and not on Enter alone", async () => {
+    const { host, onCreate } = setup();
+    const field = find<HTMLTextAreaElement>(host, "textarea");
+    type(field, "Fix the login");
+    const press = async (init: KeyboardEventInit): Promise<boolean> => {
+      const event = new KeyboardEvent("keydown", { bubbles: true, cancelable: true, ...init });
+      field.dispatchEvent(event);
+      await click(host);
+      return event.defaultPrevented;
+    };
+    expect(await press({ key: "Enter" })).toBe(false);
+    expect(await press({ key: "a", ctrlKey: true })).toBe(false);
+    expect(onCreate).not.toHaveBeenCalled();
+
+    expect(await press({ key: "Enter", ctrlKey: true })).toBe(true);
+    expect(onCreate.mock.lastCall?.[0].prompt).toBe("Fix the login");
+    type(field, "Then the logout");
+    expect(await press({ key: "Enter", metaKey: true })).toBe(true);
+    expect(onCreate.mock.lastCall?.[0].prompt).toBe("Then the logout");
+  });
+
   it("removes a repo from the registry only after a confirmation", async () => {
     const { repoRow, onRemoveRepo } = setup();
     const row = repoRow("docs");

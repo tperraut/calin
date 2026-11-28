@@ -1,17 +1,12 @@
 import { createEffect, createSignal, onSettled, Show } from "solid-js";
 import { errorMessage } from "../../lib/errors";
 import { loadEditorModule } from "./load";
-import type { EditorHandle } from "./types";
+import type { EditorHandle, EditorModule } from "./types";
 
 /** What the surrounding toolbar can ask of an editor once it exists. */
 export type EditorControls = { openSearch(): void; focus(): void };
 
-/**
- * One file in CodeMirror. The editor owns the text while it is open: `text` is
- * read when it is created and again each time `revision` moves (a reload from
- * disk), never on the reader's own keystrokes.
- */
-export function CodeEditor(props: {
+type CodeEditorProps = {
   label: string;
   path: string;
   text: () => string;
@@ -21,28 +16,54 @@ export function CodeEditor(props: {
   onChange?: (text: string) => void;
   onSave?: () => void;
   controls?: (controls: EditorControls | undefined) => void;
-}) {
+};
+
+/** Stands in while CodeMirror is on its way and once it is gone: what is asked of it is dropped. */
+const noEditor: EditorHandle = {
+  text: () => "",
+  setText() {},
+  setReadOnly() {},
+  setWrap() {},
+  openSearch() {},
+  focus() {},
+  destroy() {},
+};
+
+function openEditor(module: EditorModule, host: HTMLElement, props: CodeEditorProps): EditorHandle {
+  return module.createEditor(host, {
+    label: props.label,
+    path: props.path,
+    text: props.text(),
+    readOnly: props.readOnly,
+    wrap: props.wrap,
+    onChange: (text) => props.onChange?.(text),
+    onSave: () => props.onSave?.(),
+  });
+}
+
+const controlsOf = (editor: EditorHandle): EditorControls => ({
+  openSearch: () => editor.openSearch(),
+  focus: () => editor.focus(),
+});
+
+/**
+ * One file in CodeMirror. The editor owns the text while it is open: `text` is
+ * read when it is created and again each time `revision` moves (a reload from
+ * disk), never on the reader's own keystrokes.
+ */
+export function CodeEditor(props: CodeEditorProps) {
   const [failure, setFailure] = createSignal<string>();
   const [ready, setReady] = createSignal(false);
   let host: HTMLDivElement | undefined;
-  let handle: EditorHandle | undefined;
+  let handle = noEditor;
 
   onSettled(() => {
     let disposed = false;
     loadEditorModule().then(
       (module) => {
         if (disposed || !host) return;
-        handle = module.createEditor(host, {
-          label: props.label,
-          path: props.path,
-          text: props.text(),
-          readOnly: props.readOnly,
-          wrap: props.wrap,
-          onChange: (text) => props.onChange?.(text),
-          onSave: () => props.onSave?.(),
-        });
-        const editor = handle;
-        props.controls?.({ openSearch: () => editor.openSearch(), focus: () => editor.focus() });
+        handle = openEditor(module, host, props);
+        props.controls?.(controlsOf(handle));
         setReady(true);
       },
       (error: unknown) => {
@@ -52,25 +73,25 @@ export function CodeEditor(props: {
     return () => {
       disposed = true;
       props.controls?.(undefined);
-      handle?.destroy();
-      handle = undefined;
+      handle.destroy();
+      handle = noEditor;
     };
   });
 
   createEffect(
     // The text is read here, where reads belong, each time the revision moves.
     () => ({ revision: props.revision, text: props.text() }),
-    ({ text }) => handle?.setText(text),
+    ({ text }) => handle.setText(text),
     { defer: true },
   );
   createEffect(
     () => props.readOnly,
-    (readOnly) => handle?.setReadOnly(readOnly),
+    (readOnly) => handle.setReadOnly(readOnly),
     { defer: true },
   );
   createEffect(
     () => props.wrap,
-    (wrap) => handle?.setWrap(wrap),
+    (wrap) => handle.setWrap(wrap),
     { defer: true },
   );
 

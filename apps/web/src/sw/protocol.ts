@@ -33,7 +33,7 @@ export type WhereAnswer = { path: string };
 /** Page to worker: the user chose to reload into the waiting build. */
 export type PageMessage = { type: "activate" };
 
-function isRecord(value: unknown): value is Record<string, unknown> {
+export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 

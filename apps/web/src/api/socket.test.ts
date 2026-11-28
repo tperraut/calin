@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test"
 import type { ClientMsg } from "../gen/ClientMsg";
 import type { Event } from "../gen/Event";
 import type { ServerMsg } from "../gen/ServerMsg";
+import { makeSession } from "../test/fakes";
 import {
   createSocket,
   defaultSocketUrl,
@@ -23,6 +24,8 @@ class FakeWebSocket implements WebSocketLike {
   readonly url: string;
   readonly sent: ClientMsg[] = [];
   closed = false;
+  /** As a browser's: 0 connecting, 1 open, 2 closing, 3 closed. */
+  readyState = 0;
 
   constructor(url: string) {
     this.url = url;
@@ -39,6 +42,7 @@ class FakeWebSocket implements WebSocketLike {
 
   // What the server side of the test does.
   accept(): void {
+    this.readyState = 1;
     this.onopen?.(new Event("open"));
   }
 
@@ -51,6 +55,7 @@ class FakeWebSocket implements WebSocketLike {
   }
 
   hangUp(): void {
+    this.readyState = 3;
     this.onclose?.({} as CloseEvent);
   }
 
@@ -103,6 +108,18 @@ afterEach(() => {
 });
 
 describe("socket client", () => {
+  it("sends nothing on a socket the server is closing, before the close reaches the page", () => {
+    const client = connect();
+    const unsubscribe = client.subscribe("session:s1", () => {});
+    latest().accept();
+    latest().take();
+    // The close frame is in: the browser says CLOSING, but onclose has not run yet.
+    latest().readyState = 2;
+    unsubscribe();
+    vi.advanceTimersByTime(1000);
+    expect(latest().take()).toEqual([]);
+  });
+
   it("opens one connection, on first use, for any number of topics", () => {
     const client = connect();
     expect(FakeWebSocket.sockets).toHaveLength(0);
@@ -184,6 +201,35 @@ describe("socket client", () => {
     expect(sessions).toEqual([{ op: "subscribed", topic: "sessions", head_seq: 0 }]);
   });
 
+  it("hands a session upsert to the subscribers of the session list only", () => {
+    const client = connect();
+    const sessions: TopicMsg[] = [];
+    const one: TopicMsg[] = [];
+    client.subscribe("sessions", (msg) => sessions.push(msg));
+    client.subscribe("session:s1", (msg) => one.push(msg));
+    latest().accept();
+
+    const upsert: ServerMsg = { op: "session_upserted", session: makeSession("s1") };
+    latest().push(upsert);
+
+    expect(sessions).toEqual([upsert]);
+    expect(one).toEqual([]);
+  });
+
+  it("skips frames for a topic nobody holds", () => {
+    const client = connect();
+    const received: TopicMsg[] = [];
+    client.subscribe("session:s1", (msg) => received.push(msg));
+    latest().accept();
+
+    latest().push({ op: "event", topic: "session:s9", event: sessionEvent(1) });
+    latest().push({ op: "subscribed", topic: "session:s9", head_seq: 0 });
+    latest().push({ op: "session_upserted", session: makeSession("s9") });
+
+    expect(received).toEqual([]);
+    expect(client.state()).toBe("open");
+  });
+
   it("ignores frames that are not valid JSON or not a message", () => {
     const client = connect();
     const received: TopicMsg[] = [];
@@ -260,6 +306,32 @@ describe("socket client", () => {
     expect(FakeWebSocket.sockets).toHaveLength(2);
   });
 
+  describe("with no options", () => {
+    afterEach(() => {
+      vi.unstubAllGlobals();
+      vi.restoreAllMocks();
+    });
+
+    it("opens the browser's socket on the page's address and backs off from 500 ms to 15 s", () => {
+      vi.stubGlobal("WebSocket", FakeWebSocket);
+      // The top of the jitter range: the delay is exactly the backoff ceiling.
+      vi.spyOn(Math, "random").mockReturnValue(1);
+      const client = createSocket();
+      client.subscribe("sessions", () => {});
+      expect(latest().url).toBe(defaultSocketUrl(location));
+
+      for (const delay of [500, 1000, 2000, 4000, 8000, 15_000, 15_000]) {
+        const before = FakeWebSocket.sockets.length;
+        latest().hangUp();
+        vi.advanceTimersByTime(delay - 1);
+        expect(FakeWebSocket.sockets).toHaveLength(before);
+        vi.advanceTimersByTime(1);
+        expect(FakeWebSocket.sockets).toHaveLength(before + 1);
+      }
+      client.close();
+    });
+  });
+
   it("resubscribes every active topic after a reconnect, from the last applied seq", () => {
     const client = connect();
     let applied = 0;
@@ -294,6 +366,25 @@ describe("socket client", () => {
       { op: "subscribe", topic: "sessions" },
       { op: "subscribe", topic: "session:s1", after_seq: 3 },
     ]);
+  });
+
+  it("asks for what follows the very first event once it has it", () => {
+    const client = connect();
+    client.subscribe(
+      "session:s1",
+      () => {},
+      () => 1,
+    );
+    latest().accept();
+    expect(latest().take()).toEqual([{ op: "subscribe", topic: "session:s1", after_seq: 1 }]);
+  });
+
+  it("takes a server error frame in its stride when nobody listens for one", () => {
+    const client = connect();
+    client.subscribe("sessions", () => {});
+    latest().accept();
+    expect(() => latest().push({ op: "error", message: "unknown topic" })).not.toThrow();
+    expect(client.state()).toBe("open");
   });
 
   it("asks for the oldest position when subscribers of a topic differ", () => {

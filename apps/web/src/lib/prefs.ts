@@ -1,6 +1,6 @@
 import type { PermissionMode } from "../gen/PermissionMode";
 import type { RepoMode } from "../gen/RepoMode";
-import { permissionModes, repoModes } from "./status";
+import { permissionModes, repoModeFrom } from "./status";
 import type { ThemeChoice } from "./theme";
 
 export type RepoChoice = { repoId: string; mode: RepoMode };
@@ -53,32 +53,45 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
 
 function repoChoice(value: unknown): RepoChoice | undefined {
   if (!isRecord(value) || typeof value.repoId !== "string") return undefined;
-  const mode = repoModes.find((one) => one === value.mode) ?? "write";
+  const mode = repoModeFrom(value.mode) ?? "write";
   return { repoId: value.repoId, mode };
+}
+
+/** Each repo once, in the order stored; whatever is not a repo choice is dropped. */
+function storedRepos(values: readonly unknown[]): RepoChoice[] {
+  const seen = new Set<string>();
+  return values.flatMap((value) => {
+    const choice = repoChoice(value);
+    if (!choice || seen.has(choice.repoId)) return [];
+    seen.add(choice.repoId);
+    return [choice];
+  });
+}
+
+const filledString = (value: unknown): string | undefined =>
+  typeof value === "string" && value !== "" ? value : undefined;
+
+/** The fields every version stored: the permission mode, the runner and the workflow. */
+function storedChoices(stored: Record<string, unknown>): ComposerPrefs {
+  const prefs = defaultComposerPrefs();
+  const mode = permissionModes.find((one) => one === stored.permissionMode);
+  if (mode) prefs.permissionMode = mode;
+  const runner = filledString(stored.runner);
+  if (runner !== undefined) prefs.runner = runner;
+  const workflow = filledString(stored.workflow);
+  if (workflow !== undefined) prefs.workflow = workflow;
+  return prefs;
 }
 
 /** Whatever is stored is checked field by field: it may come from another build. */
 export function loadComposerPrefs(): ComposerPrefs {
   const current = read(COMPOSER_KEY);
-  const stored = isRecord(current) ? current : read(COMPOSER_KEY_V1);
-  const prefs = defaultComposerPrefs();
-  if (!isRecord(stored)) return prefs;
-  if (isRecord(current) && Array.isArray(current.repos)) {
-    const seen = new Set<string>();
-    prefs.repos = [];
-    for (const value of current.repos) {
-      const choice = repoChoice(value);
-      if (!choice || seen.has(choice.repoId)) continue;
-      seen.add(choice.repoId);
-      prefs.repos.push(choice);
-    }
+  if (!isRecord(current)) {
+    const first = read(COMPOSER_KEY_V1);
+    return isRecord(first) ? storedChoices(first) : defaultComposerPrefs();
   }
-  const mode = permissionModes.find((one) => one === stored.permissionMode);
-  if (mode) prefs.permissionMode = mode;
-  if (typeof stored.runner === "string" && stored.runner !== "") prefs.runner = stored.runner;
-  if (typeof stored.workflow === "string" && stored.workflow !== "") {
-    prefs.workflow = stored.workflow;
-  }
+  const prefs = storedChoices(current);
+  if (Array.isArray(current.repos)) prefs.repos = storedRepos(current.repos);
   return prefs;
 }
 

@@ -7,9 +7,14 @@ import type { WorkflowNodeRun } from "../gen/WorkflowNodeRun";
 import type { WorkflowRun } from "../gen/WorkflowRun";
 import type { WorkflowStatus } from "../gen/WorkflowStatus";
 import type { WorkflowNote } from "../state/sessionReducer";
+import { compareText, counted } from "./format";
 
 /** The workflow a session runs when it names none (workflows spec, section 1). */
 export const QUICK_WORKFLOW = "quick";
+
+/** The workflow id a session is started with; `quick` is said by saying nothing. */
+export const sentWorkflow = (picked: WorkflowInfo | undefined): string | undefined =>
+  picked?.id === QUICK_WORKFLOW ? undefined : picked?.id;
 
 /** Node types in the order of the spec's table (section 3); a newer one sorts last. */
 export const NODE_KINDS = [
@@ -50,23 +55,24 @@ export const kindIcon = (kind: string): string => (isKnown(kind) ? kindLooks[kin
 /** A node that is not a step of the work: the run's own ends. */
 export const isStep = (kind: string): boolean => kind !== "start" && kind !== "end";
 
+/** A kind's place in the spec's table; a kind it does not list comes after all of them. */
+function kindRank(kind: string): number {
+  const index = (NODE_KINDS as readonly string[]).indexOf(kind);
+  return index === -1 ? NODE_KINDS.length : index;
+}
+
+const byKind = ([a]: [string, number], [b]: [string, number]): number =>
+  kindRank(a) - kindRank(b) || compareText(a, b);
+
 /** "5 steps: 2 agent, 1 check, 1 gate, 1 ship": every node but `start` and `end`, by kind. */
 export function shapeSummary(graph: WorkflowGraph): string {
   const counts = new Map<string, number>();
   for (const node of graph.nodes) {
-    if (!isStep(node.kind)) continue;
-    counts.set(node.kind, (counts.get(node.kind) ?? 0) + 1);
+    if (isStep(node.kind)) counts.set(node.kind, (counts.get(node.kind) ?? 0) + 1);
   }
-  const total = [...counts.values()].reduce((sum, count) => sum + count, 0);
-  const rank = (kind: string): number => {
-    const index = (NODE_KINDS as readonly string[]).indexOf(kind);
-    return index === -1 ? NODE_KINDS.length : index;
-  };
-  const parts = [...counts]
-    .toSorted(([a], [b]) => rank(a) - rank(b) || (a < b ? -1 : a > b ? 1 : 0))
-    .map(([kind, count]) => `${count} ${kind}`);
-  const steps = total === 1 ? "1 step" : `${total} steps`;
-  return parts.length === 0 ? "No steps" : `${steps}: ${parts.join(", ")}`;
+  if (counts.size === 0) return "No steps";
+  const parts = [...counts].toSorted(byKind).map(([kind, count]) => `${count} ${kind}`);
+  return `${counted(stepCount(graph), "step", "steps")}: ${parts.join(", ")}`;
 }
 
 /** Number of nodes that are steps (see `isStep`). */
@@ -102,7 +108,8 @@ export function isFailurePort(node: WorkflowNodeInfo | undefined, port: string):
   return ["failed", "fail", "exhausted", "reject"].includes(port);
 }
 
-const idleRun = (id: string): WorkflowNodeRun => ({
+/** A node that has not run yet. */
+export const idleRun = (id: string): WorkflowNodeRun => ({
   id,
   state: "idle",
   runs: 0,
@@ -190,14 +197,16 @@ export function mergeRun(
     ...folded,
     budget_usd: folded.budget_usd ?? served.budget_usd,
     cost_usd: served.cost_usd,
-    nodes: folded.nodes.map((node) => {
-      const known = byId.get(node.id);
-      const max = known?.max ?? node.max;
-      if (max === null) return { ...node, iteration: known?.iteration ?? node.iteration };
-      // The events count entries as they come; the server's count may be a moment behind.
-      return { ...node, max, iteration: Math.min(node.runs, max) };
-    }),
+    nodes: folded.nodes.map((node) => mergeNode(node, byId.get(node.id))),
   };
+}
+
+/** One node of `mergeRun`: the loop limit from the server, the entries from the events. */
+function mergeNode(node: WorkflowNodeRun, known: WorkflowNodeRun | undefined): WorkflowNodeRun {
+  const max = known?.max ?? node.max;
+  if (max === null) return { ...node, iteration: known?.iteration ?? node.iteration };
+  // The events count entries as they come; the server's count may be a moment behind.
+  return { ...node, max, iteration: Math.min(node.runs, max) };
 }
 
 const statusWords: Record<WorkflowStatus, string> = {
@@ -229,32 +238,50 @@ function startWords(
   run: number,
   max: number | null,
 ): NoteWords {
-  const about = label.trim() === "" ? nodeId : label.trim();
+  const about = label.trim();
   switch (kind) {
     case "agent":
     case "parallel":
       // The id names the step; the label (a prompt's start) follows it.
-      return {
-        text: `${kindWord(kind)}: ${nodeId}`,
-        detail: label.trim() || null,
-        tone: "neutral",
-      };
+      return { text: `${kindWord(kind)}: ${nodeId}`, detail: about || null, tone: "neutral" };
     case "loop":
-      if (max !== null && run > max) {
-        return {
-          text: `Loop: no attempt left (${max} of ${max} used)`,
-          detail: null,
-          tone: "neutral",
-        };
-      }
-      return {
-        text: max === null ? `Loop: attempt ${run}` : `Loop: attempt ${run} of ${max}`,
-        detail: null,
-        tone: "neutral",
-      };
+      return { text: loopStartText(run, max), detail: null, tone: "neutral" };
     default:
-      return { text: `${kindWord(kind)}: ${about}`, detail: null, tone: "neutral" };
+      return { text: `${kindWord(kind)}: ${about || nodeId}`, detail: null, tone: "neutral" };
   }
+}
+
+/** "Loop: attempt 2 of 3", or that none is left once the limit is passed. */
+function loopStartText(run: number, max: number | null): string {
+  if (max === null) return `Loop: attempt ${run}`;
+  if (run > max) return `Loop: no attempt left (${max} of ${max} used)`;
+  return `Loop: attempt ${run} of ${max}`;
+}
+
+type Tone = NoteWords["tone"];
+
+/** A verdict's outcome is often the verdict itself: said once is enough. */
+function finishDetail(outcome: string | null, port: string): string | null {
+  const said = outcome?.trim() || null;
+  return said === port ? null : said;
+}
+
+function gateFinish(port: string, detail: string | null, tone: Tone): NoteWords {
+  if (port === "approve") return { text: "Gate approved", detail, tone: "success" };
+  if (port === "reject") return { text: "Gate rejected", detail, tone: "danger" };
+  return { text: `Gate: ${port}`, detail, tone };
+}
+
+function agentFinish(nodeId: string, port: string, detail: string | null, tone: Tone): NoteWords {
+  return port === "failed"
+    ? { text: `Agent step failed: ${nodeId}`, detail, tone: "danger" }
+    : { text: `Verdict of ${nodeId}: ${port}`, detail, tone };
+}
+
+function commitFinish(nodeId: string, port: string, detail: string | null, tone: Tone): NoteWords {
+  return port === "nothing"
+    ? { text: "Commit: nothing to commit", detail, tone: "neutral" }
+    : { text: `Commit failed: ${nodeId}`, detail, tone };
 }
 
 /** What a `node_finished` row says: only results that are news get one (see the reducer). */
@@ -265,29 +292,19 @@ function finishWords(
   outcome: string | null,
   failure: boolean,
 ): NoteWords {
-  // A verdict's outcome is often the verdict itself: said once is enough.
-  const said = outcome?.trim() || null;
-  const detail = said === port ? null : said;
+  const detail = finishDetail(outcome, port);
   const tone = failure ? "danger" : "neutral";
   switch (kind) {
     case "check":
       return { text: `Check failed: ${nodeId}`, detail, tone: "danger" };
     case "gate":
-      return port === "approve"
-        ? { text: "Gate approved", detail, tone: "success" }
-        : port === "reject"
-          ? { text: "Gate rejected", detail, tone: "danger" }
-          : { text: `Gate: ${port}`, detail, tone };
+      return gateFinish(port, detail, tone);
     case "loop":
       return { text: `Loop ${nodeId}: no attempt left`, detail, tone: "danger" };
     case "agent":
-      return port === "failed"
-        ? { text: `Agent step failed: ${nodeId}`, detail, tone: "danger" }
-        : { text: `Verdict of ${nodeId}: ${port}`, detail, tone };
+      return agentFinish(nodeId, port, detail, tone);
     case "commit":
-      return port === "nothing"
-        ? { text: "Commit: nothing to commit", detail, tone: "neutral" }
-        : { text: `Commit failed: ${nodeId}`, detail, tone };
+      return commitFinish(nodeId, port, detail, tone);
     default:
       return { text: `${kindWord(kind)} ${nodeId} left through ${port}`, detail, tone };
   }

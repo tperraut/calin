@@ -62,6 +62,9 @@ describe("inline Markdown", () => {
     ["`*not bold*`", "<c>*not bold*</c>"],
     ["`<b>&amp;</b>`", "<c><b>&amp;</b></c>"],
     ["a `line\nbreak` b", "a <c>line break</c> b"],
+    // A space on one side only is part of the code.
+    ["`ab `", "<c>ab </c>"],
+    ["` ab`", "<c> ab</c>"],
     // Bold and italics.
     ["**bold** and *italic*", "<b>bold</b> and <i>italic</i>"],
     ["__bold__ and _italic_", "<b>bold</b> and <i>italic</i>"],
@@ -70,12 +73,20 @@ describe("inline Markdown", () => {
     ["*italic with **bold** inside*", "<i>italic with <b>bold</b> inside</i>"],
     ["***a* b**", "<b><i>a</i> b</b>"],
     ["**`code` in bold**", "<b><c>code</c> in bold</b>"],
+    // `*` works inside a word; `_` does not.
+    ["un*frigging*believable", "un<i>frigging</i>believable"],
+    ["*foo*bar", "<i>foo</i>bar"],
+    ["a_b_ c", "a_b_ c"],
+    ["_foo_bar", "_foo_bar"],
     // What is not emphasis.
     ["2 * 3 * 4", "2 * 3 * 4"],
     ["snake_case_name and __init__.py", "snake_case_name and <b>init</b>.py"],
     ["a_b_c", "a_b_c"],
     ["src/*.ts and *.md", "src/*.ts and *.md"],
     ["a ** b ** c", "a ** b ** c"],
+    ["x * a* y", "x * a* y"],
+    ["a *\tb* c", "a *\tb* c"],
+    ["a *\nb* c", "a *\nb* c"],
     ["\\*not italic\\*", "*not italic*"],
     ["\\`not code\\`", "`not code`"],
     ["a \\ b", "a \\ b"],
@@ -110,6 +121,14 @@ describe("inline Markdown", () => {
     ["<javascript:alert(1)>", "<javascript:alert(1)>"],
     ["xhttps://example.com", "xhttps://example.com"],
     ["[x] (https://example.com)", "[x] (<a https://example.com/>https://example.com</a>)"],
+    ["[a]xhttps://y.example)", "[a]xhttps://y.example)"],
+    ["[a](https://x.example y)", "[a](<a https://x.example/>https://x.example</a> y)"],
+    // What comes before the link plays no part in it.
+    ["[](https://x.example) first", "<a https://x.example/></a> first"],
+    ["][b](https://x.example)", "]<a https://x.example/>b</a>"],
+    ["(https://y.example '[z')", "(<a https://y.example/>https://y.example</a> '[z')"],
+    ["'[t](<https://a.example/ ')", "'[t](<<a https://a.example/>https://a.example/</a> ')"],
+    [') [a](https://x.example "t)', ') [a](<a https://x.example/>https://x.example</a> "t)'],
     // HTML is text.
     ["<script>alert(1)</script>", "<script>alert(1)</script>"],
     ['<img src=x onerror="alert(1)">', '<img src=x onerror="alert(1)">'],
@@ -119,6 +138,8 @@ describe("inline Markdown", () => {
     ["&lt;script&gt; &amp; &quot;x&quot; &apos;y&apos;", "<script> & \"x\" 'y'"],
     ["&#60;b&#62; &#x3C;i&#x3e;", "<b> <i>"],
     ["&#0; &#xD800; &#1114112;", "� � �"],
+    // The ends of the ranges a code point may take.
+    ["&#1; &#x10FFFF; &#xD7FF; &#xDFFF; &#xE000;", "\u0001 \u{10ffff} ퟿ � "],
     ["&nope; &amp &; AT&T", "&nope; &amp &; AT&T"],
     ["a&nbsp;b", "a b"],
     // Unclosed constructs show as written.
@@ -130,6 +151,13 @@ describe("inline Markdown", () => {
     ["[label](", "[label]("],
     ["[label]", "[label]"],
     ["![image](https://example.com/a.png)", "!<a https://example.com/a.png>image</a>"],
+    // A backtick run that found no closer once is not searched for again.
+    ["`a \\``", "`a ``"],
+    ["[t](<https://a.example)", "[t](<<a https://a.example/>https://a.example</a>)"],
+    ['[t](https://a.example "title)', '[t](<a https://a.example/>https://a.example</a> "title)'],
+    ["<https://a b>", "<<a https://a/>https://a</a> b>"],
+    // A bracket opened inside the address keeps its closer.
+    ["https://a.example/[x].", "<a https://a.example/[x]>https://a.example/[x]</a>."],
   ])("%j", (source, expected) => {
     expect(inline(source)).toBe(expected);
   });
@@ -153,6 +181,38 @@ describe("inline Markdown", () => {
     }
   });
 
+  it("follows a link target or an address only within 2048 characters", () => {
+    const address = (length: number, middle = ""): string => {
+      const head = `https://x.example/${middle}`;
+      return head + "a".repeat(length - head.length);
+    };
+    const link = (href: string, label = href): Inline => ({
+      kind: "link",
+      href,
+      children: [{ kind: "text", text: label }],
+    });
+    const text = (written: string): Inline => ({ kind: "text", text: written });
+    const first = (source: string): Inline | undefined => parseInline(source)[0];
+
+    // A destination: its `)` may sit right past the reach; a pair of parentheses inside does not stretch it.
+    expect(first(`[a](${address(2048)})`)).toEqual(link(address(2048), "a"));
+    expect(first(`[a](${address(2049, "()")})`)).toEqual(text("[a]("));
+    expect(first(`[a](<${address(2047, "()")}>)`)).toEqual(link(address(2047, "()"), "a"));
+    expect(first(`[a](<${address(2048, "()")}>)`)).toEqual(text("[a](<"));
+    // A title counts towards the reach, and has a reach of its own.
+    expect(first(`[a](https://x.example "${"t".repeat(2040)}")`)).toEqual(text("[a]("));
+    expect(first(`[a](https://x.example ")${"t".repeat(2046)}")`)).toEqual(
+      link("https://x.example/", "a"),
+    );
+    expect(first(`[a](https://x.example ")${"t".repeat(2047)}")`)).toEqual(text("[a]("));
+    // An address in angle brackets.
+    expect(first(`<${address(2047)}>`)).toEqual(link(address(2047)));
+    expect(first(`<${address(2048)}>`)).toEqual(text("<"));
+    // A bare address is cut at the reach, and an unmatched bracket at its end still goes.
+    expect(parseInline(`${address(2047)})(`)).toEqual([link(address(2047)), text(")(")]);
+    expect(parseInline(`${address(2047)}][`)).toEqual([link(address(2047)), text("][")]);
+  });
+
   it("stops nesting at a fixed depth instead of following the text all the way down", () => {
     const deep = `${"*a _b ".repeat(40)}x${" b_ a*".repeat(40)}`;
     const depth = (nodes: readonly Inline[]): number =>
@@ -160,6 +220,21 @@ describe("inline Markdown", () => {
     expect(depth(parseInline(deep))).toBeLessThanOrEqual(8);
     // Everything is still there, as text.
     expect(inline(deep).replace(/<\/?[bi]>/g, "")).toContain("x");
+  });
+
+  it("reads the text past the nesting limit as written", () => {
+    // Seven levels: a link, then six kinds of emphasis; the innermost code stays text.
+    expect(inline("[***a ___b **c __d *e _f `x`_ e* d__ c** b___ a***](https://x.example)")).toBe(
+      "<a https://x.example/><b><i>a <b><i>b <b>c <b>d <i>e <i>f `x`</i> e</i> d</b> c</b> b</i></b> a</i></b></a>",
+    );
+    // An empty label past the limit leaves no empty text behind.
+    const empty = parseInline(
+      "***a ___b **c __d *e _f [](https://x.example)_ e* d__ c** b___ a***",
+    );
+    expect(inl(empty)).toBe(
+      "<b><i>a <b><i>b <b>c <b>d <i>e <i>f <a https://x.example/></a></i> e</i> d</b> c</b> b</i></b> a</i></b>",
+    );
+    expect(JSON.stringify(empty)).not.toContain('"text":""');
   });
 });
 
@@ -179,6 +254,9 @@ describe("Markdown blocks", () => {
     ["#hashtag", ["p:#hashtag"]],
     ["#", ["p:#"]],
     ["# C# and F#", ["h1:C# and F#"]],
+    ["# a#", ["h1:a#"]],
+    ["# a\t#", ["h1:a"]],
+    ["### ###", ["h3:"]],
     ["## With `code` and **bold**", ["h2:With <c>code</c> and <b>bold</b>"]],
     ["Text\n## Heading\nMore", ["p:Text", "h2:Heading", "p:More"]],
     // Code.
@@ -192,6 +270,8 @@ describe("Markdown blocks", () => {
     ["Before\n```\ncode\n```\nAfter", ["p:Before", "code():code", "p:After"]],
     ["  ```\n  in\n    deeper\n  ```", ["code():in\n  deeper"]],
     ["```inline``` is not a fence", ["p:<c>inline</c> is not a fence"]],
+    // A line indented less than its fence loses only the indent it has.
+    ["  ```\n x\nab\n  ```", ["code():x\nab"]],
     // Lists.
     ["- one\n- two", ["ul[one|two]"]],
     ["* one\n+ two", ["ul[one|two]"]],
@@ -205,6 +285,13 @@ describe("Markdown blocks", () => {
     ["- **bold** and `code`", ["ul[<b>bold</b> and <c>code</c>]"]],
     ["Intro:\n- one\n- two\n\nOutro.", ["p:Intro:", "ul[one|two]", "p:Outro."]],
     ["- a\n1. b", ["ul[a]", "ol1[b]"]],
+    ["- a\n  1. b", ["ul[aol1[b]]"]],
+    // A list nests under its last item, and never above its first.
+    ["- a\n- b\n  - c", ["ul[a|bul[c]]"]],
+    ["  - a\n- b", ["ul[a|b]"]],
+    ["- a\n\t- b", ["ul[aul[b]]"]],
+    ["- a\n# h", ["ul[a]", "h1:h"]],
+    ["- a\n---", ["ul[a]", "hr"]],
     ["1. a\n\n```\ncode\n```\n\n2. b", ["ol1[a]", "code():code", "ol2[b]"]],
     ["-not a list", ["p:-not a list"]],
     ["1.not a list", ["p:1.not a list"]],
@@ -214,6 +301,8 @@ describe("Markdown blocks", () => {
     ["---", ["hr"]],
     ["***", ["hr"]],
     ["_ _ _", ["hr"]],
+    ["   ---", ["hr"]],
+    ["    ---", ["p:    ---"]],
     ["above\n\n---\n\nbelow", ["p:above", "hr", "p:below"]],
     ["--", ["p:--"]],
     // What this reader does not know shows as written.

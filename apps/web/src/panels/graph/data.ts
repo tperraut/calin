@@ -1,8 +1,8 @@
-import { createSignal, type Accessor } from "solid-js";
+import { createSignal, type Accessor, type Setter } from "solid-js";
 import type { Graph } from "../../gen/Graph";
 import type { Timeline } from "../../gen/Timeline";
 import { errorMessage } from "../../lib/errors";
-import { createRefresher } from "../../lib/refresher";
+import { createRefresher, type Refresher } from "../../lib/refresher";
 
 export type OrchestrationView = "graph" | "timeline";
 
@@ -70,182 +70,233 @@ export function playStep(span: number): number {
  * a read in flight or a failed one.
  */
 export function createOrchestrationData(deps: OrchestrationDeps): OrchestrationData {
-  const [graph, setGraph] = createSignal<Graph>();
-  const [graphError, setGraphError] = createSignal<string>();
-  const [timeline, setTimeline] = createSignal<Timeline>();
-  const [timelineError, setTimelineError] = createSignal<string>();
-  const [inFlight, setInFlight] = createSignal(0);
-  const [live, setLiveSignal] = createSignal(true);
-  const [at, setAtSignal] = createSignal<number>();
-  const [playing, setPlayingSignal] = createSignal(false);
+  return new Orchestration(deps);
+}
+
+// A class rather than a closure of functions: each method then stands, and is measured, on its own.
+// `private`, not `#`: the complexity report does not see `#` methods.
+class Orchestration implements OrchestrationData {
+  readonly graph: Accessor<Graph | undefined>;
+  readonly graphError: Accessor<string | undefined>;
+  readonly timeline: Accessor<Timeline | undefined>;
+  readonly timelineError: Accessor<string | undefined>;
+  readonly live: Accessor<boolean>;
+  readonly at: Accessor<number | undefined>;
+  readonly playing: Accessor<boolean>;
+  private readonly setGraph: Setter<Graph | undefined>;
+  private readonly setGraphError: Setter<string | undefined>;
+  private readonly setTimeline: Setter<Timeline | undefined>;
+  private readonly setTimelineError: Setter<string | undefined>;
+  private readonly inFlight: Accessor<number>;
+  private readonly setInFlight: Setter<number>;
+  private readonly setLiveSignal: Setter<boolean>;
+  private readonly setAtSignal: Setter<number | undefined>;
+  private readonly setPlayingSignal: Setter<boolean>;
+  private readonly deps: OrchestrationDeps;
+  private readonly graphRefresher: Refresher;
+  private readonly timelineRefresher: Refresher;
 
   // Plain mirrors: timers and promise callbacks decide on these, not on signals a tick behind.
-  let isLive = true;
-  let moment: number | undefined;
-  let isPlaying = false;
-  let range: { from: number; to: number } | undefined;
-  let visible = false;
-  let view: OrchestrationView = "graph";
-  let timelineWanted = false;
-  let disposed = false;
+  private isLive = true;
+  private moment: number | undefined;
+  private isPlaying = false;
+  private range: { from: number; to: number } | undefined;
+  private visible = false;
+  private view: OrchestrationView = "graph";
+  private timelineWanted = false;
+  private disposed = false;
   // Only the answer to the newest question is shown.
-  let asked = 0;
-  let reading = false;
-  let scrubTimer: ReturnType<typeof setTimeout> | undefined;
-  let playTimer: ReturnType<typeof setInterval> | undefined;
+  private asked = 0;
+  private reading = false;
+  private scrubTimer: ReturnType<typeof setTimeout> | undefined;
+  private playTimer: ReturnType<typeof setInterval> | undefined;
 
-  async function readGraph(wanted: number | undefined): Promise<void> {
-    asked += 1;
-    const mine = asked;
-    reading = true;
-    setInFlight((count) => count + 1);
-    try {
-      const loaded = await deps.graph(wanted);
-      if (disposed || mine !== asked) return;
-      range = { from: loaded.from_ts, to: loaded.to_ts };
-      setGraph(loaded);
-      setGraphError(undefined);
-    } catch (error) {
-      if (!disposed && mine === asked) setGraphError(errorMessage(error));
-    } finally {
-      if (mine === asked) reading = false;
-      setInFlight((count) => count - 1);
+  constructor(deps: OrchestrationDeps) {
+    this.deps = deps;
+    [this.graph, this.setGraph] = createSignal<Graph>();
+    [this.graphError, this.setGraphError] = createSignal<string>();
+    [this.timeline, this.setTimeline] = createSignal<Timeline>();
+    [this.timelineError, this.setTimelineError] = createSignal<string>();
+    [this.inFlight, this.setInFlight] = createSignal(0);
+    [this.live, this.setLiveSignal] = createSignal(true);
+    [this.at, this.setAtSignal] = createSignal<number>();
+    [this.playing, this.setPlayingSignal] = createSignal(false);
+    const delay = deps.delayMs ?? REFETCH_DELAY_MS;
+    // A past moment does not change with new events: only the live graph is read again.
+    this.graphRefresher = createRefresher(
+      () => (this.isLive ? this.readGraph(undefined) : Promise.resolve()),
+      delay,
+    );
+    this.timelineRefresher = createRefresher(() => this.readTimeline(), delay);
+    // Marked stale while hidden: the first read happens when the panel is first seen.
+    this.graphRefresher.now();
+  }
+
+  refreshing(): boolean {
+    return this.inFlight() > 0;
+  }
+
+  setLive(next: boolean): void {
+    if (next) {
+      this.goLive();
+    } else if (this.isLive) {
+      this.stopPlaying();
+      this.freeze(this.range?.to ?? Date.now());
     }
   }
 
-  async function readTimeline(): Promise<void> {
-    setInFlight((count) => count + 1);
+  scrub(next: number): void {
+    this.stopPlaying();
+    this.freeze(next);
+    clearTimeout(this.scrubTimer);
+    this.scrubTimer = setTimeout(() => this.scrubRested(next), SCRUB_DELAY_MS);
+  }
+
+  play(): void {
+    const range = this.range;
+    if (this.isPlaying || !range) return;
+    clearTimeout(this.scrubTimer);
+    const start = this.replayStart(range);
+    this.freeze(start);
+    this.isPlaying = true;
+    this.setPlayingSignal(true);
+    void this.readGraph(start);
+    this.playTimer = setInterval(() => this.tick(), PLAY_TICK_MS);
+  }
+
+  pause(): void {
+    this.stopPlaying();
+  }
+
+  changed(): void {
+    this.graphRefresher.request();
+    if (this.timelineWanted) this.timelineRefresher.request();
+  }
+
+  retry(): void {
+    if (this.isLive) this.graphRefresher.now();
+    else if (this.moment !== undefined) void this.readGraph(this.moment);
+    if (this.timelineWanted) this.timelineRefresher.now();
+  }
+
+  setVisible(next: boolean): void {
+    this.visible = next;
+    this.applyVisibility();
+  }
+
+  setView(next: OrchestrationView): void {
+    this.view = next;
+    if (next === "timeline" && !this.timelineWanted) {
+      this.timelineWanted = true;
+      this.timelineRefresher.now();
+    }
+    this.applyVisibility();
+  }
+
+  dispose(): void {
+    this.disposed = true;
+    this.stopPlaying();
+    clearTimeout(this.scrubTimer);
+    this.graphRefresher.dispose();
+    this.timelineRefresher.dispose();
+  }
+
+  private async readGraph(wanted: number | undefined): Promise<void> {
+    this.asked += 1;
+    const mine = this.asked;
+    this.reading = true;
+    this.setInFlight((count) => count + 1);
     try {
-      const loaded = await deps.timeline();
-      if (disposed) return;
-      setTimeline(loaded);
-      setTimelineError(undefined);
+      this.showGraph(mine, await this.deps.graph(wanted));
     } catch (error) {
-      if (!disposed) setTimelineError(errorMessage(error));
+      if (this.answers(mine)) this.setGraphError(errorMessage(error));
     } finally {
-      setInFlight((count) => count - 1);
+      if (mine === this.asked) this.reading = false;
+      this.setInFlight((count) => count - 1);
     }
   }
 
-  const delay = deps.delayMs ?? REFETCH_DELAY_MS;
-  // A past moment does not change with new events: only the live graph is read again.
-  const graphRefresher = createRefresher(
-    () => (isLive ? readGraph(undefined) : Promise.resolve()),
-    delay,
-  );
-  const timelineRefresher = createRefresher(readTimeline, delay);
-  // Marked stale while hidden: the first read happens when the panel is first seen.
-  graphRefresher.now();
-
-  function applyVisibility(): void {
-    graphRefresher.setVisible(visible);
-    timelineRefresher.setVisible(visible && view === "timeline");
+  /** True when question `mine` is still the one whose answer is shown. */
+  private answers(mine: number): boolean {
+    return !this.disposed && mine === this.asked;
   }
 
-  function setMoment(next: number | undefined): void {
-    moment = next;
-    setAtSignal(next);
+  private showGraph(mine: number, loaded: Graph): void {
+    if (!this.answers(mine)) return;
+    this.range = { from: loaded.from_ts, to: loaded.to_ts };
+    this.setGraph(loaded);
+    this.setGraphError(undefined);
   }
 
-  function stopPlaying(): void {
-    if (playTimer !== undefined) clearInterval(playTimer);
-    playTimer = undefined;
-    isPlaying = false;
-    setPlayingSignal(false);
+  private async readTimeline(): Promise<void> {
+    this.setInFlight((count) => count + 1);
+    try {
+      this.showTimeline(await this.deps.timeline());
+    } catch (error) {
+      if (!this.disposed) this.setTimelineError(errorMessage(error));
+    } finally {
+      this.setInFlight((count) => count - 1);
+    }
   }
 
-  function goLive(): void {
-    stopPlaying();
-    clearTimeout(scrubTimer);
-    isLive = true;
-    setLiveSignal(true);
-    setMoment(undefined);
-    graphRefresher.now();
+  private showTimeline(loaded: Timeline): void {
+    if (this.disposed) return;
+    this.setTimeline(loaded);
+    this.setTimelineError(undefined);
   }
 
-  function freeze(next: number): void {
-    isLive = false;
-    setLiveSignal(false);
-    setMoment(next);
+  private applyVisibility(): void {
+    this.graphRefresher.setVisible(this.visible);
+    this.timelineRefresher.setVisible(this.visible && this.view === "timeline");
   }
 
-  function tick(): void {
+  private setMoment(next: number | undefined): void {
+    this.moment = next;
+    this.setAtSignal(next);
+  }
+
+  private stopPlaying(): void {
+    if (this.playTimer !== undefined) clearInterval(this.playTimer);
+    this.playTimer = undefined;
+    this.isPlaying = false;
+    this.setPlayingSignal(false);
+  }
+
+  private goLive(): void {
+    this.stopPlaying();
+    clearTimeout(this.scrubTimer);
+    this.isLive = true;
+    this.setLiveSignal(true);
+    this.setMoment(undefined);
+    this.graphRefresher.now();
+  }
+
+  private freeze(next: number): void {
+    this.isLive = false;
+    this.setLiveSignal(false);
+    this.setMoment(next);
+  }
+
+  private scrubRested(next: number): void {
+    this.scrubTimer = undefined;
+    if (!this.isLive && this.visible) void this.readGraph(next);
+  }
+
+  /** From the present there is nothing left to replay: start over. */
+  private replayStart(range: { from: number; to: number }): number {
+    const moment = this.moment;
+    return this.isLive || moment === undefined || moment >= range.to ? range.from : moment;
+  }
+
+  private tick(): void {
     // A slow answer holds the replay rather than piling requests up.
-    if (!visible || reading || !range || moment === undefined) return;
-    const next = moment + playStep(range.to - range.from);
-    if (next >= range.to) {
-      goLive();
+    if (!this.visible || this.reading || !this.range || this.moment === undefined) return;
+    const next = this.moment + playStep(this.range.to - this.range.from);
+    if (next >= this.range.to) {
+      this.goLive();
       return;
     }
-    setMoment(next);
-    void readGraph(next);
+    this.setMoment(next);
+    void this.readGraph(next);
   }
-
-  return {
-    graph,
-    graphError,
-    timeline,
-    timelineError,
-    refreshing: () => inFlight() > 0,
-    live,
-    at,
-    playing,
-    setLive(next) {
-      if (next) {
-        goLive();
-      } else if (isLive) {
-        stopPlaying();
-        freeze(range?.to ?? Date.now());
-      }
-    },
-    scrub(next) {
-      stopPlaying();
-      freeze(next);
-      clearTimeout(scrubTimer);
-      scrubTimer = setTimeout(() => {
-        scrubTimer = undefined;
-        if (!isLive && visible) void readGraph(next);
-      }, SCRUB_DELAY_MS);
-    },
-    play() {
-      if (isPlaying || !range) return;
-      clearTimeout(scrubTimer);
-      // From the present there is nothing left to replay: start over.
-      const start = isLive || moment === undefined || moment >= range.to ? range.from : moment;
-      freeze(start);
-      isPlaying = true;
-      setPlayingSignal(true);
-      void readGraph(start);
-      playTimer = setInterval(tick, PLAY_TICK_MS);
-    },
-    pause: stopPlaying,
-    changed() {
-      graphRefresher.request();
-      if (timelineWanted) timelineRefresher.request();
-    },
-    retry() {
-      if (isLive) graphRefresher.now();
-      else if (moment !== undefined) void readGraph(moment);
-      if (timelineWanted) timelineRefresher.now();
-    },
-    setVisible(next) {
-      visible = next;
-      applyVisibility();
-    },
-    setView(next) {
-      view = next;
-      if (next === "timeline" && !timelineWanted) {
-        timelineWanted = true;
-        timelineRefresher.now();
-      }
-      applyVisibility();
-    },
-    dispose() {
-      disposed = true;
-      stopPlaying();
-      clearTimeout(scrubTimer);
-      graphRefresher.dispose();
-      timelineRefresher.dispose();
-    },
-  };
 }

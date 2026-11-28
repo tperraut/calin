@@ -247,6 +247,30 @@ describe("GraphPanel: the graph", () => {
     expect(host.querySelector('section[aria-label="Details"]')).toBeNull();
   });
 
+  it("opens a child's subagent's details with its session's title and status, and no model it lacks", async () => {
+    const { host } = await open();
+    await tap(node(host, "agent:sub3"));
+    expect(facts(host)).toEqual({
+      Role: "tester",
+      Status: "Running",
+      Runner: "mock",
+      Cost: "$0.00",
+      Tokens: "0 in · 0 out",
+      Session: "Web: status badge",
+      "Session status": "Running",
+    });
+    expect(find<HTMLAnchorElement>(details(host), "a.btn").getAttribute("href")).toBe("/s/s3");
+  });
+
+  it("opens the user's details: where requests come from, and no relations for the tree line", async () => {
+    const { host } = await open();
+    await tap(node(host, "user"));
+    expect(find(details(host), "h2").textContent).toBe("You");
+    expect(details(host).textContent).toContain("You: where this session's requests come from.");
+    expect(details(host).querySelector('ul[aria-label="Relations"]')).toBeNull();
+    expect(details(host).querySelector("dl")).toBeNull();
+  });
+
   it("opens a repo's details: name, mode, who changed it and how much, and the way to its changes", async () => {
     const { host, panels } = await open();
     await tap(node(host, "repo:api"));
@@ -465,6 +489,19 @@ describe("GraphPanel: the graph", () => {
     await pass();
     expect(button(host, "Live").getAttribute("aria-pressed")).toBe("true");
     expect(getGraph.mock.calls.at(-1)).toEqual(["s1", undefined]);
+  });
+
+  it("says when nothing had happened yet at the slider's moment", async () => {
+    const { host, getGraph } = await open();
+    getGraph.mockImplementation((_id, at) =>
+      Promise.resolve(makeGraph({ nodes: [], edges: [], at: at ?? T0 + 60_000 })),
+    );
+    const slider = find<HTMLInputElement>(host, 'input[type="range"][aria-label="Moment"]');
+    slider.value = String(T0 + 1000);
+    slider.dispatchEvent(new InputEvent("input", { bubbles: true }));
+    await pass(SCRUB_DELAY_MS);
+    expect(host.textContent).toContain("Nothing had happened yet at this moment.");
+    expect(host.textContent).not.toContain("Nothing to draw yet");
   });
 
   it("replays with Play, which becomes Pause, and stops where it is paused", async () => {
@@ -704,6 +741,45 @@ describe("GraphPanel: the timeline", () => {
     await press("ArrowUp");
     await press("Enter");
     expect(find(details(host), "h2").textContent).toBe("Explore");
+  });
+
+  it("says so while the timeline loads", async () => {
+    const { host } = await timeline({ timeline: () => new Promise<Timeline>(() => {}) });
+    expect(host.textContent).toContain("Loading the timeline…");
+    expect(host.querySelector("[data-lane]")).toBeNull();
+  });
+
+  it("keeps the timeline on screen under a failed update, and reads again with Try again", async () => {
+    let fail = false;
+    const opened = await timeline({
+      timeline: () =>
+        fail
+          ? Promise.reject(conflict("the log is being rebuilt"))
+          : Promise.resolve(makeTimeline()),
+    });
+    fail = true;
+    opened.emit({ type: "user_message", text: "x" }, null);
+    await pass(REFETCH_DELAY_MS);
+    const alert = find(opened.host, '[role="alert"]');
+    expect(alert.textContent).toContain(
+      "The timeline could not be updated: the log is being rebuilt",
+    );
+    expect(opened.host.querySelectorAll("[data-lane]").length).toBeGreaterThan(0);
+    fail = false;
+    await click(button(alert, "Try again"));
+    await pass();
+    expect(opened.host.querySelector('[role="alert"]')).toBeNull();
+  });
+
+  it("closes a span's details and an arrow's details", async () => {
+    const { host } = await timeline();
+    await tap(span(host, "a1/turn-1"));
+    await click(find(details(host), 'button[aria-label="Close details"]'));
+    expect(host.querySelector('section[aria-label="Details"]')).toBeNull();
+    await tap(find(host, '[data-arrow="ar1"]'));
+    expect(find(details(host), "h2").textContent).toBe("Note");
+    await click(find(details(host), 'button[aria-label="Close details"]'));
+    expect(host.querySelector('section[aria-label="Details"]')).toBeNull();
   });
 
   it("says so when there is no lane yet, and when the server refuses", async () => {
@@ -1156,6 +1232,15 @@ describe("GraphPanel: the workflow", () => {
     expect(find(text, "p").textContent).toBe(
       "Path taken: start → implement → tests → retry → fix → tests → retry → fix → tests.",
     );
+  });
+
+  it("says so while the run of a session's workflow is on its way", async () => {
+    const session = makeSession("s1", 1000, { status: "running", workflow: "implement" });
+    const { host } = await openWorkflow({ session, workflowRun: new Promise(() => {}) });
+    await pass();
+    expect(viewButtons(host).at(-1)).toEqual(["Workflow", "true"]);
+    expect(host.textContent).toContain("Loading the workflow…");
+    expect(host.querySelector("svg.graph-canvas")).toBeNull();
   });
 
   it("says why the run could not be read when the events have not told it either", async () => {

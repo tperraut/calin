@@ -8,6 +8,7 @@ import {
   ICON,
   parsePushPayload,
   shellCacheName,
+  showsPath,
   staleCaches,
   type CacheLike,
   type CacheStorageLike,
@@ -172,6 +173,18 @@ describe("answering requests", () => {
     expect(await (await proxy.worker.respond("navigate", page("/"))).text()).toBe("file");
   });
 
+  it("hands back the proxy's answer, or the network's failure, when no shell is cached", async () => {
+    const down = setup({ fetch: () => Promise.reject(new TypeError("Failed to fetch")) });
+    await expect(down.worker.respond("navigate", page("/s/s1"))).rejects.toThrow("Failed to fetch");
+
+    const proxy = setup({
+      fetch: () => Promise.resolve(new Response("bad gateway", { status: 502 })),
+    });
+    const response = await proxy.worker.respond("navigate", page("/"));
+    expect(response.status).toBe(502);
+    expect(await response.text()).toBe("bad gateway");
+  });
+
   it("serves the shell from the cache without asking the network", async () => {
     const { worker, deps } = setup();
     await worker.install();
@@ -200,6 +213,29 @@ describe("answering requests", () => {
     const fetch = () => Promise.resolve(new Response("nope", { status: 404 }));
     const { worker, caches } = setup({ fetch });
     await worker.respond("on-use", new Request(`${ORIGIN}/assets/x-1.js`));
+    expect(caches.caches.get("calin-shell-v2")?.entries.size).toBe(0);
+  });
+
+  it("caches a lazy file without a content type, and never one another origin answered", async () => {
+    const opaque = new Response("x");
+    Object.defineProperty(opaque, "type", { value: "opaque" });
+    const fetch = vi
+      .fn<WorkerDeps["fetch"]>()
+      .mockResolvedValueOnce(new Response("bare"))
+      .mockResolvedValueOnce(opaque);
+    const { worker, caches } = setup({ fetch });
+    await worker.respond("on-use", new Request(`${ORIGIN}/assets/bare-1.js`));
+    await worker.respond("on-use", new Request(`${ORIGIN}/assets/far-1.js`));
+    expect([...(caches.caches.get("calin-shell-v2")?.entries.keys() ?? [])]).toEqual([
+      "/assets/bare-1.js",
+    ]);
+  });
+
+  it("fetches a shell file missing from the cache without storing it", async () => {
+    const { worker, caches, deps } = setup();
+    const response = await worker.respond("precached", new Request(`${ORIGIN}/assets/new-1.js`));
+    expect(await response.text()).toBe("network");
+    expect(deps.fetch).toHaveBeenCalledTimes(1);
     expect(caches.caches.get("calin-shell-v2")?.entries.size).toBe(0);
   });
 
@@ -292,6 +328,65 @@ describe("a push", () => {
     expect([elsewhere.asked, behind.asked, hidden.asked]).toEqual([1, 0, 0]);
   });
 
+  it("tells a focused window on the home page about a push for the home page", async () => {
+    const home = new FakeWindow(`${ORIGIN}/`, true);
+    const { worker, shown } = setup({}, [home]);
+    await worker.push(payload({ path: "/" }));
+    expect(shown).toEqual([]);
+    expect(home.messages).toEqual([{ type: "refresh", path: "/", sessionId: "s1" }]);
+  });
+
+  it("matches a window to a path on its own panels only", () => {
+    expect(showsPath("/", "/")).toBe(true);
+    expect(showsPath("/s/s1", "/")).toBe(false);
+    expect(showsPath("/s/s1", "/s/s1")).toBe(true);
+    expect(showsPath("/s/s1/changes", "/s/s1")).toBe(true);
+    expect(showsPath("/s/s10", "/s/s1")).toBe(false);
+  });
+
+  it("refuses every payload that is not a well-formed PushPayload", () => {
+    const base = { kind: "waiting", title: "t", body: "b", path: "/s/s1", session_id: "s1" };
+    const refused = [
+      undefined,
+      "",
+      "not json",
+      "null",
+      "42",
+      '"text"',
+      "true",
+      "[]",
+      "{}",
+      JSON.stringify({ ...base, kind: "nope" }),
+      JSON.stringify({ ...base, kind: 1 }),
+      JSON.stringify({ ...base, title: 3 }),
+      JSON.stringify({ ...base, title: undefined }),
+      JSON.stringify({ ...base, body: null }),
+      JSON.stringify({ ...base, path: 7 }),
+      JSON.stringify({ ...base, path: undefined }),
+      JSON.stringify({ ...base, session_id: 5 }),
+      JSON.stringify({ ...base, session_id: {} }),
+    ];
+    for (const text of refused) expect(parsePushPayload(text), String(text)).toBeUndefined();
+  });
+
+  it("keeps only the contract's fields, and takes a null session as none", () => {
+    const extra = JSON.stringify({
+      kind: "merged",
+      title: "t",
+      body: "b",
+      path: "https://evil.example/",
+      session_id: null,
+      more: 1,
+    });
+    expect(parsePushPayload(extra)).toEqual({
+      kind: "merged",
+      title: "t",
+      body: "b",
+      path: "https://evil.example/",
+      session_id: null,
+    });
+  });
+
   it("reads payloads as the contract writes them", () => {
     expect(parsePushPayload(payload())).toEqual({
       kind: "waiting",
@@ -369,6 +464,15 @@ describe("a renewed subscription", () => {
     await remember(caches, "AQID");
     await worker.subscriptionChange(false);
     expect(await (await caches.open(STATE_CACHE)).match(RECONCILE_ENTRY)).toBeDefined();
+  });
+
+  it("does not subscribe without a key it used, and still leaves the flag", async () => {
+    const open = new FakeWindow(`${ORIGIN}/`);
+    const { worker, deps, caches } = setup({}, [open]);
+    await worker.subscriptionChange(false);
+    expect(deps.subscribe).not.toHaveBeenCalled();
+    expect(await (await caches.open(STATE_CACHE)).match(RECONCILE_ENTRY)).toBeDefined();
+    expect(open.messages).toEqual([{ type: "subscription-changed" }]);
   });
 
   it("does not subscribe again when the browser already did", async () => {

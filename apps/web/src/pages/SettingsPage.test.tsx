@@ -462,6 +462,47 @@ describe("SettingsPage: workflows and the queue", () => {
     expect(putSettings.mock.calls[1][0].max_parallel).toBeNull();
   });
 
+  it("says it is reading the workflows until they arrive", async () => {
+    const pending = deferred<Awaited<ReturnType<Api["listWorkflows"]>>>();
+    const { host } = await open({ listWorkflows: () => pending.promise });
+    expect(host.textContent).toContain("Reading the workflows…");
+    pending.resolve([quickWorkflow]);
+    await settle();
+    flush();
+    expect(host.textContent).not.toContain("Reading the workflows…");
+  });
+
+  it("adds nothing and saves nothing on Enter in an empty scan root field", async () => {
+    const putSettings = vi.fn<Api["putSettings"]>();
+    const { form, roots } = await open({ putSettings });
+    const add = control(form(), "Add a scan root");
+    type(add, "   ");
+    const enter = new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true });
+    add.dispatchEvent(enter);
+    flush();
+    expect(enter.defaultPrevented).toBe(false);
+    expect(roots()).toEqual(["/home/me/code", "/srv/git"]);
+    expect(putSettings).not.toHaveBeenCalled();
+  });
+
+  it("points the limit's field at its hint, and at a refusal about it too", async () => {
+    const { form, save } = await open({
+      putSettings: () => Promise.reject(badRequest("max_parallel must be at least 1")),
+    });
+    const field = control(form(), "Sessions running at once");
+    const described = () => field.getAttribute("aria-describedby")?.split(" ") ?? [];
+    expect(described()).toHaveLength(1);
+    expect(document.getElementById(described()[0] ?? "")?.textContent).toContain(
+      "How many sessions may prepare or run at the same time",
+    );
+    expect(field.hasAttribute("aria-invalid")).toBe(false);
+    await save();
+    expect(described()).toHaveLength(2);
+    expect(document.getElementById(described()[0] ?? "")?.textContent).toBe(
+      "max_parallel must be at least 1",
+    );
+  });
+
   it("shows a 400 about the limit at its field, in the server's words", async () => {
     const message = "max_parallel must be between 1 and 64";
     const { host, form, save } = await open({

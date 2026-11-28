@@ -252,6 +252,14 @@ describe("a session's family", () => {
     expect(main.querySelector('ul[aria-label="Child sessions"]')).toBeNull();
   });
 
+  it("still leads a child to its parent when the parent is not in the list", async () => {
+    const { main } = await open("/s/s2", "s2", {}, [childApi]);
+    const family = find(find(main, "header"), '[data-part="family"]');
+    const link = findByText<HTMLAnchorElement>(family, "a", "Child of");
+    expect(link.textContent).toBe("Child ofits parent session");
+    expect(link.getAttribute("href")).toBe("/s/s1");
+  });
+
   it("nests the children under their parent in the list, on a phone and on a wide screen", async () => {
     const wide = await open("/s/s2", "s2", {}, [
       root,

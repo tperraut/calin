@@ -82,6 +82,22 @@ describe("the pre-cache list", () => {
     expect(list).not.toContain("/robots.txt");
   });
 
+  it("lists only files the build made, the page only when there is one", () => {
+    const partial = [
+      chunk("assets/a.js", {
+        isEntry: true,
+        imports: ["assets/gone.js", "assets/data.bin"],
+        importedAssets: ["assets/font.woff2"],
+      }),
+      asset("assets/data.bin"),
+    ];
+    expect(precacheList(partial, ["notes.md"])).toEqual([
+      "/assets/a.js",
+      "/assets/data.bin",
+      "/assets/font.woff2",
+    ]);
+  });
+
   it("follows import cycles once", () => {
     const cyclic = [
       asset("index.html"),

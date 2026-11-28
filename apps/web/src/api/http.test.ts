@@ -153,6 +153,37 @@ describe("http api", () => {
     expect(error.unreachable).toBe(false);
   });
 
+  it("words a JSON refusal that is not an ApiError by its status", async () => {
+    const { api } = setup(() => Promise.resolve(json({ detail: "nope" }, 418)));
+    const error = await failureOf(api.health());
+    expect(error.message).toBe("HTTP 418");
+    expect(error.status).toBe(418);
+    expect(error.fromServer).toBe(false);
+  });
+
+  it("uses the browser's fetch under /api/v1, asking for JSON and sending JSON only with a body", async () => {
+    const fetchFn = vi.fn<FetchLike>(() => Promise.resolve(json([])));
+    vi.stubGlobal("fetch", fetchFn);
+    try {
+      const api = createApi();
+      await api.listSessions();
+      await api.registerRepo({ path: "/src/a" });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+    expect(fetchFn.mock.calls).toEqual([
+      ["/api/v1/sessions", { method: "GET", headers: { Accept: "application/json" } }],
+      [
+        "/api/v1/repos",
+        {
+          method: "POST",
+          headers: { Accept: "application/json", "Content-Type": "application/json" },
+          body: JSON.stringify({ path: "/src/a" }),
+        },
+      ],
+    ]);
+  });
+
   it("rejects a success that is not JSON", async () => {
     const { api } = setup(() => Promise.resolve(new Response("<!doctype html>", { status: 200 })));
     const error = await failureOf(api.health());

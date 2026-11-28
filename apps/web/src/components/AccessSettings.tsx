@@ -15,6 +15,7 @@ import type { DeviceTokenInfo } from "../gen/DeviceTokenInfo";
 import { describeUserAgent, tokenNameProblem } from "../lib/auth";
 import { errorMessage } from "../lib/errors";
 import { absoluteTime, relativeTime } from "../lib/format";
+import { onFormSubmit } from "../lib/submit";
 import { AppContext } from "../state/app";
 import { AccountControls } from "./SignIn";
 
@@ -463,10 +464,7 @@ function DeviceTokens(props: { headingId: string }) {
         aria-label="Create a device token"
         novalidate
         class="flex flex-col gap-1.5"
-        onSubmit={(event) => {
-          event.preventDefault();
-          void create();
-        }}
+        onSubmit={onFormSubmit(create)}
       >
         <label for={nameId} class="text-sm font-medium">
           New token

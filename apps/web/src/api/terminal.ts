@@ -1,6 +1,6 @@
 import type { TermClientMsg } from "../gen/TermClientMsg";
 import type { TermServerMsg } from "../gen/TermServerMsg";
-import { API_BASE } from "./http";
+import { parseOpFrame, socketUrl } from "./frames";
 
 /** Raw terminal bytes, as a binary frame carries them. */
 export type TerminalBytes = Uint8Array<ArrayBuffer>;
@@ -62,26 +62,86 @@ export function terminalUrl(
   location: Pick<Location, "protocol" | "host">,
   request: TerminalRequest,
 ): string {
-  const scheme = location.protocol === "https:" ? "wss:" : "ws:";
   const query = new URLSearchParams();
   if (request.sessionRepoId !== undefined) query.set("session_repo_id", request.sessionRepoId);
   query.set("cols", String(request.cols));
   query.set("rows", String(request.rows));
   const session = encodeURIComponent(request.sessionId);
-  return `${scheme}//${location.host}${API_BASE}/sessions/${session}/terminals/ws?${query}`;
+  return socketUrl(location, `/sessions/${session}/terminals/ws?${query}`);
 }
 
-function parseControl(data: string): TermServerMsg | undefined {
-  let value: unknown;
-  try {
-    value = JSON.parse(data);
-  } catch {
-    return undefined;
+/** How a text frame ends the shell; `undefined` for a frame that does not. */
+function frameEnd(data: string): TerminalEnd | undefined {
+  const msg = parseOpFrame<TermServerMsg>(data);
+  if (msg?.op === "exit") return { kind: "exit", code: msg.code };
+  if (msg?.op === "error") return { kind: "error", message: msg.message };
+  return undefined;
+}
+
+/** One socket, one shell. */
+class TerminalConnection implements TerminalClient {
+  private readonly socket: TerminalSocketLike;
+  private readonly handlers: TerminalHandlers;
+  private readonly encoder = new TextEncoder();
+  private open = false;
+  private over = false;
+  // What was typed or resized while connecting goes out, in order, once the socket opens.
+  private queued: Array<string | TerminalBytes> = [];
+
+  constructor(socket: TerminalSocketLike, handlers: TerminalHandlers) {
+    this.socket = socket;
+    this.handlers = handlers;
+    socket.binaryType = "arraybuffer";
+    socket.onopen = () => this.opened();
+    socket.onmessage = (event) => this.received(event.data);
+    socket.onclose = socket.onerror = () => this.end({ kind: "lost", opened: this.open });
   }
-  if (typeof value !== "object" || value === null || !("op" in value)) return undefined;
-  if (typeof value.op !== "string") return undefined;
-  // Shapes beyond `op` are the contract's business; unknown ops are dropped by the caller.
-  return value as TermServerMsg;
+
+  write(data: string | TerminalBytes): void {
+    this.send(typeof data === "string" ? this.encoder.encode(data) : data);
+  }
+
+  resize(cols: number, rows: number): void {
+    const msg: TermClientMsg = { op: "resize", cols, rows };
+    this.send(JSON.stringify(msg));
+  }
+
+  close(): void {
+    this.end(undefined);
+  }
+
+  private opened(): void {
+    this.open = true;
+    for (const frame of this.queued) this.socket.send(frame);
+    this.queued = [];
+    this.handlers.onOpen?.();
+  }
+
+  private received(data: unknown): void {
+    if (data instanceof ArrayBuffer) {
+      this.handlers.onData(new Uint8Array(data));
+      return;
+    }
+    const result = typeof data === "string" ? frameEnd(data) : undefined;
+    if (result) this.end(result);
+  }
+
+  private send(frame: string | TerminalBytes): void {
+    if (this.over) return;
+    if (this.open) this.socket.send(frame);
+    else this.queued.push(frame);
+  }
+
+  /** `undefined`: closed from here, so nobody is told. */
+  private end(result: TerminalEnd | undefined): void {
+    if (this.over) return;
+    this.over = true;
+    this.queued = [];
+    const socket = this.socket;
+    socket.onopen = socket.onmessage = socket.onclose = socket.onerror = null;
+    socket.close();
+    if (result) this.handlers.onEnd(result);
+  }
 }
 
 /** The only place a terminal socket is opened. Each call is one socket, one shell. */
@@ -89,61 +149,6 @@ export function createTerminalOpener(options: TerminalOptions = {}): OpenTermina
   return (request, handlers) => {
     const WebSocketImpl = options.WebSocket ?? WebSocket;
     const socket = new WebSocketImpl(terminalUrl(options.location ?? location, request));
-    socket.binaryType = "arraybuffer";
-    const encoder = new TextEncoder();
-
-    let open = false;
-    let over = false;
-    // What was typed or resized while connecting goes out, in order, once the socket opens.
-    let queued: Array<string | TerminalBytes> = [];
-
-    function send(frame: string | TerminalBytes): void {
-      if (over) return;
-      if (open) socket.send(frame);
-      else queued.push(frame);
-    }
-
-    function end(result: TerminalEnd | undefined): void {
-      if (over) return;
-      over = true;
-      queued = [];
-      socket.onopen = socket.onmessage = socket.onclose = socket.onerror = null;
-      socket.close();
-      if (result) handlers.onEnd(result);
-    }
-
-    socket.onopen = () => {
-      open = true;
-      for (const frame of queued) socket.send(frame);
-      queued = [];
-      handlers.onOpen?.();
-    };
-    socket.onmessage = (event) => {
-      const data: unknown = event.data;
-      if (data instanceof ArrayBuffer) {
-        handlers.onData(new Uint8Array(data));
-        return;
-      }
-      if (typeof data !== "string") return;
-      const msg = parseControl(data);
-      if (msg?.op === "exit") end({ kind: "exit", code: msg.code });
-      else if (msg?.op === "error") end({ kind: "error", message: msg.message });
-    };
-    const lost = (): void => end({ kind: "lost", opened: open });
-    socket.onclose = lost;
-    socket.onerror = lost;
-
-    return {
-      write(data) {
-        send(typeof data === "string" ? encoder.encode(data) : data);
-      },
-      resize(cols, rows) {
-        const msg: TermClientMsg = { op: "resize", cols, rows };
-        send(JSON.stringify(msg));
-      },
-      close() {
-        end(undefined);
-      },
-    };
+    return new TerminalConnection(socket, handlers);
   };
 }

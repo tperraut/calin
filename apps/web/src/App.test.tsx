@@ -11,6 +11,8 @@ import type { RepoChanges } from "./gen/RepoChanges";
 import type { Settings } from "./gen/Settings";
 import type { SessionRepo } from "./gen/SessionRepo";
 import type { SessionStatus } from "./gen/SessionStatus";
+import type { WorkflowRun } from "./gen/WorkflowRun";
+import { specGraph } from "./test/workflows";
 import type { OpenTerminal } from "./api/terminal";
 import { editorFor, editors, resetFakeEditors } from "./test/fakeEditor";
 import { fakeTerminals, resetFakeTerminals, views } from "./test/fakeTerminal";
@@ -457,6 +459,89 @@ describe("App", () => {
     expect(findByText(main, "button", "Try again")).toBeDefined();
   });
 
+  it("says a session could not load, in the server's words, and loads it again on request", async () => {
+    const getSession = vi
+      .fn<Api["getSession"]>()
+      .mockRejectedValueOnce(conflict("the index is being rebuilt"))
+      .mockResolvedValue(makeDetail(makeSession("s1", 1000, { title: "Add a health check" })));
+    const { host, socket } = await start("/s/s1", { getSession });
+    socket.setState("open");
+    flush();
+    const main = find(host, "main");
+    expect(main.textContent).toContain("Could not load the session");
+    expect(main.textContent).toContain("the index is being rebuilt");
+
+    await click(findByText(main, "button", "Try again"));
+    await settle();
+    flush();
+    expect(find(main, "h1").textContent).toBe("Add a health check");
+  });
+
+  it("says why the message box is closed, by the session's status", async () => {
+    const placeholder = async (status: SessionStatus) => {
+      const { main } = await openSession("/s/s1", {}, status);
+      const hint = find<HTMLTextAreaElement>(main, "textarea").placeholder;
+      unmountAll();
+      return hint;
+    };
+    expect(await placeholder("queued")).toBe("Messages open once the session is running");
+    expect(await placeholder("preparing")).toBe("Messages open once the session is running");
+  });
+
+  it("counts a workflow loop's attempts against the limit the run reports", async () => {
+    const graph = specGraph();
+    const run: WorkflowRun = {
+      workflow_id: "itr",
+      name: "Implement",
+      graph,
+      nodes: graph.nodes.map((one) => ({
+        id: one.id,
+        state: "idle",
+        runs: 0,
+        last_port: null,
+        outcome: null,
+        iteration: one.kind === "loop" ? 0 : null,
+        max: one.kind === "loop" ? 3 : null,
+      })),
+      taken: [],
+      status: "running",
+      reason: null,
+      budget_usd: 5,
+      cost_usd: 0,
+    };
+    const session = makeSession("s1", 1000, { status: "running", workflow: "itr" });
+    const { main, emit, caughtUp } = await openSession("/s/s1", {
+      getSession: () => Promise.resolve(makeDetail(session)),
+      getWorkflow: () => Promise.resolve(run),
+    });
+    const loop = (phase: "started" | "finished", port: string | null = null) =>
+      emit({ type: "workflow_node", node_id: "retry", phase, port, outcome: null }, null);
+    emit(
+      { type: "workflow_started", workflow_id: "itr", name: "Implement", graph, budget_usd: 5 },
+      null,
+    );
+    loop("started");
+    loop("finished", "repeat");
+    loop("started");
+    caughtUp();
+    await settle();
+    flush();
+    expect(find(main, '[role="log"]').textContent).toContain("Loop: attempt 2 of 3");
+  });
+
+  it("says when part of the transcript could not be loaded", async () => {
+    const { main, emit, socket } = await openSession("/s/s1");
+    emit({ type: "session_status", status: "running", reason: null }, null);
+    // The server keeps announcing events the replay never brings.
+    for (let round = 0; round < 10; round += 1) {
+      socket.emit("session:s1", { op: "subscribed", topic: "session:s1", head_seq: 3 });
+    }
+    flush();
+    expect(find(main, '[role="alert"]').textContent).toBe(
+      "Part of this transcript could not be loaded. Reload the page to try again.",
+    );
+  });
+
   it("shows a not-found page for an unknown address", async () => {
     const { host } = await start("/nowhere");
     expect(find(host, "main").textContent).toContain("Page not found");
@@ -565,6 +650,42 @@ describe("App", () => {
       "webcalin/health",
     ]);
     expect(toggle.textContent).toContain("3 repos");
+  });
+
+  it("says when no repo or one repo is attached, and how to add one", async () => {
+    const none = await openSession("/s/s1");
+    const toggle = find<HTMLButtonElement>(find(none.main, "header"), "button[aria-controls]");
+    const details = find(none.main, `[id="${toggle.getAttribute("aria-controls")}"]`);
+    expect(toggle.textContent).toContain("· no repo");
+    expect(details.textContent).toContain("No repo attached");
+    expect(details.querySelector('ul[aria-label="Repos"]')).toBeNull();
+    const attach = findByText<HTMLButtonElement>(details, "button", "Attach repo");
+    expect([attach.disabled, attach.title]).toEqual([false, "Add a repo to this session"]);
+    unmountAll();
+
+    const one = await openSession("/s/s1", {}, "running", [makeSessionRepo("api")]);
+    expect(find(one.main, "header button[aria-controls]").textContent).toContain("· 1 repo");
+  });
+
+  it("counts the requests that need the reader, once the replay is over", async () => {
+    const { main, emit, caughtUp } = await openSession("/s/s1");
+    emit({ type: "permission_requested", request: permissionRequest("p1", "cargo test") });
+    emit({ type: "permission_requested", request: permissionRequest("p2", "git push") });
+    // Still replaying: what the log holds may already be answered further on.
+    expect(find(main, "header").textContent).not.toContain("need you");
+    caughtUp();
+    expect(find(main, "header").textContent).toContain("2 requests need you");
+  });
+
+  it("shows a stop the server refused inline", async () => {
+    const stopSession = vi
+      .fn<Api["stopSession"]>()
+      .mockRejectedValue(conflict("session is already over"));
+    const { main } = await openSession("/s/s1", { stopSession });
+    await click(findByText<HTMLButtonElement>(main, "button", "Stop"));
+    expect(find(main, '[role="alert"]').textContent).toBe(
+      "Could not stop the session: session is already over",
+    );
   });
 
   it("interrupts a running session, and shows the server's refusal inline", async () => {
