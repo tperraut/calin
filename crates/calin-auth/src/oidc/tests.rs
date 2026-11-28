@@ -606,6 +606,32 @@ fn callback_parameters_are_decoded_and_unknown_ones_ignored() {
     assert!(CallbackParams::from_query("").code.is_none());
 }
 
+#[test]
+fn the_longest_code_and_query_are_read_and_one_byte_more_is_refused() {
+    // A caller that decoded the query itself gets the same checks.
+    let longest = "c".repeat(MAX_CODE_BYTES);
+    let params = CallbackParams::new(Some("s"), Some(&longest), None);
+    assert_eq!(params.code_for("s"), Ok(longest.as_str()));
+    let too_long = "c".repeat(MAX_CODE_BYTES + 1);
+    assert_eq!(
+        CallbackParams::new(Some("s"), Some(&too_long), None).code_for("s"),
+        Err(LoginError::NoCode)
+    );
+
+    let query = |total: usize| {
+        let head = "state=s&code=c&pad=";
+        format!("{head}{}", "p".repeat(total - head.len()))
+    };
+    assert_eq!(
+        CallbackParams::from_query(&query(MAX_QUERY_BYTES)).code_for("s"),
+        Ok("c")
+    );
+    assert_eq!(
+        CallbackParams::from_query(&query(MAX_QUERY_BYTES + 1)).code_for("s"),
+        Err(LoginError::MalformedCallback)
+    );
+}
+
 // ------------------------------------------------------------- the ID token
 
 #[tokio::test]
