@@ -45,6 +45,14 @@ export function press(target: Element, key: string, init: KeyboardEventInit = {}
   return event.defaultPrevented;
 }
 
+/** A wheel event at (`x`, `y`) on the page: happy-dom's WheelEvent is no MouseEvent, so its position is set here. */
+export function wheel(target: Element, [x, y]: At, init: WheelEventInit = {}): WheelEvent {
+  const event = new WheelEvent("wheel", { cancelable: true, ...init });
+  Object.defineProperties(event, { clientX: { value: x }, clientY: { value: y } });
+  target.dispatchEvent(event);
+  return event;
+}
+
 /** Waits for the next animation frame: the scene writes pan and zoom then. */
 export const nextFrame = (): Promise<void> =>
   new Promise((resolve) => requestAnimationFrame(() => resolve()));
@@ -165,19 +173,14 @@ export function describeCanvasMoves(name: string, setup: () => Promise<CanvasUnd
     it("zooms with the wheel around the pointer", async () => {
       const { canvas, view } = await open();
       const before = view();
-      const wheel = new WheelEvent("wheel", {
-        deltaY: -100,
-        clientX: 0,
-        clientY: 0,
-        cancelable: true,
-      });
-      canvas.dispatchEvent(wheel);
-      expect(wheel.defaultPrevented).toBe(true);
+      expect(wheel(canvas, [0, 0], { deltaY: -100 }).defaultPrevented).toBe(true);
       await nextFrame();
-      expect(view().k).toBeCloseTo(before.k * Math.exp(0.15));
-      canvas.dispatchEvent(
-        new WheelEvent("wheel", { deltaY: 3, deltaMode: 1, clientX: 0, clientY: 0 }),
-      );
+      const zoomed = view();
+      expect(zoomed.k).toBeCloseTo(before.k * Math.exp(0.15));
+      // The drawing stays put under the pointer.
+      expect(zoomed.x / zoomed.k).toBeCloseTo(before.x / before.k);
+      expect(zoomed.y / zoomed.k).toBeCloseTo(before.y / before.k);
+      wheel(canvas, [0, 0], { deltaY: 3, deltaMode: 1 });
       await nextFrame();
       expect(view().k).toBeCloseTo(before.k);
     });
@@ -235,6 +238,134 @@ export function describeCanvasMoves(name: string, setup: () => Promise<CanvasUnd
       press(node(sample), "Enter");
       expect(selected()).toBe(sample);
       expect(press(node(sample), "x")).toBe(false);
+    });
+
+    it("pans from exactly the slop, and a new press forgets a drag that ended without a click", async () => {
+      const { canvas, view, node, sample, selected } = await open();
+      const before = view();
+      drag(canvas, 1, [10, 10], [14, 10]);
+      pointer(canvas, "pointerup", 1, [14, 10]);
+      await nextFrame();
+      expect(view()).toEqual({ x: before.x + 4, y: before.y, k: before.k });
+      // The drag ended outside: no click came. A press and a click on a node is a tap.
+      pointer(node(sample), "pointerdown", 1, [50, 50]);
+      pointer(node(sample), "pointerup", 1, [50, 50]);
+      node(sample).dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      flush();
+      expect(selected()).toBe(sample);
+    });
+
+    it("keeps the selection when a drag over the background ends", async () => {
+      const { canvas, node, sample, selected } = await open();
+      node(sample).dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      flush();
+      drag(canvas, 1, [10, 10], [60, 60]);
+      pointer(canvas, "pointerup", 1, [60, 60]);
+      canvas.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      flush();
+      expect(selected()).toBe(sample);
+    });
+
+    it("does not drag while pinching, and the click that ends a pinch selects nothing", async () => {
+      const { canvas, view, node, sample, selected } = await open();
+      const before = view();
+      const touch = { pointerType: "touch" };
+      pointer(canvas, "pointerdown", 1, [100, 100], touch);
+      pointer(canvas, "pointerdown", 2, [100, 200], touch);
+      pointer(canvas, "pointermove", 2, [100, 300], touch);
+      flush();
+      expect(canvas.hasAttribute("data-dragging")).toBe(false);
+      await nextFrame();
+      // Down the middle of the fingers: (100, 150) then (100, 200).
+      const under = (one: View, x: number, y: number) => [(x - one.x) / one.k, (y - one.y) / one.k];
+      const [wasX, wasY] = under(before, 100, 150);
+      const [nowX, nowY] = under(view(), 100, 200);
+      expect(nowX).toBeCloseTo(wasX ?? 0);
+      expect(nowY).toBeCloseTo(wasY ?? 0);
+      pointer(canvas, "pointerup", 2, [100, 300], touch);
+      pointer(canvas, "pointerup", 1, [100, 100], touch);
+      node(sample).dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      flush();
+      expect(selected()).toBeUndefined();
+    });
+
+    it("pans without zooming while two fingers touch at one point, and ignores a third", async () => {
+      const { canvas, view } = await open();
+      const touch = { pointerType: "touch" };
+      const before = view();
+      pointer(canvas, "pointerdown", 1, [100, 100], touch);
+      pointer(canvas, "pointerdown", 2, [100, 100], touch);
+      pointer(canvas, "pointermove", 2, [140, 100], touch);
+      await nextFrame();
+      expect(view()).toEqual({ x: before.x + 20, y: before.y, k: before.k });
+      // The fingers meet: half the move pans, and nothing zooms.
+      pointer(canvas, "pointermove", 2, [100, 100], touch);
+      await nextFrame();
+      expect(view()).toEqual(before);
+      pointer(canvas, "pointerup", 2, [100, 100], touch);
+      pointer(canvas, "pointerup", 1, [100, 100], touch);
+    });
+
+    it("lets a third finger do nothing, and pinches with the two left once one lifts", async () => {
+      const { canvas, view } = await open();
+      const touch = { pointerType: "touch" };
+      const before = view();
+      pointer(canvas, "pointerdown", 1, [100, 100], touch);
+      pointer(canvas, "pointerdown", 2, [200, 100], touch);
+      pointer(canvas, "pointerdown", 3, [200, 200], touch);
+      pointer(canvas, "pointermove", 3, [260, 260], touch);
+      await nextFrame();
+      expect(view()).toEqual(before);
+      pointer(canvas, "pointerup", 1, [100, 100], touch);
+      // The spread was 100 between the first two; 2 and 3 are now 200 apart.
+      pointer(canvas, "pointermove", 3, [200, 300], touch);
+      await nextFrame();
+      expect(view().k).not.toBeCloseTo(before.k);
+    });
+
+    it("zooms around the pointer on a canvas that is not at the page's corner", async () => {
+      vi.spyOn(Element.prototype, "getBoundingClientRect").mockReturnValue(
+        DOMRect.fromRect({ x: 20, y: 10, width: 400, height: 300 }),
+      );
+      const { canvas, view } = await open();
+      const before = view();
+      wheel(canvas, [120, 110], { deltaY: -100 });
+      await nextFrame();
+      const after = view();
+      expect(after.k).not.toBeCloseTo(before.k);
+      // (120, 110) on the page is (100, 100) on the canvas: the drawing stays put under it.
+      expect((100 - after.x) / after.k).toBeCloseTo((100 - before.x) / before.k);
+      expect((100 - after.y) / after.k).toBeCloseTo((100 - before.y) / before.k);
+    });
+
+    it("follows the canvas's size once it has one: + zooms around its new middle", async () => {
+      let resized: () => void = () => {};
+      vi.stubGlobal(
+        "ResizeObserver",
+        class {
+          constructor(callback: () => void) {
+            resized = callback;
+          }
+          observe(): void {}
+          disconnect(): void {}
+        },
+      );
+      try {
+        const rect = vi.spyOn(Element.prototype, "getBoundingClientRect");
+        rect.mockReturnValue(DOMRect.fromRect({ x: 0, y: 0, width: 0, height: 0 }));
+        const { canvas, view } = await open();
+        rect.mockReturnValue(DOMRect.fromRect({ x: 0, y: 0, width: 400, height: 300 }));
+        resized();
+        await nextFrame();
+        const before = view();
+        press(canvas, "+");
+        await nextFrame();
+        const after = view();
+        expect((200 - after.x) / after.k).toBeCloseTo((200 - before.x) / before.k);
+        expect((150 - after.y) / after.k).toBeCloseTo((150 - before.y) / before.k);
+      } finally {
+        vi.unstubAllGlobals();
+      }
     });
   });
 }
