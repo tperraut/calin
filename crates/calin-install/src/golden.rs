@@ -16,10 +16,8 @@ fn golden_dir(case: &str) -> PathBuf {
         .join(case)
 }
 
-/// A line diff (longest common subsequence), `-` expected, `+` actual.
-fn diff(expected: &str, actual: &str) -> String {
-    let a: Vec<&str> = expected.lines().collect();
-    let b: Vec<&str> = actual.lines().collect();
+/// `lcs[i][j]`: the length of the longest common subsequence of `a[i..]` and `b[j..]`.
+fn lcs_table(a: &[&str], b: &[&str]) -> Vec<Vec<usize>> {
     let mut lcs = vec![vec![0usize; b.len() + 1]; a.len() + 1];
     for i in (0..a.len()).rev() {
         for j in (0..b.len()).rev() {
@@ -30,6 +28,14 @@ fn diff(expected: &str, actual: &str) -> String {
             };
         }
     }
+    lcs
+}
+
+/// A line diff (longest common subsequence), `-` expected, `+` actual.
+fn diff(expected: &str, actual: &str) -> String {
+    let a: Vec<&str> = expected.lines().collect();
+    let b: Vec<&str> = actual.lines().collect();
+    let lcs = lcs_table(&a, &b);
     let (mut i, mut j, mut out) = (0, 0, String::new());
     while i < a.len() || j < b.len() {
         if i < a.len() && j < b.len() && a[i] == b[j] {
