@@ -1,6 +1,6 @@
 import type { TermClientMsg } from "../gen/TermClientMsg";
 import type { TermServerMsg } from "../gen/TermServerMsg";
-import { API_BASE } from "./http";
+import { parseOpFrame, socketUrl } from "./frames";
 
 /** Raw terminal bytes, as a binary frame carries them. */
 export type TerminalBytes = Uint8Array<ArrayBuffer>;
@@ -62,26 +62,12 @@ export function terminalUrl(
   location: Pick<Location, "protocol" | "host">,
   request: TerminalRequest,
 ): string {
-  const scheme = location.protocol === "https:" ? "wss:" : "ws:";
   const query = new URLSearchParams();
   if (request.sessionRepoId !== undefined) query.set("session_repo_id", request.sessionRepoId);
   query.set("cols", String(request.cols));
   query.set("rows", String(request.rows));
   const session = encodeURIComponent(request.sessionId);
-  return `${scheme}//${location.host}${API_BASE}/sessions/${session}/terminals/ws?${query}`;
-}
-
-function parseControl(data: string): TermServerMsg | undefined {
-  let value: unknown;
-  try {
-    value = JSON.parse(data);
-  } catch {
-    return undefined;
-  }
-  if (typeof value !== "object" || value === null || !("op" in value)) return undefined;
-  if (typeof value.op !== "string") return undefined;
-  // Shapes beyond `op` are the contract's business; unknown ops are dropped by the caller.
-  return value as TermServerMsg;
+  return socketUrl(location, `/sessions/${session}/terminals/ws?${query}`);
 }
 
 /** The only place a terminal socket is opened. Each call is one socket, one shell. */
@@ -125,7 +111,7 @@ export function createTerminalOpener(options: TerminalOptions = {}): OpenTermina
         return;
       }
       if (typeof data !== "string") return;
-      const msg = parseControl(data);
+      const msg = parseOpFrame<TermServerMsg>(data);
       if (msg?.op === "exit") end({ kind: "exit", code: msg.code });
       else if (msg?.op === "error") end({ kind: "error", message: msg.message });
     };

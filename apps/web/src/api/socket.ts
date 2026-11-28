@@ -1,6 +1,6 @@
 import type { ClientMsg } from "../gen/ClientMsg";
 import type { ServerMsg } from "../gen/ServerMsg";
-import { API_BASE } from "./http";
+import { parseOpFrame, socketUrl } from "./frames";
 
 // Topic names mirror `TOPIC_SESSIONS` and `session_topic` in calin-proto/src/lib.rs.
 export const TOPIC_SESSIONS = "sessions";
@@ -69,22 +69,11 @@ export interface SocketClient {
 type Subscriber = { handler: TopicHandler; cursor: Cursor | undefined };
 
 export function defaultSocketUrl(location: Pick<Location, "protocol" | "host">): string {
-  const scheme = location.protocol === "https:" ? "wss:" : "ws:";
-  return `${scheme}//${location.host}${API_BASE}/ws`;
+  return socketUrl(location, "/ws");
 }
 
 function parseFrame(data: unknown): ServerMsg | undefined {
-  if (typeof data !== "string") return undefined;
-  let value: unknown;
-  try {
-    value = JSON.parse(data);
-  } catch {
-    return undefined;
-  }
-  if (typeof value !== "object" || value === null || !("op" in value)) return undefined;
-  if (typeof value.op !== "string") return undefined;
-  // Shapes beyond `op` are the contract's business; unknown ops are dropped by the caller.
-  return value as ServerMsg;
+  return typeof data === "string" ? parseOpFrame<ServerMsg>(data) : undefined;
 }
 
 export function createSocket(options: SocketOptions = {}): SocketClient {
