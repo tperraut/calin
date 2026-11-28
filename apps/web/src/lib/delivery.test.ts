@@ -121,6 +121,19 @@ describe("rollUp", () => {
       "2 pull requests · 1 merged · checks failing on web",
     ],
     [
+      "checks failing on one, passing on the other: the trouble alone",
+      [pr("api", 12, { checks: "passing" }), pr("web", 7, { checks: "failing" })],
+      "2 pull requests · checks failing on web",
+    ],
+    [
+      "changes requested on one, approved with passing checks on the other: the trouble alone",
+      [
+        pr("api", 12, { checks: "passing", review: "approved" }),
+        pr("web", 7, { review: "changes_requested" }),
+      ],
+      "2 pull requests · changes requested on web",
+    ],
+    [
       "both kinds of trouble, each by repo",
       [pr("api", 12, { review: "changes_requested" }), pr("web", 7, { checks: "failing" })],
       "2 pull requests · checks failing on web · changes requested on api",
@@ -225,6 +238,24 @@ describe("pull request helpers", () => {
     expect(mergePullRequests(seed, [older], repos, true).map((one) => one.state)).toEqual([
       "open",
       "draft",
+    ]);
+    // Mid-replay, a value as new as the record's or newer wins, and one for an unlisted repo comes in.
+    const same = makePullRequest("web", 7, { state: "draft", updated_at: 500 });
+    const newer = makePullRequest("web", 7, { state: "merged", updated_at: 900 });
+    const docs = makePullRequest("docs", 3, { updated_at: 1 });
+    expect(mergePullRequests(seed, [same], repos, false).map((one) => one.state)).toEqual([
+      "open",
+      "draft",
+    ]);
+    expect(
+      mergePullRequests(seed, [newer, docs], repos, false).map((one) => [
+        one.session_repo_id,
+        one.state,
+      ]),
+    ).toEqual([
+      ["api", "open"],
+      ["web", "merged"],
+      ["docs", "open"],
     ]);
     const merged = mergePullRequests(
       [],
