@@ -1,11 +1,14 @@
 import { describe, expect, it } from "vite-plus/test";
 import type { AutomationTrigger } from "../gen/AutomationTrigger";
 import { badRequest, conflict, makeRepo } from "../test/fakes";
-import { makeAutomation } from "../test/integrations";
+import { makeAutomation, makeRun } from "../test/integrations";
 import {
   automationDraft,
   blameField,
+  causeText,
   messageAt,
+  outcomeText,
+  placeholders,
   runNumber,
   runWanted,
   saveFailure,
@@ -19,6 +22,7 @@ describe("runNumber", () => {
   it.each([
     ["12", 12],
     ["#12", 12],
+    ["1", 1],
     [" 7 ", 7],
   ])("reads %j as %d", (typed, number) => {
     expect(runNumber(typed)).toBe(number);
@@ -26,6 +30,45 @@ describe("runNumber", () => {
 
   it.each(["", "#", "0", "-3", "1.5", "twelve", "12a"])("refuses %j", (typed) => {
     expect(runNumber(typed)).toBeUndefined();
+  });
+});
+
+describe("placeholders", () => {
+  it("offers only the date to a schedule, and the item's fields to a trigger", () => {
+    expect(placeholders("schedule")).toEqual(["{{date}}"]);
+    expect(placeholders("issue")).toEqual([
+      "{{date}}",
+      "{{number}}",
+      "{{title}}",
+      "{{body}}",
+      "{{url}}",
+      "{{author}}",
+    ]);
+  });
+});
+
+describe("outcomeText", () => {
+  it("words a start alone, even with a detail", () => {
+    expect(outcomeText(makeRun("r", { detail: "ignored" }))).toBe("Started a session");
+  });
+
+  it("adds why a run was skipped or failed, when the server said", () => {
+    expect(outcomeText(makeRun("r", { outcome: "skipped", detail: "still active" }))).toBe(
+      "Skipped: still active",
+    );
+    expect(outcomeText(makeRun("r", { outcome: "failed", detail: "no repo" }))).toBe(
+      "Failed: no repo",
+    );
+    expect(outcomeText(makeRun("r", { outcome: "failed", detail: null }))).toBe("Failed");
+    expect(outcomeText(makeRun("r", { outcome: "skipped", detail: "" }))).toBe("Skipped");
+  });
+});
+
+describe("causeText", () => {
+  it("capitalizes the server's words, and leaves none as none", () => {
+    expect(causeText("schedule")).toBe("Schedule");
+    expect(causeText("issue #12")).toBe("Issue #12");
+    expect(causeText("")).toBe("");
   });
 });
 
