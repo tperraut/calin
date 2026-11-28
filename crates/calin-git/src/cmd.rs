@@ -253,12 +253,7 @@ impl Git {
 
     /// Standard output of a command that must succeed.
     pub(crate) fn run(self) -> Result<Vec<u8>> {
-        let done = self.exec()?;
-        if done.status.success() {
-            Ok(done.stdout)
-        } else {
-            Err(done.into_error())
-        }
+        Ok(self.exec()?.succeeded()?.stdout)
     }
 
     /// Standard output as text, without the trailing newline.
@@ -301,6 +296,15 @@ pub(crate) struct Done {
 }
 
 impl Done {
+    /// The command, when it exited with status 0; else its error.
+    pub(crate) fn succeeded(self) -> Result<Self> {
+        if self.status.success() {
+            Ok(self)
+        } else {
+            Err(self.into_error())
+        }
+    }
+
     pub(crate) fn into_error(self) -> Error {
         Error::Git {
             command: self.command,
