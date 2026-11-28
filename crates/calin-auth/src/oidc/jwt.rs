@@ -187,71 +187,108 @@ pub(crate) fn validate_claims(
     expected: &Expected<'_>,
 ) -> Result<Claims, IdTokenError> {
     let raw: RawClaims = parse_object(payload).map_err(IdTokenError::MalformedClaims)?;
+    // In this order: when several checks fail, the first one names the error.
+    raw.check_issuer(expected)?;
+    raw.check_audience(expected)?;
+    raw.check_times(expected.now)?;
+    raw.check_nonce(expected)?;
+    raw.check_subject()?;
+    Ok(raw.into_claims())
+}
 
-    if raw.iss != expected.issuer {
-        return Err(IdTokenError::WrongIssuer);
-    }
-    let audiences = match &raw.aud {
-        Audience::One(audience) => std::slice::from_ref(audience),
-        Audience::Many(audiences) => audiences.as_slice(),
-    };
-    if !audiences
-        .iter()
-        .any(|audience| audience == expected.client_id)
-    {
-        return Err(IdTokenError::WrongAudience);
-    }
-    // With several audiences only `azp` says the token was issued to this
-    // client; when present it must say so in every case.
-    match &raw.azp {
-        Some(party) if party != expected.client_id => {
-            return Err(IdTokenError::WrongAuthorizedParty);
+impl Audience {
+    fn as_slice(&self) -> &[String] {
+        match self {
+            Self::One(audience) => std::slice::from_ref(audience),
+            Self::Many(audiences) => audiences.as_slice(),
         }
-        None if audiences.len() > 1 => return Err(IdTokenError::WrongAuthorizedParty),
-        _ => {}
     }
+}
 
-    let seconds = |value: f64, claim: &str| {
-        if value.is_finite() && value >= 0.0 {
-            // Saturates far beyond any real date.
-            Ok(value as u64)
-        } else {
-            Err(IdTokenError::MalformedClaims(format!(
-                "{claim} is not a time"
-            )))
+impl RawClaims {
+    fn check_issuer(&self, expected: &Expected<'_>) -> Result<(), IdTokenError> {
+        if self.iss != expected.issuer {
+            return Err(IdTokenError::WrongIssuer);
         }
-    };
-    let soon = expected.now.saturating_add(CLOCK_SKEW_SECS);
-    if expected.now >= seconds(raw.exp, "exp")?.saturating_add(CLOCK_SKEW_SECS) {
-        return Err(IdTokenError::Expired);
-    }
-    if seconds(raw.iat, "iat")? > soon {
-        return Err(IdTokenError::IssuedInFuture);
-    }
-    if let Some(not_before) = raw.nbf
-        && seconds(not_before, "nbf")? > soon
-    {
-        return Err(IdTokenError::NotYetValid);
+        Ok(())
     }
 
-    let nonce_matches = raw
-        .nonce
-        .as_deref()
-        .is_some_and(|nonce| constant_time_eq(nonce.as_bytes(), expected.nonce.as_bytes()));
-    if !nonce_matches {
-        return Err(IdTokenError::WrongNonce);
+    /// `aud` must name this client, and with several audiences only `azp`
+    /// says the token was issued to it; when present `azp` must say so in
+    /// every case.
+    fn check_audience(&self, expected: &Expected<'_>) -> Result<(), IdTokenError> {
+        let audiences = self.aud.as_slice();
+        if !audiences
+            .iter()
+            .any(|audience| audience == expected.client_id)
+        {
+            return Err(IdTokenError::WrongAudience);
+        }
+        match &self.azp {
+            Some(party) if party != expected.client_id => Err(IdTokenError::WrongAuthorizedParty),
+            None if audiences.len() > 1 => Err(IdTokenError::WrongAuthorizedParty),
+            _ => Ok(()),
+        }
     }
-    if raw.sub.is_empty() {
-        return Err(IdTokenError::BadSubject);
+
+    /// `exp`, then `iat`, then `nbf`, each with [`CLOCK_SKEW_SECS`] of
+    /// allowance. A time that is not one is refused when its own check runs.
+    fn check_times(&self, now: u64) -> Result<(), IdTokenError> {
+        let soon = now.saturating_add(CLOCK_SKEW_SECS);
+        if now >= seconds(self.exp, "exp")?.saturating_add(CLOCK_SKEW_SECS) {
+            return Err(IdTokenError::Expired);
+        }
+        if seconds(self.iat, "iat")? > soon {
+            return Err(IdTokenError::IssuedInFuture);
+        }
+        if let Some(not_before) = self.nbf
+            && seconds(not_before, "nbf")? > soon
+        {
+            return Err(IdTokenError::NotYetValid);
+        }
+        Ok(())
     }
-    Ok(Claims {
-        subject: raw.sub,
-        email: match raw.email {
-            Some(serde_json::Value::String(email)) => Some(email),
-            _ => None,
-        },
-        email_verified: raw.email_verified == Some(serde_json::Value::Bool(true)),
-    })
+
+    fn check_nonce(&self, expected: &Expected<'_>) -> Result<(), IdTokenError> {
+        let nonce_matches = self
+            .nonce
+            .as_deref()
+            .is_some_and(|nonce| constant_time_eq(nonce.as_bytes(), expected.nonce.as_bytes()));
+        if !nonce_matches {
+            return Err(IdTokenError::WrongNonce);
+        }
+        Ok(())
+    }
+
+    fn check_subject(&self) -> Result<(), IdTokenError> {
+        if self.sub.is_empty() {
+            return Err(IdTokenError::BadSubject);
+        }
+        Ok(())
+    }
+
+    fn into_claims(self) -> Claims {
+        Claims {
+            subject: self.sub,
+            email: match self.email {
+                Some(serde_json::Value::String(email)) => Some(email),
+                _ => None,
+            },
+            email_verified: self.email_verified == Some(serde_json::Value::Bool(true)),
+        }
+    }
+}
+
+/// A time claim in whole seconds since the epoch.
+fn seconds(value: f64, claim: &str) -> Result<u64, IdTokenError> {
+    if value.is_finite() && value >= 0.0 {
+        // Saturates far beyond any real date.
+        Ok(value as u64)
+    } else {
+        Err(IdTokenError::MalformedClaims(format!(
+            "{claim} is not a time"
+        )))
+    }
 }
 
 #[cfg(test)]
@@ -480,6 +517,64 @@ mod tests {
                 Err(IdTokenError::MalformedClaims(_))
             ));
         }
+    }
+
+    #[test]
+    fn the_first_failing_check_names_the_error() {
+        // Bad in every way; each step fixes the claim the last error named.
+        let mut all = json!({
+            "iss": "https://evil.example/",
+            "sub": "",
+            "aud": ["other", "another"],
+            "exp": NOW - 3600,
+            "iat": NOW + 3600,
+            "nbf": NOW + 3600,
+            "nonce": "nonce-2",
+        });
+        let steps = [
+            (
+                IdTokenError::WrongIssuer,
+                "iss",
+                json!("https://idp.example.com/"),
+            ),
+            (
+                IdTokenError::WrongAudience,
+                "aud",
+                json!(["calin", "other-api"]),
+            ),
+            (IdTokenError::WrongAuthorizedParty, "azp", json!("calin")),
+            (IdTokenError::Expired, "exp", json!(NOW + 300)),
+            (IdTokenError::IssuedInFuture, "iat", json!(NOW)),
+            (IdTokenError::NotYetValid, "nbf", json!(NOW)),
+            (IdTokenError::WrongNonce, "nonce", json!("nonce-1")),
+            (IdTokenError::BadSubject, "sub", json!("user-1")),
+        ];
+        for (error, name, fixed) in steps {
+            assert_eq!(check(&all), Err(error), "before fixing {name}");
+            all[name] = fixed;
+        }
+        assert!(check(&all).is_ok());
+
+        // A time that is not one is found when its own check runs.
+        let mut late = claims();
+        late["iss"] = json!("https://evil.example/");
+        late["exp"] = json!(-1);
+        assert_eq!(check(&late), Err(IdTokenError::WrongIssuer));
+        let mut expired = claims();
+        expired["exp"] = json!(NOW - 3600);
+        expired["iat"] = json!(-1);
+        assert_eq!(check(&expired), Err(IdTokenError::Expired));
+        let mut future = claims();
+        future["iat"] = json!(NOW + 3600);
+        future["nbf"] = json!(-1);
+        assert_eq!(check(&future), Err(IdTokenError::IssuedInFuture));
+        let mut bad_nbf = claims();
+        bad_nbf["nbf"] = json!(-1);
+        bad_nbf["nonce"] = json!("nonce-2");
+        assert!(matches!(
+            check(&bad_nbf),
+            Err(IdTokenError::MalformedClaims(why)) if why == "nbf is not a time"
+        ));
     }
 
     #[test]
