@@ -209,6 +209,14 @@ struct ChildWith {
     cause: Option<String>,
 }
 
+/// Where a note goes: the session, its agent, and what that agent is
+/// handed; nothing is handed to the user, who reads it where it is sent.
+struct NoteRoute {
+    session: String,
+    agent: Option<String>,
+    handed: Option<String>,
+}
+
 /// The driver hit a storage error and cannot go on.
 struct Halt;
 
@@ -1276,11 +1284,7 @@ impl Driver {
     /// Starts the lead agent on `text` in the session's working directory,
     /// with what it may reach; its first start puts it on record.
     async fn start_agent(&mut self, text: String) -> Result<()> {
-        let runner = self
-            .runner
-            .clone()
-            .or_else(|| self.inner.registry.resolve(Some(&self.runner_id)));
-        let Some(runner) = runner else {
+        let Some(runner) = self.session_runner() else {
             let message = format!("runner {} is not available", self.runner_id);
             return self.fail(message).await;
         };
@@ -2228,64 +2232,11 @@ impl Driver {
         repos: Option<Vec<String>>,
         with: ChildWith,
     ) -> Result<Dispatched> {
-        if self.setup.dispatch.is_some() {
-            return Err(Error::Conflict(
-                "this session is itself a child session, and a child session cannot dispatch. \
-                 Do the work yourself, or say in your report what else should be dispatched."
-                    .to_owned(),
-            ));
-        }
-        if is_closed(self.status) {
-            return Err(closed(self.status));
-        }
-        let sessions = self.inner.store.sessions().await?;
-        let running = sessions
-            .iter()
-            .filter(|session| session.parent_session_id.as_deref() == Some(&self.session_id))
-            .filter(|session| !session.status.is_settled())
-            .count();
-        if running >= MAX_RUNNING_CHILDREN {
-            return Err(Error::Conflict(format!(
-                "{running} child sessions of this session are still running, which is the \
-                 limit. End your turn: their reports arrive as messages. Dispatch again once \
-                 one of them has reported."
-            )));
-        }
+        self.may_dispatch().await?;
         let given = self.child_repos(repos)?;
-        let mut start_points = BTreeMap::new();
-        let mut dispatched = Vec::with_capacity(given.len());
-        for repo in &given {
-            let dir = PathBuf::from(&repo.path);
-            // Never committed on the agent's behalf: the child starts from
-            // the last commit, and the agent is told when that leaves work behind.
-            let (commit, dirty) =
-                blocking(move || Ok((calin_git::head_commit(&dir)?, calin_git::is_dirty(&dir)?)))
-                    .await?;
-            start_points.insert(repo.repo_id.clone(), commit.clone());
-            dispatched.push(DispatchedRepo {
-                name: repo.name.clone(),
-                commit,
-                dirty,
-            });
-        }
-        let ids: Vec<&str> = given.iter().map(|repo| repo.repo_id.as_str()).collect();
-        let reservation = match ids.is_empty() {
-            true => None,
-            false => Some(self.inner.repos.reserve(&ids).await?),
-        };
-        let runner = match &with.runner {
-            Some(id) => self.inner.registry.resolve(Some(id)).ok_or_else(|| {
-                let known = self.inner.registry.ids().join(", ");
-                Error::Invalid(format!("unknown runner {id}; this server has {known}"))
-            })?,
-            None => self
-                .runner
-                .clone()
-                .or_else(|| self.inner.registry.resolve(Some(&self.runner_id)))
-                .ok_or_else(|| {
-                    Error::Conflict(format!("runner {} is not available", self.runner_id))
-                })?,
-        };
+        let (start_points, dispatched) = start_points(&given).await?;
+        let reservation = self.reserve(&given).await?;
+        let runner = self.child_runner(with.runner.as_deref())?;
         let link = Dispatch {
             parent_session_id: self.session_id.clone(),
             root_session_id: self.root_session_id.clone(),
@@ -2356,6 +2307,67 @@ impl Driver {
         })
     }
 
+    /// Refuses a dispatch the "Child sessions" semantics do not allow: from
+    /// a child, from a session that is over, or past the running children's
+    /// limit.
+    async fn may_dispatch(&self) -> Result<()> {
+        if self.setup.dispatch.is_some() {
+            return Err(Error::Conflict(
+                "this session is itself a child session, and a child session cannot dispatch. \
+                 Do the work yourself, or say in your report what else should be dispatched."
+                    .to_owned(),
+            ));
+        }
+        if is_closed(self.status) {
+            return Err(closed(self.status));
+        }
+        let sessions = self.inner.store.sessions().await?;
+        let running = sessions
+            .iter()
+            .filter(|session| session.parent_session_id.as_deref() == Some(&self.session_id))
+            .filter(|session| !session.status.is_settled())
+            .count();
+        if running >= MAX_RUNNING_CHILDREN {
+            return Err(Error::Conflict(format!(
+                "{running} child sessions of this session are still running, which is the \
+                 limit. End your turn: their reports arrive as messages. Dispatch again once \
+                 one of them has reported."
+            )));
+        }
+        Ok(())
+    }
+
+    /// Holds `repos` in place until the child that is given them has them.
+    async fn reserve(&self, repos: &[SessionRepo]) -> Result<Option<Reservation>> {
+        let ids: Vec<&str> = repos.iter().map(|repo| repo.repo_id.as_str()).collect();
+        if ids.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(self.inner.repos.reserve(&ids).await?))
+    }
+
+    /// The runner a child runs on: the one a workflow node names, else the
+    /// session's own.
+    fn child_runner(&self, named: Option<&str>) -> Result<Arc<dyn Runner>> {
+        let Some(id) = named else {
+            return self.session_runner().ok_or_else(|| {
+                Error::Conflict(format!("runner {} is not available", self.runner_id))
+            });
+        };
+        self.inner.registry.resolve(Some(id)).ok_or_else(|| {
+            let known = self.inner.registry.ids().join(", ");
+            Error::Invalid(format!("unknown runner {id}; this server has {known}"))
+        })
+    }
+
+    /// The session's runner: the one it was started with, else the one of
+    /// its name this server has.
+    fn session_runner(&self) -> Option<Arc<dyn Runner>> {
+        self.runner
+            .clone()
+            .or_else(|| self.inner.registry.resolve(Some(&self.runner_id)))
+    }
+
     /// The repos a child is given: the named ones, which must be `write`
     /// repos of this session, or every `write` repo of it.
     fn child_repos(&self, names: Option<Vec<String>>) -> Result<Vec<SessionRepo>> {
@@ -2398,54 +2410,11 @@ impl Driver {
         text: String,
     ) -> Result<NoteOutcome> {
         let store = self.inner.store.clone();
-        // Where it goes: the session, its agent, and what that agent is handed.
-        let (to_session, to_agent, delivery) = match &to {
-            NoteTarget::User => (self.session_id.clone(), None, None),
-            NoteTarget::Parent => {
-                let Some(dispatch) = &self.setup.dispatch else {
-                    return Err(Error::Missing(
-                        "this session was not dispatched by another session, so it has no \
-                         parent. Use `user` to leave a note for the user."
-                            .to_owned(),
-                    ));
-                };
-                let handed = briefing::note_from_child(&self.title, &self.session_id, &text);
-                let parent = dispatch.parent_session_id.clone();
-                (parent, Some(dispatch.agent_id.clone()), Some(handed))
-            }
-            NoteTarget::Child(child_id) => {
-                let sessions = store.sessions().await?;
-                let children: Vec<String> = sessions
-                    .iter()
-                    .rev()
-                    .filter(|session| {
-                        session.parent_session_id.as_deref() == Some(&self.session_id)
-                    })
-                    .map(|session| format!("{} (\"{}\")", session.id, session.title))
-                    .collect();
-                let known = sessions.iter().any(|session| {
-                    session.id == *child_id
-                        && session.parent_session_id.as_deref() == Some(&self.session_id)
-                });
-                if !known {
-                    let children = match children.is_empty() {
-                        true => "This session has no child sessions.".to_owned(),
-                        false => format!("Its child sessions: {}.", children.join(", ")),
-                    };
-                    return Err(Error::Missing(format!(
-                        "{child_id} is not `parent`, `user` or the id of a child session of \
-                         this session. {children}"
-                    )));
-                }
-                let lead = store.setup(child_id).await?.dispatch;
-                let handed = briefing::note_from_parent(&self.title, &text);
-                (
-                    child_id.clone(),
-                    lead.map(|dispatch| dispatch.lead_agent_id),
-                    Some(handed),
-                )
-            }
-        };
+        let NoteRoute {
+            session: to_session,
+            agent: to_agent,
+            handed: delivery,
+        } = self.note_route(&to, &text).await?;
         let message = AgentMessage {
             id: Ulid::generate().to_string(),
             kind: MessageKind::Note,
@@ -2482,6 +2451,68 @@ impl Driver {
         Ok(match is_closed(status) {
             true => NoteOutcome::Unread(status),
             false => NoteOutcome::Delivered,
+        })
+    }
+
+    /// Where a note to `to` goes.
+    async fn note_route(&self, to: &NoteTarget, text: &str) -> Result<NoteRoute> {
+        match to {
+            NoteTarget::User => Ok(NoteRoute {
+                session: self.session_id.clone(),
+                agent: None,
+                handed: None,
+            }),
+            NoteTarget::Parent => {
+                let Some(dispatch) = &self.setup.dispatch else {
+                    return Err(Error::Missing(
+                        "this session was not dispatched by another session, so it has no \
+                         parent. Use `user` to leave a note for the user."
+                            .to_owned(),
+                    ));
+                };
+                let handed = briefing::note_from_child(&self.title, &self.session_id, text);
+                Ok(NoteRoute {
+                    session: dispatch.parent_session_id.clone(),
+                    agent: Some(dispatch.agent_id.clone()),
+                    handed: Some(handed),
+                })
+            }
+            NoteTarget::Child(child_id) => self.child_route(child_id, text).await,
+        }
+    }
+
+    /// Where a note to the child session `child_id` goes; refused, with
+    /// the children there are, when it is no child of this session.
+    async fn child_route(&self, child_id: &str, text: &str) -> Result<NoteRoute> {
+        let sessions = self.inner.store.sessions().await?;
+        let mine = |session: &&calin_proto::Session| {
+            session.parent_session_id.as_deref() == Some(&self.session_id)
+        };
+        if !sessions
+            .iter()
+            .filter(mine)
+            .any(|session| session.id == child_id)
+        {
+            let children: Vec<String> = sessions
+                .iter()
+                .rev()
+                .filter(mine)
+                .map(|session| format!("{} (\"{}\")", session.id, session.title))
+                .collect();
+            let children = match children.is_empty() {
+                true => "This session has no child sessions.".to_owned(),
+                false => format!("Its child sessions: {}.", children.join(", ")),
+            };
+            return Err(Error::Missing(format!(
+                "{child_id} is not `parent`, `user` or the id of a child session of \
+                 this session. {children}"
+            )));
+        }
+        let lead = self.inner.store.setup(child_id).await?.dispatch;
+        Ok(NoteRoute {
+            session: child_id.to_owned(),
+            agent: lead.map(|dispatch| dispatch.lead_agent_id),
+            handed: Some(briefing::note_from_parent(&self.title, text)),
         })
     }
 
@@ -3094,6 +3125,30 @@ enum Ending<'a> {
     Failed(&'a str),
     /// It was stopped before it came to rest.
     Stopped,
+}
+
+/// Where a child starts in each of `repos`: the commit each is at, by repo
+/// id, and what the dispatching agent is told of each. Never committed on
+/// the agent's behalf: the child starts from the last commit, and the agent
+/// is told when that leaves work behind.
+async fn start_points(
+    repos: &[SessionRepo],
+) -> Result<(BTreeMap<String, String>, Vec<DispatchedRepo>)> {
+    let mut start_points = BTreeMap::new();
+    let mut dispatched = Vec::with_capacity(repos.len());
+    for repo in repos {
+        let dir = PathBuf::from(&repo.path);
+        let (commit, dirty) =
+            blocking(move || Ok((calin_git::head_commit(&dir)?, calin_git::is_dirty(&dir)?)))
+                .await?;
+        start_points.insert(repo.repo_id.clone(), commit.clone());
+        dispatched.push(DispatchedRepo {
+            name: repo.name.clone(),
+            commit,
+            dirty,
+        });
+    }
+    Ok((start_points, dispatched))
 }
 
 /// A session's branches as a report describes them: where each stands
