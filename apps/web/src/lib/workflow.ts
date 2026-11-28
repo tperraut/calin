@@ -102,7 +102,8 @@ export function isFailurePort(node: WorkflowNodeInfo | undefined, port: string):
   return ["failed", "fail", "exhausted", "reject"].includes(port);
 }
 
-const idleRun = (id: string): WorkflowNodeRun => ({
+/** A node that has not run yet. */
+export const idleRun = (id: string): WorkflowNodeRun => ({
   id,
   state: "idle",
   runs: 0,

@@ -1,8 +1,7 @@
 import type { WorkflowEdge } from "../../gen/WorkflowEdge";
 import type { WorkflowNodeInfo } from "../../gen/WorkflowNodeInfo";
-import type { WorkflowNodeRun } from "../../gen/WorkflowNodeRun";
 import type { WorkflowRun } from "../../gen/WorkflowRun";
-import { isFailurePort, kindWord, loopProgress } from "../../lib/workflow";
+import { idleRun, isFailurePort, kindWord, loopProgress } from "../../lib/workflow";
 
 /** One node with where it stands in the run. */
 export type NodeOverlay = {
@@ -40,21 +39,11 @@ export type RunOverlay = {
 const sameEdge = (a: WorkflowEdge, b: WorkflowEdge): boolean =>
   a.from === b.from && a.port === b.port && a.to === b.to;
 
-const idle = (id: string): WorkflowNodeRun => ({
-  id,
-  state: "idle",
-  runs: 0,
-  last_port: null,
-  outcome: null,
-  iteration: null,
-  max: null,
-});
-
 /** The run laid over its graph. Pure. */
 export function runOverlay(run: WorkflowRun): RunOverlay {
   const runs = new Map(run.nodes.map((node) => [node.id, node]));
   const nodes = run.graph.nodes.map((info): NodeOverlay => {
-    const known = runs.get(info.id) ?? idle(info.id);
+    const known = runs.get(info.id) ?? idleRun(info.id);
     const iteration =
       known.iteration ?? (info.kind === "loop" && known.runs > 0 ? known.runs : null);
     return {
