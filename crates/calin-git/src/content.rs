@@ -97,3 +97,55 @@ pub(crate) fn read_hashed(path: &Path, max_bytes: u64) -> Result<Hashed> {
         hash: hex(hasher.finalize().as_slice()),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+
+    use super::*;
+    use crate::testing::Sandbox;
+
+    /// Answers each read with the next result; a read past the last one is an error.
+    struct Scripted(VecDeque<io::Result<&'static [u8]>>);
+
+    impl Read for Scripted {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let bytes = self
+                .0
+                .pop_front()
+                .unwrap_or_else(|| Err(io::Error::other("read past the end")))?;
+            buf[..bytes.len()].copy_from_slice(bytes);
+            Ok(bytes.len())
+        }
+    }
+
+    #[test]
+    fn chunks_are_read_up_to_the_end_and_an_interrupted_read_is_tried_again() {
+        let reader = Scripted(VecDeque::from([
+            Err(ErrorKind::Interrupted.into()),
+            Ok(&b"ab"[..]),
+            Err(ErrorKind::Interrupted.into()),
+            Ok(&b"c"[..]),
+            Ok(&b""[..]),
+        ]));
+        let mut seen = Vec::new();
+        read_chunks(reader, |chunk| {
+            seen.extend_from_slice(chunk);
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+        assert_eq!(seen, b"abc");
+    }
+
+    #[test]
+    fn a_capped_read_keeps_a_file_at_the_limit_and_refuses_one_byte_more() {
+        let sandbox = Sandbox::new();
+        let path = sandbox.dir("files").join("f");
+        std::fs::write(&path, "12345").unwrap();
+        assert_eq!(
+            read_capped(&path, 5).unwrap().as_deref(),
+            Some(&b"12345"[..])
+        );
+        assert_eq!(read_capped(&path, 4).unwrap(), None);
+    }
+}
