@@ -53,6 +53,8 @@ describe("messageHeading", () => {
       to_agent_id: "a1",
     });
     expect(messageHeading(fromSubagent, "received", inParent)).toBe("Note from explorer");
+    const fromUnknown = makeMessage("m", { from_agent_id: "gone", to_session_id: "s1" });
+    expect(messageHeading(fromUnknown, "received", inParent)).toBe("Note from the agent");
   });
 
   it("falls back to the session's place in the tree when its title is not known", () => {
@@ -79,8 +81,11 @@ describe("messageHeading", () => {
 
 describe("isLongBody", () => {
   it("is true past ten lines or six hundred characters", () => {
+    const lines = (count: number) => Array.from({ length: count }, () => "line").join("\n");
     expect(isLongBody("short")).toBe(false);
+    expect(isLongBody("x".repeat(600))).toBe(false);
     expect(isLongBody("x".repeat(601))).toBe(true);
-    expect(isLongBody(Array.from({ length: 11 }, () => "line").join("\n"))).toBe(true);
+    expect(isLongBody(lines(10))).toBe(false);
+    expect(isLongBody(lines(11))).toBe(true);
   });
 });

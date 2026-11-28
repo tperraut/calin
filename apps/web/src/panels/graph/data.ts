@@ -41,8 +41,6 @@ export type OrchestrationData = {
 export type OrchestrationDeps = {
   graph(at?: number): Promise<Graph>;
   timeline(): Promise<Timeline>;
-  /** How long changes are gathered before one read. */
-  delayMs?: number;
 };
 
 /** Events arrive in bursts: one read per burst. */
@@ -121,13 +119,12 @@ class Orchestration implements OrchestrationData {
     [this.live, this.setLiveSignal] = createSignal(true);
     [this.at, this.setAtSignal] = createSignal<number>();
     [this.playing, this.setPlayingSignal] = createSignal(false);
-    const delay = deps.delayMs ?? REFETCH_DELAY_MS;
     // A past moment does not change with new events: only the live graph is read again.
     this.graphRefresher = createRefresher(
       () => (this.isLive ? this.readGraph(undefined) : Promise.resolve()),
-      delay,
+      REFETCH_DELAY_MS,
     );
-    this.timelineRefresher = createRefresher(() => this.readTimeline(), delay);
+    this.timelineRefresher = createRefresher(() => this.readTimeline(), REFETCH_DELAY_MS);
     // Marked stale while hidden: the first read happens when the panel is first seen.
     this.graphRefresher.now();
   }

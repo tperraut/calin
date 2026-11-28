@@ -3,7 +3,15 @@ import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import type { SessionRepo } from "../../gen/SessionRepo";
 import type { TreeEntry } from "../../gen/TreeEntry";
 import { deferred, makeSessionRepo, settle } from "../../test/fakes";
-import { createFileTree, dirKey, parentKey, type FileTree, type TreeRow } from "./tree";
+import {
+  createFileTree,
+  dirKey,
+  isFolder,
+  parentKey,
+  treeRows,
+  type FileTree,
+  type TreeRow,
+} from "./tree";
 
 const entry = (path: string, kind: TreeEntry["kind"] = "file", ignored = false): TreeEntry => ({
   name: path.slice(path.lastIndexOf("/") + 1),
@@ -118,7 +126,7 @@ describe("file tree", () => {
 
     listings["api\nsrc"] = [...listings["api\nsrc"], entry("src/health.rs")];
     tree.refresh("api");
-    expect(rows()).toContain("  (loading)");
+    expect(rows()).toEqual(["v api", "  (loading)", "v web", "  package.json"]);
     await settle();
     expect(rows()).toContain("    health.rs");
     expect(list.mock.calls.map(([repoId, path]) => `${repoId}:${path}`).toSorted()).toEqual([
@@ -136,8 +144,18 @@ describe("file tree", () => {
     expect(rows()).toEqual(["v api", "  (error: src is not a directory)", "> web"]);
     tree.collapse(dirKey("api", ""));
     tree.expand(dirKey("api", ""));
+    expect(rows()).toEqual(["v api", "  (loading)", "> web"]);
     await settle();
     expect(rows()).toContain("  Cargo.toml");
+  });
+
+  it("keeps a listed folder's entries on screen while it is listed again", async () => {
+    const { tree, rows } = setup();
+    tree.expand(dirKey("api", ""));
+    await settle();
+    tree.reloadDir("api", "");
+    expect(rows()).toContain("  Cargo.toml");
+    expect(rows()).not.toContain("  (loading)");
   });
 
   it("drops a listing that answers after a refresh asked for a newer one", async () => {
@@ -189,6 +207,31 @@ describe("file tree", () => {
     const { rows, setKnown } = setup();
     setKnown([makeSessionRepo("web"), makeSessionRepo("docs", { mode: "read" })]);
     expect(rows()).toEqual(["> web", "> docs"]);
+  });
+
+  it("tells folders, roots included, from files", async () => {
+    const { tree } = setup();
+    tree.expand(dirKey("api", ""));
+    await settle();
+    flush();
+    const folders = tree
+      .rows()
+      .flatMap((row) => (row.kind === "note" ? [] : [`${row.key}:${isFolder(row)}`]));
+    expect(folders).toEqual([
+      "api\n:true",
+      "api\nassets:true",
+      "api\nsrc:true",
+      "api\nCargo.toml:false",
+      "api\nREADME.md:false",
+      "web\n:true",
+    ]);
+  });
+
+  it("says an open folder nothing was listed for yet is loading", () => {
+    const repos = [makeSessionRepo("api")];
+    const opened = new Set([dirKey("api", "")]);
+    const rows = treeRows(repos, { listed: new Map(), opened }).map(describe_);
+    expect(rows).toEqual(["v api", "  (loading)"]);
   });
 
   it("knows the parent of an entry", () => {

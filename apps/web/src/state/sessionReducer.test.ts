@@ -323,6 +323,23 @@ describe("applyEvent", () => {
     expect(items(view)).toEqual([textItem("i1", "text")]);
   });
 
+  it("keeps reasoning out of a text item and text out of a reasoning item", () => {
+    const thinking: Item = {
+      id: "r1",
+      status: "running",
+      content: { kind: "reasoning", text: "Hm" },
+    };
+    const view = fold(
+      log(
+        { type: "item_started", item: textItem("i1", "text") },
+        { type: "item_started", item: thinking },
+        { type: "item_delta", item_id: "i1", delta: { kind: "reasoning", text: " why" } },
+        { type: "item_delta", item_id: "r1", delta: { kind: "text", text: " said" } },
+      ),
+    );
+    expect(items(view)).toEqual([textItem("i1", "text"), thinking]);
+  });
+
   it("ignores unknown event types and delta kinds, and keeps their place in the sequence", () => {
     const [future, futureDelta, known] = log(
       { type: "user_message", text: "placeholder" },
@@ -1090,6 +1107,33 @@ describe("a permission request that names its tool call", () => {
     expect(asks(view, "m1")).toBeUndefined();
   });
 
+  it("goes into the call it names wherever that call stands, and only that one", () => {
+    const view = fold(
+      log({ type: "item_started", item: toolItem("t0", null) }, started, asked, {
+        type: "permission_requested",
+        request: request("p2"),
+      }),
+    );
+    expect(kinds(view)).toEqual(["item", "item", "permission"]);
+    expect(asks(view, "t0")).toBeUndefined();
+    expect(asks(view, "t1")?.map((one) => one.request.id)).toEqual(["p1"]);
+  });
+
+  it("answers the row that shows a request, not a call that came after it", () => {
+    const view = fold(
+      log(
+        { type: "permission_requested", request: request("p1") },
+        started,
+        answer("user", "allow"),
+      ),
+    );
+    expect(view.transcript[0]).toMatchObject({
+      kind: "permission",
+      outcome: { state: "resolved", decision: "allow", by: "user" },
+    });
+    expect(asks(view, "t1")).toBeUndefined();
+  });
+
   it("moves into the card when its call arrives after it", () => {
     const early = log(asked, started);
     const view = fold(early);
@@ -1185,6 +1229,17 @@ describe("a repo attached while the session is under way", () => {
       log({ type: "item_started", item: textItem("m1", "Hi") }, attach("web", AGENT)),
     );
     expect(repoRows(fromItem)).toEqual([["web", "agent", AGENT]]);
+  });
+
+  it("counts the turn as begun still once that first item completes", () => {
+    const view = fold(
+      log(
+        { type: "item_started", item: textItem("m1", "Hi") },
+        { type: "item_completed", item: textItem("m1", "Hi", "completed") },
+        attach("web"),
+      ),
+    );
+    expect(repoRows(view)).toEqual([["web", "user", null]]);
   });
 
   it("is not news when the session already has the repo", () => {
@@ -1482,6 +1537,20 @@ describe("applyEvent: questions", () => {
     expect(view.transcript[0]).toMatchObject({ kind: "question", outcome: { state: "expired" } });
   });
 
+  it("closes a question that is not the first row", () => {
+    const view = fold(
+      log(
+        { type: "user_message", text: "go" },
+        { type: "question_asked", question },
+        { type: "question_answered", question_id: "q1", answer: "Footer", by: "user" },
+      ),
+    );
+    expect(view.transcript[1]).toMatchObject({
+      kind: "question",
+      outcome: { state: "answered", answer: "Footer", by: "user" },
+    });
+  });
+
   it("keeps several questions open, oldest first, and closes the one that is answered", () => {
     const second = { id: "q2", text: "Which color?", options: [], gate: false };
     const view = fold(
@@ -1588,6 +1657,18 @@ describe("applyEvent: subagents", () => {
     // `t1` started with the event `e2`.
     events[3] = { ...events[3], parent_id: "e2" };
     expect(fold(events).subagentCalls).toEqual({ sub1: "t1" });
+  });
+
+  it("never links a subagent to a call that is no delegation", () => {
+    const events = log(
+      { type: "agent_spawned", agent },
+      { type: "item_started", item: toolItem("b1", null) },
+      ["a1", { type: "agent_spawned", agent: sub("sub1", "explorer") }],
+      ["a1", { type: "agent_spawned", agent: sub("sub2", "reviewer") }],
+    );
+    // `sub2` names the Bash call's start as its cause.
+    events[3] = { ...events[3], parent_id: "e2" };
+    expect(fold(events).subagentCalls).toEqual({});
   });
 
   it("keeps the link when the subagent is announced again", () => {
@@ -1796,6 +1877,11 @@ describe("applyEvent: workflow runs", () => {
     const view = fold(log(on("implement"), off("implement", "done"), end("success")));
     expect(view.workflow).toBeNull();
     expect(view.transcript).toEqual([]);
+  });
+
+  it("keeps the reason of the end as the server gave it", () => {
+    const view = fold(log(begin, end("failed", "")));
+    expect(view.workflow?.reason).toBe("");
   });
 
   it("writes light rows: the start, each step that starts, the results that are news, the end", () => {

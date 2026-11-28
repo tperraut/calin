@@ -10,7 +10,19 @@ import {
   userNode,
 } from "../../test/orchestration";
 import { layoutGraph } from "./layout";
-import { describeGraph, edgeSentence, graphModel, sessionLead, type EdgeView } from "./model";
+import {
+  clip,
+  clipMiddle,
+  describeGraph,
+  edgeEmphasis,
+  edgeKindWords,
+  edgeSentence,
+  edgesOf,
+  graphModel,
+  repoChangers,
+  sessionLead,
+  type EdgeView,
+} from "./model";
 
 const model = () => graphModel(makeGraph(), "s1");
 
@@ -83,6 +95,15 @@ describe("graphModel: the nodes", () => {
     });
     expect(graphModel(graph, "s1").nodeById.get("agent:a2")?.name).toBe("worker (coder)");
   });
+
+  it("shows only the title of an agent node the server sent without its agent", () => {
+    const graph = makeGraph({
+      nodes: [userNode(), agentNode(makeAgent("a1"), "user", { label: "lead", agent: null })],
+      edges: [],
+    });
+    const lead = graphModel(graph, "s1").nodeById.get("agent:a1");
+    expect([lead?.name, lead?.status, lead?.cost]).toEqual(["lead", undefined, undefined]);
+  });
 });
 
 describe("graphModel: the edges", () => {
@@ -140,6 +161,14 @@ describe("graphModel: the edges", () => {
         lane: 0,
       },
     ]);
+  });
+
+  it("never links a repo to a parent, even one the server gave it", () => {
+    const graph = makeGraph({
+      nodes: [userNode(), repoNode("api", { parent_id: "user" })],
+      edges: [],
+    });
+    expect(graphModel(graph, "s1").edges).toEqual([]);
   });
 });
 
@@ -248,5 +277,123 @@ describe("sessionLead", () => {
   it("finds none for no session, or for a session whose lead is not in the graph", () => {
     expect(sessionLead(null, model())).toBeUndefined();
     expect(sessionLead("s9", model())).toBeUndefined();
+  });
+});
+
+describe("edgeKindWords", () => {
+  it("names each kind in words, a tree link as a start, and an unknown kind by its wire name", () => {
+    expect(edgeKindWords("spawned")).toBe("Spawned subagent");
+    expect(edgeKindWords("changed")).toBe("Changed files");
+    expect(edgeKindWords("link")).toBe("Started");
+    expect(edgeKindWords("zap" as unknown as EdgeView["kind"])).toBe("zap");
+  });
+});
+
+describe("repoChangers", () => {
+  it("lists who changed a repo, most files first, and nothing of other repos", () => {
+    const graph = makeGraph({
+      edges: [
+        makeEdge("changed", "agent:a1", "repo:api"),
+        makeEdge("changed", "agent:a2", "repo:api", { count: 4 }),
+        makeEdge("changed", "agent:sub1", "repo:api", { count: 2 }),
+        makeEdge("changed", "agent:a3", "repo:web", { count: 9 }),
+      ],
+    });
+    expect(repoChangers("repo:api", graphModel(graph, "s1"))).toEqual([
+      { edgeId: "changed:agent:a2:repo:api", name: "worker (API: add /health)", count: 4 },
+      { edgeId: "changed:agent:sub1:repo:api", name: "explorer", count: 2 },
+      { edgeId: "changed:agent:a1:repo:api", name: "lead", count: 1 },
+    ]);
+  });
+});
+
+describe("edgeEmphasis", () => {
+  const a2Edges = [
+    "dispatched:agent:a1:agent:a2",
+    "message:agent:a2:agent:a1",
+    "message:agent:a1:agent:a2",
+    "report:agent:a2:agent:a1",
+    "changed:agent:a2:repo:api",
+  ];
+  const emphasis = (
+    selection: { kind: "node" | "edge"; id: string } | undefined,
+    focused: string | undefined,
+  ) => {
+    const { active, hot } = edgeEmphasis(model(), selection, focused);
+    return { active, hot: [...hot] };
+  };
+
+  it("brings out a picked edge alone", () => {
+    expect(emphasis({ kind: "edge", id: "report:agent:a2:agent:a1" }, "agent:a1")).toEqual({
+      active: true,
+      hot: ["report:agent:a2:agent:a1"],
+    });
+  });
+
+  it("brings out every edge of the picked node, in and out, over the focused one", () => {
+    expect(emphasis({ kind: "node", id: "agent:a2" }, "agent:a1")).toEqual({
+      active: true,
+      hot: a2Edges,
+    });
+  });
+
+  it("brings out the edges of the focused node when nothing is picked, or a gone edge is", () => {
+    expect(emphasis(undefined, "agent:a2")).toEqual({ active: true, hot: a2Edges });
+    expect(emphasis({ kind: "edge", id: "gone" }, "agent:a2")).toEqual({
+      active: true,
+      hot: a2Edges,
+    });
+  });
+
+  it("fades nothing for no node, or for a node the model does not hold", () => {
+    const none = { active: false, hot: [] };
+    expect(emphasis(undefined, undefined)).toEqual(none);
+    expect(emphasis({ kind: "node", id: "agent:gone" }, "agent:a2")).toEqual(none);
+    expect(emphasis(undefined, "agent:gone")).toEqual(none);
+  });
+});
+
+describe("edgesOf", () => {
+  it("lists every edge in or out of a node but its tree link", () => {
+    expect(edgesOf("agent:a1", model()).map((one) => one.id)).toEqual([
+      "spawned:agent:a1:agent:sub1",
+      "spawned:agent:a1:agent:sub2",
+      "dispatched:agent:a1:agent:a2",
+      "dispatched:agent:a1:agent:a3",
+      "message:agent:a2:agent:a1",
+      "message:agent:a1:agent:a2",
+      "report:agent:a2:agent:a1",
+      "changed:agent:a1:repo:api",
+    ]);
+  });
+});
+
+describe("clip", () => {
+  it("keeps a text that fits, to the last character", () => {
+    expect(clip("abcde", 5)).toBe("abcde");
+  });
+
+  it("cuts a longer text to the size, the ellipsis included, without a trailing space", () => {
+    expect(clip("hello world", 6)).toBe("hello…");
+    expect(clip("ab cd", 4)).toBe("ab…");
+  });
+
+  it("keeps at least one character", () => {
+    expect(clip("abc", 1)).toBe("a…");
+  });
+});
+
+describe("clipMiddle", () => {
+  it("keeps a text that fits, to the last character", () => {
+    expect(clipMiddle("abcdef", 6)).toBe("abcdef");
+  });
+
+  it("keeps the start and the end, the start one longer when they cannot be even", () => {
+    expect(clipMiddle("abcdefghij", 6)).toBe("abc…ij");
+    expect(clipMiddle("abcdefghij", 7)).toBe("abc…hij");
+  });
+
+  it("drops the spaces next to the ellipsis", () => {
+    expect(clipMiddle("Ship the health check: part A", 16)).toBe("Ship the…part A");
   });
 });

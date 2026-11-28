@@ -19,6 +19,7 @@ import { createBuffers, sessionTabStorage, type Buffer, type Buffers } from "./f
 import { FileTreeView } from "./files/FileTreeView";
 import { createFileTree, dirKey, type FileTree } from "./files/tree";
 import type { FileTarget, PanelLinks, PanelProps } from "./registry";
+import { ErrorNote } from "../components/ErrorNote";
 
 /** Width of the panel from which the tree and the editor fit side by side. */
 const COLUMNS_FROM = 600;
@@ -197,13 +198,7 @@ function NewFileForm(props: { state: FilesState; where: NewFile }) {
         disabled={props.state.creating()}
         onInput={(event) => props.state.setNewName(event.currentTarget.value)}
       />
-      <Show when={props.state.newError()}>
-        {(message) => (
-          <p role="alert" class="text-sm text-tone-danger">
-            {message()}
-          </p>
-        )}
-      </Show>
+      <ErrorNote message={props.state.newError()} />
       <div class="flex justify-end gap-2">
         <button
           type="button"

@@ -15,6 +15,7 @@ import {
   viewChoices,
 } from "./panelModel";
 import { laneViews } from "./timelineModel";
+import { ACROSS_MIN_WIDTH } from "./workflowLayout";
 
 const lanes = () => laneViews(makeTimeline(), "s1", () => undefined);
 
@@ -35,7 +36,10 @@ describe("the panel's views", () => {
 
   it("draws the workflow top to bottom only on a pane known to be narrow", () => {
     expect(orientationFor(0)).toBe("across");
+    expect(orientationFor(1)).toBe("down");
     expect(orientationFor(400)).toBe("down");
+    expect(orientationFor(ACROSS_MIN_WIDTH - 1)).toBe("down");
+    expect(orientationFor(ACROSS_MIN_WIDTH)).toBe("across");
     expect(orientationFor(900)).toBe("across");
   });
 });
@@ -104,6 +108,7 @@ describe("what is picked in the timeline", () => {
     expect(pickedArrow(makeTimeline(), { kind: "arrow", id: "gone" })).toBeUndefined();
     expect(pickedArrow(undefined, { kind: "arrow", id: "ar3" })).toBeUndefined();
     expect(pickedArrow(makeTimeline(), { kind: "span", agentId: "a1", id: "t1" })).toBeUndefined();
+    expect(pickedArrow(makeTimeline(), undefined)).toBeUndefined();
   });
 
   it("names an arrow's end: the user, a lane, or an agent without one", () => {
@@ -116,9 +121,21 @@ describe("what is picked in the timeline", () => {
     const tool = pickedSpan(lanes(), { kind: "span", agentId: "a1", id: "t1" });
     const turn = pickedSpan(lanes(), { kind: "span", agentId: "a1", id: "turn-1" });
     const child = pickedSpan(lanes(), { kind: "span", agentId: "a2", id: "c1" });
-    expect(spanItem(undefined, "s1", [])).toBeUndefined();
-    expect(spanItem(turn, "s1", [])).toBeUndefined();
-    expect(spanItem(child, "s1", [])).toBeUndefined();
+    const item = (id: string): TranscriptEntry => ({
+      kind: "item",
+      key: id,
+      ts: 1,
+      agentId: null,
+      item: { id, status: "completed", content: { kind: "text", text: "" } },
+      interrupted: false,
+    });
+    const held = [item("t1"), item("turn-1"), item("c1")];
+    expect(spanItem(tool, "s1", held)).toBe("t1");
+    expect(spanItem(undefined, "s1", held)).toBeUndefined();
+    expect(spanItem(turn, "s1", held)).toBeUndefined();
+    expect(spanItem(child, "s1", held)).toBeUndefined();
+    expect(spanItem(tool, "s2", held)).toBeUndefined();
+    expect(spanItem(tool, "s1", [item("turn-1")])).toBeUndefined();
     expect(spanItem(tool, "s1", [{ kind: "user", key: "u1", ts: 1, text: "t1" }])).toBeUndefined();
   });
 });

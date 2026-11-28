@@ -1,5 +1,6 @@
 import { createMemo, createSignal, createUniqueId, For, Show } from "solid-js";
 import { announceNewest, type Announcement } from "../lib/announcement";
+import { filled } from "../lib/format";
 import { answerState, createAnswers } from "../state/permissionAnswers";
 import type { OpenQuestion } from "../state/sessionReducer";
 import { ErrorNote } from "./ErrorNote";
@@ -18,12 +19,6 @@ const sectionLabelOf = (open: OpenQuestion): string =>
 
 const sayQuestion = (newest: OpenQuestion): string =>
   `${askerOf(newest)}: ${newest.question.text.slice(0, ANNOUNCED_CHARS)}`;
-
-/** A gate's comment as sent: trimmed, and none when only blank was written. */
-function commentOf(note: string | undefined): string | undefined {
-  const said = note?.trim() ?? "";
-  return said === "" ? undefined : said;
-}
 
 /** Sends through `onAnswer`, passing a comment only when there is one. */
 const answerWith =
@@ -72,7 +67,7 @@ export function QuestionBar(props: {
   async function answer(value: string, note?: string): Promise<void> {
     const id = currentId();
     if (id === undefined || value.trim() === "" || waiting()) return;
-    if (!(await answers.answer(id, value.trim(), commentOf(note)))) return;
+    if (!(await answers.answer(id, value.trim(), filled(note)))) return;
     setText("");
     setComment("");
   }

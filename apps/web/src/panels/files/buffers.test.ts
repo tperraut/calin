@@ -124,6 +124,41 @@ describe("buffers", () => {
     expect(read).toHaveBeenCalledTimes(1);
   });
 
+  it("is neither dirty nor busy while it loads, and its text arrives as a new revision", async () => {
+    const { buffers, read } = setup();
+    const pending = deferred<FileContent>();
+    read.mockReturnValueOnce(pending.promise);
+    buffers.open(main);
+    flush();
+    const [buffer] = buffers.list();
+    expect([buffer.dirty(), buffer.busy(), buffers.anyDirty(), buffer.revision()]).toEqual([
+      false,
+      false,
+      false,
+      0,
+    ]);
+    pending.resolve(content(main, "fn main() {}\n"));
+    await settle();
+    flush();
+    expect(buffer.revision()).toBe(1);
+  });
+
+  it("works without anywhere to keep its tabs", async () => {
+    const read = (target: FileTarget) => Promise.resolve(content(target, "text\n"));
+    let buffers!: Buffers;
+    dispose = createRoot((stop) => {
+      buffers = createBuffers({ read, write: read, readOnly: () => false });
+      return stop;
+    });
+    buffers.open(main);
+    await settle();
+    flush();
+    expect(buffers.active()?.text()).toBe("text\n");
+    buffers.close(bufferKey(main));
+    flush();
+    expect(buffers.list()).toEqual([]);
+  });
+
   it("shows an open file again instead of opening it twice", async () => {
     const { buffers, opened, read } = setup();
     await opened(main);
@@ -402,6 +437,7 @@ describe("buffers", () => {
     flush();
     expect(buffers.list().map((buffer) => buffer.name)).toEqual(["main.rs", "guide.md"]);
     expect(buffers.activeKey()).toBe(bufferKey(guide));
+    expect(buffers.active()?.name).toBe("guide.md");
     buffers.close(bufferKey(guide));
     flush();
     expect(buffers.activeKey()).toBe(bufferKey(main));
@@ -409,6 +445,16 @@ describe("buffers", () => {
     flush();
     expect(buffers.activeKey()).toBeUndefined();
     expect(buffers.active()).toBeUndefined();
+  });
+
+  it("moves to the tab before when the last one closes", async () => {
+    const { buffers, opened } = setup();
+    await opened(main);
+    await opened(lib);
+    await opened(guide);
+    buffers.close(bufferKey(guide));
+    flush();
+    expect(buffers.activeKey()).toBe(bufferKey(lib));
   });
 
   it("creates a file without a hash, opens it, and passes on a 409 when it already exists", async () => {
@@ -615,7 +661,17 @@ describe("buffers", () => {
     expect(storage.load()).toBeUndefined();
     sessionStorage.setItem(
       "calin.files.v1:s1",
-      JSON.stringify({ tabs: [main, { path: 3 }, "x", { ...lib, text: "leaked" }], active: 7 }),
+      JSON.stringify({
+        tabs: [
+          main,
+          { path: 3 },
+          "x",
+          { ...lib, text: "leaked" },
+          { path: "a.rs" },
+          { sessionRepoId: 5, path: "a.rs" },
+        ],
+        active: 7,
+      }),
     );
     expect(storage.load()).toEqual({ tabs: [main, lib], active: null });
     sessionStorage.setItem("calin.files.v1:s1", JSON.stringify({ active: bufferKey(main) }));

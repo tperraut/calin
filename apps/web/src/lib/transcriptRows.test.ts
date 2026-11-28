@@ -1,8 +1,9 @@
 import { describe, expect, it } from "vite-plus/test";
 import type { Item } from "../gen/Item";
 import type { TranscriptEntry } from "../state/sessionReducer";
+import { makePullRequest } from "../test/fakes";
 import { makeAgent, makeSubagent } from "../test/orchestration";
-import { transcriptRows } from "./transcriptRows";
+import { entryAgent, transcriptRows } from "./transcriptRows";
 
 const item = (
   id: string,
@@ -116,6 +117,25 @@ describe("transcriptRows", () => {
     ]);
     const quiet = transcriptRows([user, item("m1", "a1")], agents, {}, null);
     expect(shape(quiet)).toEqual(["event:u", "item:m1"]);
+  });
+
+  it("gathers the rows of a session's only subagent too", () => {
+    const one = [makeAgent("a1"), makeSubagent("sub1", "explorer")];
+    const rows = transcriptRows(entries.slice(0, 4), one, { sub1: "t1" }, null);
+    expect(shape(rows)).toEqual(["event:u", "item:m1", "item:t1", "subagent:sub1[item:s1a]#1"]);
+  });
+
+  it("says the user's rows and the pull request rows are nobody's", () => {
+    const opened: TranscriptEntry = {
+      kind: "pull_request",
+      key: "pull_request:r1:7:opened",
+      ts: 0,
+      what: "opened",
+      pullRequest: makePullRequest("r1", 7),
+    };
+    expect(entryAgent(user)).toBeNull();
+    expect(entryAgent(opened)).toBeNull();
+    expect(entryAgent(item("m1", "a1"))).toBe("a1");
   });
 
   it("leaves the transcript flat when the session has no subagent", () => {

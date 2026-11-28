@@ -163,7 +163,7 @@ class Placement {
   /** A tree under the ones already placed. */
   placeTree(root: GraphNode): void {
     this.treeRows += this.place(root, 0, this.treeRows);
-    this.height = Math.max(0, this.treeRows * SLOT - (SLOT - NODE_SIZE.agent.h));
+    this.height = this.treeRows * SLOT - (SLOT - NODE_SIZE.agent.h);
   }
 
   /** A node and everything under it from row `top`; the rows they take. */

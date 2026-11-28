@@ -49,6 +49,12 @@ export const compareText = (a: string, b: string): number => (a < b ? -1 : a > b
 /** Text typed in an optional field, trimmed; `null` when nothing is left, which the server reads as "not set". */
 export const blankAsNull = (typed: string): string | null => typed.trim() || null;
 
+/** Text trimmed, or `undefined` when there is nothing but blanks. */
+export function filled(text: string | undefined): string | undefined {
+  const trimmed = text?.trim();
+  return trimmed === "" ? undefined : trimmed;
+}
+
 /** "api", "api and web", "api, web and docs". */
 export function listInWords(items: readonly string[]): string {
   if (items.length <= 1) return items.join("");

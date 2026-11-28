@@ -117,6 +117,11 @@ const layerMap = (layout: WorkflowLayout): Record<string, number> =>
 
 const orientations: Orientation[] = ["across", "down"];
 
+const sizeOf = (example: WorkflowGraph, orientation: Orientation): number[] => {
+  const { width, height } = layoutWorkflow(example, orientation);
+  return [width, height];
+};
+
 /** A 30-node workflow: a chain of checks and agents, branches to ends, and loops back. */
 function thirtyNodes(): WorkflowGraph {
   const nodes: WorkflowNodeInfo[] = [node("start", "start")];
@@ -158,6 +163,8 @@ describe("backEdges", () => {
       ["start -> a", "a.done -> b", "b.done -> end"],
     );
     expect(backEdges(upward).size).toBe(0);
+    // Each node still goes after the longest path to it, wherever the file declares it.
+    expect(Object.fromEntries(layersOf(upward))).toEqual({ start: 0, a: 1, b: 2, end: 3 });
   });
 
   it("counts a node that leads to itself", () => {
@@ -341,10 +348,177 @@ describe("layoutWorkflow", () => {
     expect(layerMap(layout)).toEqual({ start: 0, a: 1 });
   });
 
-  it("lays out an empty graph as nothing", () => {
+  it("lays out an empty graph as nothing but its padding", () => {
     const layout = layoutWorkflow({ nodes: [], edges: [] }, "down");
     expect(layout.nodes).toEqual([]);
     expect(layout.layers).toEqual([]);
-    expect(Number.isFinite(layout.width) && Number.isFinite(layout.height)).toBe(true);
+    expect([layout.width, layout.height]).toEqual([32, 32]);
+  });
+
+  it("lays a lone node out in one layer", () => {
+    expect(layoutWorkflow(graph([node("start", "start")], []), "across").layers).toEqual([
+      ["start"],
+    ]);
+  });
+
+  it("centres a narrow layer on the widest one", () => {
+    const diamond = graph(
+      [
+        node("start", "start", [
+          ["left", false],
+          ["right", false],
+        ]),
+        node("a", "agent"),
+        node("b", "agent"),
+      ],
+      ["start.left -> a", "start.right -> b"],
+    );
+    for (const orientation of orientations) {
+      const placed = layoutWorkflow(diamond, orientation).byId;
+      const side = (id: string) => {
+        const one = placed.get(id);
+        if (!one) return Number.NaN;
+        return orientation === "across" ? one.y + one.h / 2 : one.x + one.w / 2;
+      };
+      expect(side("start")).toBe((side("a") + side("b")) / 2);
+    }
+  });
+
+  it("sizes the drawing for its layers, its widest layer and the lanes of its back edges", () => {
+    // Seven layers, three nodes in the widest, two back edges.
+    expect(sizeOf(specExample(), "across")).toEqual([1784, 324]);
+    expect(sizeOf(specExample(), "down")).toEqual([632, 836]);
+  });
+
+  /**
+   * One node with three ports, given out of port order: `pass` to the end,
+   * `fail` back to the start, and `odd`, a port the node does not list.
+   */
+  const ported = () =>
+    graph(
+      [node("start", "start"), node("a", "check"), node("end", "end")],
+      ["start -> a", "a.odd -> end", "a.fail -> start", "a.pass -> end"],
+    );
+
+  const drawn = (layout: WorkflowLayout) => ({
+    nodes: layout.nodes.map(({ id, x, y }) => [id, x, y]),
+    edges: layout.edges.map(({ index, back, d, label, middle }) => ({
+      index,
+      back,
+      d,
+      label: [label.x, label.y],
+      middle: [middle.x, middle.y],
+    })),
+    size: [layout.width, layout.height],
+  });
+
+  it("draws each edge from its port's place, in port order, to the pixel, across", () => {
+    expect(drawn(layoutWorkflow(ported(), "across"))).toEqual({
+      nodes: [
+        ["start", 16, 16],
+        ["a", 280, 16],
+        ["end", 544, 16],
+      ],
+      edges: [
+        {
+          index: 0,
+          back: false,
+          d: "M184,46C232,46,232,46,280,46",
+          label: [190, 41],
+          middle: [232, 46],
+        },
+        // The unlisted port leaves last, at three quarters of the side.
+        {
+          index: 1,
+          back: false,
+          d: "M448,61C496,61,496,46,544,46",
+          label: [454, 56],
+          middle: [496, 53.5],
+        },
+        // Out past the node, down into its lane, back along it and in through the gap before the start.
+        {
+          index: 2,
+          back: true,
+          d: "M448,46L453,46Q458,46,458,51L458,92Q458,100,450,100L14,100Q6,100,6,92L6,66Q6,61,11,61L16,61",
+          label: [454, 41],
+          middle: [232, 100],
+        },
+        {
+          index: 3,
+          back: false,
+          d: "M448,31C496,31,496,46,544,46",
+          label: [454, 26],
+          middle: [496, 38.5],
+        },
+      ],
+      size: [728, 124],
+    });
+  });
+
+  it("draws each edge from its port's place, in port order, to the pixel, down", () => {
+    expect(drawn(layoutWorkflow(ported(), "down"))).toEqual({
+      nodes: [
+        ["start", 16, 16],
+        ["a", 16, 140],
+        ["end", 16, 264],
+      ],
+      edges: [
+        {
+          index: 0,
+          back: false,
+          d: "M100,76C100,108,100,108,100,140",
+          label: [105, 90],
+          middle: [100, 108],
+        },
+        {
+          index: 1,
+          back: false,
+          d: "M142,200C142,232,100,232,100,264",
+          label: [147, 214],
+          middle: [121, 232],
+        },
+        {
+          index: 2,
+          back: true,
+          d: "M100,200L100,205Q100,210,105,210L200,210Q208,210,208,202L208,14Q208,6,200,6L147,6Q142,6,142,11L142,16",
+          label: [105, 214],
+          middle: [208, 108],
+        },
+        {
+          index: 3,
+          back: false,
+          d: "M58,200C58,232,100,232,100,264",
+          label: [63, 214],
+          middle: [79, 232],
+        },
+      ],
+      size: [232, 340],
+    });
+  });
+
+  it("turns each back edge into its lane further out, but never past the middle of the gap", () => {
+    for (const [orientation, insets] of [
+      ["across", [10, 16, 22, 28, 34, 40, 44, 44, 44]],
+      ["down", [10, 16, 22, 28, 28, 28, 28, 28, 28]],
+    ] as const) {
+      const layout = layoutWorkflow(thirtyNodes(), orientation);
+      const turns = layout.edges
+        .filter((edge) => edge.back)
+        .map((edge) => {
+          const from = layout.byId.get(edge.edge.from);
+          // The first corner of the path is where it turns into its lane.
+          const corner = /Q([-\d.]+),([-\d.]+)/.exec(edge.d);
+          if (!from || !corner) return Number.NaN;
+          return orientation === "across"
+            ? Number(corner[1]) - (from.x + from.w)
+            : Number(corner[2]) - (from.y + from.h);
+        });
+      expect(turns).toEqual(insets);
+      // Each lane runs 16 px further out than the one before.
+      const lanes = layout.edges
+        .filter((edge) => edge.back)
+        .map((edge) => (orientation === "across" ? edge.middle.y : edge.middle.x));
+      expect(lanes.map((lane) => lane - lanes[0])).toEqual(insets.map((_, lane) => lane * 16));
+    }
   });
 });

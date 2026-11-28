@@ -188,6 +188,16 @@ describe("runOverlay", () => {
     expect(runOverlay(run).byId.get("tests")?.loop).toBeUndefined();
   });
 
+  it("counts a loop entered once, and says nothing while the server counts no entry", () => {
+    const once = runThrough(twice.slice(0, 4));
+    expect(runOverlay(once).byId.get("retry")?.loop).toBe("entered once");
+    const unentered: WorkflowRun = {
+      ...once,
+      nodes: once.nodes.map((node) => (node.id === "retry" ? { ...node, iteration: 0 } : node)),
+    };
+    expect(runOverlay(unentered).byId.get("retry")?.loop).toBeUndefined();
+  });
+
   it("counts each edge once per traversal, and leaves the others at zero", () => {
     const overlay = runOverlay(runThrough(twice));
     const taken = (from: string, port: string) =>
@@ -235,6 +245,23 @@ describe("ports and words", () => {
       "done ends the run as succeeded",
     );
     expect(portTargets(run, "nowhere")).toEqual([]);
+  });
+
+  it("lists each port once, and a port only an edge names after the listed ones", () => {
+    const run = runThrough([]);
+    expect(portTargets(run, "start").map(portSentence)).toEqual(["next leads to implement"]);
+    const newer: WorkflowRun = {
+      ...run,
+      graph: { ...run.graph, edges: [...graph.edges, { from: "ok", port: "later", to: "start" }] },
+    };
+    expect(portTargets(newer, "ok").map(portSentence)).toEqual(["later leads to start"]);
+  });
+
+  it("counts runs only past the first", () => {
+    const overlay = runOverlay(runThrough(twice));
+    expect(stateWords(overlay.byId.get("implement") ?? overlay.nodes[0])).toBe(
+      "Finished through done",
+    );
   });
 
   it("names a node by its id, kind and state, with its loop count", () => {

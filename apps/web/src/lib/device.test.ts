@@ -3,6 +3,8 @@ import {
   appPath,
   base64UrlToBytes,
   bytesToBase64Url,
+  isPageMessage,
+  isWhereAnswer,
   isWorkerMessage,
   PUSH_KEY_ENTRY,
   RECONCILE_ENTRY,
@@ -54,6 +56,18 @@ describe("this device", () => {
     expect(isWorkerMessage({ type: "refresh", path: "/s/1", sessionId: null })).toBe(true);
     expect(isWorkerMessage({ type: "refresh", path: "/s/1" })).toBe(false);
     expect(isWorkerMessage({ type: "other" })).toBe(false);
+  });
+
+  it("takes a page's answer to `where` only when it names a path", () => {
+    expect(isWhereAnswer({ path: "/s/1" })).toBe(true);
+    for (const answer of [{ path: 3 }, {}, null, "/s/1"]) expect(isWhereAnswer(answer)).toBe(false);
+  });
+
+  it("activates the waiting build only on the page's `activate` message", () => {
+    expect(isPageMessage({ type: "activate" })).toBe(true);
+    for (const message of [{ type: "where" }, {}, null, "activate"]) {
+      expect(isPageMessage(message)).toBe(false);
+    }
   });
 
   it("gives up on a push service that never answers", async () => {
