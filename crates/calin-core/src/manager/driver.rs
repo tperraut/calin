@@ -3147,83 +3147,106 @@ fn one_line(title: &str) -> String {
 /// the first failure, or early when cancelled.
 async fn prepare(plans: Vec<AttachPlan>, results: mpsc::Sender<Prepared>, cancel: Arc<AtomicBool>) {
     for plan in plans {
-        if cancel.load(Ordering::Relaxed) {
-            return;
-        }
-        let name = plan.repo.name.clone();
-        let setup = plan.repo.setup.clone();
-        let limit = plan.setup_limit;
-        let (repo, fresh) = match blocking(move || attach(plan)).await {
-            Ok(attached) => attached,
-            Err(error) => {
-                let _ = results.send(Prepared::Failed { repo: name, error }).await;
-                return;
-            }
-        };
-        let dir = PathBuf::from(&repo.path);
-        if results.send(Prepared::Repo(repo)).await.is_err() {
-            return;
-        }
-        // Setup is for a worktree that was just made (design spec, section
-        // 3): one that was already there has had it.
-        let Some(command) = setup.filter(|_| fresh) else {
-            continue;
-        };
-        let mut item = setup_item(&name, &command);
-        if results
-            .send(Prepared::SetupStarted(item.clone()))
-            .await
-            .is_err()
-        {
-            return;
-        }
-        let stop = Arc::clone(&cancel);
-        let ran = blocking(move || Ok(calin_git::run_setup(&dir, &command, limit, &stop)?)).await;
-        let (output, failure) = match ran {
-            Ok(run) => {
-                let failure = match run.end {
-                    calin_git::SetupEnd::Succeeded => None,
-                    calin_git::SetupEnd::Failed(how) => Some(format!("failed ({how})")),
-                    calin_git::SetupEnd::TimedOut => {
-                        Some(format!("was stopped: it ran longer than {limit:?}"))
-                    }
-                    calin_git::SetupEnd::Cancelled => Some("was cancelled".to_owned()),
-                };
-                (run.output, failure)
-            }
-            Err(err) => (String::new(), Some(format!("could not be run: {err}"))),
-        };
-        item.status = match failure {
-            None => ItemStatus::Completed,
-            Some(_) => ItemStatus::Failed,
-        };
-        if let ItemContent::Tool { output: slot, .. } = &mut item.content {
-            *slot = Some(output);
-        }
-        let failure = failure.map(|how| format!("the setup command of {name} {how}"));
-        if results
-            .send(Prepared::SetupEnded { item, failure })
-            .await
-            .is_err()
-        {
+        if cancel.load(Ordering::Relaxed) || prepare_one(plan, &results, &cancel).await.is_none() {
             return;
         }
     }
 }
 
-/// The tool item a setup command shows as. Its id is new for every run.
-fn setup_item(repo: &str, command: &str) -> Item {
+/// Makes one repo ready, then runs the setup of a worktree that is new.
+/// `None` when the preparation ends here: the repo failed, or nobody
+/// listens any more.
+async fn prepare_one(
+    plan: AttachPlan,
+    results: &mpsc::Sender<Prepared>,
+    cancel: &Arc<AtomicBool>,
+) -> Option<()> {
+    let name = plan.repo.name.clone();
+    let setup = plan.repo.setup.clone();
+    let limit = plan.setup_limit;
+    let (repo, fresh) = match blocking(move || attach(plan)).await {
+        Ok(attached) => attached,
+        Err(error) => {
+            let _ = results.send(Prepared::Failed { repo: name, error }).await;
+            return None;
+        }
+    };
+    let dir = PathBuf::from(&repo.path);
+    results.send(Prepared::Repo(repo)).await.ok()?;
+    // Setup is for a worktree that was just made (design spec, section
+    // 3): one that was already there has had it.
+    match setup.filter(|_| fresh) {
+        Some(command) => run_setup(&name, dir, command, limit, results, cancel).await,
+        None => Some(()),
+    }
+}
+
+/// Runs the setup command of `repo` in `dir`, its tool item started then
+/// ended. `None` once nobody listens any more.
+async fn run_setup(
+    repo: &str,
+    dir: PathBuf,
+    command: String,
+    limit: Duration,
+    results: &mpsc::Sender<Prepared>,
+    cancel: &Arc<AtomicBool>,
+) -> Option<()> {
+    let mut item = tool_item("setup", repo, &command);
+    results
+        .send(Prepared::SetupStarted(item.clone()))
+        .await
+        .ok()?;
+    let stop = Arc::clone(cancel);
+    let ran = blocking(move || Ok(calin_git::run_setup(&dir, &command, limit, &stop)?)).await;
+    let (output, failure) = setup_outcome(ran, limit);
+    finish_item(&mut item, output, failure.is_some());
+    let failure = failure.map(|how| format!("the setup command of {repo} {how}"));
+    results
+        .send(Prepared::SetupEnded { item, failure })
+        .await
+        .ok()
+}
+
+/// What a setup command printed, and how it failed when it did.
+fn setup_outcome(ran: Result<calin_git::SetupRun>, limit: Duration) -> (String, Option<String>) {
+    let run = match ran {
+        Ok(run) => run,
+        Err(err) => return (String::new(), Some(format!("could not be run: {err}"))),
+    };
+    let failure = match run.end {
+        calin_git::SetupEnd::Succeeded => None,
+        calin_git::SetupEnd::Failed(how) => Some(format!("failed ({how})")),
+        calin_git::SetupEnd::TimedOut => Some(format!("was stopped: it ran longer than {limit:?}")),
+        calin_git::SetupEnd::Cancelled => Some("was cancelled".to_owned()),
+    };
+    (run.output, failure)
+}
+
+/// The tool item a command the orchestrator runs shows as, nobody's tool
+/// call: `name` is `setup` or `check`. Its id is new for every run.
+fn tool_item(name: &str, repo: &str, command: &str) -> Item {
     Item {
-        id: format!("setup-{}", Ulid::generate()),
+        id: format!("{name}-{}", Ulid::generate()),
         status: ItemStatus::Running,
         content: ItemContent::Tool {
-            name: "setup".to_owned(),
+            name: name.to_owned(),
             tool_kind: ToolKind::Execute,
             title: command.to_owned(),
             input: serde_json::json!({ "command": command, "repo": repo }),
             output: None,
             locations: Vec::new(),
         },
+    }
+}
+
+/// Ends the tool item of such a command with what it printed.
+fn finish_item(item: &mut Item, output: String, failed: bool) {
+    item.status = match failed {
+        true => ItemStatus::Failed,
+        false => ItemStatus::Completed,
+    };
+    if let ItemContent::Tool { output: slot, .. } = &mut item.content {
+        *slot = Some(output);
     }
 }
 
