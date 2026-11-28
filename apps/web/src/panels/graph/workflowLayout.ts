@@ -79,29 +79,36 @@ export function backEdges(graph: WorkflowGraph): ReadonlySet<number> {
   for (const edge of graph.edges) {
     next.set(edge.from, [...(next.get(edge.from) ?? []), edge.to]);
   }
-  const reaches = (from: string, to: string): boolean => {
-    const seen = new Set<string>([from]);
-    const stack = [from];
-    while (stack.length > 0) {
-      const at = stack.pop() as string;
-      if (at === to) return true;
-      for (const one of next.get(at) ?? []) {
-        if (!seen.has(one)) {
-          seen.add(one);
-          stack.push(one);
-        }
-      }
-    }
-    return false;
-  };
   const back = new Set<number>();
   graph.edges.forEach((edge, index) => {
-    const from = position.get(edge.from);
-    const to = position.get(edge.to);
-    if (from === undefined || to === undefined || to > from) return;
-    if (reaches(edge.to, edge.from)) back.add(index);
+    if (closesCycle(edge, position, next)) back.add(index);
   });
   return back;
+}
+
+/** True when `edge` goes back in file order and its target leads back to its source. */
+function closesCycle(
+  edge: WorkflowEdge,
+  position: ReadonlyMap<string, number>,
+  next: ReadonlyMap<string, readonly string[]>,
+): boolean {
+  const from = position.get(edge.from);
+  const to = position.get(edge.to);
+  return from !== undefined && to !== undefined && to <= from && reaches(next, edge.to, edge.from);
+}
+
+/** True when a path along `next` goes from `from` to `to`. */
+function reaches(next: ReadonlyMap<string, readonly string[]>, from: string, to: string): boolean {
+  const seen = new Set<string>([from]);
+  const stack = [from];
+  while (stack.length > 0) {
+    const at = stack.pop() as string;
+    if (at === to) return true;
+    const unseen = (next.get(at) ?? []).filter((one) => !seen.has(one));
+    for (const one of unseen) seen.add(one);
+    stack.push(...unseen);
+  }
+  return false;
 }
 
 /**
@@ -116,24 +123,39 @@ export function layersOf(
   const forward = graph.edges.filter(
     (edge, index) => !back.has(index) && ids.has(edge.from) && ids.has(edge.to),
   );
-  const incoming = new Map(graph.nodes.map((node) => [node.id, 0]));
-  for (const edge of forward) incoming.set(edge.to, (incoming.get(edge.to) ?? 0) + 1);
-  const layer = new Map(graph.nodes.map((node) => [node.id, 0]));
+  return longestPaths(
+    graph.nodes.map((node) => node.id),
+    forward,
+  );
+}
+
+/** The longest path to each of `ids` over `forward`, which is acyclic. */
+function longestPaths(
+  ids: readonly string[],
+  forward: readonly WorkflowEdge[],
+): ReadonlyMap<string, number> {
+  const incoming = new Map(ids.map((id) => [id, 0]));
+  for (const edge of forward) bump(incoming, edge.to, 1);
+  const layer = new Map(ids.map((id) => [id, 0]));
   // Kahn's order, ready nodes taken in file order, so the result never depends on anything else.
-  const ready = graph.nodes.filter((node) => incoming.get(node.id) === 0).map((node) => node.id);
-  const done = new Set<string>();
+  const ready = ids.filter((id) => incoming.get(id) === 0);
   while (ready.length > 0) {
     const at = ready.shift() as string;
-    done.add(at);
-    for (const edge of forward) {
-      if (edge.from !== at) continue;
-      layer.set(edge.to, Math.max(layer.get(edge.to) ?? 0, (layer.get(at) ?? 0) + 1));
-      const left = (incoming.get(edge.to) ?? 0) - 1;
-      incoming.set(edge.to, left);
-      if (left === 0) ready.push(edge.to);
+    for (const edge of forward.filter((one) => one.from === at)) {
+      layer.set(edge.to, Math.max(countOf(layer, edge.to), countOf(layer, at) + 1));
+      if (bump(incoming, edge.to, -1) === 0) ready.push(edge.to);
     }
   }
   return layer;
+}
+
+const countOf = (counts: ReadonlyMap<string, number>, id: string): number => counts.get(id) ?? 0;
+
+/** Adds `by` to the count of `id`; the new count. */
+function bump(counts: Map<string, number>, id: string, by: number): number {
+  const next = countOf(counts, id) + by;
+  counts.set(id, next);
+  return next;
 }
 
 /** A path through `points` with rounded corners; every segment is horizontal or vertical. */
@@ -176,119 +198,25 @@ function cubic(x0: number, y0: number, x1: number, y1: number, across: boolean):
  * and comes back through the gap before its target's layer. Pure and deterministic.
  */
 export function layoutWorkflow(graph: WorkflowGraph, orientation: Orientation): WorkflowLayout {
-  const across = orientation === "across";
   const back = backEdges(graph);
-  const layerOf = layersOf(graph, back);
-  const layerCount = Math.max(0, ...layerOf.values()) + (graph.nodes.length > 0 ? 1 : 0);
-  const layers: string[][] = Array.from({ length: layerCount }, () => []);
-  for (const node of graph.nodes) layers[layerOf.get(node.id) ?? 0].push(node.id);
-  const widest = Math.max(0, ...layers.map((layer) => layer.length));
-
-  const { w, h } = WF_NODE;
-  const layerStep = across ? w + LAYER_GAP_ACROSS : h + LAYER_GAP_DOWN;
-  const slotStep = across ? h + SLOT_GAP_ACROSS : w + SLOT_GAP_DOWN;
-  const placed = new Map<string, PlacedNode>();
-  layers.forEach((layer, index) => {
-    const offset = ((widest - layer.length) * slotStep) / 2;
-    layer.forEach((id, slot) => {
-      const along = PAD + index * layerStep;
-      const side = PAD + offset + slot * slotStep;
-      placed.set(id, {
-        id,
-        x: across ? along : side,
-        y: across ? side : along,
-        w,
-        h,
-        layer: index,
-        slot,
-      });
-    });
-  });
+  const layers = layerLists(graph, layersOf(graph, back));
+  const frame = frameOf(orientation, Math.max(0, ...layers.map((layer) => layer.length)));
+  const placed = placeNodes(layers, frame);
   const nodes = graph.nodes.flatMap((node) => {
     const one = placed.get(node.id);
     return one ? [one] : [];
   });
-
-  // The far side of the nodes: back edges run beyond it.
-  const nodesEnd = across
-    ? PAD + Math.max(0, widest * slotStep - SLOT_GAP_ACROSS)
-    : PAD + Math.max(0, widest * slotStep - SLOT_GAP_DOWN);
-  const backCount = back.size;
-
-  // Where each edge leaves its node: one place per outgoing edge, in port order.
-  const portRank = (edge: WorkflowEdge): number => {
-    const node = graph.nodes.find((one) => one.id === edge.from);
-    const rank = node?.ports.findIndex((port) => port.name === edge.port) ?? -1;
-    return rank === -1 ? Number.MAX_SAFE_INTEGER : rank;
-  };
-  const drawn = graph.edges
-    .map((edge, index) => ({ edge, index }))
-    .filter(({ edge }) => placed.has(edge.from) && placed.has(edge.to));
-  const leaving = new Map<string, number[]>();
-  for (const { edge, index } of drawn.toSorted(
-    (a, b) => portRank(a.edge) - portRank(b.edge) || a.index - b.index,
-  )) {
-    leaving.set(edge.from, [...(leaving.get(edge.from) ?? []), index]);
-  }
-
-  let lane = 0;
-  const edges: PlacedEdge[] = drawn.map(({ edge, index }) => {
-    const from = placed.get(edge.from) as PlacedNode;
-    const to = placed.get(edge.to) as PlacedNode;
-    const mine = leaving.get(edge.from) ?? [index];
-    const share = (mine.indexOf(index) + 1) / (mine.length + 1);
-    // Leaving from the side that faces the next layer.
-    const x0 = across ? from.x + from.w : from.x + from.w * share;
-    const y0 = across ? from.y + from.h * share : from.y + from.h;
-    const isBack = back.has(index);
-    const label = across
-      ? { x: x0 + 6, y: y0 - 5, anchor: "start" as const }
-      : { x: x0 + 5, y: y0 + 14, anchor: "start" as const };
-    if (!isBack) {
-      const x1 = across ? to.x : to.x + to.w / 2;
-      const y1 = across ? to.y + to.h / 2 : to.y;
-      return {
-        index,
-        edge,
-        back: false,
-        d: cubic(x0, y0, x1, y1, across),
-        label,
-        middle: { x: (x0 + x1) / 2, y: (y0 + y1) / 2 },
-      };
-    }
-    const mineLane = lane;
-    lane += 1;
-    // Out into the gap after the source's layer, around the outside, back through the gap before the target's.
-    const inset = Math.min(10 + mineLane * 6, (across ? LAYER_GAP_ACROSS : LAYER_GAP_DOWN) / 2 - 4);
-    const outside = nodesEnd + LANE_OFFSET + mineLane * LANE_STEP;
-    const points: Point[] = across
-      ? [
-          { x: x0, y: y0 },
-          { x: from.x + from.w + inset, y: y0 },
-          { x: from.x + from.w + inset, y: outside },
-          { x: to.x - inset, y: outside },
-          { x: to.x - inset, y: to.y + to.h * 0.75 },
-          { x: to.x, y: to.y + to.h * 0.75 },
-        ]
-      : [
-          { x: x0, y: y0 },
-          { x: x0, y: from.y + from.h + inset },
-          { x: outside, y: from.y + from.h + inset },
-          { x: outside, y: to.y - inset },
-          { x: to.x + to.w * 0.75, y: to.y - inset },
-          { x: to.x + to.w * 0.75, y: to.y },
-        ];
-    const middle = across
-      ? { x: (points[2].x + points[3].x) / 2, y: outside }
-      : { x: outside, y: (points[2].y + points[3].y) / 2 };
-    return { index, edge, back: true, d: orthogonal(points), label, middle };
+  const drawn = graph.edges.flatMap((edge, index) => {
+    const from = placed.get(edge.from);
+    const to = placed.get(edge.to);
+    return from && to ? [{ edge, index, from, to }] : [];
   });
-
-  const lanesRoom = backCount === 0 ? 0 : LANE_OFFSET + (backCount - 1) * LANE_STEP + 8;
-  const layersEnd =
-    PAD + Math.max(0, layerCount * layerStep - (across ? LAYER_GAP_ACROSS : LAYER_GAP_DOWN));
-  const width = across ? layersEnd + PAD : nodesEnd + lanesRoom + PAD;
-  const height = across ? nodesEnd + lanesRoom + PAD : layersEnd + PAD;
+  const leaving = leavingOrder(graph, drawn);
+  // Each back edge runs in a lane of its own, in edge order.
+  const lanes = new Map(
+    drawn.filter(({ index }) => back.has(index)).map(({ index }, lane) => [index, lane]),
+  );
+  const edges = drawn.map((one) => placeEdge(one, leaving, lanes.get(one.index), frame));
   return {
     orientation,
     nodes,
@@ -296,7 +224,169 @@ export function layoutWorkflow(graph: WorkflowGraph, orientation: Orientation): 
     edges,
     order: layers.flat(),
     layers,
-    width,
-    height,
+    ...drawingSize(frame, layers.length, back.size),
   };
+}
+
+/** The nodes of each layer, in file order. */
+function layerLists(graph: WorkflowGraph, layerOf: ReadonlyMap<string, number>): string[][] {
+  const layerCount = Math.max(0, ...layerOf.values()) + (graph.nodes.length > 0 ? 1 : 0);
+  const layers: string[][] = Array.from({ length: layerCount }, () => []);
+  for (const node of graph.nodes) layers[layerOf.get(node.id) ?? 0].push(node.id);
+  return layers;
+}
+
+/** The steps and gaps of a drawing in one orientation, with `widest` nodes in its widest layer. */
+type Frame = {
+  across: boolean;
+  /** From one layer to the next. */
+  layerStep: number;
+  /** From one node of a layer to the next. */
+  slotStep: number;
+  layerGap: number;
+  widest: number;
+  /** The far side of the nodes: back edges run beyond it. */
+  nodesEnd: number;
+};
+
+function frameOf(orientation: Orientation, widest: number): Frame {
+  const across = orientation === "across";
+  const { w, h } = WF_NODE;
+  const layerGap = across ? LAYER_GAP_ACROSS : LAYER_GAP_DOWN;
+  const slotGap = across ? SLOT_GAP_ACROSS : SLOT_GAP_DOWN;
+  const slotStep = (across ? h : w) + slotGap;
+  return {
+    across,
+    layerStep: (across ? w : h) + layerGap,
+    slotStep,
+    layerGap,
+    widest,
+    nodesEnd: PAD + Math.max(0, widest * slotStep - slotGap),
+  };
+}
+
+/** Each layer's nodes one after the other, the layer centred on the widest one. */
+function placeNodes(layers: readonly (readonly string[])[], frame: Frame): Map<string, PlacedNode> {
+  const { w, h } = WF_NODE;
+  const placed = new Map<string, PlacedNode>();
+  layers.forEach((layer, index) => {
+    const offset = ((frame.widest - layer.length) * frame.slotStep) / 2;
+    layer.forEach((id, slot) => {
+      const along = PAD + index * frame.layerStep;
+      const side = PAD + offset + slot * frame.slotStep;
+      const [x, y] = frame.across ? [along, side] : [side, along];
+      placed.set(id, { id, x, y, w, h, layer: index, slot });
+    });
+  });
+  return placed;
+}
+
+/** An edge between two placed nodes, with both of them. */
+type DrawnEdge = { edge: WorkflowEdge; index: number; from: PlacedNode; to: PlacedNode };
+
+/** The rank of an edge's port among its node's ports; a port the node does not list goes last. */
+function portRank(graph: WorkflowGraph, edge: WorkflowEdge): number {
+  const node = graph.nodes.find((one) => one.id === edge.from);
+  const rank = node?.ports.findIndex((port) => port.name === edge.port) ?? -1;
+  return rank === -1 ? Number.MAX_SAFE_INTEGER : rank;
+}
+
+/** Where each edge leaves its node: one place per outgoing edge, in port order. */
+function leavingOrder(
+  graph: WorkflowGraph,
+  drawn: readonly DrawnEdge[],
+): ReadonlyMap<string, readonly number[]> {
+  const leaving = new Map<string, number[]>();
+  const ranked = drawn.toSorted(
+    (a, b) => portRank(graph, a.edge) - portRank(graph, b.edge) || a.index - b.index,
+  );
+  for (const { edge, index } of ranked) {
+    leaving.set(edge.from, [...(leaving.get(edge.from) ?? []), index]);
+  }
+  return leaving;
+}
+
+/** An edge's path from its place on the side of its node; `lane` is set for a back edge. */
+function placeEdge(
+  drawn: DrawnEdge,
+  leaving: ReadonlyMap<string, readonly number[]>,
+  lane: number | undefined,
+  frame: Frame,
+): PlacedEdge {
+  const { edge, index, from, to } = drawn;
+  const mine = leaving.get(edge.from) ?? [index];
+  const share = (mine.indexOf(index) + 1) / (mine.length + 1);
+  const start = edgeStart(from, share, frame.across);
+  const label = frame.across
+    ? { x: start.x + 6, y: start.y - 5, anchor: "start" as const }
+    : { x: start.x + 5, y: start.y + 14, anchor: "start" as const };
+  const path =
+    lane === undefined
+      ? forwardPath(start, to, frame.across)
+      : backPath(start, from, to, lane, frame);
+  return { index, edge, back: lane !== undefined, d: path.d, label, middle: path.middle };
+}
+
+/** Where an edge leaves its node: on the side that faces the next layer, at `share` of its length. */
+function edgeStart(from: PlacedNode, share: number, across: boolean): Point {
+  return across
+    ? { x: from.x + from.w, y: from.y + from.h * share }
+    : { x: from.x + from.w * share, y: from.y + from.h };
+}
+
+/** A curve into the middle of the target's near side. */
+function forwardPath(start: Point, to: PlacedNode, across: boolean): { d: string; middle: Point } {
+  const x1 = across ? to.x : to.x + to.w / 2;
+  const y1 = across ? to.y + to.h / 2 : to.y;
+  return {
+    d: cubic(start.x, start.y, x1, y1, across),
+    middle: { x: (start.x + x1) / 2, y: (start.y + y1) / 2 },
+  };
+}
+
+/** Out into the gap after the source's layer, around the outside, back through the gap before the target's. */
+function backPath(
+  start: Point,
+  from: PlacedNode,
+  to: PlacedNode,
+  lane: number,
+  frame: Frame,
+): { d: string; middle: Point } {
+  const inset = Math.min(10 + lane * 6, frame.layerGap / 2 - 4);
+  const outside = frame.nodesEnd + LANE_OFFSET + lane * LANE_STEP;
+  const points: Point[] = frame.across
+    ? [
+        start,
+        { x: from.x + from.w + inset, y: start.y },
+        { x: from.x + from.w + inset, y: outside },
+        { x: to.x - inset, y: outside },
+        { x: to.x - inset, y: to.y + to.h * 0.75 },
+        { x: to.x, y: to.y + to.h * 0.75 },
+      ]
+    : [
+        start,
+        { x: start.x, y: from.y + from.h + inset },
+        { x: outside, y: from.y + from.h + inset },
+        { x: outside, y: to.y - inset },
+        { x: to.x + to.w * 0.75, y: to.y - inset },
+        { x: to.x + to.w * 0.75, y: to.y },
+      ];
+  const middle = frame.across
+    ? { x: (points[2].x + points[3].x) / 2, y: outside }
+    : { x: outside, y: (points[2].y + points[3].y) / 2 };
+  return { d: orthogonal(points), middle };
+}
+
+/** The drawing's size: its layers one way, its nodes and the back edges' lanes the other. */
+function drawingSize(
+  frame: Frame,
+  layerCount: number,
+  backCount: number,
+): { width: number; height: number } {
+  const lanesRoom = backCount === 0 ? 0 : LANE_OFFSET + (backCount - 1) * LANE_STEP + 8;
+  const layersEnd = PAD + Math.max(0, layerCount * frame.layerStep - frame.layerGap) + PAD;
+  const nodesEnd = frame.nodesEnd + lanesRoom + PAD;
+  return frame.across
+    ? { width: layersEnd, height: nodesEnd }
+    : { width: nodesEnd, height: layersEnd };
 }
