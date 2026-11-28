@@ -1552,11 +1552,7 @@ impl Driver {
     /// keeps waiting for its answer instead.
     async fn rest(&mut self) -> Result<()> {
         if self.question.is_some() {
-            if self.status != SessionStatus::Waiting {
-                let reason = Some(WAITING_FOR_ANSWER.to_owned());
-                self.set_status(SessionStatus::Waiting, reason).await?;
-            }
-            return Ok(());
+            return self.wait_for_user(WAITING_FOR_ANSWER).await;
         }
         if self.run.is_some() {
             // The lead resting ends its node, not the session.
@@ -1857,18 +1853,38 @@ impl Driver {
         if let Target::Files { repos, .. } = &target {
             open.repos = repos.iter().flatten().copied().collect();
         }
-        let (decision, message) = match policy::decide(self.permission_mode, &target, &self.repos) {
-            Verdict::Allow => (PermissionDecision::Allow, None),
-            Verdict::Deny(message) => (PermissionDecision::Deny, Some(message)),
+        match policy::decide(self.permission_mode, &target, &self.repos) {
+            Verdict::Allow => {
+                self.policy_decided(open, PermissionDecision::Allow, None)
+                    .await
+            }
+            Verdict::Deny(message) => {
+                self.policy_decided(open, PermissionDecision::Deny, Some(message))
+                    .await
+            }
             Verdict::Ask => {
                 self.open.push(open);
-                if self.status != SessionStatus::Waiting {
-                    let reason = Some(WAITING_FOR_PERMISSION.to_owned());
-                    self.set_status(SessionStatus::Waiting, reason).await?;
-                }
-                return Ok(());
+                self.wait_for_user(WAITING_FOR_PERMISSION).await
             }
-        };
+        }
+    }
+
+    /// The session waits for the user, for `reason`, unless it already does.
+    async fn wait_for_user(&mut self, reason: &str) -> Result<()> {
+        if self.status != SessionStatus::Waiting {
+            let reason = Some(reason.to_owned());
+            self.set_status(SessionStatus::Waiting, reason).await?;
+        }
+        Ok(())
+    }
+
+    /// Records the policy's answer to a request and hands it to the agent.
+    async fn policy_decided(
+        &mut self,
+        open: OpenRequest,
+        decision: PermissionDecision,
+        message: Option<String>,
+    ) -> Result<()> {
         let resolved = EventBody::PermissionResolved {
             request_id: open.request_id.clone(),
             decision,
@@ -1924,39 +1940,15 @@ impl Driver {
         decision: PermissionDecision,
         message: Option<String>,
     ) -> Result<()> {
-        let store = &self.inner.store;
-        // The `permission_requested` event: the cause of the answer.
         let waiting = self
             .open
             .iter()
             .position(|open| open.request_id == request_id)
             .map(|index| self.open.remove(index));
-        let lead = self.lead.as_ref().map(|lead| lead.id.clone());
+        // The `permission_requested` event: the cause of the answer.
         let (asked, asker) = match &waiting {
             Some(open) => (Some(open.event_id.clone()), open.agent_id.clone()),
-            None => match store
-                .permission_resolved(&self.session_id, &request_id)
-                .await?
-            {
-                None => {
-                    return Err(Error::Missing(format!(
-                        "unknown permission request {request_id}"
-                    )));
-                }
-                Some(true) => {
-                    return Err(Error::Conflict(
-                        "this permission request was already answered".to_owned(),
-                    ));
-                }
-                // Open in the log but not waiting here: its agent is gone.
-                // The answer is still recorded, so the card closes.
-                Some(false) => store
-                    .open_permissions(Some(&self.session_id))
-                    .await?
-                    .into_iter()
-                    .find(|open| open.request_id == request_id)
-                    .map_or((None, lead), |open| (Some(open.event_id), open.agent_id)),
-            },
+            None => self.unheld_request(&request_id).await?,
         };
         let resolved = EventBody::PermissionResolved {
             request_id: request_id.clone(),
@@ -1965,17 +1957,46 @@ impl Driver {
             message: message.clone(),
         };
         self.append(as_agent(asker, resolved).parent(asked)).await?;
-        if let Some(open) = waiting {
-            // The last answer the session waited for lets it run again,
-            // which takes a slot. Without one the decision waits with the
-            // session: handing it over is what lets the agent go on.
-            let resumes = self.status == SessionStatus::Waiting && !self.waits_on_user();
-            if resumes && !self.take_slot() {
-                self.held.push((open, decision, message));
-                return self.park(Resume::Turn).await;
-            }
-            self.forward_decision(open, decision, message);
+        let Some(open) = waiting else {
+            return self.resume_if_waiting().await;
+        };
+        // The last answer the session waited for lets it run again, which
+        // takes a slot. Without one the decision waits with the session:
+        // handing it over is what lets the agent go on.
+        let resumes = self.status == SessionStatus::Waiting && !self.waits_on_user();
+        if resumes && !self.take_slot() {
+            self.held.push((open, decision, message));
+            return self.park(Resume::Turn).await;
         }
+        self.forward_decision(open, decision, message);
+        self.resume_if_waiting().await
+    }
+
+    /// The cause and the asker of a request no agent waits on here. One the
+    /// log still has open belongs to an agent that is gone: the answer is
+    /// still recorded, so that its card closes.
+    async fn unheld_request(&self, request_id: &str) -> Result<(Option<String>, Option<String>)> {
+        let store = &self.inner.store;
+        match store
+            .permission_resolved(&self.session_id, request_id)
+            .await?
+        {
+            None => Err(Error::Missing(format!(
+                "unknown permission request {request_id}"
+            ))),
+            Some(true) => Err(Error::Conflict(
+                "this permission request was already answered".to_owned(),
+            )),
+            Some(false) => {
+                let lead = self.lead.as_ref().map(|lead| lead.id.clone());
+                let open = store.open_permissions(Some(&self.session_id)).await?;
+                let open = open.into_iter().find(|open| open.request_id == request_id);
+                Ok(open.map_or((None, lead), |open| (Some(open.event_id), open.agent_id)))
+            }
+        }
+    }
+
+    async fn resume_if_waiting(&mut self) -> Result<()> {
         if self.status == SessionStatus::Waiting {
             self.resume_status().await?;
         }
@@ -2721,10 +2742,7 @@ impl Driver {
             agent_id: Some(agent_id),
             event_id: asked.id.clone(),
         });
-        if self.status != SessionStatus::Waiting {
-            let reason = Some(WAITING_FOR_ANSWER.to_owned());
-            self.set_status(SessionStatus::Waiting, reason).await?;
-        }
+        self.wait_for_user(WAITING_FOR_ANSWER).await?;
         Ok(question_id)
     }
 

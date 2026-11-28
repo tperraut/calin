@@ -979,15 +979,11 @@ impl Driver {
             question_id,
             gate,
         });
-        if self.status != SessionStatus::Waiting {
-            let reason = match gate {
-                true => WAITING_AT_GATE,
-                false => WAITING_FOR_ANSWER,
-            };
-            self.set_status(SessionStatus::Waiting, Some(reason.to_owned()))
-                .await?;
-        }
-        Ok(())
+        let reason = match gate {
+            true => WAITING_AT_GATE,
+            false => WAITING_FOR_ANSWER,
+        };
+        self.wait_for_user(reason).await
     }
 
     /// Refuses an answer a gate cannot take (the "gate" semantics in
