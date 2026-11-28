@@ -355,10 +355,45 @@ export function newNode(
   };
 }
 
-/** Removes every entry whose id is not in `ids`. */
-function keepOnly(map: Map<string, unknown>, ids: readonly string[]): void {
-  const wanted = new Set(ids);
+/** Points a node already drawn at its new place: a tween takes it there, or it is there at once. */
+function retarget(node: SceneNode, input: SceneNodeInput, tween: boolean): boolean {
+  Object.assign(node, { w: input.w, h: input.h, fx: node.x, fy: node.y, tx: input.x, ty: input.y });
+  node.moving = node.x !== input.x || node.y !== input.y;
+  if (node.moving && !tween) {
+    node.x = input.x;
+    node.y = input.y;
+    node.moving = false;
+    place(node.el, node);
+  }
+  return node.moving;
+}
+
+/** Moves a node `eased` of the way to its place; `t` is 1 at the tween's end. */
+function stepNode(node: SceneNode, eased: number, t: number): void {
+  node.x = lerp(node.fx, node.tx, eased);
+  node.y = lerp(node.fy, node.ty, eased);
+  place(node.el, node);
+  node.moving = t < 1;
+}
+
+/** Where a curve is drawn now, mid-tween included: its new lanes start from there. */
+const drawnCorners = (edge: SceneEdge | undefined): readonly Point[] | undefined =>
+  edge?.current?.kind === "poly" ? edge.current.points : undefined;
+
+/**
+ * Drops what `inputs` no longer holds, then places each input.
+ * True when anything is on its way somewhere.
+ */
+function placeAll<T extends { id: string }>(
+  map: Map<string, unknown>,
+  inputs: readonly T[],
+  placeOne: (input: T) => boolean,
+): boolean {
+  const wanted = new Set(inputs.map((input) => input.id));
   for (const id of map.keys()) if (!wanted.has(id)) map.delete(id);
+  let anyMoving = false;
+  for (const input of inputs) anyMoving = placeOne(input) || anyMoving;
+  return anyMoving;
 }
 
 export type Scene = ReturnType<typeof createScene>;
@@ -371,39 +406,52 @@ export type Scene = ReturnType<typeof createScene>;
  * while something moves.
  */
 export function createScene(options: SceneOptions) {
-  const requestFrame = options.requestFrame ?? ((run) => requestAnimationFrame(run));
-  const cancelFrame = options.cancelFrame ?? ((handle) => cancelAnimationFrame(handle));
-  const now = options.now ?? (() => performance.now());
+  return new LiveScene(options);
+}
 
-  const nodes = new Map<string, SceneNode>();
-  const edges = new Map<string, SceneEdge>();
-  const pulses = new Map<string, Pulse>();
-  const pendingNodeEls = new Map<string, SVGGElement>();
-  const pendingEdgeEls = new Map<string, EdgeElements>();
-  let mode: LayoutMode = "indented";
-  let content: Size = { w: 0, h: 0 };
-  let homeWidth = 0;
+// A class rather than a closure of methods: each method then stands, and is measured, on its own.
+// `private`, not `#`: the complexity report does not see `#` methods.
+class LiveScene {
+  private readonly options: SceneOptions;
+  private readonly requestFrame: (run: (time: number) => void) => number;
+  private readonly cancelFrame: (handle: number) => void;
+  private readonly now: () => number;
+  private readonly nodes = new Map<string, SceneNode>();
+  private readonly edges = new Map<string, SceneEdge>();
+  private readonly pulses = new Map<string, Pulse>();
+  private readonly pendingNodeEls = new Map<string, SVGGElement>();
+  private readonly pendingEdgeEls = new Map<string, EdgeElements>();
+  private mode: LayoutMode = "indented";
+  private content: Size = { w: 0, h: 0 };
+  private homeWidth = 0;
   /** How far the running tween is, eased: 1 when none runs. */
-  let progress = 1;
-  let viewport: Size = { w: 0, h: 0 };
-  const view: ViewTransform = { x: 0, y: 0, k: 1 };
-  let viewEl: SVGGElement | undefined;
-  let lod = false;
-  let viewDirty = true;
-  let tweenStart: number | undefined;
-  let frameHandle: number | undefined;
-  let anchor: string | undefined;
-  let homed = false;
+  private progress = 1;
+  private viewport: Size = { w: 0, h: 0 };
+  private readonly transform: ViewTransform = { x: 0, y: 0, k: 1 };
+  private viewEl: SVGGElement | undefined;
+  private lod = false;
+  private viewDirty = true;
+  private tweenStart: number | undefined;
+  private frameHandle: number | undefined;
+  private anchor: string | undefined;
+  private homed = false;
   // Until the reader pans or zooms, the view is ours to set again when the pane changes size.
-  let untouched = true;
-  let pulseSeq = 0;
-  let disposed = false;
-  let kept: Kept = { x0: 0, y0: 0, x1: 0, y1: 0, k: 0 };
+  private untouched = true;
+  private pulseSeq = 0;
+  private disposed = false;
+  private kept: Kept = { x0: 0, y0: 0, x1: 0, y1: 0, k: 0 };
   // The node that holds the keyboard's tab stop is never taken out: it must stay focusable.
-  let pinned: string | undefined;
+  private pinned: string | undefined;
 
-  function writeEdge(edge: SceneEdge): void {
-    const route = routeOf(edge, nodes, mode, progress);
+  constructor(options: SceneOptions) {
+    this.options = options;
+    this.requestFrame = options.requestFrame ?? ((run) => requestAnimationFrame(run));
+    this.cancelFrame = options.cancelFrame ?? ((handle) => cancelAnimationFrame(handle));
+    this.now = options.now ?? (() => performance.now());
+  }
+
+  private writeEdge(edge: SceneEdge): void {
+    const route = routeOf(edge, this.nodes, this.mode, this.progress);
     edge.current = route;
     if (!route || !edge.els) return;
     const d = routePath(route);
@@ -420,284 +468,290 @@ export function createScene(options: SceneOptions) {
    * not the whole graph. The kept area is the viewport and half of it again on
    * every side, worked out again only when the view leaves it.
    */
-  function cull(force: boolean): void {
-    if (unmeasured(viewport)) return;
-    const visible = visibleArea(view, viewport);
-    if (!force && view.k === kept.k && contains(kept, visible)) return;
-    kept = { ...grown(visible), k: view.k };
-    for (const node of nodes.values()) {
-      display(node, nodeShown(node, kept, pinned), force, node.el);
+  private cull(force: boolean): void {
+    if (unmeasured(this.viewport)) return;
+    const visible = visibleArea(this.transform, this.viewport);
+    if (!force && this.transform.k === this.kept.k && contains(this.kept, visible)) return;
+    this.kept = { ...grown(visible), k: this.transform.k };
+    for (const node of this.nodes.values()) {
+      display(node, nodeShown(node, this.kept, this.pinned), force, node.el);
     }
-    for (const edge of edges.values()) {
-      display(edge, edgeShown(edge, kept), force, edge.els?.path?.parentElement);
+    for (const edge of this.edges.values()) {
+      display(edge, edgeShown(edge, this.kept), force, edge.els?.path?.parentElement);
     }
   }
 
-  function writeView(): void {
-    viewDirty = false;
-    cull(false);
-    viewEl?.setAttribute("transform", viewTransform(view));
-    const wanted = view.k < LOD_BELOW;
-    if (wanted !== lod || viewEl?.classList.contains("lod") !== wanted) {
-      lod = wanted;
-      viewEl?.classList.toggle("lod", wanted);
+  private writeView(): void {
+    this.viewDirty = false;
+    this.cull(false);
+    this.viewEl?.setAttribute("transform", viewTransform(this.transform));
+    const wanted = this.transform.k < LOD_BELOW;
+    if (wanted !== this.lod || this.viewEl?.classList.contains("lod") !== wanted) {
+      this.lod = wanted;
+      this.viewEl?.classList.toggle("lod", wanted);
     }
-    options.onView?.({ ...view });
+    this.options.onView?.({ ...this.transform });
   }
 
-  function schedule(): void {
-    if (frameHandle !== undefined || disposed) return;
-    frameHandle = requestFrame(frame);
+  private schedule(): void {
+    if (this.frameHandle !== undefined || this.disposed) return;
+    this.frameHandle = this.requestFrame(() => this.frame());
   }
 
-  function publishPulses(): void {
-    options.onPulses([...pulses.keys()]);
+  private publishPulses(): void {
+    this.options.onPulses([...this.pulses.keys()]);
   }
 
-  function frame(): void {
-    frameHandle = undefined;
-    if (disposed) return;
-    const time = now();
-    if (tweenStart !== undefined) {
-      const t = tweenProgress(time, tweenStart);
-      const eased = ease(t);
-      progress = eased;
-      const held = anchor === undefined ? undefined : nodes.get(anchor);
-      const heldAt = held ? { x: held.x, y: held.y } : undefined;
-      for (const node of nodes.values()) {
-        if (!node.moving) continue;
-        node.x = lerp(node.fx, node.tx, eased);
-        node.y = lerp(node.fy, node.ty, eased);
-        place(node.el, node);
-        if (t >= 1) node.moving = false;
-      }
-      for (const edge of edges.values()) {
-        if (!edge.moving) continue;
-        writeEdge(edge);
-        if (t >= 1) edge.moving = false;
-      }
-      // The node under the reader's eye stays where it is on screen: the view follows it.
-      if (held && heldAt && (held.x !== heldAt.x || held.y !== heldAt.y)) {
-        view.x -= (held.x - heldAt.x) * view.k;
-        view.y -= (held.y - heldAt.y) * view.k;
-        viewDirty = true;
-      }
-      if (t >= 1) {
-        tweenStart = undefined;
-        progress = 1;
-        // What was only drawn because it was moving may now rest outside.
-        cull(true);
-      }
+  private frame(): void {
+    this.frameHandle = undefined;
+    if (this.disposed) return;
+    const time = this.now();
+    if (this.tweenStart !== undefined) this.stepTween(tweenProgress(time, this.tweenStart));
+    this.stepPulses(time);
+    if (this.viewDirty) this.writeView();
+    if (this.busy()) this.schedule();
+  }
+
+  /** Moves what is on its way `t` of the tween. */
+  private stepTween(t: number): void {
+    this.progress = ease(t);
+    const held = this.anchorAt();
+    for (const node of this.nodes.values()) if (node.moving) stepNode(node, this.progress, t);
+    for (const edge of this.edges.values()) {
+      if (!edge.moving) continue;
+      this.writeEdge(edge);
+      edge.moving = t < 1;
     }
+    this.hold(held);
+    if (t >= 1) {
+      this.tweenStart = undefined;
+      this.progress = 1;
+      // What was only drawn because it was moving may now rest outside.
+      this.cull(true);
+    }
+  }
+
+  private anchorAt(): Point | undefined {
+    return this.anchor === undefined ? undefined : this.position(this.anchor);
+  }
+
+  /** The node under the reader's eye stays where it is on screen: the view follows it. */
+  private hold(before: Point | undefined): void {
+    const after = this.anchorAt();
+    if (!before || !after || (after.x === before.x && after.y === before.y)) return;
+    this.transform.x -= (after.x - before.x) * this.transform.k;
+    this.transform.y -= (after.y - before.y) * this.transform.k;
+    this.viewDirty = true;
+  }
+
+  private stepPulses(time: number): void {
     let ended = false;
-    for (const pulse of pulses.values()) {
-      const at = pulsePoint(edges.get(pulse.edge)?.current, (time - pulse.start) / PULSE_MS);
+    for (const pulse of this.pulses.values()) {
+      const route = this.edges.get(pulse.edge)?.current;
+      const at = pulsePoint(route, (time - pulse.start) / PULSE_MS);
       if (at) place(pulse.el, at);
       else {
-        pulses.delete(pulse.id);
+        this.pulses.delete(pulse.id);
         ended = true;
       }
     }
-    if (ended) publishPulses();
-    if (viewDirty) writeView();
-    if (tweenStart !== undefined || pulses.size > 0) schedule();
+    if (ended) this.publishPulses();
   }
 
-  function touchView(): void {
-    viewDirty = true;
-    schedule();
+  private touchView(): void {
+    this.viewDirty = true;
+    this.schedule();
   }
 
-  function home(): void {
-    const next = homeView(viewport, content, homeWidth);
+  private home(): void {
+    const next = homeView(this.viewport, this.content, this.homeWidth);
     if (!next) return;
-    homed = true;
-    Object.assign(view, next);
-    touchView();
+    this.homed = true;
+    Object.assign(this.transform, next);
+    this.touchView();
   }
 
-  return {
-    /** The group that holds the drawing: pan and zoom are its `transform`. */
-    mount(element: SVGGElement): void {
-      viewEl = element;
-      writeView();
-    },
-    nodeRef(id: string, element: SVGGElement): void {
-      const node = nodes.get(id);
-      if (!node) {
-        // The element came before the layout that places it.
-        pendingNodeEls.set(id, element);
-        return;
-      }
-      node.el = element;
-      place(element, node);
-      if (!node.shown) element.style.display = "none";
-    },
-    edgeRef(id: string, part: EdgePart, element: SVGPathElement | SVGGElement): void {
-      const edge = edges.get(id);
-      const elements = edge ? (edge.els ??= {}) : (pendingEdgeEls.get(id) ?? {});
-      Object.assign(elements, { [part]: element });
-      if (edge) {
-        // A new element has no path yet, whatever was written to the others.
-        edge.written = undefined;
-        writeEdge(edge);
-      } else pendingEdgeEls.set(id, elements);
-    },
-    pulseRef(id: string, element: SVGCircleElement): void {
-      const pulse = pulses.get(id);
-      if (!pulse) return;
-      pulse.el = element;
-      const route = edges.get(pulse.edge)?.current;
-      if (route) place(element, routePoint(route, 0));
-    },
-    /** Takes a new layout: what moved is tweened to its place, unless `animate` is false. */
-    setLayout(layout: SceneLayout, animate: boolean): void {
-      const tween = animate && !options.reducedMotion() && nodes.size > 0;
-      mode = layout.mode;
-      content = { w: layout.width, h: layout.height };
-      homeWidth = layout.homeWidth ?? 0;
-      keepOnly(
-        nodes,
-        layout.nodes.map((node) => node.id),
-      );
-      let anyMoving = false;
-      for (const input of layout.nodes) {
-        const existing = nodes.get(input.id);
-        if (existing) {
-          existing.w = input.w;
-          existing.h = input.h;
-          existing.fx = existing.x;
-          existing.fy = existing.y;
-          existing.tx = input.x;
-          existing.ty = input.y;
-          existing.moving = existing.x !== input.x || existing.y !== input.y;
-          if (existing.moving && !tween) {
-            existing.x = input.x;
-            existing.y = input.y;
-            existing.moving = false;
-            place(existing.el, existing);
-          }
-          anyMoving ||= existing.moving;
-          continue;
-        }
-        // A newcomer flies out of the node that started it.
-        const origin = tween && input.origin !== undefined ? nodes.get(input.origin) : undefined;
-        const node = newNode(input, origin, pendingNodeEls.get(input.id));
-        pendingNodeEls.delete(input.id);
-        nodes.set(input.id, node);
-        place(node.el, node);
-        anyMoving ||= node.moving;
-      }
-      keepOnly(
-        edges,
-        layout.edges.map((edge) => edge.id),
-      );
-      const targets = (id: string): Point | undefined => {
-        const node = nodes.get(id);
-        return node ? { x: node.tx, y: node.ty } : undefined;
-      };
-      for (const input of layout.edges) {
-        const existing = edges.get(input.id);
-        const drawn = existing?.current?.kind === "poly" ? existing.current.points : undefined;
-        const edge: SceneEdge = existing
-          ? Object.assign(existing, input)
-          : { ...input, moving: false, shown: true, els: pendingEdgeEls.get(input.id) };
-        pendingEdgeEls.delete(input.id);
-        edges.set(input.id, edge);
-        const ends = [nodes.get(edge.from), nodes.get(edge.to)];
-        edge.start = tween ? lanesFrom(edge.points, drawn, targets) : undefined;
-        edge.moving = edge.start !== undefined || ends.some((end) => end?.moving === true);
-        anyMoving ||= edge.moving;
-      }
-      progress = anyMoving ? 0 : 1;
-      for (const edge of edges.values()) writeEdge(edge);
-      cull(true);
-      if (anyMoving) {
-        tweenStart = now();
-        schedule();
-      }
-      // Every element this layout wanted is taken: the rest belong to nodes and edges that came and went.
-      pendingNodeEls.clear();
-      pendingEdgeEls.clear();
-      if (!homed) home();
-    },
-    setViewport(size: Size): void {
-      const resized = size.w !== viewport.w || size.h !== viewport.h;
-      viewport = size;
-      if (!homed || (untouched && resized)) home();
-      if (resized) cull(true);
-    },
-    /** Names the node that must stay in the drawing wherever it is: the keyboard's tab stop. */
-    pin(id: string | undefined): void {
-      if (id === pinned) return;
-      pinned = id;
-      cull(true);
-    },
-    /** Keeps this node where it is on screen while a layout moves it. */
-    setAnchor(id: string | undefined): void {
-      anchor = id;
-    },
-    panBy(dx: number, dy: number): void {
-      untouched = false;
-      view.x += dx;
-      view.y += dy;
-      touchView();
-    },
-    /** Zooms by `factor` keeping the point (`px`, `py`) of the viewport where it is. */
-    zoomAt(px: number, py: number, factor: number): void {
-      untouched = false;
-      Object.assign(view, zoomAbout(view, px, py, factor));
-      touchView();
-    },
-    zoomBy(factor: number): void {
-      this.zoomAt(viewport.w / 2, viewport.h / 2, factor);
-    },
-    /**
-     * Shows the whole drawing. With `legible`, never below the zoom at which
-     * cards keep their text, and never under the buttons that float over the
-     * canvas: a drawing that is then too big starts at its top-left corner.
-     */
-    fit(legible = false): void {
-      if (unmeasured(viewport)) return;
-      homed = true;
-      untouched = false;
-      Object.assign(view, fitTo(content, viewport, legible));
-      touchView();
-    },
-    /** Pans just enough to bring a node into the viewport. */
-    reveal(id: string): void {
-      const node = nodes.get(id);
-      if (!node || viewport.w === 0) return;
-      const { dx, dy } = revealShift(
-        { x: node.tx, y: node.ty, w: node.w, h: node.h },
-        view,
-        viewport,
-      );
-      if (dx !== 0 || dy !== 0) this.panBy(dx, dy);
-      // At once, not at the next frame: the node is about to take the focus.
-      cull(false);
-    },
-    /** Sends one pulse along an edge. Nothing when motion is to be reduced. */
-    pulse(edgeId: string): void {
-      if (options.reducedMotion() || !edges.has(edgeId)) return;
-      pulseSeq += 1;
-      const id = `pulse-${pulseSeq}`;
-      pulses.set(id, { id, edge: edgeId, start: now() });
-      publishPulses();
-      schedule();
-    },
-    view: (): ViewTransform => ({ ...view }),
-    /** Where a node is right now, mid-tween included. */
-    position(id: string): { x: number; y: number } | undefined {
-      const node = nodes.get(id);
-      return node ? { x: node.x, y: node.y } : undefined;
-    },
-    /** True while a tween or a pulse is running. */
-    busy: (): boolean => tweenStart !== undefined || pulses.size > 0,
-    dispose(): void {
-      disposed = true;
-      if (frameHandle !== undefined) cancelFrame(frameHandle);
-      frameHandle = undefined;
-    },
-  };
+  private placeNode(input: SceneNodeInput, tween: boolean): boolean {
+    const existing = this.nodes.get(input.id);
+    if (existing) return retarget(existing, input, tween);
+    // A newcomer flies out of the node that started it.
+    const origin = tween && input.origin !== undefined ? this.nodes.get(input.origin) : undefined;
+    const node = newNode(input, origin, this.pendingNodeEls.get(input.id));
+    this.nodes.set(input.id, node);
+    place(node.el, node);
+    return node.moving;
+  }
+
+  private placeEdge(input: SceneEdgeInput, tween: boolean): boolean {
+    const existing = this.edges.get(input.id);
+    const drawn = drawnCorners(existing);
+    const edge: SceneEdge = existing
+      ? Object.assign(existing, input)
+      : { ...input, moving: false, shown: true, els: this.pendingEdgeEls.get(input.id) };
+    this.edges.set(input.id, edge);
+    edge.start = tween ? lanesFrom(edge.points, drawn, (id) => this.target(id)) : undefined;
+    edge.moving = edge.start !== undefined || this.endsMoving(edge);
+    return edge.moving;
+  }
+
+  /** Where a node is going. */
+  private target(id: string): Point | undefined {
+    const node = this.nodes.get(id);
+    return node ? { x: node.tx, y: node.ty } : undefined;
+  }
+
+  private endsMoving(edge: SceneEdge): boolean {
+    return [edge.from, edge.to].some((id) => this.nodes.get(id)?.moving === true);
+  }
+
+  /** The group that holds the drawing: pan and zoom are its `transform`. */
+  mount(element: SVGGElement): void {
+    this.viewEl = element;
+    this.writeView();
+  }
+
+  nodeRef(id: string, element: SVGGElement): void {
+    const node = this.nodes.get(id);
+    if (!node) {
+      // The element came before the layout that places it.
+      this.pendingNodeEls.set(id, element);
+      return;
+    }
+    node.el = element;
+    place(element, node);
+    if (!node.shown) element.style.display = "none";
+  }
+
+  edgeRef(id: string, part: EdgePart, element: SVGPathElement | SVGGElement): void {
+    const edge = this.edges.get(id);
+    const elements = edge ? (edge.els ??= {}) : (this.pendingEdgeEls.get(id) ?? {});
+    Object.assign(elements, { [part]: element });
+    if (edge) {
+      // A new element has no path yet, whatever was written to the others.
+      edge.written = undefined;
+      this.writeEdge(edge);
+    } else this.pendingEdgeEls.set(id, elements);
+  }
+
+  pulseRef(id: string, element: SVGCircleElement): void {
+    const pulse = this.pulses.get(id);
+    if (!pulse) return;
+    pulse.el = element;
+    const route = this.edges.get(pulse.edge)?.current;
+    if (route) place(element, routePoint(route, 0));
+  }
+
+  /** Takes a new layout: what moved is tweened to its place, unless `animate` is false. */
+  setLayout(layout: SceneLayout, animate: boolean): void {
+    const tween = animate && !this.options.reducedMotion() && this.nodes.size > 0;
+    this.mode = layout.mode;
+    this.content = { w: layout.width, h: layout.height };
+    this.homeWidth = layout.homeWidth ?? 0;
+    const nodesMoving = placeAll(this.nodes, layout.nodes, (input) => this.placeNode(input, tween));
+    const edgesMoving = placeAll(this.edges, layout.edges, (input) => this.placeEdge(input, tween));
+    const anyMoving = nodesMoving || edgesMoving;
+    this.progress = anyMoving ? 0 : 1;
+    for (const edge of this.edges.values()) this.writeEdge(edge);
+    this.cull(true);
+    if (anyMoving) {
+      this.tweenStart = this.now();
+      this.schedule();
+    }
+    // Every element this layout wanted is taken: the rest belong to nodes and edges that came and went.
+    this.pendingNodeEls.clear();
+    this.pendingEdgeEls.clear();
+    if (!this.homed) this.home();
+  }
+
+  setViewport(size: Size): void {
+    const resized = size.w !== this.viewport.w || size.h !== this.viewport.h;
+    this.viewport = size;
+    if (!this.homed || (this.untouched && resized)) this.home();
+    if (resized) this.cull(true);
+  }
+
+  /** Names the node that must stay in the drawing wherever it is: the keyboard's tab stop. */
+  pin(id: string | undefined): void {
+    if (id === this.pinned) return;
+    this.pinned = id;
+    this.cull(true);
+  }
+
+  /** Keeps this node where it is on screen while a layout moves it. */
+  setAnchor(id: string | undefined): void {
+    this.anchor = id;
+  }
+
+  panBy(dx: number, dy: number): void {
+    this.untouched = false;
+    this.transform.x += dx;
+    this.transform.y += dy;
+    this.touchView();
+  }
+
+  /** Zooms by `factor` keeping the point (`px`, `py`) of the viewport where it is. */
+  zoomAt(px: number, py: number, factor: number): void {
+    this.untouched = false;
+    Object.assign(this.transform, zoomAbout(this.transform, px, py, factor));
+    this.touchView();
+  }
+
+  zoomBy(factor: number): void {
+    this.zoomAt(this.viewport.w / 2, this.viewport.h / 2, factor);
+  }
+
+  /**
+   * Shows the whole drawing. With `legible`, never below the zoom at which
+   * cards keep their text, and never under the buttons that float over the
+   * canvas: a drawing that is then too big starts at its top-left corner.
+   */
+  fit(legible = false): void {
+    if (unmeasured(this.viewport)) return;
+    this.homed = true;
+    this.untouched = false;
+    Object.assign(this.transform, fitTo(this.content, this.viewport, legible));
+    this.touchView();
+  }
+
+  /** Pans just enough to bring a node into the viewport. */
+  reveal(id: string): void {
+    const node = this.nodes.get(id);
+    if (!node || this.viewport.w === 0) return;
+    const target = { x: node.tx, y: node.ty, w: node.w, h: node.h };
+    const { dx, dy } = revealShift(target, this.transform, this.viewport);
+    if (dx !== 0 || dy !== 0) this.panBy(dx, dy);
+    // At once, not at the next frame: the node is about to take the focus.
+    this.cull(false);
+  }
+
+  /** Sends one pulse along an edge. Nothing when motion is to be reduced. */
+  pulse(edgeId: string): void {
+    if (this.options.reducedMotion() || !this.edges.has(edgeId)) return;
+    this.pulseSeq += 1;
+    const id = `pulse-${this.pulseSeq}`;
+    this.pulses.set(id, { id, edge: edgeId, start: this.now() });
+    this.publishPulses();
+    this.schedule();
+  }
+
+  view(): ViewTransform {
+    return { ...this.transform };
+  }
+
+  /** Where a node is right now, mid-tween included. */
+  position(id: string): { x: number; y: number } | undefined {
+    const node = this.nodes.get(id);
+    return node ? { x: node.x, y: node.y } : undefined;
+  }
+
+  /** True while a tween or a pulse is running. */
+  busy(): boolean {
+    return this.tweenStart !== undefined || this.pulses.size > 0;
+  }
+
+  dispose(): void {
+    this.disposed = true;
+    if (this.frameHandle !== undefined) this.cancelFrame(this.frameHandle);
+    this.frameHandle = undefined;
+  }
 }

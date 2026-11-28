@@ -371,6 +371,48 @@ describe("scene", () => {
     expect(scene.view()).toEqual({ x: 21, y: 65, k: 0.6 });
   });
 
+  it("culls again when only the pane's height changes, and not for the same size", () => {
+    const { scene } = setup();
+    const far = g();
+    scene.nodeRef("far", far);
+    scene.setLayout(layout([node("a", 0, 0), node("far", 0, 3000)]), false);
+    scene.setViewport({ w: 300, h: 300 });
+    expect(far.style.display).toBe("none");
+    scene.panBy(0, 0);
+    // A taller pane reaches it; the reader moved, so the view stays as it was.
+    scene.setViewport({ w: 300, h: 3000 });
+    expect(far.style.display).toBe("");
+    const view = scene.view();
+    // Hidden by hand: a cull forced by a resize would show it again.
+    far.style.display = "none";
+    scene.setViewport({ w: 300, h: 3000 });
+    expect(far.style.display).toBe("none");
+    expect(scene.view()).toEqual(view);
+  });
+
+  it("leaves an edge whose cards stay where it is during a tween, and one to a missing card undrawn", () => {
+    const { scene, frame } = setup();
+    const still = path();
+    const dangling = path();
+    scene.edgeRef("still", "path", still);
+    scene.edgeRef("dangling", "path", dangling);
+    const edges = [
+      { id: "still", from: "c", to: "d", route: "tree" },
+      { id: "dangling", from: "a", to: "gone", route: "tree" },
+    ] as const;
+    const resting = [node("c", 300, 0), node("d", 328, 64)];
+    scene.setLayout(layout([node("a", 0, 0), ...resting], edges), false);
+    const before = still.getAttribute("d");
+    expect(before).toMatch(/^M/);
+    scene.setLayout(layout([node("a", 0, 64), ...resting], edges), true);
+    frame(TWEEN_MS / 2);
+    expect(scene.position("a")?.y).toBeGreaterThan(0);
+    expect(still.getAttribute("d")).toBe(before);
+    expect(dangling.getAttribute("d")).toBeNull();
+    frame(TWEEN_MS);
+    expect(scene.busy()).toBe(false);
+  });
+
   it("places a node's element that arrives after its layout, hidden when it is far outside", () => {
     const { scene } = setup();
     scene.setLayout(layout([node("a", 0, 0), node("far", 0, 3000)]), false);
