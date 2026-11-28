@@ -81,117 +81,184 @@ function parseFrame(data: unknown): ServerMsg | undefined {
   return typeof data === "string" ? parseOpFrame<ServerMsg>(data) : undefined;
 }
 
+function subscribeMsg(topic: string, afterSeq: number | undefined): ClientMsg {
+  return afterSeq !== undefined && afterSeq > 0
+    ? { op: "subscribe", topic, after_seq: afterSeq }
+    : { op: "subscribe", topic };
+}
+
+/** The oldest position any subscriber of `topic` is at; later ones skip duplicates. */
+function cursorOf(subscribers: Set<Subscriber>): number | undefined {
+  let lowest: number | undefined;
+  for (const { cursor } of subscribers) {
+    const seq = cursor?.();
+    if (seq === undefined) return undefined;
+    lowest = lowest === undefined ? seq : Math.min(lowest, seq);
+  }
+  return lowest;
+}
+
+/** The wait before attempt number `attempt` (from 0), with `jitter` in [0, 1). */
+function backoffDelay(attempt: number, baseMs: number, maxMs: number, jitter: number): number {
+  const ceiling = Math.min(maxMs, baseMs * 2 ** attempt);
+  // Half fixed, half random, so clients do not reconnect in step after a restart.
+  return ceiling * (0.5 + jitter * 0.5);
+}
+
 export function createSocket(options: SocketOptions = {}): SocketClient {
-  const pingIntervalMs = options.pingIntervalMs ?? 20_000;
-  const pongTimeoutMs = options.pongTimeoutMs ?? 10_000;
-  const backoffBaseMs = options.backoffBaseMs ?? 500;
-  const backoffMaxMs = options.backoffMaxMs ?? 15_000;
-  const random = options.random ?? Math.random;
+  return new EventSocket(options);
+}
 
-  const topics = new Map<string, Set<Subscriber>>();
+class EventSocket implements SocketClient {
+  private readonly pingIntervalMs: number;
+  private readonly pongTimeoutMs: number;
+  private readonly backoffBaseMs: number;
+  private readonly backoffMaxMs: number;
+  private readonly random: () => number;
+  private readonly options: SocketOptions;
+
+  private readonly topics = new Map<string, Set<Subscriber>>();
   // Topics whose last `subscribe` was refused: the server holds nothing to leave.
-  const refused = new Set<string>();
-  const stateListeners = new Set<(state: ConnectionState) => void>();
-  const refusedListeners = new Set<() => void>();
+  private readonly refused = new Set<string>();
+  private readonly stateListeners = new Set<(state: ConnectionState) => void>();
+  private readonly refusedListeners = new Set<() => void>();
 
-  let ws: WebSocketLike | null = null;
-  let state: ConnectionState = "connecting";
-  let started = false;
-  let closed = false;
-  let attempt = 0;
-  let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
-  let pingTimer: ReturnType<typeof setInterval> | undefined;
-  let pongTimer: ReturnType<typeof setTimeout> | undefined;
+  private ws: WebSocketLike | null = null;
+  private current: ConnectionState = "connecting";
+  private started = false;
+  private closed = false;
+  private attempt = 0;
+  private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+  private pingTimer: ReturnType<typeof setInterval> | undefined;
+  private pongTimer: ReturnType<typeof setTimeout> | undefined;
 
-  function setState(next: ConnectionState): void {
-    if (state === next) return;
-    state = next;
-    for (const listener of stateListeners) listener(next);
+  constructor(options: SocketOptions) {
+    this.options = options;
+    this.pingIntervalMs = options.pingIntervalMs ?? 20_000;
+    this.pongTimeoutMs = options.pongTimeoutMs ?? 10_000;
+    this.backoffBaseMs = options.backoffBaseMs ?? 500;
+    this.backoffMaxMs = options.backoffMaxMs ?? 15_000;
+    this.random = options.random ?? Math.random;
   }
 
-  function send(msg: ClientMsg): void {
+  subscribe(topic: string, handler: TopicHandler, cursor?: Cursor): () => void {
+    const subscriber: Subscriber = { handler, cursor };
+    const subscribers = this.topics.get(topic);
+    if (subscribers) {
+      subscribers.add(subscriber);
+    } else {
+      this.topics.set(topic, new Set([subscriber]));
+      this.send(subscribeMsg(topic, cursor?.()));
+    }
+    this.start();
+    return () => this.leave(topic, subscriber);
+  }
+
+  resync(topic: string, afterSeq: number): void {
+    if (!this.topics.has(topic)) return;
+    // Leaving first makes the server start one clean replay instead of two feeds.
+    if (!this.refused.has(topic)) this.send({ op: "unsubscribe", topic });
+    this.send(subscribeMsg(topic, afterSeq));
+  }
+
+  state(): ConnectionState {
+    return this.current;
+  }
+
+  onState(listener: (state: ConnectionState) => void): () => void {
+    this.stateListeners.add(listener);
+    return () => this.stateListeners.delete(listener);
+  }
+
+  onRefused(listener: () => void): () => void {
+    this.refusedListeners.add(listener);
+    return () => this.refusedListeners.delete(listener);
+  }
+
+  reconnectNow(): void {
+    if (this.reconnectTimer === undefined) return;
+    clearTimeout(this.reconnectTimer);
+    this.open();
+  }
+
+  close(): void {
+    this.closed = true;
+    clearTimeout(this.reconnectTimer);
+    this.detach();
+  }
+
+  private leave(topic: string, subscriber: Subscriber): void {
+    const current = this.topics.get(topic);
+    if (!current?.delete(subscriber) || current.size > 0) return;
+    this.topics.delete(topic);
+    if (!this.refused.delete(topic)) this.send({ op: "unsubscribe", topic });
+  }
+
+  private setState(next: ConnectionState): void {
+    if (this.current === next) return;
+    this.current = next;
+    for (const listener of this.stateListeners) listener(next);
+  }
+
+  private send(msg: ClientMsg): void {
     // The server may have closed it already (signing out does): a send then only
     // makes the browser log an error.
-    if (state === "open" && ws?.readyState === OPEN) ws.send(JSON.stringify(msg));
+    if (this.current === "open" && this.ws?.readyState === OPEN) this.ws.send(JSON.stringify(msg));
   }
 
-  function sendSubscribe(topic: string, afterSeq: number | undefined): void {
-    send(
-      afterSeq !== undefined && afterSeq > 0
-        ? { op: "subscribe", topic, after_seq: afterSeq }
-        : { op: "subscribe", topic },
-    );
+  private stopHeartbeat(): void {
+    clearInterval(this.pingTimer);
+    clearTimeout(this.pongTimer);
+    this.pingTimer = undefined;
+    this.pongTimer = undefined;
   }
 
-  /** The oldest position any subscriber of `topic` is at; later ones skip duplicates. */
-  function cursorOf(subscribers: Set<Subscriber>): number | undefined {
-    let lowest: number | undefined;
-    for (const { cursor } of subscribers) {
-      const seq = cursor?.();
-      if (seq === undefined) return undefined;
-      lowest = lowest === undefined ? seq : Math.min(lowest, seq);
-    }
-    return lowest;
+  private startHeartbeat(): void {
+    this.pingTimer = setInterval(() => this.ping(), this.pingIntervalMs);
   }
 
-  function stopHeartbeat(): void {
-    clearInterval(pingTimer);
-    clearTimeout(pongTimer);
-    pingTimer = undefined;
-    pongTimer = undefined;
+  private ping(): void {
+    this.send({ op: "ping" });
+    this.pongTimer ??= setTimeout(() => this.drop(), this.pongTimeoutMs);
   }
 
-  function startHeartbeat(): void {
-    pingTimer = setInterval(() => {
-      send({ op: "ping" });
-      pongTimer ??= setTimeout(drop, pongTimeoutMs);
-    }, pingIntervalMs);
-  }
-
-  function detach(): void {
-    stopHeartbeat();
-    if (!ws) return;
-    ws.onopen = ws.onmessage = ws.onclose = ws.onerror = null;
-    ws.close();
-    ws = null;
+  private detach(): void {
+    this.stopHeartbeat();
+    if (!this.ws) return;
+    this.ws.onopen = this.ws.onmessage = this.ws.onclose = this.ws.onerror = null;
+    this.ws.close();
+    this.ws = null;
   }
 
   /** The connection is gone or presumed dead: tear it down and try again later. */
-  function drop(): void {
-    detach();
-    if (closed) return;
-    setState("reconnecting");
-    const ceiling = Math.min(backoffMaxMs, backoffBaseMs * 2 ** attempt);
-    attempt += 1;
-    // Half fixed, half random, so clients do not reconnect in step after a restart.
-    reconnectTimer = setTimeout(open, ceiling * (0.5 + random() * 0.5));
+  private drop(): void {
+    this.detach();
+    if (this.closed) return;
+    this.setState("reconnecting");
+    const delay = backoffDelay(this.attempt, this.backoffBaseMs, this.backoffMaxMs, this.random());
+    this.attempt += 1;
+    this.reconnectTimer = setTimeout(() => this.open(), delay);
   }
 
-  function dispatch(msg: ServerMsg): void {
+  private deliver(topic: string, msg: TopicMsg): void {
+    for (const { handler } of this.topics.get(topic) ?? []) handler(msg);
+  }
+
+  private dispatch(msg: ServerMsg): void {
     switch (msg.op) {
       case "subscribed":
-        refused.delete(msg.topic);
-        for (const { handler } of topics.get(msg.topic) ?? []) handler(msg);
+        this.refused.delete(msg.topic);
+        this.deliver(msg.topic, msg);
         break;
       case "event":
-        for (const { handler } of topics.get(msg.topic) ?? []) handler(msg);
+        this.deliver(msg.topic, msg);
         break;
       case "session_upserted":
-        for (const { handler } of topics.get(TOPIC_SESSIONS) ?? []) handler(msg);
+        this.deliver(TOPIC_SESSIONS, msg);
         break;
-      case "error": {
-        if (msg.topic === undefined) {
-          options.onServerError?.(msg.message);
-          break;
-        }
-        // A topic everyone has left since asking: the refusal concerns nobody anymore.
-        const subscribers = topics.get(msg.topic);
-        if (!subscribers) break;
-        refused.add(msg.topic);
-        const refusal: TopicRefusal = { op: "error", message: msg.message, topic: msg.topic };
-        for (const { handler } of subscribers) handler(refusal);
+      case "error":
+        this.serverError(msg);
         break;
-      }
       case "pong":
       default:
         // `pong` only proves liveness; an op this build does not know is skipped.
@@ -199,87 +266,59 @@ export function createSocket(options: SocketOptions = {}): SocketClient {
     }
   }
 
-  function open(): void {
-    reconnectTimer = undefined;
-    if (closed) return;
-    const WebSocketImpl = options.WebSocket ?? WebSocket;
-    const socket = new WebSocketImpl(options.url ?? defaultSocketUrl(location));
-    ws = socket;
-    socket.onopen = () => {
-      attempt = 0;
-      // A new connection, possibly to a server that now knows the topic.
-      refused.clear();
-      setState("open");
-      for (const [topic, subscribers] of topics) sendSubscribe(topic, cursorOf(subscribers));
-      startHeartbeat();
-    };
-    socket.onmessage = (event) => {
-      // Any frame shows the connection is alive, not only the `pong` itself:
-      // a long replay on a slow link must not look like a dead socket.
-      clearTimeout(pongTimer);
-      pongTimer = undefined;
-      const msg = parseFrame(event.data);
-      if (msg) dispatch(msg);
-    };
-    const lost = (): void => {
-      // Only an attempt that opened ever sets "open".
-      const neverOpened = state !== "open";
-      drop();
-      if (neverOpened) for (const listener of refusedListeners) listener();
-    };
-    socket.onclose = lost;
-    socket.onerror = lost;
+  private serverError(msg: Extract<ServerMsg, { op: "error" }>): void {
+    if (msg.topic === undefined) {
+      this.options.onServerError?.(msg.message);
+      return;
+    }
+    // A topic everyone has left since asking: the refusal concerns nobody anymore.
+    if (!this.topics.has(msg.topic)) return;
+    this.refused.add(msg.topic);
+    this.deliver(msg.topic, { op: "error", message: msg.message, topic: msg.topic });
   }
 
-  function start(): void {
-    if (started || closed) return;
-    started = true;
-    open();
+  private open(): void {
+    this.reconnectTimer = undefined;
+    if (this.closed) return;
+    const WebSocketImpl = this.options.WebSocket ?? WebSocket;
+    const socket = new WebSocketImpl(this.options.url ?? defaultSocketUrl(location));
+    this.ws = socket;
+    socket.onopen = () => this.opened();
+    socket.onmessage = (event) => this.received(event);
+    socket.onclose = () => this.lost();
+    socket.onerror = () => this.lost();
   }
 
-  return {
-    subscribe(topic, handler, cursor) {
-      const subscriber: Subscriber = { handler, cursor };
-      let subscribers = topics.get(topic);
-      if (subscribers) {
-        subscribers.add(subscriber);
-      } else {
-        subscribers = new Set([subscriber]);
-        topics.set(topic, subscribers);
-        sendSubscribe(topic, cursor?.());
-      }
-      start();
-      return () => {
-        const current = topics.get(topic);
-        if (!current?.delete(subscriber) || current.size > 0) return;
-        topics.delete(topic);
-        if (!refused.delete(topic)) send({ op: "unsubscribe", topic });
-      };
-    },
-    resync(topic, afterSeq) {
-      if (!topics.has(topic)) return;
-      // Leaving first makes the server start one clean replay instead of two feeds.
-      if (!refused.has(topic)) send({ op: "unsubscribe", topic });
-      sendSubscribe(topic, afterSeq);
-    },
-    state: () => state,
-    onState(listener) {
-      stateListeners.add(listener);
-      return () => stateListeners.delete(listener);
-    },
-    onRefused(listener) {
-      refusedListeners.add(listener);
-      return () => refusedListeners.delete(listener);
-    },
-    reconnectNow() {
-      if (reconnectTimer === undefined) return;
-      clearTimeout(reconnectTimer);
-      open();
-    },
-    close() {
-      closed = true;
-      clearTimeout(reconnectTimer);
-      detach();
-    },
-  };
+  private opened(): void {
+    this.attempt = 0;
+    // A new connection, possibly to a server that now knows the topic.
+    this.refused.clear();
+    this.setState("open");
+    for (const [topic, subscribers] of this.topics) {
+      this.send(subscribeMsg(topic, cursorOf(subscribers)));
+    }
+    this.startHeartbeat();
+  }
+
+  private received(event: MessageEvent): void {
+    // Any frame shows the connection is alive, not only the `pong` itself:
+    // a long replay on a slow link must not look like a dead socket.
+    clearTimeout(this.pongTimer);
+    this.pongTimer = undefined;
+    const msg = parseFrame(event.data);
+    if (msg) this.dispatch(msg);
+  }
+
+  private lost(): void {
+    // Only an attempt that opened ever sets "open".
+    const neverOpened = this.current !== "open";
+    this.drop();
+    if (neverOpened) for (const listener of this.refusedListeners) listener();
+  }
+
+  private start(): void {
+    if (this.started || this.closed) return;
+    this.started = true;
+    this.open();
+  }
 }
