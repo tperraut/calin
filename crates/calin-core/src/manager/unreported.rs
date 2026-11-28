@@ -289,47 +289,57 @@ fn unreported<'a>(
     already: impl Fn(&str) -> Option<&'a FileState>,
 ) -> Vec<(String, FileOp)> {
     let paths: BTreeSet<&String> = old.keys().chain(new.keys()).collect();
-    let mut changes = Vec::new();
-    for path in paths {
-        let (op, disk) = match (old.get(path), new.get(path)) {
-            (Some(before), Some(after)) if before == after => continue,
-            (None, Some(after)) => {
-                let op = match after.kind {
-                    Kind::New => FileOp::Create,
-                    Kind::Modified => FileOp::Edit,
-                    Kind::Deleted => FileOp::Delete,
-                    Kind::Renamed(_) => FileOp::Rename,
-                };
-                (op, &after.disk)
-            }
-            (Some(before), Some(after)) => {
-                let op = match &after.kind {
-                    Kind::Deleted => FileOp::Delete,
-                    Kind::Renamed(_) if before.kind != after.kind => FileOp::Rename,
-                    _ => FileOp::Edit,
-                };
-                (op, &after.disk)
-            }
-            (Some(_), None) => {
-                let Some(disk) = left.get(path.as_str()) else {
-                    continue;
-                };
-                // Back to the base when it is still there; otherwise a file
-                // the base never had was removed.
-                let op = match disk {
-                    FileState::Absent => FileOp::Delete,
-                    _ => FileOp::Edit,
-                };
-                (op, disk)
-            }
-            (None, None) => continue,
-        };
-        if already(path) == Some(disk) {
-            continue;
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let (op, disk) = change(old.get(path), new.get(path), left.get(path.as_str()))?;
+            (already(path) != Some(disk)).then(|| (path.clone(), op))
+        })
+        .collect()
+}
+
+/// How one path changed between two snapshots, with its state on disk
+/// now; `None` when it did not change, or left with no state to show.
+fn change<'s>(
+    before: Option<&'s Fingerprint>,
+    after: Option<&'s Fingerprint>,
+    left: Option<&'s FileState>,
+) -> Option<(FileOp, &'s FileState)> {
+    match (before, after) {
+        (Some(before), Some(after)) if before == after => None,
+        (None, Some(after)) => Some((appeared(&after.kind), &after.disk)),
+        (Some(before), Some(after)) => Some((changed(&before.kind, &after.kind), &after.disk)),
+        (Some(_), None) => {
+            let disk = left?;
+            // Back to the base when it is still there; otherwise a file
+            // the base never had was removed.
+            let op = match disk {
+                FileState::Absent => FileOp::Delete,
+                _ => FileOp::Edit,
+            };
+            Some((op, disk))
         }
-        changes.push((path.clone(), op));
+        (None, None) => None,
     }
-    changes
+}
+
+/// The change of a path that was not in the list before.
+fn appeared(kind: &Kind) -> FileOp {
+    match kind {
+        Kind::New => FileOp::Create,
+        Kind::Modified => FileOp::Edit,
+        Kind::Deleted => FileOp::Delete,
+        Kind::Renamed(_) => FileOp::Rename,
+    }
+}
+
+/// The change of a path that was in the list and still is, differently.
+fn changed(before: &Kind, after: &Kind) -> FileOp {
+    match after {
+        Kind::Deleted => FileOp::Delete,
+        Kind::Renamed(_) if before != after => FileOp::Rename,
+        _ => FileOp::Edit,
+    }
 }
 
 #[cfg(test)]
@@ -338,6 +348,86 @@ mod tests {
 
     use super::*;
     use crate::testing::{git, git_repo, write_file};
+
+    fn file(content: &str) -> FileState {
+        FileState::File {
+            sha256: content.to_owned(),
+            executable: false,
+        }
+    }
+
+    fn print(kind: Kind, content: &str) -> Fingerprint {
+        Fingerprint {
+            kind,
+            disk: file(content),
+        }
+    }
+
+    fn snapshot(paths: &[(&str, Fingerprint)]) -> Snapshot {
+        paths
+            .iter()
+            .map(|(path, print)| ((*path).to_owned(), print.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn what_changed_between_two_snapshots_is_named_by_what_it_is_now() {
+        let renamed = Kind::Renamed(Some("old.rs".to_owned()));
+        let old = snapshot(&[
+            ("same.rs", print(Kind::Modified, "a")),
+            ("edited.rs", print(Kind::Modified, "a")),
+            ("deleted.rs", print(Kind::Modified, "a")),
+            ("moved.rs", print(Kind::New, "a")),
+            ("still_moved.rs", print(renamed.clone(), "a")),
+            ("reverted.rs", print(Kind::Modified, "a")),
+            ("removed.rs", print(Kind::New, "a")),
+            ("unread.rs", print(Kind::Modified, "a")),
+        ]);
+        let new = snapshot(&[
+            ("same.rs", print(Kind::Modified, "a")),
+            ("edited.rs", print(Kind::Modified, "b")),
+            ("deleted.rs", print(Kind::Deleted, "")),
+            ("moved.rs", print(renamed.clone(), "a")),
+            ("still_moved.rs", print(renamed.clone(), "b")),
+            ("created.rs", print(Kind::New, "c")),
+            ("touched.rs", print(Kind::Modified, "c")),
+            ("gone.rs", print(Kind::Deleted, "")),
+            ("arrived.rs", print(renamed, "c")),
+        ]);
+        let left = HashMap::from([
+            ("reverted.rs".to_owned(), file("base")),
+            ("removed.rs".to_owned(), FileState::Absent),
+        ]);
+        let changes = unreported(&old, &new, &left, |_| None);
+        assert_eq!(
+            changes,
+            [
+                ("arrived.rs".to_owned(), FileOp::Rename),
+                ("created.rs".to_owned(), FileOp::Create),
+                ("deleted.rs".to_owned(), FileOp::Delete),
+                ("edited.rs".to_owned(), FileOp::Edit),
+                ("gone.rs".to_owned(), FileOp::Delete),
+                ("moved.rs".to_owned(), FileOp::Rename),
+                ("removed.rs".to_owned(), FileOp::Delete),
+                ("reverted.rs".to_owned(), FileOp::Edit),
+                ("still_moved.rs".to_owned(), FileOp::Edit),
+                ("touched.rs".to_owned(), FileOp::Edit),
+            ]
+        );
+        // What a tool call reported in the state it is in now is left out;
+        // in another state it is not.
+        let reported = HashMap::from([
+            ("edited.rs".to_owned(), file("b")),
+            ("created.rs".to_owned(), file("old")),
+            ("removed.rs".to_owned(), FileState::Absent),
+        ]);
+        let changes = unreported(&old, &new, &left, |path| reported.get(path));
+        let paths: Vec<&str> = changes.iter().map(|(path, _)| path.as_str()).collect();
+        assert!(!paths.contains(&"edited.rs"), "{paths:?}");
+        assert!(!paths.contains(&"removed.rs"), "{paths:?}");
+        assert!(paths.contains(&"created.rs"), "{paths:?}");
+        assert_eq!(paths.len(), 8);
+    }
 
     /// What a snapshot costs: `cargo test --release -p calin-core -- --ignored
     /// --nocapture snapshot_cost`. Not a check, a measurement.
