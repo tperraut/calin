@@ -130,6 +130,13 @@ describe("inline Markdown", () => {
     ["[label](", "[label]("],
     ["[label]", "[label]"],
     ["![image](https://example.com/a.png)", "!<a https://example.com/a.png>image</a>"],
+    // A backtick run that found no closer once is not searched for again.
+    ["`a \\``", "`a ``"],
+    ["[t](<https://a.example)", "[t](<<a https://a.example/>https://a.example</a>)"],
+    ['[t](https://a.example "title)', '[t](<a https://a.example/>https://a.example</a> "title)'],
+    ["<https://a b>", "<<a https://a/>https://a</a> b>"],
+    // A bracket opened inside the address keeps its closer.
+    ["https://a.example/[x].", "<a https://a.example/[x]>https://a.example/[x]</a>."],
   ])("%j", (source, expected) => {
     expect(inline(source)).toBe(expected);
   });
@@ -160,6 +167,13 @@ describe("inline Markdown", () => {
     expect(depth(parseInline(deep))).toBeLessThanOrEqual(8);
     // Everything is still there, as text.
     expect(inline(deep).replace(/<\/?[bi]>/g, "")).toContain("x");
+  });
+
+  it("reads the text past the nesting limit as written", () => {
+    // Seven levels: a link, then six kinds of emphasis; the innermost code stays text.
+    expect(inline("[***a ___b **c __d *e _f `x`_ e* d__ c** b___ a***](https://x.example)")).toBe(
+      "<a https://x.example/><b><i>a <b><i>b <b>c <b>d <i>e <i>f `x`</i> e</i> d</b> c</b> b</i></b> a</i></b></a>",
+    );
   });
 });
 
@@ -205,6 +219,9 @@ describe("Markdown blocks", () => {
     ["- **bold** and `code`", ["ul[<b>bold</b> and <c>code</c>]"]],
     ["Intro:\n- one\n- two\n\nOutro.", ["p:Intro:", "ul[one|two]", "p:Outro."]],
     ["- a\n1. b", ["ul[a]", "ol1[b]"]],
+    ["- a\n\t- b", ["ul[aul[b]]"]],
+    ["- a\n# h", ["ul[a]", "h1:h"]],
+    ["- a\n---", ["ul[a]", "hr"]],
     ["1. a\n\n```\ncode\n```\n\n2. b", ["ol1[a]", "code():code", "ol2[b]"]],
     ["-not a list", ["p:-not a list"]],
     ["1.not a list", ["p:1.not a list"]],
