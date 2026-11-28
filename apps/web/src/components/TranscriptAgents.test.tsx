@@ -213,6 +213,30 @@ describe("Transcript: the agent filter", () => {
     expect(find<HTMLSelectElement>(host, "select").value).toBe("");
   });
 
+  it("tells namesakes apart by their position", () => {
+    const { host } = setup([
+      lead,
+      makeSubagent("sub1", "explorer"),
+      makeSubagent("sub2", "explorer"),
+      makeSubagent("sub3", "explorer"),
+    ]);
+    const select = find<HTMLSelectElement>(host, 'select[aria-label="Agent filter"]');
+    expect([...select.options].map((option) => option.textContent)).toEqual([
+      "All agents",
+      "lead",
+      "explorer (subagent)",
+      "explorer 2 (subagent)",
+      "explorer 3 (subagent)",
+    ]);
+  });
+
+  it("has no filter where nothing can take the reader's choice", () => {
+    const host = mount(() => (
+      <Transcript entries={entries} synced={true} agents={[lead, makeSubagent("sub1", "x")]} />
+    ));
+    expect(host.querySelector("select")).toBeNull();
+  });
+
   it("has no filter where the session has a single agent and none is set", () => {
     const { host, setFilter } = setup([lead]);
     expect(host.querySelector("select")).toBeNull();

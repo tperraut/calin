@@ -9,7 +9,10 @@ import { conflict, deferred, makePullRequest, makeSessionRepo } from "../test/fa
 import { click, find, findByText, mount, unmountAll } from "../test/render";
 import { Transcript } from "./Transcript";
 
-afterEach(unmountAll);
+afterEach(() => {
+  unmountAll();
+  vi.unstubAllGlobals();
+});
 
 const itemEntry = (item: Item): TranscriptEntry => ({
   kind: "item",
@@ -249,6 +252,60 @@ describe("Transcript", () => {
     setEntries([user, text("m1", "more"), text("m2", "and more")]);
     flush();
     expect(scroller.scrollTop).toBe(1800);
+  });
+
+  it("keeps the end in view when the viewport resizes, and stops following when a row grows", () => {
+    // happy-dom never reports a resize: the test plays the browser's observer.
+    const observed: Element[] = [];
+    let report: (targets: Element[]) => void = () => {};
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        // The transcript reads only which element changed.
+        constructor(callback: (changes: { target: Element }[]) => void) {
+          report = (targets) => callback(targets.map((target) => ({ target })));
+        }
+        observe(target: Element) {
+          observed.push(target);
+        }
+        disconnect() {}
+      },
+    );
+    const host = mount(() => <Transcript entries={[user]} synced={true} />);
+    const scroller = find(host, '[role="log"]');
+    const content = find(scroller, ":scope > div");
+    expect(observed).toEqual([scroller, content]);
+
+    layout(scroller, { scrollHeight: 900, clientHeight: 400 });
+    report([scroller]);
+    expect(scroller.scrollTop).toBe(900);
+
+    // A card opened near the end: the reader is no longer at the bottom.
+    scroller.scrollTop = 500;
+    layout(scroller, { scrollHeight: 1400, clientHeight: 400 });
+    report([content]);
+    flush();
+    expect(findByText(host, "button", "Jump to latest")).toBeDefined();
+    // Not following any more: a resize of the viewport leaves the position alone.
+    report([scroller]);
+    expect(scroller.scrollTop).toBe(500);
+  });
+
+  it("learns nothing from a scroll while hidden behind another panel", () => {
+    const host = mount(() => <Transcript entries={[user]} synced={true} />);
+    const scroller = find(host, '[role="log"]');
+    layout(scroller, { scrollHeight: 900, clientHeight: 0 });
+    scrollTo(scroller, 0);
+    expect(host.querySelector("button")).toBeNull();
+  });
+
+  it("ignores a request to reveal an item it does not hold", () => {
+    const [reveal, setReveal] = createSignal<{ itemId: string; seq: number }>();
+    const host = mount(() => <Transcript entries={[user]} synced={true} reveal={reveal()} />);
+    setReveal({ itemId: "nowhere", seq: 1 });
+    flush();
+    expect(host.querySelector("[data-revealed]")).toBeNull();
+    expect(host.querySelector("button")).toBeNull();
   });
 
   it("treats a position near the end as the bottom", () => {
