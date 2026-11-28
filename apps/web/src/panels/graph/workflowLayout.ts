@@ -297,9 +297,8 @@ function leavingOrder(
   drawn: readonly DrawnEdge[],
 ): ReadonlyMap<string, readonly number[]> {
   const leaving = new Map<string, number[]>();
-  const ranked = drawn.toSorted(
-    (a, b) => portRank(graph, a.edge) - portRank(graph, b.edge) || a.index - b.index,
-  );
+  // `toSorted` is stable and `drawn` is in edge order: edges of one rank keep that order.
+  const ranked = drawn.toSorted((a, b) => portRank(graph, a.edge) - portRank(graph, b.edge));
   for (const { edge, index } of ranked) {
     leaving.set(edge.from, [...(leaving.get(edge.from) ?? []), index]);
   }
