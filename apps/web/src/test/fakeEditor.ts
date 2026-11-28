@@ -1,5 +1,5 @@
-// Stands in for `panels/editor/codemirror.ts` in tests: the same contract over a
-// plain <textarea>, since CodeMirror needs a layout engine happy-dom lacks.
+// Stands in for `panels/editor/codemirror.ts` in the panel tests: the same contract
+// over a plain <textarea> they can type into. `codemirror.test.ts` drives the real one.
 import type {
   DiffHandle,
   DiffOptions,

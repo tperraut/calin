@@ -1,6 +1,6 @@
 // What the panels need from CodeMirror, and nothing else. `codemirror.ts` is
-// the one module that implements it; tests replace that module with a plain
-// fake, since CodeMirror needs a layout engine happy-dom does not have.
+// the one module that implements it; the panel tests replace that module with
+// a plain fake (test/fakeEditor.ts), and codemirror.test.ts drives the real one.
 
 export type EditorOptions = {
   /** The editor's accessible name. */
