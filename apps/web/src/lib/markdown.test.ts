@@ -254,6 +254,9 @@ describe("Markdown blocks", () => {
     ["#hashtag", ["p:#hashtag"]],
     ["#", ["p:#"]],
     ["# C# and F#", ["h1:C# and F#"]],
+    ["# a#", ["h1:a#"]],
+    ["# a\t#", ["h1:a"]],
+    ["### ###", ["h3:"]],
     ["## With `code` and **bold**", ["h2:With <c>code</c> and <b>bold</b>"]],
     ["Text\n## Heading\nMore", ["p:Text", "h2:Heading", "p:More"]],
     // Code.
@@ -267,6 +270,8 @@ describe("Markdown blocks", () => {
     ["Before\n```\ncode\n```\nAfter", ["p:Before", "code():code", "p:After"]],
     ["  ```\n  in\n    deeper\n  ```", ["code():in\n  deeper"]],
     ["```inline``` is not a fence", ["p:<c>inline</c> is not a fence"]],
+    // A line indented less than its fence loses only the indent it has.
+    ["  ```\n x\nab\n  ```", ["code():x\nab"]],
     // Lists.
     ["- one\n- two", ["ul[one|two]"]],
     ["* one\n+ two", ["ul[one|two]"]],
@@ -280,6 +285,10 @@ describe("Markdown blocks", () => {
     ["- **bold** and `code`", ["ul[<b>bold</b> and <c>code</c>]"]],
     ["Intro:\n- one\n- two\n\nOutro.", ["p:Intro:", "ul[one|two]", "p:Outro."]],
     ["- a\n1. b", ["ul[a]", "ol1[b]"]],
+    ["- a\n  1. b", ["ul[aol1[b]]"]],
+    // A list nests under its last item, and never above its first.
+    ["- a\n- b\n  - c", ["ul[a|bul[c]]"]],
+    ["  - a\n- b", ["ul[a|b]"]],
     ["- a\n\t- b", ["ul[aul[b]]"]],
     ["- a\n# h", ["ul[a]", "h1:h"]],
     ["- a\n---", ["ul[a]", "hr"]],
@@ -292,6 +301,8 @@ describe("Markdown blocks", () => {
     ["---", ["hr"]],
     ["***", ["hr"]],
     ["_ _ _", ["hr"]],
+    ["   ---", ["hr"]],
+    ["    ---", ["p:    ---"]],
     ["above\n\n---\n\nbelow", ["p:above", "hr", "p:below"]],
     ["--", ["p:--"]],
     // What this reader does not know shows as written.
