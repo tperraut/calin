@@ -15,6 +15,7 @@ import type { ChangedFile } from "../gen/ChangedFile";
 import type { FileDiff } from "../gen/FileDiff";
 import type { PullRequest } from "../gen/PullRequest";
 import type { RepoChanges } from "../gen/RepoChanges";
+import { inRepoSetOrder } from "../lib/delivery";
 import { errorMessage } from "../lib/errors";
 import { createMediaQuery, createWidth, WIDE_QUERY } from "../lib/media";
 import { loadDiffLayout, saveDiffLayout, type DiffLayoutChoice } from "../lib/prefs";
@@ -23,7 +24,6 @@ import {
   diffContent,
   filesLabel,
   findFile,
-  inRepoOrder,
   repoTotals,
   sameDiff,
   sessionTotals,
@@ -333,7 +333,7 @@ export default function ChangesPanel(props: PanelProps) {
     });
   }
 
-  const ordered = createMemo(() => inRepoOrder(changes() ?? [], props.store.repos()));
+  const ordered = createMemo(() => inRepoSetOrder(changes() ?? [], props.store.repos()));
   const totals = createMemo(() => sessionTotals(changes() ?? []));
   const pullRequests = createMemo(() => props.store.delivery.pullRequests());
   const selectedFile = createMemo(() => {

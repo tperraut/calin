@@ -65,14 +65,17 @@ export function pullRequestHref(url: string): string | undefined {
   return url;
 }
 
-/** In the order of the session's repo set; those of a repo it does not list come after. */
-export function inRepoSetOrder(
-  pullRequests: readonly PullRequest[],
+/**
+ * In the order of the session's repo set (primary first); those of a repo it
+ * does not list keep their order, after.
+ */
+export function inRepoSetOrder<T extends { session_repo_id: string }>(
+  items: readonly T[],
   repos: readonly SessionRepo[],
-): PullRequest[] {
+): T[] {
   const rank = new Map(repos.map((repo, index) => [repo.id, index]));
-  const position = (one: PullRequest): number => rank.get(one.session_repo_id) ?? repos.length;
-  return pullRequests.toSorted((a, b) => position(a) - position(b));
+  const position = (one: T): number => rank.get(one.session_repo_id) ?? repos.length;
+  return items.toSorted((a, b) => position(a) - position(b));
 }
 
 /**

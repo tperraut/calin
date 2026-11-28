@@ -2,12 +2,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test"
 import type { ChangedFile } from "../../gen/ChangedFile";
 import type { FileDiff } from "../../gen/FileDiff";
 import type { RepoChanges } from "../../gen/RepoChanges";
+import { inRepoSetOrder } from "../../lib/delivery";
 import { deferred, makeSessionRepo, settle } from "../../test/fakes";
 import {
   createRefresher,
   diffContent,
   findFile,
-  inRepoOrder,
   repoTotals,
   sameDiff,
   sessionTotals,
@@ -73,7 +73,7 @@ describe("changes", () => {
 
   it("orders repos like the session's repo set, primary first, unknown ones last", () => {
     const known = [makeSessionRepo("web", { primary: true }), makeSessionRepo("api")];
-    const ordered = inRepoOrder([repo("ghost", []), repo("api", []), repo("web", [])], known);
+    const ordered = inRepoSetOrder([repo("ghost", []), repo("api", []), repo("web", [])], known);
     expect(ordered.map((one) => one.session_repo_id)).toEqual(["web", "api", "ghost"]);
   });
 
