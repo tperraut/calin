@@ -100,13 +100,9 @@ fn contain(root: &Path, parts: &[&str], rel: &str) -> Result<PathBuf> {
     for existing in (0..=parts.len()).rev() {
         let mut candidate = root.to_path_buf();
         candidate.extend(&parts[..existing]);
-        match fs::symlink_metadata(&candidate) {
-            Ok(_) => {}
-            // Not there yet (or below a plain file): try one level up.
-            Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
-                continue;
-            }
-            Err(e) => return Err(Error::io(&candidate, e)),
+        // Not there yet (or below a plain file): try one level up.
+        if metadata_no_follow(&candidate)?.is_none() {
+            continue;
         }
         // The entry exists, so a failure here is a dangling or looping
         // symlink. Its target is unknown, so it cannot be trusted.
@@ -131,6 +127,16 @@ fn contain(root: &Path, parts: &[&str], rel: &str) -> Result<PathBuf> {
     }
     // Only reached when the root vanished after it was canonicalized.
     Err(Error::NotFound(root.display().to_string()))
+}
+
+/// What is at `path`, without following a final symlink. `None` when nothing
+/// is there, or when a parent is a plain file.
+pub(crate) fn metadata_no_follow(path: &Path) -> Result<Option<fs::Metadata>> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => Ok(Some(meta)),
+        Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => Ok(None),
+        Err(e) => Err(Error::io(path, e)),
+    }
 }
 
 /// An absolute path with its existing part canonicalized, for comparing

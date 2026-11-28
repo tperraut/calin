@@ -11,7 +11,7 @@ use sha2::{Digest as _, Sha256};
 use crate::cmd::work_dir;
 use crate::content::hex;
 use crate::error::{Error, Result};
-use crate::path::resolve_no_follow;
+use crate::path::{metadata_no_follow, resolve_no_follow};
 
 /// A path's state on disk. Two equal values mean the file did not change in
 /// any way git would record.
@@ -47,23 +47,24 @@ fn file_state(dir: &Path, path: &str) -> FileState {
     let Ok(at) = resolve_no_follow(dir, path) else {
         return FileState::Other;
     };
-    let meta = match fs::symlink_metadata(&at.abs) {
-        Ok(meta) => meta,
-        Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
-            return FileState::Absent;
-        }
-        Err(_) => return FileState::Other,
-    };
+    match metadata_no_follow(&at.abs) {
+        Ok(Some(meta)) => state_of(&at.abs, &meta),
+        Ok(None) => FileState::Absent,
+        Err(_) => FileState::Other,
+    }
+}
+
+/// The state of what `meta` says is at `path`.
+fn state_of(path: &Path, meta: &fs::Metadata) -> FileState {
     if meta.is_symlink() {
-        return match fs::read_link(&at.abs) {
-            Ok(target) => FileState::Link(target.to_string_lossy().into_owned()),
-            Err(_) => FileState::Other,
-        };
+        return fs::read_link(path).map_or(FileState::Other, |target| {
+            FileState::Link(target.to_string_lossy().into_owned())
+        });
     }
     if !meta.is_file() {
         return FileState::Other;
     }
-    match hash_file(&at.abs) {
+    match hash_file(path) {
         Ok(Some((sha256, executable))) => FileState::File { sha256, executable },
         Ok(None) => FileState::Other,
         Err(Error::NotFound(_)) => FileState::Absent,
@@ -198,6 +199,17 @@ mod tests {
                 FileState::Other,
             ]
         );
+    }
+
+    #[test]
+    fn a_file_in_an_unreadable_directory_is_other() {
+        let sandbox = Sandbox::new();
+        let dir = sandbox.dir("d");
+        write(&dir, "locked/f.txt", "f\n");
+        fs::set_permissions(dir.join("locked"), fs::Permissions::from_mode(0o000)).unwrap();
+        let states = file_states(&dir, &["locked/f.txt"]);
+        fs::set_permissions(dir.join("locked"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(states.unwrap(), [FileState::Other]);
     }
 
     #[test]

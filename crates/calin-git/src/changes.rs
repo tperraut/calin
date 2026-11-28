@@ -10,7 +10,7 @@ use calin_proto::{ChangeStatus, ChangedFile, FileDiff};
 use crate::cmd::{Git, require_commit, work_dir};
 use crate::content::{decode, read_capped};
 use crate::error::{Error, Result};
-use crate::path::{clean, resolve_no_follow};
+use crate::path::{clean, metadata_no_follow, resolve_no_follow};
 
 /// Git looks for a NUL in this many leading bytes to call a file binary.
 /// Untracked files are judged the same way so both kinds agree.
@@ -209,12 +209,8 @@ fn base_side(dir: &Path, base: &str, rel: &str, max_bytes: u64) -> Result<Side> 
 
 /// The content at `path`, whose last component has not been resolved.
 fn disk_side(path: &Path, max_bytes: u64) -> Result<Side> {
-    let meta = match fs::symlink_metadata(path) {
-        Ok(meta) => meta,
-        Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
-            return Ok(Side::Absent);
-        }
-        Err(e) => return Err(Error::io(path, e)),
+    let Some(meta) = metadata_no_follow(path)? else {
+        return Ok(Side::Absent);
     };
     if meta.is_symlink() {
         // What git stores for a link, and it never reads through it.
@@ -234,6 +230,11 @@ fn disk_side(path: &Path, max_bytes: u64) -> Result<Side> {
     if meta.len() > max_bytes {
         return Ok(Side::TooLarge);
     }
+    file_side(path, max_bytes)
+}
+
+/// The content of the regular file at `path`.
+fn file_side(path: &Path, max_bytes: u64) -> Result<Side> {
     match read_capped(path, max_bytes) {
         Ok(Some(bytes)) => Ok(Side::of(bytes)),
         // It grew past the limit between the two looks.
@@ -478,6 +479,7 @@ fn untracked_stats(path: &Path) -> Option<(u32, bool)> {
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::{PermissionsExt as _, symlink};
+    use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
     use std::time::{Duration, SystemTime};
 
@@ -1033,6 +1035,29 @@ mod tests {
             file_diff(&wt, &base, "outside-dir/secret.txt", None, MIB),
             Err(Error::InvalidPath { .. })
         ));
+    }
+
+    #[test]
+    fn a_socket_is_not_a_change_and_its_diff_is_binary() {
+        let sandbox = Sandbox::new();
+        let (wt, base) = session(&sandbox, &[("a.txt", "a\n")]);
+        let _socket = UnixListener::bind(wt.join("socket")).unwrap();
+
+        assert_changes(&wt, &base, vec![]);
+        let d = diff(&wt, &base, "socket");
+        assert!(d.binary && !d.too_large);
+        assert_eq!((d.old, d.new), (None, None));
+    }
+
+    #[test]
+    fn diff_of_a_file_in_an_unreadable_directory_is_an_io_error() {
+        let sandbox = Sandbox::new();
+        let (wt, base) = session(&sandbox, &[("a.txt", "a\n")]);
+        write(&wt, "locked/f.txt", "f\n");
+        fs::set_permissions(wt.join("locked"), fs::Permissions::from_mode(0o000)).unwrap();
+        let d = file_diff(&wt, &base, "locked/f.txt", None, MIB);
+        fs::set_permissions(wt.join("locked"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(d, Err(Error::Io { .. })), "{d:?}");
     }
 
     #[test]
