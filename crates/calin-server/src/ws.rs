@@ -7,6 +7,7 @@
 //! the store, is disconnected, and replays from its last sequence number.
 
 use std::collections::HashMap;
+use std::ops::ControlFlow;
 use std::time::Duration;
 
 use axum::Extension;
@@ -15,7 +16,7 @@ use axum::extract::ws::rejection::WebSocketUpgradeRejection;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use calin_core::Store;
+use calin_core::{Live, Store};
 use calin_proto::{ClientMsg, ServerMsg, TOPIC_SESSIONS, parse_session_topic};
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
@@ -60,37 +61,15 @@ async fn serve(socket: WebSocket, state: AppState, caller: Caller) {
     let closing = state.shutdown.child_token();
     close_with_credential(&state, &caller, &closing);
     let writer = tokio::spawn(write(sink, outbound, closing.clone()));
-    let identity = match &caller {
-        Caller::SignedIn(who) => Some(who.identity.to_string()),
-        Caller::Local | Caller::Anonymous => None,
-    };
-    let mut connection = Connection {
-        store: state.manager.store().clone(),
-        out,
-        closing: closing.clone(),
-        topics: HashMap::new(),
-        retired: HashMap::new(),
-        viewers: state.viewers.clone(),
-        identity,
-        views: HashMap::new(),
-    };
+    let mut connection = Connection::new(&state, &caller, out, closing.clone());
 
     loop {
         let frame = tokio::select! {
             () = closing.cancelled() => break,
             frame = frames.next() => frame,
         };
-        let reply = match frame {
-            Some(Ok(Message::Text(text))) => match serde_json::from_str::<ClientMsg>(&text) {
-                Ok(message) => connection.handle(message),
-                Err(err) => Some(error(format!("unreadable frame: {err}"), None)),
-            },
-            Some(Ok(Message::Binary(_))) => {
-                Some(error("binary frames are not supported".to_owned(), None))
-            }
-            // The protocol library answers pings itself.
-            Some(Ok(Message::Ping(_) | Message::Pong(_))) => None,
-            Some(Ok(Message::Close(_)) | Err(_)) | None => break,
+        let ControlFlow::Continue(reply) = connection.answer(frame) else {
+            break;
         };
         // A full queue here means the client sends but does not read.
         if let Some(reply) = reply
@@ -173,6 +152,49 @@ struct Connection {
 }
 
 impl Connection {
+    fn new(
+        state: &AppState,
+        caller: &Caller,
+        out: mpsc::Sender<ServerMsg>,
+        closing: CancellationToken,
+    ) -> Self {
+        let identity = match caller {
+            Caller::SignedIn(who) => Some(who.identity.to_string()),
+            Caller::Local | Caller::Anonymous => None,
+        };
+        Self {
+            store: state.manager.store().clone(),
+            out,
+            closing,
+            topics: HashMap::new(),
+            retired: HashMap::new(),
+            viewers: state.viewers.clone(),
+            identity,
+            views: HashMap::new(),
+        }
+    }
+
+    /// Reads one frame off the socket: `Break` when the connection ends,
+    /// else what to answer right away, if anything.
+    fn answer(
+        &mut self,
+        frame: Option<Result<Message, axum::Error>>,
+    ) -> ControlFlow<(), Option<ServerMsg>> {
+        let reply = match frame {
+            Some(Ok(Message::Text(text))) => match serde_json::from_str::<ClientMsg>(&text) {
+                Ok(message) => self.handle(message),
+                Err(err) => Some(error(format!("unreadable frame: {err}"), None)),
+            },
+            Some(Ok(Message::Binary(_))) => {
+                Some(error("binary frames are not supported".to_owned(), None))
+            }
+            // The protocol library answers pings itself.
+            Some(Ok(Message::Ping(_) | Message::Pong(_))) => None,
+            Some(Ok(Message::Close(_)) | Err(_)) | None => return ControlFlow::Break(()),
+        };
+        ControlFlow::Continue(reply)
+    }
+
     /// Handles a client frame. Returns what to answer right away, if anything.
     fn handle(&mut self, message: ClientMsg) -> Option<ServerMsg> {
         match message {
@@ -266,55 +288,54 @@ impl Forwarder {
     }
 
     async fn session(&self, session_id: &str, after_seq: u64) -> Result<(), Gone> {
-        let mut subscription = match self.store.subscribe(session_id, after_seq).await {
+        let subscription = match self.store.subscribe(session_id, after_seq).await {
             Ok(subscription) => subscription,
             Err(err) => return self.refuse(err).await,
         };
-        for event in subscription.backlog {
-            self.send(ServerMsg::Event {
-                topic: self.topic.clone(),
-                event,
-            })
-            .await?;
-        }
-        self.subscribed(subscription.head_seq).await?;
-        loop {
-            match subscription.live.recv().await {
-                Ok(event) => {
-                    self.send(ServerMsg::Event {
-                        topic: self.topic.clone(),
-                        event: (*event).clone(),
-                    })
-                    .await?;
-                }
-                Err(end) => return self.disconnect(format!("{end:?}")),
-            }
-        }
+        let event = |event| ServerMsg::Event {
+            topic: self.topic.clone(),
+            event,
+        };
+        let backlog = subscription.backlog.into_iter().map(event);
+        self.follow(backlog, subscription.head_seq, subscription.live, |live| {
+            event((*live).clone())
+        })
+        .await
     }
 
     async fn sessions(&self) -> Result<(), Gone> {
-        let (sessions, mut updates) = match self.store.subscribe_sessions().await {
+        let (sessions, updates) = match self.store.subscribe_sessions().await {
             Ok(subscribed) => subscribed,
             Err(err) => return self.refuse(err).await,
         };
-        for session in sessions {
-            self.send(ServerMsg::SessionUpserted { session }).await?;
-        }
-        self.subscribed(0).await?;
-        loop {
-            match updates.recv().await {
-                Ok(session) => self.send(ServerMsg::SessionUpserted { session }).await?,
-                Err(end) => return self.disconnect(format!("{end:?}")),
-            }
-        }
+        let upserted = |session| ServerMsg::SessionUpserted { session };
+        self.follow(sessions.into_iter().map(upserted), 0, updates, upserted)
+            .await
     }
 
-    async fn subscribed(&self, head_seq: u64) -> Result<(), Gone> {
+    /// Sends the backlog, then `subscribed` at `head_seq`, then each live
+    /// item until the client falls behind or goes away.
+    async fn follow<T: Clone>(
+        &self,
+        backlog: impl IntoIterator<Item = ServerMsg>,
+        head_seq: u64,
+        mut live: Live<T>,
+        frame: impl Fn(T) -> ServerMsg,
+    ) -> Result<(), Gone> {
+        for message in backlog {
+            self.send(message).await?;
+        }
         self.send(ServerMsg::Subscribed {
             topic: self.topic.clone(),
             head_seq,
         })
-        .await
+        .await?;
+        loop {
+            match live.recv().await {
+                Ok(item) => self.send(frame(item)).await?,
+                Err(end) => return self.disconnect(format!("{end:?}")),
+            }
+        }
     }
 
     async fn send(&self, message: ServerMsg) -> Result<(), Gone> {
