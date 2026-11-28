@@ -280,6 +280,19 @@ impl RepoRegistry {
         })
     }
 
+    /// [`reserve`](Self::reserve) for the repos a new session names; `None`
+    /// when it names none.
+    pub(crate) async fn reserve_named<'a>(
+        &self,
+        repo_ids: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Option<Reservation>> {
+        let ids: Vec<&str> = repo_ids.into_iter().collect();
+        if ids.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(self.reserve(&ids).await?))
+    }
+
     /// Reads the home repo's file again and scans for clones, off the
     /// runtime, then gives every newly declared repo its id. `settings` are
     /// the ones in effect.

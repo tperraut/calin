@@ -2294,7 +2294,12 @@ impl Driver {
         self.may_dispatch().await?;
         let given = self.child_repos(repos)?;
         let (start_points, dispatched) = start_points(&given).await?;
-        let reservation = self.reserve(&given).await?;
+        // Holds the repos in place until the child that is given them has them.
+        let reservation = self
+            .inner
+            .repos
+            .reserve_named(given.iter().map(|repo| repo.repo_id.as_str()))
+            .await?;
         let runner = self.child_runner(with.runner.as_deref())?;
         let link = Dispatch {
             parent_session_id: self.session_id.clone(),
@@ -2394,15 +2399,6 @@ impl Driver {
             )));
         }
         Ok(())
-    }
-
-    /// Holds `repos` in place until the child that is given them has them.
-    async fn reserve(&self, repos: &[SessionRepo]) -> Result<Option<Reservation>> {
-        let ids: Vec<&str> = repos.iter().map(|repo| repo.repo_id.as_str()).collect();
-        if ids.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(self.inner.repos.reserve(&ids).await?))
     }
 
     /// The runner a child runs on: the one a workflow node names, else the

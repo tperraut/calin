@@ -645,7 +645,11 @@ impl SessionManager {
         let (issue, context) = self.start_from_issue(&mut request, blank_prompt).await?;
         let title = filled(request.title.take()).unwrap_or_else(|| default_title(&request.prompt));
         // Before anything is created: every repo must exist, once.
-        let reservation = self.reserve(&request.repos).await?;
+        let reservation = self
+            .inner
+            .repos
+            .reserve_named(request.repos.iter().map(|repo| repo.repo_id.as_str()))
+            .await?;
         let session = self
             .inner
             .store
@@ -719,16 +723,6 @@ impl SessionManager {
             url: detail.issue.url,
         };
         Ok((Some(issue), Some(context)))
-    }
-
-    /// Holds the repos a new session names against removal, after the
-    /// checks of [`RepoRegistry::reserve`].
-    async fn reserve(&self, repos: &[AttachRepoRequest]) -> Result<Option<Reservation>> {
-        if repos.is_empty() {
-            return Ok(None);
-        }
-        let ids: Vec<&str> = repos.iter().map(|repo| repo.repo_id.as_str()).collect();
-        Ok(Some(self.inner.repos.reserve(&ids).await?))
     }
 
     /// Sends user text to the session's lead agent. It starts a turn right
