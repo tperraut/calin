@@ -324,6 +324,10 @@ fn invalid_files() {
             vec!["`budget_usd` must be a positive number"],
         ),
         (
+            format!("{}budget_usd: 0\n", doc(BASE_NODES, BASE_EDGES)),
+            vec!["`budget_usd` must be a positive number, found 0"],
+        ),
+        (
             format!("{}budget_usd: five\n", doc(BASE_NODES, BASE_EDGES)),
             vec!["`budget_usd` must be a number"],
         ),
@@ -871,6 +875,18 @@ fn graph_rules() {
 ",
     ));
     assert_mentions(&p, &["nodes `a`, `b` form a cycle", "no `loop` node"], "");
+    // A self-edge on the first node listed, which nothing else leads to.
+    let p = problems(&doc(
+        "  - { id: a, type: agent, prompt: p }
+  - { id: start, type: start }
+  - { id: e, type: end }
+",
+        "  - { from: start, to: e }
+  - { from: a.done, to: a }
+",
+    ));
+    assert_mentions(&p, &["node `a` is not reachable"], "");
+    assert_mentions(&p, &["nodes `a` form a cycle", "no `loop` node"], "");
     // An unreachable island that is also a cycle reports both.
     let p = problems(&doc(
         "  - { id: start, type: start }
@@ -892,6 +908,12 @@ fn graph_rules() {
         "",
     ));
     assert_mentions(&p, &["node `s2`", "second `start`", "`s1`"], "");
+    // Only the second one is reported, not the first as well.
+    let seconds = p
+        .iter()
+        .filter(|q| q.message.contains("second `start`"))
+        .count();
+    assert_eq!(seconds, 1, "{p}");
     assert_mentions(&p, &["no `end` node"], "");
     assert_mentions(&p, &["node `s2` is not reachable"], "");
     // An unknown type does not cascade into edge, reachability or cycle problems.
@@ -1048,6 +1070,71 @@ fn shapes_the_reader_refuses() {
     assert_mentions(&p, &["edge #3 must be a mapping, found a string"], &yaml);
     let w = ok(&format!("{}budget_usd: 2.5\n", doc(BASE_NODES, BASE_EDGES)));
     assert_eq!(w.budget_usd(), Some(2.5));
+}
+
+#[test]
+fn a_second_edge_from_one_port_does_not_count_for_cycles() {
+    // The refused edge would close a self-loop; only the port problem is reported.
+    let yaml = doc(
+        BASE_NODES,
+        &format!("{BASE_EDGES}  - {{ from: work.done, to: work }}\n"),
+    );
+    let p = problems(&yaml);
+    assert_eq!(p.len(), 1, "{p}");
+    assert_mentions(
+        &p,
+        &["port `work.done` already has an outgoing edge"],
+        &yaml,
+    );
+}
+
+#[test]
+fn an_id_of_forty_characters_is_valid() {
+    let id = "a".repeat(40);
+    let w = ok(&with_node(
+        &format!("{{ id: {id}, type: commit, message: m }}"),
+        &id,
+    ));
+    assert!(w.node(&id).is_some());
+}
+
+#[test]
+fn a_node_without_an_id_is_named_by_its_position() {
+    let yaml = doc(
+        &format!("{BASE_NODES}  - {{ type: commit, message: \" \" }}\n"),
+        BASE_EDGES,
+    );
+    let p = problems(&yaml);
+    let blank = p
+        .iter()
+        .find(|q| q.message.contains("`message` must not be empty"))
+        .unwrap_or_else(|| panic!("no blank message problem:\n{p}"));
+    assert!(blank.message.starts_with("node #4: "), "{blank}");
+    assert_eq!(blank.subject, Subject::Node { id: "#4".into() });
+}
+
+#[test]
+fn a_branch_prompt_problem_points_at_that_branch() {
+    let yaml = "version: 1
+name: x
+nodes:
+  - { id: start, type: start }
+  - id: p
+    type: parallel
+    branches:
+      - id: a
+        prompt: fine
+      - id: b
+        prompt: \"{{nodes.zz.summary}}\"
+  - { id: e, type: end }
+edges:
+  - { from: start, to: p }
+  - { from: p.done, to: e }
+";
+    let p = problems(yaml);
+    assert_eq!(p.len(), 1, "{p}");
+    assert_mentions(&p, &["`branches[b].prompt`", "no node `zz`"], yaml);
+    assert_eq!(p.0[0].line, Some(11), "{p}");
 }
 
 #[test]
