@@ -1,6 +1,6 @@
 import { flush } from "solid-js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
-import type { Api } from "../api/http";
+import { HttpError, type Api } from "../api/http";
 import type { Health } from "../gen/Health";
 import type { Me } from "../gen/Me";
 import type { Repo } from "../gen/Repo";
@@ -25,7 +25,14 @@ import {
 } from "../test/fakes";
 import { makeIssue } from "../test/integrations";
 import { workflowInfo } from "../test/workflows";
-import { createAppState, type AppServices } from "./app";
+import {
+  authPending,
+  createAppState,
+  meAuth,
+  meFailure,
+  meRetryDelay,
+  type AppServices,
+} from "./app";
 
 const health: Health = {
   name: "calin",
@@ -805,5 +812,36 @@ describe("app state: sign-in and the browser", () => {
     await settle();
     expect(device.renewed).toBe(true);
     expect(createPushSubscription).not.toHaveBeenCalled();
+  });
+});
+
+describe("what /me says", () => {
+  it("is local mode, or signed in under the identity it names", () => {
+    expect(meAuth({ mode: "local", identity: null, device_token: false })).toEqual({
+      status: "local",
+    });
+    expect(meAuth({ mode: "public", identity: "ada@example.org", device_token: true })).toEqual({
+      status: "signed_in",
+      identity: "ada@example.org",
+    });
+  });
+
+  it("leaves a 401 to the http layer, takes a server's 404 as local mode, and retries the rest", () => {
+    expect(meFailure(signedOut())).toBe("handled");
+    expect(meFailure(new HttpError(404, "not found", true))).toBe("local");
+    expect(meFailure(new HttpError(404, "not found", false))).toBe("unreachable");
+    expect(meFailure(unreachable())).toBe("unreachable");
+    expect(meFailure(new Error("boom"))).toBe("unreachable");
+  });
+
+  it("waits twice as long after each failure, up to fifteen seconds", () => {
+    expect([0, 1, 2, 3, 4, 10].map(meRetryDelay)).toEqual([1000, 2000, 4000, 8000, 15_000, 15_000]);
+  });
+
+  it("is pending until it has answered as Calin", () => {
+    expect(authPending({ status: "checking" })).toBe(true);
+    expect(authPending({ status: "unreachable" })).toBe(true);
+    expect(authPending({ status: "local" })).toBe(false);
+    expect(authPending({ status: "signed_out", ended: true })).toBe(false);
   });
 });
