@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc as std_mpsc};
 use std::thread;
 
 use pty_process::Size;
-use pty_process::blocking::{Command, Pty};
+use pty_process::blocking::{Command, Pts, Pty};
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 use rustix::io::Errno;
@@ -89,38 +89,11 @@ impl Terminal {
                 config.cwd.display()
             )));
         }
-        let (pty, pts) = pty_process::blocking::open().map_err(spawn_error("open a pty"))?;
-        pty.resize(clamp_size(config.cols, config.rows))
-            .map_err(spawn_error("size the pty"))?;
-        // The threads below wait with poll(2) so that the exit of the program
-        // can interrupt them; a blocking read or write could not be.
-        let flags = fcntl_getfl(&pty).map_err(spawn_error("configure the pty"))?;
-        fcntl_setfl(&pty, flags | OFlags::NONBLOCK).map_err(spawn_error("configure the pty"))?;
-        let pty = Arc::new(pty);
-        // Closing the write end wakes every thread polling the read end.
-        let (exited, on_exit) = io::pipe().map_err(spawn_error("open a pipe"))?;
-        let exited = Arc::new(exited);
-
-        let (output_tx, output_rx) = mpsc::channel(OUTPUT_QUEUE);
-        let (input_tx, mut input_rx) = mpsc::channel(INPUT_QUEUE);
-        let (exit_tx, exit_rx) = watch::channel(None);
-        let (start_tx, start_rx) = std_mpsc::channel();
-
+        let (pty, pts) = open_pty(config)?;
         // The threads start before the program so that a failure to start one
         // leaves no process to clean up. If anything below fails, dropping the
         // locals ends them: the tty closes, and so do the channels.
-        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        spawn_thread(format!("pty-out-{id}"), {
-            let (pty, exited) = (pty.clone(), exited.clone());
-            move || read_output(&pty, &exited, &output_tx)
-        })?;
-        spawn_thread(format!("pty-in-{id}"), {
-            let pty = pty.clone();
-            move || write_input(&pty, &exited, &mut input_rx)
-        })?;
-        spawn_thread(format!("pty-wait-{id}"), move || {
-            watch_exit(&start_rx, on_exit, &exit_tx);
-        })?;
+        let ends = start_threads(&pty)?;
 
         let (program, args) = config.command_line();
         let child = Command::new(&program)
@@ -139,11 +112,11 @@ impl Terminal {
         let shared = Arc::new(Shared {
             live: Mutex::new(Some(Live {
                 pty,
-                input: input_tx,
+                input: ends.input,
                 leader,
             })),
         });
-        if let Err(std_mpsc::SendError(start)) = start_tx.send(Start {
+        if let Err(std_mpsc::SendError(start)) = ends.start.send(Start {
             child,
             leader,
             shared: shared.clone(),
@@ -153,11 +126,11 @@ impl Terminal {
 
         let terminal = Self {
             shared,
-            exit: exit_rx,
+            exit: ends.exit,
             pid,
-            id,
+            id: ends.id,
         };
-        Ok((terminal, output_rx))
+        Ok((terminal, ends.output))
     }
 
     /// Process id of the program, which is also its session and group id.
@@ -235,6 +208,60 @@ impl fmt::Debug for Terminal {
             .field("pid", &self.pid)
             .finish_non_exhaustive()
     }
+}
+
+/// A new pty of the configured size, and the program's end of it.
+fn open_pty(config: &TerminalConfig) -> Result<(Arc<Pty>, Pts), TermError> {
+    let (pty, pts) = pty_process::blocking::open().map_err(spawn_error("open a pty"))?;
+    pty.resize(clamp_size(config.cols, config.rows))
+        .map_err(spawn_error("size the pty"))?;
+    // The threads wait with poll(2) so that the exit of the program can
+    // interrupt them; a blocking read or write could not be.
+    let flags = fcntl_getfl(&pty).map_err(spawn_error("configure the pty"))?;
+    fcntl_setfl(&pty, flags | OFlags::NONBLOCK).map_err(spawn_error("configure the pty"))?;
+    Ok((Arc::new(pty), pts))
+}
+
+/// What [`Terminal::spawn`] keeps of the threads it started: their number
+/// and the ends of their channels.
+struct Ends {
+    id: u64,
+    output: Output,
+    input: mpsc::Sender<Vec<u8>>,
+    exit: watch::Receiver<Option<Option<i32>>>,
+    start: std_mpsc::Sender<Start>,
+}
+
+/// Starts the output, input and exit watcher threads of a terminal on `pty`.
+fn start_threads(pty: &Arc<Pty>) -> Result<Ends, TermError> {
+    // Closing the write end wakes every thread polling the read end.
+    let (exited, on_exit) = io::pipe().map_err(spawn_error("open a pipe"))?;
+    let exited = Arc::new(exited);
+
+    let (output_tx, output_rx) = mpsc::channel(OUTPUT_QUEUE);
+    let (input_tx, mut input_rx) = mpsc::channel(INPUT_QUEUE);
+    let (exit_tx, exit_rx) = watch::channel(None);
+    let (start_tx, start_rx) = std_mpsc::channel();
+
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    spawn_thread(format!("pty-out-{id}"), {
+        let (pty, exited) = (pty.clone(), exited.clone());
+        move || read_output(&pty, &exited, &output_tx)
+    })?;
+    spawn_thread(format!("pty-in-{id}"), {
+        let pty = pty.clone();
+        move || write_input(&pty, &exited, &mut input_rx)
+    })?;
+    spawn_thread(format!("pty-wait-{id}"), move || {
+        watch_exit(&start_rx, on_exit, &exit_tx);
+    })?;
+    Ok(Ends {
+        id,
+        output: output_rx,
+        input: input_tx,
+        exit: exit_rx,
+        start: start_tx,
+    })
 }
 
 fn clamp_size(cols: u16, rows: u16) -> Size {
@@ -349,35 +376,14 @@ fn wait_ready(
 fn read_output(pty: &Pty, exited: &PipeReader, output: &mpsc::Sender<Vec<u8>>) {
     let mut reader = pty;
     let mut buffer = vec![0; READ_BUFFER];
-    let mut has_exited = false;
-    let mut read_after_exit = 0;
-    loop {
-        let ready = if has_exited {
-            wait_ready(pty, PollFlags::IN, None, Some(&QUIET_AFTER_EXIT))
-        } else {
-            wait_ready(pty, PollFlags::IN, Some(exited), None)
-        };
-        let Ok(ready) = ready else { return };
-        if !ready.pty {
-            if has_exited {
-                return;
-            }
-            has_exited = ready.exited;
-            continue;
-        }
-        has_exited |= ready.exited;
+    let mut drain = Drain::default();
+    while drain.wait_for_output(pty, exited) {
         match reader.read(&mut buffer) {
             Ok(0) => return,
             Ok(n) => {
                 // Blocks while the queue is full; fails once the receiver is dropped.
-                if output.blocking_send(buffer[..n].to_vec()).is_err() {
+                if output.blocking_send(buffer[..n].to_vec()).is_err() || drain.read_too_much(n) {
                     return;
-                }
-                if has_exited {
-                    read_after_exit += n;
-                    if read_after_exit > MAX_OUTPUT_AFTER_EXIT {
-                        return;
-                    }
                 }
             }
             Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {}
@@ -387,28 +393,78 @@ fn read_output(pty: &Pty, exited: &PipeReader, output: &mpsc::Sender<Vec<u8>>) {
     }
 }
 
-/// Body of the input thread: queue to pty, until the terminal is closed.
-fn write_input(pty: &Pty, exited: &PipeReader, input: &mut mpsc::Receiver<Vec<u8>>) {
-    let mut writer = pty;
-    while let Some(bytes) = input.blocking_recv() {
-        let mut rest = bytes.as_slice();
-        while !rest.is_empty() {
-            match writer.write(rest) {
-                Ok(0) => return,
-                Ok(n) => rest = &rest[n..],
-                Err(e) if e.kind() == ErrorKind::Interrupted => {}
-                // The program is not reading its input: wait for room, unless
-                // it exits first.
-                Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                    match wait_ready(pty, PollFlags::OUT, Some(exited), None) {
-                        Ok(ready) if !ready.exited => {}
-                        _ => return,
-                    }
-                }
-                Err(_) => return,
+/// Where the output thread is: before the program's exit, or after it with
+/// how much it has read since.
+#[derive(Default)]
+struct Drain {
+    has_exited: bool,
+    read_after_exit: usize,
+}
+
+impl Drain {
+    /// Waits until the pty has output. False when the output is over: it was
+    /// quiet for too long after the exit, or waiting failed.
+    fn wait_for_output(&mut self, pty: &Pty, exited: &PipeReader) -> bool {
+        loop {
+            let ready = if self.has_exited {
+                wait_ready(pty, PollFlags::IN, None, Some(&QUIET_AFTER_EXIT))
+            } else {
+                wait_ready(pty, PollFlags::IN, Some(exited), None)
+            };
+            let Ok(ready) = ready else { return false };
+            if ready.pty {
+                self.has_exited |= ready.exited;
+                return true;
             }
+            if self.has_exited {
+                return false;
+            }
+            self.has_exited = ready.exited;
         }
     }
+
+    /// Counts `n` bytes read. True once more came after the exit than the
+    /// program itself can have left in the kernel's buffer.
+    fn read_too_much(&mut self, n: usize) -> bool {
+        if !self.has_exited {
+            return false;
+        }
+        self.read_after_exit += n;
+        self.read_after_exit > MAX_OUTPUT_AFTER_EXIT
+    }
+}
+
+/// Body of the input thread: queue to pty, until the terminal is closed.
+fn write_input(pty: &Pty, exited: &PipeReader, input: &mut mpsc::Receiver<Vec<u8>>) {
+    while let Some(bytes) = input.blocking_recv() {
+        if !write_all(pty, exited, &bytes) {
+            return;
+        }
+    }
+}
+
+/// Writes all of `bytes` to the pty. False when the input is over: the
+/// program exited or the pty failed.
+fn write_all(pty: &Pty, exited: &PipeReader, bytes: &[u8]) -> bool {
+    let mut writer = pty;
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        match writer.write(rest) {
+            Ok(0) => return false,
+            Ok(n) => rest = &rest[n..],
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            // The program is not reading its input: wait for room, unless
+            // it exits first.
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                if !matches!(wait_ready(pty, PollFlags::OUT, Some(exited), None), Ok(ready) if !ready.exited)
+                {
+                    return false;
+                }
+            }
+            Err(_) => return false,
+        }
+    }
+    true
 }
 
 #[cfg(test)]

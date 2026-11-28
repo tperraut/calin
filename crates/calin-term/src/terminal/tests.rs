@@ -387,6 +387,38 @@ async fn output_ends_even_if_a_detached_process_keeps_the_tty() {
 }
 
 #[tokio::test]
+async fn output_ends_even_if_a_detached_process_keeps_writing() {
+    within(async {
+        // The child leaves the session and never stops writing, so the tty is
+        // neither closed nor quiet after the program exits.
+        let script = r#"setsid sh -c 'echo "child:$$."; exec yes' & read go; exit 0"#;
+        let (terminal, mut output) = spawn(&sh(script));
+        let id = terminal.id;
+        let mut seen = String::new();
+        let child = read_pid(&mut output, &mut seen, "child").await;
+        terminal.write("\n").await.expect("write");
+
+        let code = terminal.wait().await;
+        let ended = timeout(Duration::from_secs(10), async {
+            while output.recv().await.is_some() {}
+        })
+        .await;
+        // Clean up before asserting, so a failure leaves no process behind.
+        // Once nothing reads the pty, the writer may already have died on EIO.
+        let pid = Pid::from_raw(i32::try_from(child).expect("pid")).expect("pid");
+        let _ = kill_process(pid, Signal::KILL);
+
+        assert_eq!(code, Some(0));
+        assert!(
+            ended.is_ok(),
+            "output did not end while a process kept writing"
+        );
+        threads_gone(id..id + 1).await;
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn spawn_failure_reports_the_reason_and_leaves_no_thread() {
     within(async {
         let first = NEXT_ID.load(Ordering::Relaxed);
