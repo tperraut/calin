@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
+use super::http::MAX_RESPONSE_BYTES;
 use super::testing::{FakeProvider, Misbehavior, Signing, SigningKey};
 use super::*;
 use crate::clock::ManualClock;
@@ -1209,6 +1210,20 @@ async fn token_endpoint_failures_are_refusals() {
             "it answered HTTP 302",
         ),
     ];
+    // Exactly the limit is read (and holds no token); one byte more is not.
+    let mut cases = cases;
+    for declare_length in [true, false] {
+        for (bytes, expected) in [
+            (MAX_RESPONSE_BYTES, "its answer holds no ID token"),
+            (MAX_RESPONSE_BYTES + 1, too_large),
+        ] {
+            let misbehavior = Misbehavior::Oversized {
+                bytes,
+                declare_length,
+            };
+            cases.push((misbehavior, expected));
+        }
+    }
     for (n, (misbehavior, expected)) in cases.into_iter().enumerate() {
         harness.provider.state().token = Some(misbehavior);
         assert_eq!(

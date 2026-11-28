@@ -351,6 +351,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_https_url_is_contacted_over_tls() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut first = [0u8; 1];
+            stream.read_exact(&mut first).await.unwrap();
+            first[0]
+        });
+        // This end hangs up mid-handshake: no certificate it could show
+        // would be trusted anyway.
+        let result = client(LoopbackHttp::Refuse)
+            .get(&url(&format!("https://127.0.0.1:{port}/keys")))
+            .await;
+        assert!(
+            matches!(result, Err(HttpError::Transport(_))),
+            "{:?}",
+            result.map(|r| r.status)
+        );
+        let first = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("the client never connected")
+            .unwrap();
+        // A TLS handshake record, not plain HTTP.
+        assert_eq!(first, 0x16);
+    }
+
+    /// Answers one request per connection with `200 {}` and then holds the
+    /// connection open, as a provider with keep-alive does. Reports each
+    /// connection it accepts.
+    async fn keep_alive_server(
+        listener: TcpListener,
+        accepted: tokio::sync::mpsc::UnboundedSender<()>,
+    ) {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            accepted.send(()).unwrap();
+            tokio::spawn(async move {
+                let mut received = Vec::new();
+                while !received.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let mut chunk = [0u8; 4096];
+                    let read = stream.read(&mut chunk).await.unwrap();
+                    assert!(read > 0, "the client hung up before its request ended");
+                    received.extend_from_slice(&chunk[..read]);
+                }
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+                    .await
+                    .unwrap();
+                // A second request on this connection is never answered.
+                std::future::pending::<()>().await;
+                drop(stream);
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn every_request_opens_its_own_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = url(&format!("http://{}/keys", listener.local_addr().unwrap()));
+        let (accepted, mut connections) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(keep_alive_server(listener, accepted));
+        let lenient = client(LoopbackHttp::AllowForDevelopment);
+        for _ in 0..2 {
+            assert_eq!(lenient.get(&target).await.unwrap().status, 200);
+        }
+        server.abort();
+        let mut count = 0;
+        while connections.try_recv().is_ok() {
+            count += 1;
+        }
+        assert_eq!(count, 2);
+    }
+
+    #[tokio::test]
     async fn a_get_sends_no_credentials_and_no_body() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let target = url(&format!("http://{}/keys", listener.local_addr().unwrap()));
