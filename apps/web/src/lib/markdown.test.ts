@@ -174,6 +174,14 @@ describe("inline Markdown", () => {
     expect(inline("[***a ___b **c __d *e _f `x`_ e* d__ c** b___ a***](https://x.example)")).toBe(
       "<a https://x.example/><b><i>a <b><i>b <b>c <b>d <i>e <i>f `x`</i> e</i> d</b> c</b> b</i></b> a</i></b></a>",
     );
+    // An empty label past the limit leaves no empty text behind.
+    const empty = parseInline(
+      "***a ___b **c __d *e _f [](https://x.example)_ e* d__ c** b___ a***",
+    );
+    expect(inl(empty)).toBe(
+      "<b><i>a <b><i>b <b>c <b>d <i>e <i>f <a https://x.example/></a></i> e</i> d</b> c</b> b</i></b> a</i></b>",
+    );
+    expect(JSON.stringify(empty)).not.toContain('"text":""');
   });
 });
 
