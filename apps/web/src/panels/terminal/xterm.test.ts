@@ -3,7 +3,7 @@
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import { until } from "../../test/render";
 import type { TerminalView } from "./types";
-import terminalModule from "./xterm";
+import terminalModule, { isProposedGrid } from "./xterm";
 
 type Opened = { parent: HTMLElement; view: TerminalView; input: string[] };
 
@@ -72,6 +72,13 @@ describe("terminal view", () => {
   it("has no size to offer while its element is not laid out", () => {
     const { view } = openView();
     expect(view.fit()).toBeUndefined();
+  });
+
+  it("takes a proposed grid only when both sides are numbers", () => {
+    expect(isProposedGrid({ cols: 80, rows: 24 })).toBe(true);
+    expect(isProposedGrid(undefined)).toBe(false);
+    expect(isProposedGrid({ cols: Number.NaN, rows: 24 })).toBe(false);
+    expect(isProposedGrid({ cols: 80, rows: Number.POSITIVE_INFINITY })).toBe(false);
   });
 
   it("takes the focus into its keyboard field", () => {
