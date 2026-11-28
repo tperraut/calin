@@ -1181,14 +1181,7 @@ impl Driver {
 
     async fn on_attached(&mut self, prepared: Option<Prepared>) -> Result<()> {
         match prepared {
-            Some(Prepared::Repo(repo)) => {
-                let agent_id = self.attaching.as_ref().and_then(|a| a.agent_id.clone());
-                self.attach(repo.clone(), agent_id.as_deref()).await?;
-                if let Some(attaching) = &mut self.attaching {
-                    attaching.attached = Some(repo);
-                }
-                Ok(())
-            }
+            Some(Prepared::Repo(repo)) => self.attach_recorded(repo).await,
             Some(Prepared::SetupStarted(item)) => self.setup_started(item).await,
             Some(Prepared::SetupEnded { item, failure }) => self.setup_ended(item, failure).await,
             Some(Prepared::Failed { repo, error }) => {
@@ -1199,26 +1192,42 @@ impl Driver {
                 self.next_attach().await
             }
             None => {
-                if let Some(attaching) = self.attaching.take() {
-                    let result = attaching.attached.ok_or_else(no_longer_active);
-                    // An agent that asked is told by its tool's result. One
-                    // that did not is told with the next message, unless it
-                    // is not running: its next start names every repo.
-                    if let (Ok(repo), None, true) =
-                        (&result, &attaching.agent_id, self.handle.is_some())
-                    {
-                        self.notes.push(briefing::attach_note(repo));
-                    }
-                    // Tracked from now on, before anyone is told it is there.
-                    let tracker = unreported::tracker(&self.inner.trackers, &self.session_id);
-                    if let (Ok(repo), Some(tracker)) = (&result, tracker) {
-                        tracker.lock().await.attached(&self.session_id, repo).await;
-                    }
-                    let _ = attaching.reply.send(result);
-                }
+                self.attach_ended().await;
                 self.next_attach().await
             }
         }
+    }
+
+    /// The repo being attached is on record, by the agent that asked for
+    /// it, if one did; its setup may still be running.
+    async fn attach_recorded(&mut self, repo: SessionRepo) -> Result<()> {
+        let agent_id = self.attaching.as_ref().and_then(|a| a.agent_id.clone());
+        self.attach(repo.clone(), agent_id.as_deref()).await?;
+        if let Some(attaching) = &mut self.attaching {
+            attaching.attached = Some(repo);
+        }
+        Ok(())
+    }
+
+    /// The attach in progress is over: its caller is answered with the
+    /// repo, once the repo is tracked.
+    async fn attach_ended(&mut self) {
+        let Some(attaching) = self.attaching.take() else {
+            return;
+        };
+        let result = attaching.attached.ok_or_else(no_longer_active);
+        // An agent that asked is told by its tool's result. One that did
+        // not is told with the next message, unless it is not running: its
+        // next start names every repo.
+        if let (Ok(repo), None, true) = (&result, &attaching.agent_id, self.handle.is_some()) {
+            self.notes.push(briefing::attach_note(repo));
+        }
+        // Tracked from now on, before anyone is told it is there.
+        let tracker = unreported::tracker(&self.inner.trackers, &self.session_id);
+        if let (Ok(repo), Some(tracker)) = (&result, tracker) {
+            tracker.lock().await.attached(&self.session_id, repo).await;
+        }
+        let _ = attaching.reply.send(result);
     }
 
     /// Takes up the next attach request that waited for the one that ended.

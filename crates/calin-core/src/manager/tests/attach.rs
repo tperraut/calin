@@ -383,6 +383,25 @@ async fn a_repo_without_a_clone_cannot_be_attached_or_started_with() {
 }
 
 #[tokio::test]
+async fn an_attach_whose_worktree_cannot_be_made_fails_alone_and_the_next_goes_on() {
+    let session = running(PermissionMode::Autonomous).await;
+    let web = session.repo("web").await;
+    let docs = session.repo("docs").await;
+    let before = session.head_seq().await;
+    // Something that is not a worktree is where web's would go.
+    let work_dir = Home::new(session._dir.path()).work_dir(&session.id);
+    std::fs::write(work_dir.join("web"), "in the way").unwrap();
+
+    let failed = session.attach(&web, None).await;
+    assert!(failed.is_err(), "{failed:?}");
+    let docs = session.attach(&docs, None).await.unwrap();
+    assert_eq!(docs.name, "docs");
+    let events = session.events_after(before).await;
+    assert_eq!(labels(&events), ["repo_attached:docs"]);
+    assert_eq!(session.status().await, SessionStatus::Running);
+}
+
+#[tokio::test]
 async fn two_attaches_at_once_are_made_one_after_the_other() {
     let session = running(PermissionMode::Autonomous).await;
     let web = session.repo("web").await;
