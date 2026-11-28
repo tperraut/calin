@@ -947,6 +947,49 @@ async fn a_manual_run_works_switched_off_and_names_its_item() {
 }
 
 #[tokio::test]
+async fn a_manual_run_of_a_pull_request_trigger_runs_on_the_pull_request_it_names() {
+    let mut a = auto(false).await;
+    a.gh.pulls(&[11]);
+    let trigger = AutomationTrigger::PullRequest {
+        repo_id: a.api.id.clone(),
+    };
+    let reviews = a
+        .manager
+        .create_automation(automation(trigger, "Review {{title}} at {{url}}", false))
+        .await
+        .unwrap();
+    let unknown = a
+        .manager
+        .run_automation(&reviews.id, RunAutomationRequest { number: Some(99) })
+        .await;
+    assert!(
+        matches!(&unknown, Err(Error::Missing(what)) if what == "there is no pull request #99 on api"),
+        "{unknown:?}"
+    );
+    let run = a
+        .manager
+        .run_automation(&reviews.id, RunAutomationRequest { number: Some(11) })
+        .await
+        .unwrap();
+    assert_eq!(
+        (run.cause.as_str(), run.outcome),
+        ("manual", AutomationOutcome::Started)
+    );
+    let detail = a
+        .manager
+        .get(run.session_id.as_ref().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        detail.session.prompt,
+        "Review Pull 11 at https://github.com/acme/api/pull/11"
+    );
+    assert_eq!(detail.session.title, format!("{} #11", reviews.name));
+    let eleven = play(&mut a.starts).await;
+    a.finish(&eleven).await;
+}
+
+#[tokio::test]
 async fn in_dry_run_schedules_fire_and_triggers_do_not_poll() {
     let a = auto(true).await;
     let daily = a
@@ -978,6 +1021,41 @@ async fn in_dry_run_schedules_fire_and_triggers_do_not_poll() {
         .unwrap()
         .session;
     assert!(session.issue.unwrap().title.starts_with("Sample issue: "));
+    // And a sample pull request, which only exists as #5.
+    let reviews = a
+        .manager
+        .create_automation(automation(
+            AutomationTrigger::PullRequest {
+                repo_id: a.api.id.clone(),
+            },
+            "Review {{title}}",
+            true,
+        ))
+        .await
+        .unwrap();
+    let missing = a
+        .manager
+        .run_automation(&reviews.id, RunAutomationRequest { number: Some(6) })
+        .await;
+    assert!(
+        matches!(&missing, Err(Error::Missing(what)) if what == "api has no pull request #6"),
+        "{missing:?}"
+    );
+    let run = a
+        .manager
+        .run_automation(&reviews.id, RunAutomationRequest { number: Some(5) })
+        .await
+        .unwrap();
+    let session = a
+        .manager
+        .get(run.session_id.as_ref().unwrap())
+        .await
+        .unwrap()
+        .session;
+    assert_eq!(
+        session.prompt,
+        "Review Sample pull request: bump the dependencies"
+    );
 }
 
 #[tokio::test]
