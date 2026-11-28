@@ -175,6 +175,20 @@ pub(super) enum Abort {
     Stopped,
 }
 
+impl Abort {
+    /// Why the run failed, in the words of its `workflow_finished`.
+    fn reason(&self) -> String {
+        match self {
+            Self::Budget { budget, spent } => format!(
+                "the budget of {} was passed: the session and its child sessions have cost {}",
+                dollars(*budget),
+                dollars(*spent)
+            ),
+            Self::Stopped => STOPPED.to_owned(),
+        }
+    }
+}
+
 pub(super) async fn next_worked(run: &mut Option<Run>) -> Option<Worked> {
     match run.as_mut().and_then(|run| run.work.as_mut()) {
         Some(work) => work.recv().await,
@@ -1013,53 +1027,52 @@ impl Driver {
     pub(super) async fn on_worked(&mut self, worked: Option<Worked>) -> Result<()> {
         let parent = self.run.as_ref().and_then(|run| run.node_event.clone());
         match worked {
-            // A check shows in the transcript as a tool call nobody but the
-            // orchestrator made, like a setup command.
             Some(Worked::CheckStarted(item)) => {
-                let started = EventBody::ItemStarted { item };
-                self.append(EventDraft::new(started).parent(parent)).await?;
+                self.check_step(EventBody::ItemStarted { item }, parent)
+                    .await?;
             }
             Some(Worked::CheckEnded(item)) => {
-                let completed = EventBody::ItemCompleted { item };
-                self.append(EventDraft::new(completed).parent(parent))
+                self.check_step(EventBody::ItemCompleted { item }, parent)
                     .await?;
             }
             Some(Worked::CheckDone(done)) => self.done(done),
-            Some(Worked::Committed(committed)) => {
-                let Some(run) = &mut self.run else {
-                    return Ok(());
-                };
-                let Wait::Commit { node } = &run.wait else {
-                    return Ok(());
-                };
-                run.done = Some(match committed {
-                    Ok(repos) if repos.is_empty() => {
-                        Done::new(node, "nothing", "nothing to commit")
-                    }
-                    Ok(repos) => {
-                        Done::new(node, "done", format!("committed in {}", repos.join(", ")))
-                    }
-                    Err(why) => Done::new(node, "failed", excerpt(&why)),
-                });
-            }
-            // The work ended without its last word: it died.
-            None => {
-                let Some(run) = &mut self.run else {
-                    return Ok(());
-                };
-                run.work = None;
-                if run.done.is_none() {
-                    let port = match &run.wait {
-                        Wait::Check { .. } => "fail",
-                        _ => "failed",
-                    };
-                    if let Some(node) = run.wait.node() {
-                        run.done = Some(Done::new(node, port, "the work ended unexpectedly"));
-                    }
-                }
-            }
+            Some(Worked::Committed(committed)) => self.committed(committed),
+            None => self.work_died(),
         }
         Ok(())
+    }
+
+    /// The commit of a `commit` node is over: its result.
+    fn committed(&mut self, committed: std::result::Result<Vec<String>, String>) {
+        let Some(run) = &mut self.run else {
+            return;
+        };
+        let Wait::Commit { node } = &run.wait else {
+            return;
+        };
+        run.done = Some(match committed {
+            Ok(repos) if repos.is_empty() => Done::new(node, "nothing", "nothing to commit"),
+            Ok(repos) => Done::new(node, "done", format!("committed in {}", repos.join(", "))),
+            Err(why) => Done::new(node, "failed", excerpt(&why)),
+        });
+    }
+
+    /// The work ended without its last word: it died, and its node fails.
+    fn work_died(&mut self) {
+        let Some(run) = &mut self.run else {
+            return;
+        };
+        run.work = None;
+        if run.done.is_some() {
+            return;
+        }
+        let port = match &run.wait {
+            Wait::Check { .. } => "fail",
+            _ => "failed",
+        };
+        if let Some(node) = run.wait.node() {
+            run.done = Some(Done::new(node, port, "the work ended unexpectedly"));
+        }
     }
 
     /// The engine says the run is over.
@@ -1079,9 +1092,7 @@ impl Driver {
         let Some(run) = self.run.take() else {
             return Ok(());
         };
-        let finished = EventBody::WorkflowFinished { status, reason };
-        self.append(EventDraft::new(finished).parent(Some(run.started_event.clone())))
-            .await?;
+        self.record_finish(&run, status, reason).await?;
         // Branches no lead turn was told about go with its next message.
         if self.handle.is_some() {
             self.notes.extend(run.notes);
@@ -1113,65 +1124,11 @@ impl Driver {
         let Some(mut run) = self.run.take() else {
             return Ok(());
         };
-        let reason = match &why {
-            Abort::Budget { budget, spent } => format!(
-                "the budget of {} was passed: the session and its child sessions have cost {}",
-                dollars(*budget),
-                dollars(*spent)
-            ),
-            Abort::Stopped => STOPPED.to_owned(),
-        };
         let budget = matches!(why, Abort::Budget { .. });
         run.cancel.store(true, Ordering::Relaxed);
-        match &run.wait {
-            Wait::Children { children, .. } => {
-                let unsettled = children.iter().filter(|child| child.report.is_none());
-                self.stop_children(unsettled.map(|child| child.session_id.clone()));
-            }
-            // The command is killed; its tool item still gets its end.
-            Wait::Check { .. } => {
-                if let Some(mut work) = run.work.take() {
-                    let parent = run.node_event.clone();
-                    let grace = tokio::time::sleep(STOP_GRACE);
-                    tokio::pin!(grace);
-                    loop {
-                        let body = tokio::select! {
-                            worked = work.recv() => match worked {
-                                Some(Worked::CheckStarted(item)) => EventBody::ItemStarted { item },
-                                Some(Worked::CheckEnded(item)) => EventBody::ItemCompleted { item },
-                                Some(Worked::CheckDone(_) | Worked::Committed(_)) | None => break,
-                            },
-                            () = &mut grace => break,
-                        };
-                        self.append(EventDraft::new(body).parent(parent.clone()))
-                            .await?;
-                    }
-                }
-            }
-            Wait::Answer { .. } => self.expire_question().await?,
-            // A stop waits for the ship itself, to record what it opened.
-            Wait::Ship { .. } if budget => self.abort_shipping(),
-            Wait::Lead { .. } | Wait::Commit { .. } | Wait::Ship { .. } | Wait::Nothing => {}
-        }
-        if let Some(node) = run.wait.node() {
-            let line = match budget {
-                true => "stopped: the budget was passed".to_owned(),
-                false => format!("stopped: {STOPPED}"),
-            };
-            let closed = EventBody::WorkflowNode {
-                node_id: node.to_owned(),
-                phase: NodePhase::Finished,
-                port: None,
-                outcome: Some(line),
-            };
-            self.append(EventDraft::new(closed).parent(run.node_event.clone()))
-                .await?;
-        }
-        let finished = EventBody::WorkflowFinished {
-            status: WorkflowStatus::Failed,
-            reason: Some(reason),
-        };
-        self.append(EventDraft::new(finished).parent(Some(run.started_event.clone())))
+        self.call_off(&mut run, budget).await?;
+        self.close_aborted_node(&run, budget).await?;
+        self.record_finish(&run, WorkflowStatus::Failed, Some(why.reason()))
             .await?;
         if !budget {
             // The stop that called this cancels the session.
@@ -1184,6 +1141,90 @@ impl Driver {
             return self.ask_to_end_turn().await;
         }
         self.settle_run(run.shipped).await
+    }
+
+    /// Calls off what the active node of an aborted run waits for.
+    async fn call_off(&mut self, run: &mut Run, budget: bool) -> Result<()> {
+        match &run.wait {
+            Wait::Children { children, .. } => {
+                let unsettled = children.iter().filter(|child| child.report.is_none());
+                self.stop_children(unsettled.map(|child| child.session_id.clone()));
+            }
+            Wait::Check { .. } => {
+                let parent = run.node_event.clone();
+                self.drain_check(run.work.take(), parent).await?;
+            }
+            Wait::Answer { .. } => self.expire_question().await?,
+            // A stop waits for the ship itself, to record what it opened.
+            Wait::Ship { .. } if budget => self.abort_shipping(),
+            Wait::Lead { .. } | Wait::Commit { .. } | Wait::Ship { .. } | Wait::Nothing => {}
+        }
+        Ok(())
+    }
+
+    /// The command of a check is killed; its tool item still gets its end.
+    async fn drain_check(
+        &mut self,
+        work: Option<mpsc::Receiver<Worked>>,
+        parent: Option<String>,
+    ) -> Result<()> {
+        let Some(mut work) = work else {
+            return Ok(());
+        };
+        let grace = tokio::time::sleep(STOP_GRACE);
+        tokio::pin!(grace);
+        loop {
+            let body = tokio::select! {
+                worked = work.recv() => match worked {
+                    Some(Worked::CheckStarted(item)) => EventBody::ItemStarted { item },
+                    Some(Worked::CheckEnded(item)) => EventBody::ItemCompleted { item },
+                    Some(Worked::CheckDone(_) | Worked::Committed(_)) | None => break,
+                },
+                () = &mut grace => break,
+            };
+            self.check_step(body, parent.clone()).await?;
+        }
+        Ok(())
+    }
+
+    /// A check shows in the transcript as a tool call nobody but the
+    /// orchestrator made, like a setup command, under its node.
+    async fn check_step(&mut self, body: EventBody, parent: Option<String>) -> Result<()> {
+        self.append(EventDraft::new(body).parent(parent)).await?;
+        Ok(())
+    }
+
+    /// Closes the node an aborted run was at, if it was at one.
+    async fn close_aborted_node(&mut self, run: &Run, budget: bool) -> Result<()> {
+        let Some(node) = run.wait.node() else {
+            return Ok(());
+        };
+        let line = match budget {
+            true => "stopped: the budget was passed".to_owned(),
+            false => format!("stopped: {STOPPED}"),
+        };
+        let closed = EventBody::WorkflowNode {
+            node_id: node.to_owned(),
+            phase: NodePhase::Finished,
+            port: None,
+            outcome: Some(line),
+        };
+        self.append(EventDraft::new(closed).parent(run.node_event.clone()))
+            .await?;
+        Ok(())
+    }
+
+    /// Records the end of `run`, caused by its start.
+    async fn record_finish(
+        &mut self,
+        run: &Run,
+        status: WorkflowStatus,
+        reason: Option<String>,
+    ) -> Result<()> {
+        let finished = EventBody::WorkflowFinished { status, reason };
+        self.append(EventDraft::new(finished).parent(Some(run.started_event.clone())))
+            .await?;
+        Ok(())
     }
 
     /// Ends the run when the session tree has cost more than its budget.

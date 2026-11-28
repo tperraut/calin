@@ -844,6 +844,47 @@ async fn a_commit_node_commits_what_there_is_and_says_when_there_is_nothing() {
     assert_eq!(git(docs, &["rev-list", "--count", "HEAD"]), "1");
 }
 
+#[tokio::test]
+async fn a_commit_that_git_refuses_fails_the_node_with_the_reason() {
+    let mut flow = flow(&[("commit", COMMIT)]).await;
+    let api = flow.repo("api").await;
+    // Worktrees share the hooks of their clone.
+    let hooks = Path::new(&api.path).join(".git/hooks");
+    git(
+        Path::new(&api.path),
+        &["config", "core.hooksPath", hooks.to_str().unwrap()],
+    );
+    let hook = hooks.join("pre-commit");
+    std::fs::write(&hook, "#!/bin/sh\necho refused by the hook >&2\nexit 1\n").unwrap();
+    let mut mode = std::fs::metadata(&hook).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut mode, 0o755);
+    std::fs::set_permissions(&hook, mode).unwrap();
+    let mut wanted = request("Add the file", Some("puppet"));
+    wanted.workflow = Some("commit".to_owned());
+    wanted.repos = vec![attach(&api, None)];
+    let id = flow
+        .manager
+        .create_session(wanted)
+        .await
+        .unwrap()
+        .session
+        .id;
+    let mut lead = Lead::default();
+    lead.prompt(&mut flow.starts).await;
+    let worktree = lead.cwd();
+    write_file(&worktree, "added.txt", "new\n");
+    lead.answer("Added it.").await;
+
+    let events = flow.reviewed(&id).await;
+    let (port, outcome) = finished(&events, "save");
+    assert_eq!(port.as_deref(), Some("failed"));
+    let outcome = outcome.as_deref().unwrap();
+    assert!(outcome.starts_with("api: "), "{outcome}");
+    assert_eq!(finish_reason(&events).0, WorkflowStatus::Failed);
+    // Nothing was committed.
+    assert_eq!(git(&worktree, &["rev-list", "--count", "HEAD"]), "1");
+}
+
 const SHIP: &str = r#"
 version: 1
 name: Ship it
