@@ -54,13 +54,11 @@ fn is_local_path(raw: &str) -> bool {
     // Second opinion from a real parser: resolved against a placeholder
     // origin, the result must still be on that origin.
     const BASE: &str = "https://calin.invalid";
-    let Ok(base) = Url::parse(BASE) else {
-        return false;
-    };
-    match base.join(raw) {
-        Ok(joined) => joined.origin() == base.origin() && joined.as_str().starts_with(BASE),
-        Err(_) => false,
-    }
+    Url::parse(BASE).is_ok_and(|base| {
+        base.join(raw).is_ok_and(|joined| {
+            joined.origin() == base.origin() && joined.as_str().starts_with(BASE)
+        })
+    })
 }
 
 #[cfg(test)]
