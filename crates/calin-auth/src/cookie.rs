@@ -56,9 +56,7 @@ impl SessionToken {
     /// planted to swap the user into another session, and there is no
     /// telling which one is genuine. Only the prefixed name is read.
     pub fn from_cookie_headers<'a>(headers: impl IntoIterator<Item = &'a str>) -> Option<Self> {
-        single_cookie(headers, SESSION_COOKIE)
-            .filter(|value| has_token_shape(value))
-            .map(|value| Self(value.to_owned()))
+        single_token_cookie(headers, SESSION_COOKIE).map(Self)
     }
 
     /// Every distinct, well-shaped session token among the request's
@@ -112,9 +110,7 @@ impl PendingLoginRef {
     /// Reads the reference from the request's `Cookie` header values, with
     /// the same rules as [`SessionToken::from_cookie_headers`].
     pub fn from_cookie_headers<'a>(headers: impl IntoIterator<Item = &'a str>) -> Option<Self> {
-        single_cookie(headers, PENDING_LOGIN_COOKIE)
-            .filter(|value| has_token_shape(value))
-            .map(|value| Self(value.to_owned()))
+        single_token_cookie(headers, PENDING_LOGIN_COOKIE).map(Self)
     }
 
     /// The `Set-Cookie` value: sent only to `/auth`, gone after 10 minutes.
@@ -236,6 +232,16 @@ fn single_cookie<'a>(headers: impl IntoIterator<Item = &'a str>, name: &'a str) 
         }
     }
     found
+}
+
+/// The [`single_cookie`] `name`, when it is shaped like a token.
+fn single_token_cookie<'a>(
+    headers: impl IntoIterator<Item = &'a str>,
+    name: &'a str,
+) -> Option<String> {
+    single_cookie(headers, name)
+        .filter(|value| has_token_shape(value))
+        .map(str::to_owned)
 }
 
 #[cfg(test)]
@@ -479,6 +485,25 @@ mod tests {
         assert_eq!(
             PendingLoginRef::from_cookie_headers([header.as_str()]),
             None
+        );
+    }
+
+    #[test]
+    fn a_pending_login_cookie_not_shaped_like_a_token_is_refused() {
+        let short = &TOKEN[1..];
+        let bad_char = format!("{}!", &TOKEN[1..]);
+        for value in ["", short, bad_char.as_str()] {
+            let header = format!("__Secure-calin_login={value}");
+            assert_eq!(
+                PendingLoginRef::from_cookie_headers([header.as_str()]),
+                None,
+                "{value:?}"
+            );
+        }
+        let quoted = format!("__Secure-calin_login=\"{TOKEN}\"");
+        assert_eq!(
+            PendingLoginRef::from_cookie_headers([quoted.as_str()]).map(|p| p.0),
+            Some(TOKEN.to_owned())
         );
     }
 
