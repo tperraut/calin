@@ -89,6 +89,35 @@ describe("transcriptRows", () => {
     expect(shape(rows)).toEqual(["item:t1", "subagent:sub1[]#0"]);
   });
 
+  it("puts two subagents started by one call under it, in the order they were announced", () => {
+    const rows = transcriptRows(entries, agents, { sub1: "t2", sub2: "t2" }, null);
+    expect(shape(rows)).toEqual([
+      "event:u",
+      "item:m1",
+      "item:t1",
+      "item:t2",
+      "subagent:sub1[item:s1a,item:s1b,item:s1c]#2",
+      "subagent:sub2[item:s2a]#1",
+      "item:m2",
+    ]);
+  });
+
+  it("takes only a top-level call as a subagent's start, and leaves out one with no call and no rows", () => {
+    // sub2's call is one of sub1's own items: it is placed where it first did something.
+    const rows = transcriptRows(entries, agents, { sub1: "t1", sub2: "s1a" }, null);
+    expect(shape(rows)).toEqual([
+      "event:u",
+      "item:m1",
+      "item:t1",
+      "subagent:sub1[item:s1a,item:s1b,item:s1c]#2",
+      "item:t2",
+      "subagent:sub2[item:s2a]#1",
+      "item:m2",
+    ]);
+    const quiet = transcriptRows([user, item("m1", "a1")], agents, {}, null);
+    expect(shape(quiet)).toEqual(["event:u", "item:m1"]);
+  });
+
   it("leaves the transcript flat when the session has no subagent", () => {
     const rows = transcriptRows(entries, [makeAgent("a1")], {}, null);
     expect(rows.every((row) => row.kind === "entry")).toBe(true);
