@@ -754,6 +754,84 @@ describe("permissions", () => {
     });
   });
 
+  it("replaces a request asked again in place, and keeps it pending as the newest", () => {
+    const view = fold(
+      log(
+        { type: "permission_requested", request: request("p1") },
+        { type: "permission_requested", request: request("p2") },
+        { type: "permission_requested", request: request("p1", { title: "run p1 again" }) },
+      ),
+    );
+    expect(view.transcript.map((entry) => entry.key)).toEqual(["permission:p1", "permission:p2"]);
+    expect(view.transcript[0]).toMatchObject({
+      ts: 1002,
+      request: request("p1", { title: "run p1 again" }),
+    });
+    expect(view.pendingPermissions.map((one) => [one.request.id, one.seq])).toEqual([
+      ["p2", 2],
+      ["p1", 3],
+    ]);
+  });
+
+  it("lapses only what is still pending when the turn ends, in rows and in cards", () => {
+    const resolved = (id: string): EventBody => ({
+      type: "permission_resolved",
+      request_id: id,
+      decision: "allow",
+      by: "user",
+      message: null,
+    });
+    const view = fold(
+      log(
+        status("running"),
+        { type: "permission_requested", request: request("p1") },
+        resolved("p1"),
+        { type: "permission_requested", request: request("p2") },
+        { type: "item_started", item: toolItem("t1", "ok", "completed") },
+        { type: "permission_requested", request: request("p3", { item_id: "t1" }) },
+        resolved("p3"),
+        { type: "permission_requested", request: request("p4", { item_id: "t1" }) },
+        { type: "item_started", item: toolItem("t2", "ok", "completed") },
+        status("review"),
+      ),
+    );
+    const outcomes = view.transcript.map((entry) =>
+      entry.kind === "permission"
+        ? [entry.request.id, entry.outcome.state]
+        : entry.kind === "item"
+          ? [
+              entry.item.id,
+              entry.interrupted,
+              entry.permissions?.map((one) => [one.request.id, one.outcome.state]),
+            ]
+          : [entry.kind],
+    );
+    expect(outcomes).toEqual([
+      ["p1", "resolved"],
+      ["p2", "lapsed"],
+      [
+        "t1",
+        false,
+        [
+          ["p3", "resolved"],
+          ["p4", "lapsed"],
+        ],
+      ],
+      ["t2", false, undefined],
+    ]);
+    expect(view.pendingPermissions).toEqual([]);
+  });
+
+  it("leaves the view as it is when the turn ends with nothing open", () => {
+    const before = fold(
+      log(status("running"), { type: "item_started", item: toolItem("t1", "ok", "completed") }),
+    );
+    const [ended] = log(status("review"));
+    const after = applyEvent(before, { ...ended, seq: before.seq + 1 }).view;
+    expect(after.transcript).toBe(before.transcript);
+    expect(after.pendingPermissions).toBe(before.pendingPermissions);
+  });
+
   it("keeps requests pending through running and waiting", () => {
     const view = fold(
       log(
@@ -1417,6 +1495,24 @@ describe("applyEvent: questions", () => {
     expect(kinds(view)).toEqual(["question", "question"]);
   });
 
+  it("replaces a question asked again in place, and keeps it open as the newest", () => {
+    const second = { id: "q2", text: "Which color?", options: [], gate: false };
+    const again = { ...question, text: "Header or footer, finally?" };
+    const view = fold(
+      log(
+        { type: "question_asked", question },
+        { type: "question_asked", question: second },
+        { type: "question_asked", question: again },
+      ),
+    );
+    expect(view.transcript.map((entry) => entry.key)).toEqual(["question:q1", "question:q2"]);
+    expect(view.transcript[0]).toMatchObject({ ts: 1002, question: again });
+    expect(view.openQuestions.map((one) => [one.question.id, one.seq])).toEqual([
+      ["q2", 2],
+      ["q1", 3],
+    ]);
+  });
+
   it("ignores an answer to a question the log never asked", () => {
     const view = fold(
       log({ type: "question_answered", question_id: "nope", answer: "x", by: "user" }),
@@ -1669,6 +1765,31 @@ describe("applyEvent: workflow runs", () => {
     expect(view.workflow).toEqual(before.workflow);
     expect(view.transcript).toEqual(before.transcript);
     expect(view.seq).toBe(odd.length);
+  });
+
+  it("finishes a node that names no port without a row, keeping its last port", () => {
+    const view = fold(
+      log(begin, ...through("implement", "done"), on("implement"), [
+        null,
+        {
+          type: "workflow_node",
+          node_id: "implement",
+          phase: "finished",
+          port: null,
+          outcome: "stopped",
+        },
+      ]),
+    );
+    expect(nodeOf(view, "implement")).toMatchObject({
+      state: "finished",
+      last_port: "done",
+      outcome: "stopped",
+      runs: 2,
+    });
+    const notes = view.transcript.flatMap((entry) =>
+      entry.kind === "workflow" ? [entry.note.what] : [],
+    );
+    expect(notes).toEqual(["started", "node_started", "node_started"]);
   });
 
   it("ignores nodes and ends that come before the run's start", () => {
