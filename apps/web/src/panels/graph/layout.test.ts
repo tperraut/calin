@@ -13,6 +13,7 @@ import {
   displacements,
   INDENT,
   layoutGraph,
+  NODE_SIZE,
   sizeOf,
   SLOT,
   type Layout,
@@ -346,6 +347,47 @@ describe("layoutGraph", () => {
     expect(more.positions.get("repo:web")).toEqual(indented.positions.get("repo:web"));
   });
 
+  it("measures just what holds every card: the tree, then the repo band", () => {
+    const size = (nodes: readonly GraphNode[], mode: LayoutMode) => {
+      const { width, height } = layoutGraph(nodes, undefined, mode);
+      return { width, height };
+    };
+    const { agent, repo } = NODE_SIZE;
+    expect(size([], "indented")).toEqual({ width: 0, height: 0 });
+    const tree = [userNode(), lead(), sub("s1", "agent:a1"), sub("s2", "agent:a1")];
+    // Four rows: three whole, and the last card without the gap under it; the subagents two steps in.
+    expect(size(tree, "indented")).toEqual({
+      width: 2 * INDENT + agent.w,
+      height: 3 * SLOT + agent.h,
+    });
+    // The user, the lead and the first subagent share a row: two rows.
+    expect(size(tree, "columns")).toEqual({
+      width: 2 * COLUMN_STEP + agent.w,
+      height: SLOT + agent.h,
+    });
+    // Two repos side by side under seven rows, the third under them.
+    expect(size(makeGraph().nodes, "indented")).toEqual({
+      width: repo.w + 12 + repo.w,
+      height: 7 * SLOT + 20 + (repo.h + 12) + repo.h,
+    });
+    expect(size(makeGraph().nodes, "columns").width).toBe(4 * COLUMN_STEP + repo.w);
+  });
+
+  it("puts the user's tree first, and keeps stray trees in their places", () => {
+    const one = sub("o1", "agent:gone");
+    const two = sub("o2", "agent:gone");
+    const self = { ...sub("self", "agent:a1"), parent_id: "agent:self" };
+    for (const mode of modes) {
+      const first = layoutGraph([one, two, self, userNode(), lead()], undefined, mode);
+      expect(first.order).toEqual(["user", "agent:a1", "agent:o1", "agent:o2", "agent:self"]);
+      // An agent the server hangs under itself starts a tree of its own.
+      expect(first.parent.has("agent:self")).toBe(false);
+      expect(first.children.get("agent:self")).toEqual([]);
+      const again = layoutGraph([self, two, one, lead(), userNode()], first.positions, mode);
+      expect(Object.fromEntries(again.positions)).toEqual(Object.fromEntries(first.positions));
+    }
+  });
+
   it("still places an agent whose parent is missing, and survives a cycle", () => {
     const orphan = sub("orphan", "agent:gone");
     const a = sub("ca", "agent:cb");
@@ -357,5 +399,8 @@ describe("layoutGraph", () => {
       expect(overlaps(nodes, layout)).toEqual([]);
       expect(layout.order.at(0)).toBe("user");
     }
+    // A cycle takes one row per member, as a chain would.
+    const cycle = layoutGraph([userNode(), lead(), orphan, a, b], undefined, "indented");
+    expect(cycle.height).toBe(4 * SLOT + NODE_SIZE.agent.h);
   });
 });
