@@ -32,9 +32,10 @@ use super::unreported::{self, MAX_CHANGES_PER_TURN, Tracker};
 use super::{
     ChildEnd, Command, Dispatched, DispatchedRepo, Inner, NoteOutcome, NoteTarget, Reply,
     SessionManager, closed, expired, is_closed, no_attaching, no_longer_active, no_shipping,
-    no_turn, now_ms, ships, status_name, takes_messages, takes_repos, unanswered,
+    no_turn, ships, status_name, takes_messages, takes_repos, unanswered,
 };
 use crate::briefing::{self, ChildOf, MAX_RUNNING_CHILDREN, ReportedBranch};
+use crate::clock::now_ms;
 use crate::error::{Error, Result};
 use crate::policy::{self, Target, Verdict};
 use crate::repos::{Reservation, blocking};

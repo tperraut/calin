@@ -7,7 +7,7 @@ use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{BufRead, BufReader, ErrorKind, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use calin_proto::{
     AttachRepoRequest, Event, EventBody, Graph, Session, SessionDetail, SessionStatus, Timeline,
@@ -23,6 +23,7 @@ use super::{
     Dispatch, EventDraft, NewSession, OpenPermission, OpenQuestion, SessionSetup, UsageQuery, log,
     usage, views,
 };
+use crate::clock::now_ms;
 use crate::error::{Error, Result};
 use crate::home::Home;
 use crate::title::default_title;
@@ -855,10 +856,4 @@ fn index_in_transaction(db: &mut Connection, event: &Event, offset: u64, end: u6
     index::index_event(&tx, event, offset, end)?;
     tx.commit()?;
     Ok(())
-}
-
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_millis() as i64)
 }

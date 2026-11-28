@@ -19,10 +19,16 @@ pub struct SystemClock;
 
 impl Clock for SystemClock {
     fn now_ms(&self) -> i64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.as_millis() as i64)
+        now_ms()
     }
+}
+
+/// The machine's time in Unix milliseconds, for the times that do not go
+/// through the injected clock (event and message timestamps).
+pub(crate) fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as i64)
 }
 
 /// A clock that moves only when told to.

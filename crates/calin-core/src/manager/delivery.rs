@@ -7,7 +7,7 @@
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use calin_git::{CommitOutcome, GitHub, PullRequestInfo};
 use calin_proto::{
@@ -15,6 +15,7 @@ use calin_proto::{
 };
 use tokio::sync::mpsc;
 
+use crate::clock::now_ms;
 use crate::store::Store;
 
 /// The remote a session's branches are pushed to and pull requests opened on.
@@ -506,12 +507,6 @@ pub(super) fn same(a: &PullRequest, b: &PullRequest) -> bool {
         ..pull_request.clone()
     };
     timeless(a) == timeless(b)
-}
-
-pub(super) fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_millis() as i64)
 }
 
 /// Looks at each pull request on GitHub and returns the ones that answered,

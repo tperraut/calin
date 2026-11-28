@@ -37,7 +37,7 @@ use self::driver::Driver;
 use self::queue::Queue;
 use crate::automations::AutomationStore;
 use crate::briefing;
-use crate::clock::{SharedClock, TimeZone};
+use crate::clock::{SharedClock, TimeZone, now_ms};
 use crate::error::{Error, Result};
 use crate::limits::LimitBoard;
 use crate::repos::{RepoRegistry, Reservation};
@@ -1494,13 +1494,6 @@ fn unanswered(question_id: String) -> EventBody {
         answer: String::new(),
         by: DecisionSource::Expired,
     }
-}
-
-/// Now, in Unix milliseconds: the time a message says it was sent at.
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_millis() as i64)
 }
 
 #[cfg(test)]
