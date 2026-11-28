@@ -1,11 +1,16 @@
 import { createMemo, createSignal, createUniqueId, For, Show } from "solid-js";
+import { announceNewest, type Announcement } from "../lib/announcement";
 import { errorMessage } from "../lib/errors";
 import type { OpenQuestion } from "../state/sessionReducer";
 import { Markdown } from "./Markdown";
-
-type Announcement = { seq: number; text: string };
+import { WaitingNote } from "./WaitingNote";
 
 const ANNOUNCED_CHARS = 200;
+
+const sayQuestion = (newest: OpenQuestion): string => {
+  const asker = newest.question.gate ? "Workflow gate" : "The agent asks";
+  return `${asker}: ${newest.question.text.slice(0, ANNOUNCED_CHARS)}`;
+};
 
 /**
  * The oldest open question an agent asked, pinned above the message box: its
@@ -52,17 +57,9 @@ export function QuestionBar(props: {
   };
 
   // Each question is read out once, when it arrives.
-  const announcement = createMemo<Announcement>((previous) => {
-    const last = previous ?? { seq: 0, text: "" };
-    const newest = props.questions.at(-1);
-    if (!newest) return last.text === "" ? last : { seq: last.seq, text: "" };
-    if (newest.seq <= last.seq) return last;
-    const asker = newest.question.gate ? "Workflow gate" : "The agent asks";
-    return {
-      seq: newest.seq,
-      text: `${asker}: ${newest.question.text.slice(0, ANNOUNCED_CHARS)}`,
-    };
-  });
+  const announcement = createMemo<Announcement>((previous) =>
+    announceNewest(previous, props.questions, sayQuestion),
+  );
 
   async function answer(value: string, note?: string): Promise<void> {
     const id = currentId();
@@ -155,11 +152,12 @@ export function QuestionBar(props: {
                     )}
                   </Show>
                   <div class="flex flex-wrap items-center justify-end gap-2">
-                    <Show when={waiting()}>
-                      <span class="mr-auto text-xs text-muted">
-                        {sending() !== undefined ? "Sending…" : "Sent, waiting for the workflow…"}
-                      </span>
-                    </Show>
+                    <WaitingNote
+                      waiting={waiting()}
+                      sending={sending() !== undefined}
+                      asker="workflow"
+                      class="mr-auto text-xs text-muted"
+                    />
                     <button
                       type="button"
                       class="btn"
@@ -225,11 +223,12 @@ export function QuestionBar(props: {
                   />
                 </div>
                 <div class="flex items-center justify-end gap-2">
-                  <Show when={waiting()}>
-                    <span class="mr-auto text-xs text-muted sm:mr-0">
-                      {sending() !== undefined ? "Sending…" : "Sent, waiting for the agent…"}
-                    </span>
-                  </Show>
+                  <WaitingNote
+                    waiting={waiting()}
+                    sending={sending() !== undefined}
+                    asker="agent"
+                    class="mr-auto text-xs text-muted sm:mr-0"
+                  />
                   <button
                     type="submit"
                     class="btn btn-primary"

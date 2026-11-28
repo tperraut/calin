@@ -45,6 +45,7 @@ import type {
 import { Badge, ItemStatusBadge } from "./Badge";
 import { Markdown } from "./Markdown";
 import { PullRequestLink } from "./PullRequests";
+import { WaitingNote } from "./WaitingNote";
 
 type ToolContent = Extract<ItemContent, { kind: "tool" }>;
 
@@ -178,11 +179,12 @@ function ToolPermissionLine(props: { asked: ToolPermission }) {
         <Show when={around.answers()}>
           {(answers) => (
             <span class="ml-auto flex flex-wrap items-center justify-end gap-2">
-              <Show when={waiting()}>
-                <span class="text-xs text-muted">
-                  {answers().sending(id()) ? "Sending…" : "Sent, waiting for the agent…"}
-                </span>
-              </Show>
+              <WaitingNote
+                waiting={waiting()}
+                sending={answers().sending(id())}
+                asker="agent"
+                class="text-xs text-muted"
+              />
               {/* Named after the call, so each button says what it answers; the bar's are the plain ones. */}
               <button
                 type="button"
