@@ -601,17 +601,11 @@ impl AuthStore {
     /// Errors as [`AuthStore::sign_out`]: revoked for this process, possibly
     /// not yet in the file.
     pub async fn revoke_session(&self, identity: &Identity, id: &str) -> Result<bool, StoreError> {
-        let generation = {
-            let mut state = self.inner.state();
-            let before = state.sessions.len();
-            state
-                .sessions
-                .retain(|s| !(s.id == id && &s.identity == identity));
-            (state.sessions.len() < before).then(|| state.changed())
-        };
-        self.persist_revocation(generation)
-            .await
-            .map(|()| generation.is_some())
+        self.revoke_one(
+            |state| &mut state.sessions,
+            |s| s.id == id && &s.identity == identity,
+        )
+        .await
     }
 
     /// Creates a device token named `name` for `identity`, which must be on
@@ -686,13 +680,26 @@ impl AuthStore {
         identity: &Identity,
         id: &str,
     ) -> Result<bool, StoreError> {
+        self.revoke_one(
+            |state| &mut state.device_tokens,
+            |t| t.id == id && &t.identity == identity,
+        )
+        .await
+    }
+
+    /// Removes what `revoked` picks from the list `held` names, then persists
+    /// as [`AuthStore::sign_out`] does. `Ok(false)` when nothing was picked.
+    async fn revoke_one<T>(
+        &self,
+        held: impl FnOnce(&mut State) -> &mut Vec<T>,
+        revoked: impl Fn(&T) -> bool,
+    ) -> Result<bool, StoreError> {
         let generation = {
             let mut state = self.inner.state();
-            let before = state.device_tokens.len();
-            state
-                .device_tokens
-                .retain(|t| !(t.id == id && &t.identity == identity));
-            (state.device_tokens.len() < before).then(|| state.changed())
+            let list = held(&mut state);
+            let before = list.len();
+            list.retain(|item| !revoked(item));
+            (list.len() < before).then(|| state.changed())
         };
         self.persist_revocation(generation)
             .await
@@ -976,7 +983,7 @@ fn read_if_present(path: &Path) -> Result<Option<Vec<u8>>, StoreError> {
 /// Kept, not overwritten: it may be a newer version's file, or hold device
 /// tokens worth recovering.
 fn set_aside(path: &Path, reason: String) -> Result<LoadedFile, StoreError> {
-    let kept_as = corrupt_path(path);
+    let kept_as = beside(path, ".corrupt");
     std::fs::rename(path, &kept_as).map_err(io_error(path))?;
     Ok(LoadedFile::Corrupt { reason, kept_as })
 }
@@ -1003,15 +1010,10 @@ fn from_the_future(created: u64, now: u64) -> bool {
     created > now.saturating_add(CLOCK_TOLERANCE_SECS)
 }
 
-fn corrupt_path(path: &Path) -> PathBuf {
+/// The file next to `path` whose name is `path`'s with `suffix` added.
+fn beside(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(".corrupt");
-    path.with_file_name(name)
-}
-
-fn temporary_path(path: &Path) -> PathBuf {
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(".tmp");
+    name.push(suffix);
     path.with_file_name(name)
 }
 
@@ -1035,7 +1037,7 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
 
 /// Writes `bytes` to a new mode-0600 file next to `path` and syncs it.
 fn write_temporary(path: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
-    let temporary = temporary_path(path);
+    let temporary = beside(path, ".tmp");
     // A leftover from a crash is removed, not reused: `create_new` then
     // guarantees a file this process created, with the mode asked for.
     match std::fs::remove_file(&temporary) {
