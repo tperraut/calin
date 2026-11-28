@@ -4,15 +4,17 @@
 //! sessions, notes, reports and questions. Without a directive the mock
 //! plays its fixed turn.
 
+use std::ops::Range;
+
 use calin_proto::{
-    Item, ItemContent, ItemDelta, ItemStatus, PermissionDecision, PermissionMode,
-    PermissionRequest, ToolKind,
+    Item, ItemContent, ItemDelta, ItemStatus, PermissionDecision, PermissionMode, ToolKind,
 };
 use serde_json::{Value, json};
 
-use super::tools::{self, Endpoint};
-use super::{Cut, MockAgent, Prose, quote};
-use crate::runner::{PermissionAsk, ToolAccess};
+use super::tools;
+use super::{Cut, MockAgent, quote};
+use crate::prose::Prose;
+use crate::runner::ToolAccess;
 
 /// What Calin hands an agent, as `calin-core`'s briefing writes it.
 const BRIEF: &str = "[Calin] Brief from the session that dispatched you";
@@ -90,45 +92,48 @@ struct Found {
 fn scan(text: &str) -> Vec<Found> {
     // ASCII lowercasing keeps every byte where it was.
     let lower = text.to_ascii_lowercase();
-    let bytes = lower.as_bytes();
     let mut found = Vec::new();
     let mut from = 0;
     while let Some(at) = lower[from..].find("demo") {
         let start = from + at;
         from = start + "demo".len();
-        // `demo` must start a word.
-        if start > 0 && bytes[start - 1].is_ascii_alphanumeric() {
-            continue;
+        if let Some(word) = directive_word(lower.as_bytes(), start, from) {
+            from = word.end;
+            found.push(Found {
+                directive: Directive::from_word(&lower[word.clone()]),
+                start,
+                end: word.end,
+            });
         }
-        let mut cursor = from;
-        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
-            cursor += 1;
-        }
-        if bytes.get(cursor) != Some(&b':') {
-            continue;
-        }
-        cursor += 1;
-        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
-            cursor += 1;
-        }
-        let word_start = cursor;
-        while bytes
-            .get(cursor)
-            .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'-')
-        {
-            cursor += 1;
-        }
-        if cursor == word_start {
-            continue;
-        }
-        found.push(Found {
-            directive: Directive::from_word(&lower[word_start..cursor]),
-            start,
-            end: cursor,
-        });
-        from = cursor;
     }
     found
+}
+
+/// Where the word of a directive is, when the `demo` at `start..end` begins
+/// one: `demo` starts a word, then a colon with any spaces around, then a
+/// word.
+fn directive_word(bytes: &[u8], start: usize, end: usize) -> Option<Range<usize>> {
+    if start > 0 && bytes[start - 1].is_ascii_alphanumeric() {
+        return None;
+    }
+    let colon = skip_while(bytes, end, u8::is_ascii_whitespace);
+    if bytes.get(colon) != Some(&b':') {
+        return None;
+    }
+    let word_start = skip_while(bytes, colon + 1, u8::is_ascii_whitespace);
+    let word_end = skip_while(bytes, word_start, |b| {
+        b.is_ascii_alphanumeric() || *b == b'_' || *b == b'-'
+    });
+    (word_end > word_start).then_some(word_start..word_end)
+}
+
+/// The first index from `from` whose byte is not `skipped`.
+fn skip_while(bytes: &[u8], from: usize, skipped: impl Fn(&u8) -> bool) -> usize {
+    let mut cursor = from;
+    while bytes.get(cursor).is_some_and(&skipped) {
+        cursor += 1;
+    }
+    cursor
 }
 
 /// The directives in `text`, in order; unknown words are left out.
@@ -168,21 +173,33 @@ fn subject(text: &str) -> String {
 /// answer only ever reaches an agent that used the tools, and a brief's
 /// header names the parent's title, which may hold directives of its own.
 pub(super) fn script(text: &str) -> Option<Script> {
+    delivered(text).or_else(|| requested(request_in(text)))
+}
+
+/// A report, a note or an answer that Calin delivered.
+fn delivered(text: &str) -> Option<Script> {
     if let Some(title) = quoted_after(text, REPORT) {
         return Some(Script::Report { title });
     }
     if let Some(title) = quoted_after(text, CHILD_NOTE) {
         return Some(Script::ChildNote { title });
     }
-    if let Some(at) = text.find(ANSWER) {
-        let answer = text[at + ANSWER.len()..].trim().to_owned();
-        return Some(Script::Answer { answer });
-    }
-    let request = match text.find(BRIEF) {
+    let at = text.find(ANSWER)?;
+    let answer = text[at + ANSWER.len()..].trim().to_owned();
+    Some(Script::Answer { answer })
+}
+
+/// What was asked: the brief when Calin handed one, else the whole text.
+fn request_in(text: &str) -> &str {
+    match text.find(BRIEF) {
         // The brief itself follows the header's paragraph.
         Some(at) => text[at..].split_once("\n\n").map_or("", |(_, brief)| brief),
         None => text,
-    };
+    }
+}
+
+/// The script the directives in `request` ask for.
+fn requested(request: &str) -> Option<Script> {
     let found = directives(request);
     let subject = subject(request);
     if found.contains(&Directive::Orchestrate) {
@@ -386,29 +403,32 @@ impl MockAgent {
         .await?;
         // Like the CLI, it asks unless it may do anything; Calin's policy
         // allows its own tools at once.
-        if self.permission_mode != PermissionMode::Autonomous {
-            let request = PermissionAsk {
-                request: PermissionRequest {
-                    id: format!("{id}-permission"),
-                    tool_name: name,
-                    tool_kind: ToolKind::Other,
-                    title,
-                    input: arguments.clone(),
-                    item_id: Some(id),
-                },
-                access: ToolAccess::Orchestrator,
-                subagent: self.inside.clone(),
-            };
-            if let (PermissionDecision::Deny, message) = self.ask(request).await? {
-                self.set_output(message);
-                self.complete_item(ItemStatus::Declined).await?;
-                return Ok(None);
-            }
+        if self.permission_mode != PermissionMode::Autonomous
+            && let (PermissionDecision::Deny, message) = self
+                .ask_about(
+                    id,
+                    &name,
+                    ToolKind::Other,
+                    &title,
+                    arguments.clone(),
+                    ToolAccess::Orchestrator,
+                )
+                .await?
+        {
+            self.set_tool_output(message);
+            self.complete_item(ItemStatus::Declined).await?;
+            return Ok(None);
         }
-        let outcome = match self.tools.clone() {
-            Ok(endpoint) => self.request(endpoint, tool, arguments).await?,
-            Err(reason) => Err(reason),
-        };
+        let outcome = self.request(tool, arguments).await?;
+        self.complete_call(outcome).await
+    }
+
+    /// Completes the open call with the tool's answer: its text when it
+    /// succeeded, `None` when it failed.
+    async fn complete_call(
+        &mut self,
+        outcome: Result<String, String>,
+    ) -> Result<Option<String>, Cut> {
         match outcome {
             Ok(text) => {
                 self.delta(ItemDelta::Output { text: text.clone() }).await?;
@@ -416,20 +436,24 @@ impl MockAgent {
                 Ok(Some(text))
             }
             Err(text) => {
-                self.set_output(Some(text));
+                self.set_tool_output(Some(text));
                 self.complete_item(ItemStatus::Failed).await?;
                 Ok(None)
             }
         }
     }
 
-    /// The HTTP call, given up at once on an interrupt or a stop.
+    /// The HTTP call, given up at once on an interrupt or a stop. Without
+    /// an endpoint it fails with the reason there is none.
     async fn request(
         &mut self,
-        endpoint: Endpoint,
         tool: &str,
         arguments: Value,
     ) -> Result<Result<String, String>, Cut> {
+        let endpoint = match self.tools.clone() {
+            Ok(endpoint) => endpoint,
+            Err(reason) => return Ok(Err(reason)),
+        };
         self.rpc_ids += 1;
         let call = tools::call_tool(endpoint, self.rpc_ids, tool, arguments);
         tokio::pin!(call);
@@ -441,17 +465,6 @@ impl MockAgent {
                     None => return Err(Cut::Detached),
                 },
             }
-        }
-    }
-
-    /// Sets the output the open tool item completes with.
-    fn set_output(&mut self, text: Option<String>) {
-        if let Some(Item {
-            content: ItemContent::Tool { output, .. },
-            ..
-        }) = &mut self.open
-        {
-            *output = text;
         }
     }
 }

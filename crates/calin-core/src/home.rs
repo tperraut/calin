@@ -93,8 +93,16 @@ impl Home {
 /// `CALIN_HOME`, else `~/.calin`. This is the only place that reads the
 /// environment for it, and only the binary calls it.
 pub fn resolve_home(explicit: Option<PathBuf>) -> Result<Home, HomeError> {
-    let root = pick_root(explicit, std::env::var_os(ENV_HOME), std::env::home_dir())
-        .ok_or(HomeError::NoUserHome)?;
+    home_from(explicit, std::env::var_os(ENV_HOME), std::env::home_dir())
+}
+
+/// [`resolve_home`], given what it reads from the environment.
+fn home_from(
+    explicit: Option<PathBuf>,
+    env_home: Option<OsString>,
+    user_home: Option<PathBuf>,
+) -> Result<Home, HomeError> {
+    let root = pick_root(explicit, env_home, user_home).ok_or(HomeError::NoUserHome)?;
     Ok(Home::new(std::path::absolute(root)?))
 }
 
@@ -136,6 +144,30 @@ mod tests {
             Some(PathBuf::from("/home/u/.calin"))
         );
         assert_eq!(pick_root(None, None, None), None);
+    }
+
+    #[test]
+    fn the_data_directory_is_absolute_and_needs_somewhere_to_be() {
+        let home = home_from(None, Some("/env".into()), None).unwrap();
+        assert_eq!(home.root(), Path::new("/env"));
+        let relative = home_from(Some("data".into()), None, None).unwrap();
+        assert_eq!(
+            relative.root(),
+            std::env::current_dir().unwrap().join("data")
+        );
+        assert!(matches!(
+            home_from(None, None, None),
+            Err(HomeError::NoUserHome)
+        ));
+        assert!(matches!(
+            home_from(Some(PathBuf::new()), None, None),
+            Err(HomeError::Io(_))
+        ));
+        // The flag is the caller's: the environment is not needed for it.
+        assert_eq!(
+            resolve_home(Some("/flag".into())).unwrap().root(),
+            Path::new("/flag")
+        );
     }
 
     #[test]

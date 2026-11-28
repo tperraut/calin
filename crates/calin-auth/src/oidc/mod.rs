@@ -240,6 +240,29 @@ impl CallbackParams {
         params
     }
 
+    /// The authorization code, once the callback is well formed, carries
+    /// the pending login's `state`, and reports no provider error. Checked
+    /// in that order: the first failing check names the error.
+    fn code_for(&self, expected_state: &str) -> Result<&str, LoginError> {
+        if self.malformed {
+            return Err(LoginError::MalformedCallback);
+        }
+        let state_matches = self
+            .state
+            .as_deref()
+            .is_some_and(|state| constant_time_eq(state.as_bytes(), expected_state.as_bytes()));
+        if !state_matches {
+            return Err(LoginError::StateMismatch);
+        }
+        if let Some(error) = &self.error {
+            return Err(LoginError::ProviderRefused(log_safe(error)));
+        }
+        self.code
+            .as_deref()
+            .filter(|code| !code.is_empty() && code.len() <= MAX_CODE_BYTES)
+            .ok_or(LoginError::NoCode)
+    }
+
     /// For a caller whose framework already decoded the query.
     pub fn new(state: Option<&str>, code: Option<&str>, error: Option<&str>) -> Self {
         Self {
@@ -406,25 +429,20 @@ impl OidcClient {
         login: PendingLogin,
         params: &CallbackParams,
     ) -> Result<LoginSuccess, LoginError> {
-        if params.malformed {
-            return Err(LoginError::MalformedCallback);
+        let code = params.code_for(&login.state)?;
+        let identity = self.identity_for(code, &login).await?;
+        if !self.config.allow_list().allows(&identity) {
+            return Err(LoginError::NotAllowed(identity));
         }
-        let state_matches = params
-            .state
-            .as_deref()
-            .is_some_and(|state| constant_time_eq(state.as_bytes(), login.state.as_bytes()));
-        if !state_matches {
-            return Err(LoginError::StateMismatch);
-        }
-        if let Some(error) = &params.error {
-            return Err(LoginError::ProviderRefused(log_safe(error)));
-        }
-        let code = params
-            .code
-            .as_deref()
-            .filter(|code| !code.is_empty() && code.len() <= MAX_CODE_BYTES)
-            .ok_or(LoginError::NoCode)?;
+        Ok(LoginSuccess {
+            identity,
+            next: login.next,
+        })
+    }
 
+    /// Exchanges the code and validates the ID token it buys: who signed in,
+    /// not yet checked against the allow-list.
+    async fn identity_for(&self, code: &str, login: &PendingLogin) -> Result<Identity, LoginError> {
         let (token_endpoint, issuer) = {
             let ready = self.ready().await?;
             (
@@ -446,14 +464,7 @@ impl OidcClient {
                 now: self.clock.now(),
             },
         )?;
-        let identity = identity_of(&claims)?;
-        if !self.config.allow_list().allows(&identity) {
-            return Err(LoginError::NotAllowed(identity));
-        }
-        Ok(LoginSuccess {
-            identity,
-            next: login.next,
-        })
+        Ok(identity_of(&claims)?)
     }
 
     /// Exchanges the code at the token endpoint and returns the ID token.

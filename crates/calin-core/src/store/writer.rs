@@ -5,8 +5,9 @@
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{BufRead, BufReader, ErrorKind, Seek, SeekFrom, Write};
+use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use calin_proto::{
     AttachRepoRequest, Event, EventBody, Graph, Session, SessionDetail, SessionStatus, Timeline,
@@ -22,6 +23,7 @@ use super::{
     Dispatch, EventDraft, NewSession, OpenPermission, OpenQuestion, SessionSetup, UsageQuery, log,
     usage, views,
 };
+use crate::clock::now_ms;
 use crate::error::{Error, Result};
 use crate::home::Home;
 use crate::title::default_title;
@@ -162,6 +164,33 @@ impl LogState {
             stale: false,
         }
     }
+
+    /// The log open for appending, opened at `path` when it is not open yet.
+    fn file(&mut self, path: &Path) -> Result<&mut File> {
+        Ok(match &mut self.file {
+            Some(file) => file,
+            empty => empty.insert(log::open_for_append(path)?),
+        })
+    }
+
+    fn send_live(&mut self, event: &Arc<Event>) {
+        if let Some(live) = &self.live
+            && live.send(Arc::clone(event)).is_err()
+        {
+            // Nobody is subscribed any more.
+            self.live = None;
+        }
+    }
+}
+
+/// Appends a whole line at `offset`, the end of the log, or nothing: half a
+/// line must not stay behind, the next event would be glued to it.
+fn write_line(file: &mut File, line: &[u8], offset: u64) -> std::io::Result<()> {
+    let written = file.write_all(line).and_then(|()| file.flush());
+    if written.is_err() {
+        let _ = file.set_len(offset);
+    }
+    written
 }
 
 /// `session.json`: what a session was created with. The session itself,
@@ -237,8 +266,7 @@ impl Writer {
                     let _ = reply.send(self.cut(&session_id, after_seq));
                 }
                 Cmd::SubscribeSessions { reply } => {
-                    let receiver = self.upserts.subscribe();
-                    let _ = reply.send(index::sessions(&self.db).map(|all| (all, receiver)));
+                    let _ = reply.send(self.subscribe_sessions());
                 }
                 Cmd::Sessions { reply } => {
                     let _ = reply.send(index::sessions(&self.db));
@@ -296,22 +324,13 @@ impl Writer {
                     at,
                     reply,
                 } => {
-                    let graph = views::graph(&self.db, &session_id, at)
-                        .and_then(|graph| graph.ok_or(Error::NotFound(session_id)));
-                    let _ = reply.send(graph);
+                    let _ = reply.send(self.graph(session_id, at));
                 }
                 Cmd::Timeline { session_id, reply } => {
-                    let timeline = views::timeline(&self.db, &session_id)
-                        .and_then(|timeline| timeline.ok_or(Error::NotFound(session_id)));
-                    let _ = reply.send(timeline);
+                    let _ = reply.send(self.timeline(session_id));
                 }
                 Cmd::WorkflowRun { session_id, reply } => {
-                    let run = match index::indexed(&self.db, &session_id) {
-                        Ok(Some(_)) => index::workflow_run(&self.db, &session_id),
-                        Ok(None) => Err(Error::NotFound(session_id)),
-                        Err(err) => Err(err),
-                    };
-                    let _ = reply.send(run);
+                    let _ = reply.send(self.workflow_run(session_id));
                 }
                 Cmd::TreeCost { session_id, reply } => {
                     let _ = reply.send(index::tree_cost(&self.db, &session_id));
@@ -328,6 +347,27 @@ impl Writer {
                 }
             }
         }
+    }
+
+    fn subscribe_sessions(&self) -> Result<(Vec<Session>, broadcast::Receiver<Session>)> {
+        let receiver = self.upserts.subscribe();
+        index::sessions(&self.db).map(|all| (all, receiver))
+    }
+
+    fn graph(&self, session_id: String, at: Option<i64>) -> Result<Graph> {
+        views::graph(&self.db, &session_id, at)?.ok_or(Error::NotFound(session_id))
+    }
+
+    fn timeline(&self, session_id: String) -> Result<Timeline> {
+        views::timeline(&self.db, &session_id)?.ok_or(Error::NotFound(session_id))
+    }
+
+    /// `None` for a session that runs no workflow; an unknown session is not found.
+    fn workflow_run(&self, session_id: String) -> Result<Option<WorkflowRun>> {
+        if index::indexed(&self.db, &session_id)?.is_none() {
+            return Err(Error::NotFound(session_id));
+        }
+        index::workflow_run(&self.db, &session_id)
     }
 
     fn create_session(&mut self, new: NewSession) -> Result<Session> {
@@ -402,13 +442,8 @@ impl Writer {
 
         // Log first. The file is unbuffered, so once `write_all` returns the
         // line is with the kernel and survives a crash of this process.
-        let file = match &mut state.file {
-            Some(file) => file,
-            empty => empty.insert(log::open_for_append(&self.home.log_path(session_id))?),
-        };
-        if let Err(err) = file.write_all(&line).and_then(|()| file.flush()) {
-            // Half a line must not stay behind: the next event would be glued to it.
-            let _ = file.set_len(offset);
+        let file = state.file(&self.home.log_path(session_id))?;
+        if let Err(err) = write_line(file, &line, offset) {
             self.logs.remove(session_id);
             return Err(err.into());
         }
@@ -425,15 +460,20 @@ impl Writer {
         state.len = end;
 
         let event = Arc::new(event);
-        if let Some(live) = &state.live
-            && live.send(Arc::clone(&event)).is_err()
-        {
-            // Nobody is subscribed any more.
-            state.live = None;
-        }
+        state.send_live(&event);
+        self.upsert_after(session_id, &event.body);
+        Ok(event)
+    }
+
+    /// Announces the session after an event was appended: a status change
+    /// at once, anything else at most once per interval.
+    fn upsert_after(&mut self, session_id: &str, body: &EventBody) {
+        let Some(state) = self.logs.get_mut(session_id) else {
+            return;
+        };
         let now = Instant::now();
         let due = state.upserted.map(|at| at + UPSERT_INTERVAL);
-        if let EventBody::SessionStatus { status, .. } = &event.body {
+        if let EventBody::SessionStatus { status, .. } = body {
             if matches!(
                 status,
                 SessionStatus::Done | SessionStatus::Failed | SessionStatus::Cancelled
@@ -449,7 +489,6 @@ impl Writer {
             state.stale = true;
             self.set_timer(due);
         }
-        Ok(event)
     }
 
     /// Announces the session as it is now on the sessions topic.
@@ -591,41 +630,8 @@ impl Writer {
         let path = self.home.log_path(session_id);
         let mut reader = BufReader::new(File::open(&path)?);
         reader.seek(SeekFrom::Start(from.log_len))?;
-        let mut at = from;
-        let mut corrupt = None;
-        let mut line = Vec::new();
-
         let tx = self.db.transaction()?;
-        loop {
-            line.clear();
-            let read = reader.read_until(b'\n', &mut line)? as u64;
-            if read == 0 {
-                break;
-            }
-            if line.pop() != Some(b'\n') {
-                // A crash interrupted the last write. Nobody saw that event,
-                // and the next append must start on a line boundary.
-                OpenOptions::new()
-                    .write(true)
-                    .open(&path)?
-                    .set_len(at.log_len)?;
-                break;
-            }
-            match log::parse_line(&line, session_id, at.head_seq + 1) {
-                Ok(event) => {
-                    let end = at.log_len + read;
-                    index::index_event(&tx, &event, at.log_len, end)?;
-                    at = Indexed {
-                        head_seq: event.seq,
-                        log_len: end,
-                    };
-                }
-                Err(err) => {
-                    corrupt = Some(err);
-                    break;
-                }
-            }
-        }
+        let (at, corrupt) = index_lines(&tx, &mut reader, &path, session_id, from)?;
         // What precedes a corrupt line is still good and stays indexed.
         tx.commit()?;
         match corrupt {
@@ -643,14 +649,7 @@ impl Writer {
                 index::delete_session(&self.db, &id)?;
             }
         }
-        for entry in std::fs::read_dir(self.home.sessions_dir())? {
-            let entry = entry?;
-            let Ok(id) = entry.file_name().into_string() else {
-                continue;
-            };
-            if Ulid::from_string(&id).is_err() || !entry.path().is_dir() {
-                continue;
-            }
+        for id in session_dirs(&self.home)? {
             // One unreadable session must not keep the others from loading.
             if let Err(err) = self.catch_up_session(&id) {
                 tracing::warn!(session = %id, %err, "could not index the session from its log");
@@ -699,33 +698,17 @@ impl Writer {
             Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(err.into()),
         };
-        let (mut created_at, mut prompt, mut runner) = (None, None, None);
-        for line in BufReader::new(file).lines() {
-            let Ok(event) = serde_json::from_str::<Event>(&line?) else {
-                break;
-            };
-            created_at.get_or_insert(event.ts);
-            match event.body {
-                EventBody::UserMessage { text } if prompt.is_none() => prompt = Some(text),
-                EventBody::AgentSpawned { agent } if runner.is_none() => {
-                    runner = Some(agent.runner);
-                }
-                _ => {}
-            }
-            if prompt.is_some() && runner.is_some() {
-                break;
-            }
-        }
-        let Some(created_at) = created_at else {
+        let Some(start) = log_start(file)? else {
             return Ok(None);
         };
-        let prompt = prompt.unwrap_or_default();
+        let created_at = start.created_at;
+        let prompt = start.prompt.unwrap_or_default();
         Ok(Some(Session {
             id: session_id.to_owned(),
             title: default_title(&prompt),
             prompt,
             status: SessionStatus::Queued,
-            runner: runner.unwrap_or_else(|| "unknown".to_owned()),
+            runner: start.runner.unwrap_or_else(|| "unknown".to_owned()),
             permission_mode: Default::default(),
             // Which file it was is not in the log; the run itself still is.
             workflow: None,
@@ -748,6 +731,56 @@ impl Writer {
         }
         .to_string()
     }
+}
+
+/// What the first events of a log say: when it began, the first prompt and
+/// the runner of the first agent.
+struct LogStart {
+    created_at: i64,
+    prompt: Option<String>,
+    runner: Option<String>,
+}
+
+/// Reads up to the first line that is not an event; `None` for a log
+/// without a single event.
+fn log_start(file: File) -> Result<Option<LogStart>> {
+    let (mut created_at, mut prompt, mut runner) = (None, None, None);
+    for line in BufReader::new(file).lines() {
+        let Ok(event) = serde_json::from_str::<Event>(&line?) else {
+            break;
+        };
+        created_at.get_or_insert(event.ts);
+        match event.body {
+            EventBody::UserMessage { text } if prompt.is_none() => prompt = Some(text),
+            EventBody::AgentSpawned { agent } if runner.is_none() => {
+                runner = Some(agent.runner);
+            }
+            _ => {}
+        }
+        if prompt.is_some() && runner.is_some() {
+            break;
+        }
+    }
+    Ok(created_at.map(|created_at| LogStart {
+        created_at,
+        prompt,
+        runner,
+    }))
+}
+
+/// The sessions on disk: the directories of `sessions/` named with a ULID.
+fn session_dirs(home: &Home) -> Result<Vec<String>> {
+    let mut ids = Vec::new();
+    for entry in std::fs::read_dir(home.sessions_dir())? {
+        let entry = entry?;
+        let Ok(id) = entry.file_name().into_string() else {
+            continue;
+        };
+        if Ulid::from_string(&id).is_ok() && entry.path().is_dir() {
+            ids.push(id);
+        }
+    }
+    Ok(ids)
 }
 
 /// Two processes appending to the same logs would each hand out the same
@@ -776,15 +809,51 @@ fn lock(home: &Home) -> Result<File> {
     Ok(file)
 }
 
+/// Indexes the lines `reader` has left, from `from` on, until the end, a
+/// torn last line or a corrupt one. Returns where the index stands, and the
+/// corruption when that is what stopped it.
+fn index_lines(
+    db: &Connection,
+    reader: &mut BufReader<File>,
+    path: &Path,
+    session_id: &str,
+    from: Indexed,
+) -> Result<(Indexed, Option<Error>)> {
+    let mut at = from;
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let read = reader.read_until(b'\n', &mut line)? as u64;
+        if read == 0 {
+            return Ok((at, None));
+        }
+        if line.pop() != Some(b'\n') {
+            cut_torn_line(path, at.log_len)?;
+            return Ok((at, None));
+        }
+        let event = match log::parse_line(&line, session_id, at.head_seq + 1) {
+            Ok(event) => event,
+            Err(err) => return Ok((at, Some(err))),
+        };
+        let end = at.log_len + read;
+        index::index_event(db, &event, at.log_len, end)?;
+        at = Indexed {
+            head_seq: event.seq,
+            log_len: end,
+        };
+    }
+}
+
+/// A crash interrupted the last write. Nobody saw that event, and the next
+/// append must start on a line boundary.
+fn cut_torn_line(path: &Path, len: u64) -> Result<()> {
+    OpenOptions::new().write(true).open(path)?.set_len(len)?;
+    Ok(())
+}
+
 fn index_in_transaction(db: &mut Connection, event: &Event, offset: u64, end: u64) -> Result<()> {
     let tx = db.transaction()?;
     index::index_event(&tx, event, offset, end)?;
     tx.commit()?;
     Ok(())
-}
-
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_millis() as i64)
 }

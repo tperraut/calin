@@ -383,6 +383,25 @@ async fn a_repo_without_a_clone_cannot_be_attached_or_started_with() {
 }
 
 #[tokio::test]
+async fn an_attach_whose_worktree_cannot_be_made_fails_alone_and_the_next_goes_on() {
+    let session = running(PermissionMode::Autonomous).await;
+    let web = session.repo("web").await;
+    let docs = session.repo("docs").await;
+    let before = session.head_seq().await;
+    // Something that is not a worktree is where web's would go.
+    let work_dir = Home::new(session._dir.path()).work_dir(&session.id);
+    std::fs::write(work_dir.join("web"), "in the way").unwrap();
+
+    let failed = session.attach(&web, None).await;
+    assert!(failed.is_err(), "{failed:?}");
+    let docs = session.attach(&docs, None).await.unwrap();
+    assert_eq!(docs.name, "docs");
+    let events = session.events_after(before).await;
+    assert_eq!(labels(&events), ["repo_attached:docs"]);
+    assert_eq!(session.status().await, SessionStatus::Running);
+}
+
+#[tokio::test]
 async fn two_attaches_at_once_are_made_one_after_the_other() {
     let session = running(PermissionMode::Autonomous).await;
     let web = session.repo("web").await;
@@ -707,6 +726,12 @@ async fn in_accept_edits_the_policy_answers_for_the_sessions_repos_and_opens_eac
     let (_, _, request) = waiting_request(&session.manager, &session.id, before).await;
     assert_eq!(request.id, "o1");
     emit(&session.io, ask("b1", None)).await;
+    // On record before o1 is answered: the driver takes output and commands
+    // in either order, and b1 is what keeps the session waiting.
+    events_until(&session.manager, &session.id, before, |event| {
+        matches!(&event.body, EventBody::PermissionRequested { request } if request.id == "b1")
+    })
+    .await;
     session
         .manager
         .resolve_permission(&session.id, "o1", PermissionDecision::Deny, None)
@@ -1006,9 +1031,13 @@ async fn a_repo_is_attached_in_review_after_the_agent_has_exited() {
 /// A manager whose home repo declares `api` with `setup`, registered by hand
 /// so that it has a clone, and with a setup limit short enough to hit.
 async fn with_setup(setup: &str) -> (Fixture, TempDir, Repo) {
+    with_setup_limit(setup, Duration::from_millis(400)).await
+}
+
+async fn with_setup_limit(setup: &str, setup_limit: Duration) -> (Fixture, TempDir, Repo) {
     let dir = TempDir::new().unwrap();
     let config = ManagerConfig {
-        setup_limit: Duration::from_millis(400),
+        setup_limit,
         ..config()
     };
     let (manager, starts) = manager_with(&dir, false, config).await;
@@ -1139,6 +1168,36 @@ async fn a_failing_setup_is_an_error_in_the_transcript_and_the_session_goes_on()
         ItemContent::Tool { output: Some(output), .. } if output == "no network\n"
     ));
     assert_eq!(events[6].agent_id, None);
+}
+
+#[tokio::test]
+async fn stopping_during_a_setup_cancels_it_and_keeps_its_end_on_record() {
+    let (fixture, _clones, api) = with_setup_limit("sleep 30", TIMEOUT).await;
+    let Fixture {
+        manager,
+        mut starts,
+        ..
+    } = fixture;
+    let mut wanted = request("stopped setup", Some("puppet"));
+    wanted.repos = vec![attach(&api, None)];
+    let id = manager.create_session(wanted).await.unwrap().session.id;
+    let before = events_until(&manager, &id, 0, |event| {
+        matches!(event.body, EventBody::ItemStarted { .. })
+    })
+    .await;
+    within(manager.stop(&id)).await.unwrap();
+    let events = events_until(&manager, &id, 0, is_status(SessionStatus::Cancelled)).await;
+    assert_eq!(
+        labels(&events[before.len()..]),
+        [
+            "item_completed",
+            "error:the setup command of api was cancelled",
+            "session_status:cancelled",
+        ]
+    );
+    assert_eq!(setup_items(&events)[1].status, ItemStatus::Failed);
+    // No agent was ever started.
+    assert!(starts.try_recv().is_err());
 }
 
 #[tokio::test]

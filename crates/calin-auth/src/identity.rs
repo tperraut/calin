@@ -131,33 +131,39 @@ impl TryFrom<IdentityRepr> for Identity {
 /// a dotted domain, and none of the characters that only appear in display
 /// names, lists or quoted forms. Deliberately narrower than RFC 5322.
 fn plausible_email(text: &str) -> bool {
-    if text.len() > MAX_EMAIL_BYTES {
-        return false;
-    }
-    let forbidden = |c: char| {
-        c.is_whitespace()
-            || c.is_control()
-            || matches!(c, ',' | ';' | ':' | '<' | '>' | '(' | ')' | '[' | ']')
-            // `*` is legal in an address but far more likely a wildcard
-            // attempt, which this list does not support.
-            || matches!(c, '"' | '\\' | '/' | '*')
-    };
-    if text.chars().any(forbidden) {
+    if text.len() > MAX_EMAIL_BYTES || text.chars().any(forbidden_in_email) {
         return false;
     }
     let Some((local, domain)) = text.split_once('@') else {
         return false;
     };
-    if local.is_empty() || local.len() > MAX_EMAIL_LOCAL_BYTES || domain.contains('@') {
-        return false;
-    }
-    let label_ok = |label: &str| {
-        !label.is_empty()
-            && !label.starts_with('-')
-            && !label.ends_with('-')
-            && label.chars().all(|c| c.is_alphanumeric() || c == '-')
-    };
-    domain.contains('.') && domain.split('.').all(label_ok)
+    plausible_local_part(local) && plausible_domain(domain)
+}
+
+/// Characters that only appear in display names, lists or quoted forms.
+fn forbidden_in_email(c: char) -> bool {
+    c.is_whitespace()
+        || c.is_control()
+        || matches!(c, ',' | ';' | ':' | '<' | '>' | '(' | ')' | '[' | ']')
+        // `*` is legal in an address but far more likely a wildcard
+        // attempt, which this list does not support.
+        || matches!(c, '"' | '\\' | '/' | '*')
+}
+
+fn plausible_local_part(local: &str) -> bool {
+    !local.is_empty() && local.len() <= MAX_EMAIL_LOCAL_BYTES
+}
+
+/// Dotted, with no second `@`, each label letters, digits and inner hyphens.
+fn plausible_domain(domain: &str) -> bool {
+    !domain.contains('@') && domain.contains('.') && domain.split('.').all(plausible_label)
+}
+
+fn plausible_label(label: &str) -> bool {
+    !label.is_empty()
+        && !label.starts_with('-')
+        && !label.ends_with('-')
+        && label.chars().all(|c| c.is_alphanumeric() || c == '-')
 }
 
 /// The identities that may sign in. Never empty.
@@ -196,11 +202,7 @@ impl AllowList {
         let mut identities: Vec<Identity> = Vec::new();
         let mut problems = Vec::new();
         for entry in text.split(',').map(str::trim).filter(|e| !e.is_empty()) {
-            let parsed = match entry.strip_prefix("sub:") {
-                Some(subject) => Identity::subject(subject),
-                None => Identity::email(entry),
-            };
-            match parsed {
+            match Self::entry(entry) {
                 Ok(identity) if identities.contains(&identity) => {}
                 Ok(identity) => identities.push(identity),
                 Err(reason) => problems.push(AllowListProblem::InvalidEntry {
@@ -209,17 +211,29 @@ impl AllowList {
                 }),
             }
         }
-        if identities.is_empty() && problems.is_empty() {
-            problems.push(AllowListProblem::Empty);
-        }
-        if identities.len() > MAX_ALLOW_LIST_ENTRIES {
-            problems.push(AllowListProblem::TooLong);
-        }
+        problems.extend(Self::size_problem(identities.len(), problems.is_empty()));
         if problems.is_empty() {
             Ok(Self { identities })
         } else {
             Err(problems)
         }
+    }
+
+    /// `sub:<subject>`, or else an email address.
+    fn entry(entry: &str) -> Result<Identity, InvalidIdentity> {
+        match entry.strip_prefix("sub:") {
+            Some(subject) => Identity::subject(subject),
+            None => Identity::email(entry),
+        }
+    }
+
+    /// Empty is a problem only when no entry was bad: a list of bad entries
+    /// already says why nobody could sign in.
+    fn size_problem(entries: usize, no_bad_entry: bool) -> Option<AllowListProblem> {
+        if entries == 0 && no_bad_entry {
+            return Some(AllowListProblem::Empty);
+        }
+        (entries > MAX_ALLOW_LIST_ENTRIES).then_some(AllowListProblem::TooLong)
     }
 
     /// Whether `identity` may sign in: an email identity must equal an email
@@ -415,6 +429,44 @@ mod tests {
         assert_eq!(
             AllowList::parse(&text.join(",")),
             Err(vec![AllowListProblem::TooLong])
+        );
+        // Bad entries come first, in order; duplicates do not count.
+        let mut text = text.join(",");
+        text.push_str(",bob,u0@example.com");
+        assert_eq!(
+            AllowList::parse(&text),
+            Err(vec![
+                AllowListProblem::InvalidEntry {
+                    entry: "bob".to_owned(),
+                    reason: InvalidIdentity::Email,
+                },
+                AllowListProblem::TooLong,
+            ])
+        );
+        let exactly: Vec<String> = (0..MAX_ALLOW_LIST_ENTRIES)
+            .map(|i| format!("u{i}@example.com"))
+            .collect();
+        let text = format!("{},U0@example.com", exactly.join(","));
+        assert_eq!(
+            AllowList::parse(&text).unwrap().identities().len(),
+            MAX_ALLOW_LIST_ENTRIES
+        );
+    }
+
+    #[test]
+    fn only_bad_entries_are_not_also_an_empty_list() {
+        assert_eq!(
+            AllowList::parse("bob, sub:"),
+            Err(vec![
+                AllowListProblem::InvalidEntry {
+                    entry: "bob".to_owned(),
+                    reason: InvalidIdentity::Email,
+                },
+                AllowListProblem::InvalidEntry {
+                    entry: "sub:".to_owned(),
+                    reason: InvalidIdentity::Subject,
+                },
+            ])
         );
     }
 

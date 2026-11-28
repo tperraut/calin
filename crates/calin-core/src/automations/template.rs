@@ -97,17 +97,23 @@ impl Template {
         for segment in &self.segments {
             match segment {
                 Segment::Text(literal) => text.push_str(literal),
-                Segment::Var(var) => text.push_str(match var {
-                    Var::Date => &values.date,
-                    Var::Number => &values.number,
-                    Var::Title => &values.title,
-                    Var::Body => &values.body,
-                    Var::Url => &values.url,
-                    Var::Author => &values.author,
-                }),
+                Segment::Var(var) => text.push_str(values.get(*var)),
             }
         }
         text
+    }
+}
+
+impl Values {
+    fn get(&self, var: Var) -> &str {
+        match var {
+            Var::Date => &self.date,
+            Var::Number => &self.number,
+            Var::Title => &self.title,
+            Var::Body => &self.body,
+            Var::Url => &self.url,
+            Var::Author => &self.author,
+        }
     }
 }
 

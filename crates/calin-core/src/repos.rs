@@ -139,12 +139,7 @@ impl RepoRegistry {
 
     /// Every repo: the home repo first, then by name.
     pub(crate) async fn list(&self) -> Vec<Repo> {
-        let state = self.state.lock().await;
-        state
-            .entries()
-            .into_iter()
-            .map(|entry| entry.repo)
-            .collect()
+        self.state.lock().await.repos()
     }
 
     pub(crate) async fn get(&self, repo_id: &str) -> Option<Repo> {
@@ -158,11 +153,7 @@ impl RepoRegistry {
     /// is dropped.
     pub(crate) async fn sets(&self) -> Vec<RepoSet> {
         let state = self.state.lock().await;
-        let repos: Vec<Repo> = state
-            .entries()
-            .into_iter()
-            .map(|entry| entry.repo)
-            .collect();
+        let repos = state.repos();
         let sets = state.catalog.sets.iter();
         sets.map(|(name, members)| {
             let mut repo_ids: Vec<String> = Vec::new();
@@ -192,19 +183,7 @@ impl RepoRegistry {
             ));
         }
         let clone = blocking(move || Ok(calin_git::inspect_clone(&path)?)).await?;
-        let name = match name.map(str::trim).filter(|name| !name.is_empty()) {
-            Some(name) => name.to_owned(),
-            None => clone
-                .root
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(str::to_owned)
-                .ok_or_else(|| {
-                    Error::Invalid("this folder has no usable name; give the repo one".to_owned())
-                })?,
-        };
-        check_name(&name)
-            .map_err(|reason| Error::Invalid(format!("the name of a repo {reason}")))?;
+        let name = repo_name(name, &clone.root)?;
         let Some(root) = clone.root.to_str() else {
             return Err(Error::Invalid(
                 "the path of a repo must be valid UTF-8".to_owned(),
@@ -212,33 +191,7 @@ impl RepoRegistry {
         };
 
         let mut state = self.state.lock().await;
-        if let Some(existing) = state.file.repos.iter().find(|repo| repo.path == root) {
-            return Err(Error::Conflict(format!(
-                "{root} is already registered as {}",
-                existing.name
-            )));
-        }
-        // A name the home repo declares is not taken: registering it says
-        // where that repo is on this machine, and it keeps its id. The same
-        // goes for the home repo's own folder.
-        let id = match state
-            .entries()
-            .into_iter()
-            .find(|entry| entry.repo.name == name)
-        {
-            None => Ulid::generate().to_string(),
-            Some(entry) if entry.registered => {
-                return Err(Error::Conflict(format!(
-                    "a repo named {name} is already registered"
-                )));
-            }
-            Some(entry) if entry.repo.declared || entry.repo.path == root => entry.repo.id,
-            Some(_) => {
-                return Err(Error::Conflict(format!(
-                    "the home repo is already listed as {name}"
-                )));
-            }
-        };
+        let id = state.id_to_register(&name, root)?;
         state.file.repos.push(Registered {
             id: id.clone(),
             name,
@@ -251,9 +204,8 @@ impl RepoRegistry {
             return Err(err);
         }
         state
-            .entries()
+            .repos()
             .into_iter()
-            .map(|entry| entry.repo)
             .find(|repo| repo.id == id)
             .ok_or_else(|| Error::Missing(format!("unknown repo {id}")))
     }
@@ -328,6 +280,19 @@ impl RepoRegistry {
         })
     }
 
+    /// [`reserve`](Self::reserve) for the repos a new session names; `None`
+    /// when it names none.
+    pub(crate) async fn reserve_named<'a>(
+        &self,
+        repo_ids: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Option<Reservation>> {
+        let ids: Vec<&str> = repo_ids.into_iter().collect();
+        if ids.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(self.reserve(&ids).await?))
+    }
+
     /// Reads the home repo's file again and scans for clones, off the
     /// runtime, then gives every newly declared repo its id. `settings` are
     /// the ones in effect.
@@ -337,44 +302,19 @@ impl RepoRegistry {
         let catalog = blocking(move || Ok(read_catalog(&settings))).await?;
         let mut state = self.state.lock().await;
         state.catalog = catalog;
-
-        let mut new_ids = false;
-        let names: Vec<String> = state
-            .catalog
-            .declared
-            .iter()
-            .map(|d| d.name.clone())
-            .collect();
-        for name in names {
-            let known = state.file.declared.contains_key(&name)
-                || state.file.repos.iter().any(|repo| repo.name == name);
-            if !known {
-                state
-                    .file
-                    .declared
-                    .insert(name, Ulid::generate().to_string());
-                new_ids = true;
-            }
-        }
-        if let Some(path) = state.catalog.home.as_ref().map(|home| home.path.clone()) {
-            let known = state.file.home.contains_key(&path)
-                || state.file.repos.iter().any(|repo| repo.path == path);
-            if !known {
-                state.file.home.insert(path, Ulid::generate().to_string());
-                new_ids = true;
-            }
-        }
+        let declared_ids = state.give_declared_ids();
+        let home_id = state.give_home_id();
         // A failure is only worth showing while the repo still needs a clone.
         let missing: HashSet<String> = state
-            .entries()
+            .repos()
             .into_iter()
-            .filter(|entry| entry.repo.declared && !entry.repo.available)
-            .map(|entry| entry.repo.name)
+            .filter(|repo| repo.declared && !repo.available)
+            .map(|repo| repo.name)
             .collect();
         state
             .clone_problems
             .retain(|name, _| missing.contains(name));
-        if new_ids {
+        if declared_ids || home_id {
             self.save(&state).await?;
         }
         Ok(())
@@ -458,118 +398,156 @@ impl RepoRegistry {
 }
 
 impl State {
+    /// Every repo: the home repo first, then by name.
+    fn repos(&self) -> Vec<Repo> {
+        self.entries().into_iter().map(|entry| entry.repo).collect()
+    }
+
     /// The repo list: registered and declared repos merged by name, each
     /// declared one resolved to a clone, and the home repo marked or added.
     fn entries(&self) -> Vec<Entry> {
-        let mut entries: Vec<Entry> = self
-            .file
-            .repos
-            .iter()
-            .map(|repo| Entry {
-                repo: Repo {
-                    id: repo.id.clone(),
-                    name: repo.name.clone(),
-                    path: repo.path.clone(),
-                    default_branch: repo.default_branch.clone(),
-                    remote_url: repo.remote_url.clone(),
-                    available: true,
-                    declared: false,
-                    home: false,
-                    url: None,
-                    setup: None,
-                    checks: Vec::new(),
-                    cloning: false,
-                    problem: None,
-                },
-                registered: true,
-            })
-            .collect();
-
+        let mut entries: Vec<Entry> = self.file.repos.iter().map(registered).collect();
         for declared in &self.catalog.declared {
-            let describe = |repo: &mut Repo| {
-                repo.declared = true;
-                repo.url.clone_from(&declared.url);
-                repo.setup.clone_from(&declared.setup);
-                repo.checks.clone_from(&declared.checks);
-            };
-            // Registered by hand under this name: that is where it is.
-            if let Some(entry) = entries.iter_mut().find(|e| e.repo.name == declared.name) {
-                describe(&mut entry.repo);
-                continue;
-            }
-            // Refresh gave every declared name an id before this could run.
-            let Some(id) = self.file.declared.get(&declared.name) else {
-                continue;
-            };
-            let found = self.resolve(declared);
-            let mut repo = Repo {
-                id: id.clone(),
-                name: declared.name.clone(),
-                path: found.map(|clone| clone.path.clone()).unwrap_or_default(),
-                default_branch: found.and_then(|clone| clone.default_branch.clone()),
-                remote_url: found.and_then(|clone| clone.remote_url.clone()),
-                available: found.is_some(),
-                declared: true,
-                home: false,
-                url: None,
-                setup: None,
-                checks: Vec::new(),
-                cloning: found.is_none() && self.cloning.contains(&declared.name),
-                problem: None,
-            };
-            if found.is_none() {
-                repo.problem = self.clone_problems.get(&declared.name).cloned();
-            }
-            describe(&mut repo);
-            entries.push(Entry {
-                repo,
-                registered: false,
-            });
+            self.add_declared(&mut entries, declared);
         }
-
         if let Some(home) = &self.catalog.home {
-            let listed = entries
-                .iter_mut()
-                .find(|entry| entry.repo.available && entry.repo.path == home.path);
-            match listed {
-                Some(entry) => {
-                    entry.repo.home = true;
-                    if home.problem.is_some() {
-                        entry.repo.problem.clone_from(&home.problem);
-                    }
-                }
-                None => {
-                    if let Some(id) = self.file.home.get(&home.path) {
-                        let (default_branch, remote_url) = home.clone.clone().unwrap_or_default();
-                        let repo = Repo {
-                            id: id.clone(),
-                            name: home_name(&home.path, &entries),
-                            path: home.path.clone(),
-                            default_branch,
-                            remote_url,
-                            available: home.clone.is_some(),
-                            declared: false,
-                            home: true,
-                            url: None,
-                            setup: None,
-                            checks: Vec::new(),
-                            cloning: false,
-                            problem: home.problem.clone(),
-                        };
-                        entries.push(Entry {
-                            repo,
-                            registered: false,
-                        });
-                    }
-                }
-            }
+            self.add_home(&mut entries, home);
         }
-
         entries.sort_by(|a, b| {
             // `false < true`, so the home repo sorts first.
             (!a.repo.home, &a.repo.name, &a.repo.id).cmp(&(!b.repo.home, &b.repo.name, &b.repo.id))
         });
         entries
+    }
+
+    /// A declared repo: the registered one of its name, or its clone found
+    /// by the scan, or a repo without a clone.
+    fn add_declared(&self, entries: &mut Vec<Entry>, declared: &Declared) {
+        // Registered by hand under this name: that is where it is.
+        if let Some(entry) = entries.iter_mut().find(|e| e.repo.name == declared.name) {
+            describe(&mut entry.repo, declared);
+            return;
+        }
+        // Refresh gave every declared name an id before this could run.
+        let Some(id) = self.file.declared.get(&declared.name) else {
+            return;
+        };
+        let found = self.resolve(declared);
+        let mut repo = Repo {
+            id: id.clone(),
+            name: declared.name.clone(),
+            path: found.map(|clone| clone.path.clone()).unwrap_or_default(),
+            default_branch: found.and_then(|clone| clone.default_branch.clone()),
+            remote_url: found.and_then(|clone| clone.remote_url.clone()),
+            available: found.is_some(),
+            declared: true,
+            home: false,
+            url: None,
+            setup: None,
+            checks: Vec::new(),
+            cloning: found.is_none() && self.cloning.contains(&declared.name),
+            problem: None,
+        };
+        if found.is_none() {
+            repo.problem = self.clone_problems.get(&declared.name).cloned();
+        }
+        describe(&mut repo, declared);
+        entries.push(Entry {
+            repo,
+            registered: false,
+        });
+    }
+
+    /// Marks the repo listed at the home repo's path, or adds the home repo.
+    fn add_home(&self, entries: &mut Vec<Entry>, home: &HomeRepo) {
+        let listed = entries
+            .iter_mut()
+            .find(|entry| entry.repo.available && entry.repo.path == home.path);
+        if let Some(entry) = listed {
+            entry.repo.home = true;
+            if home.problem.is_some() {
+                entry.repo.problem.clone_from(&home.problem);
+            }
+            return;
+        }
+        let Some(id) = self.file.home.get(&home.path) else {
+            return;
+        };
+        let (default_branch, remote_url) = home.clone.clone().unwrap_or_default();
+        let repo = Repo {
+            id: id.clone(),
+            name: home_name(&home.path, entries),
+            path: home.path.clone(),
+            default_branch,
+            remote_url,
+            available: home.clone.is_some(),
+            declared: false,
+            home: true,
+            url: None,
+            setup: None,
+            checks: Vec::new(),
+            cloning: false,
+            problem: home.problem.clone(),
+        };
+        entries.push(Entry {
+            repo,
+            registered: false,
+        });
+    }
+
+    /// The id the clone at `root` is registered under as `name`: a new one,
+    /// or the one of the declared repo or home repo whose place it says.
+    fn id_to_register(&self, name: &str, root: &str) -> Result<String> {
+        if let Some(existing) = self.file.repos.iter().find(|repo| repo.path == root) {
+            return Err(Error::Conflict(format!(
+                "{root} is already registered as {}",
+                existing.name
+            )));
+        }
+        // A name the home repo declares is not taken: registering it says
+        // where that repo is on this machine, and it keeps its id. The same
+        // goes for the home repo's own folder.
+        let listed = self.entries().into_iter().find(|e| e.repo.name == name);
+        match listed {
+            None => Ok(Ulid::generate().to_string()),
+            Some(entry) if entry.registered => Err(Error::Conflict(format!(
+                "a repo named {name} is already registered"
+            ))),
+            Some(entry) if entry.repo.declared || entry.repo.path == root => Ok(entry.repo.id),
+            Some(_) => Err(Error::Conflict(format!(
+                "the home repo is already listed as {name}"
+            ))),
+        }
+    }
+
+    /// Gives every newly declared repo an id. True when one got one.
+    fn give_declared_ids(&mut self) -> bool {
+        let mut new_ids = false;
+        for declared in &self.catalog.declared {
+            let name = &declared.name;
+            let known = self.file.declared.contains_key(name)
+                || self.file.repos.iter().any(|repo| repo.name == *name);
+            if !known {
+                let id = Ulid::generate().to_string();
+                self.file.declared.insert(name.clone(), id);
+                new_ids = true;
+            }
+        }
+        new_ids
+    }
+
+    /// Gives the home repo an id unless it has one. True when it got one.
+    fn give_home_id(&mut self) -> bool {
+        let Some(home) = &self.catalog.home else {
+            return false;
+        };
+        let known = self.file.home.contains_key(&home.path)
+            || self.file.repos.iter().any(|repo| repo.path == home.path);
+        if !known {
+            let id = Ulid::generate().to_string();
+            self.file.home.insert(home.path.clone(), id);
+        }
+        !known
     }
 
     /// The clone of a declared repo: the one whose remote is the declared
@@ -588,6 +566,52 @@ impl State {
             }
         }
     }
+}
+
+/// A repo registered by hand, as the list shows it.
+fn registered(repo: &Registered) -> Entry {
+    Entry {
+        repo: Repo {
+            id: repo.id.clone(),
+            name: repo.name.clone(),
+            path: repo.path.clone(),
+            default_branch: repo.default_branch.clone(),
+            remote_url: repo.remote_url.clone(),
+            available: true,
+            declared: false,
+            home: false,
+            url: None,
+            setup: None,
+            checks: Vec::new(),
+            cloning: false,
+            problem: None,
+        },
+        registered: true,
+    }
+}
+
+/// Adds what the home repo says about a repo it declares.
+fn describe(repo: &mut Repo, declared: &Declared) {
+    repo.declared = true;
+    repo.url.clone_from(&declared.url);
+    repo.setup.clone_from(&declared.setup);
+    repo.checks.clone_from(&declared.checks);
+}
+
+/// The name a clone is registered under: the one given, else its folder's.
+fn repo_name(given: Option<&str>, root: &Path) -> Result<String> {
+    let name = match given.map(str::trim).filter(|name| !name.is_empty()) {
+        Some(name) => name.to_owned(),
+        None => root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                Error::Invalid("this folder has no usable name; give the repo one".to_owned())
+            })?,
+    };
+    check_name(&name).map_err(|reason| Error::Invalid(format!("the name of a repo {reason}")))?;
+    Ok(name)
 }
 
 /// The home repo's folder name, made different from every name in use.

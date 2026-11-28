@@ -9,12 +9,13 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
 use calin_proto::{
-    EventBody, Item, ItemContent, ItemDelta, ItemStatus, LimitWindow, PermissionDecision,
-    PermissionRequest, ToolKind,
+    EventBody, Item, ItemContent, ItemStatus, LimitWindow, PermissionDecision, PermissionRequest,
+    ToolKind,
 };
 use serde_json::{Value, json};
 
 use super::tools;
+use crate::prose::Prose;
 use crate::runner::{DirGrant, PermissionAsk, RunnerOutput, SubagentStart};
 
 /// Told to the agent with a denial that carries no message of its own.
@@ -90,28 +91,6 @@ struct Block {
     text: String,
     /// Reasoning starts with its first text: the CLI usually sends none.
     started: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Prose {
-    Text,
-    Reasoning,
-}
-
-impl Prose {
-    fn content(self, text: String) -> ItemContent {
-        match self {
-            Self::Text => ItemContent::Text { text },
-            Self::Reasoning => ItemContent::Reasoning { text },
-        }
-    }
-
-    fn delta(self, text: String) -> ItemDelta {
-        match self {
-            Self::Text => ItemDelta::Text { text },
-            Self::Reasoning => ItemDelta::Reasoning { text },
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -202,13 +181,7 @@ impl Mapper {
             Some("assistant") => self.assistant(message, &mut out),
             Some("user") => self.user(message, &mut out),
             Some("control_request") => self.control_request(message, &mut out),
-            // The CLI withdrawing a request of its own. Part of the SDK
-            // protocol; no recording holds one.
-            Some("control_cancel_request") => {
-                if let Some(request_id) = str_field(message, "request_id") {
-                    self.pending.remove(request_id);
-                }
-            }
+            Some("control_cancel_request") => self.cancel_request(message),
             Some("result") => self.result(message, &mut out),
             Some("rate_limit_event") => rate_limits(message, &mut out),
             _ => {}
@@ -349,63 +322,94 @@ impl Mapper {
             .get("message")
             .and_then(|inner| str_field(inner, "id"))
             .or_else(|| str_field(message, "api_message_id"));
-        if let Some(id) = message_id
-            && self
-                .scopes
-                .get(&parent)
-                .and_then(|s| s.message_id.as_deref())
-                != Some(id)
-        {
-            // Another message: whatever the previous one left open is over.
-            self.close_block(&parent, out);
-            self.scopes.entry(parent.clone()).or_default().message_id = Some(id.to_owned());
-        }
+        self.enter_message(&parent, message_id, out);
         match str_field(event, "type") {
-            Some("message_start") => self.close_block(&parent, out),
-            Some("content_block_start") => {
-                self.close_block(&parent, out);
-                let block = event.get("content_block").unwrap_or(&Value::Null);
-                let (prose, initial) = match str_field(block, "type") {
-                    Some("text") => (Prose::Text, str_field(block, "text")),
-                    Some("thinking") => (Prose::Reasoning, str_field(block, "thinking")),
-                    // Tool calls become items from their complete message, which has the input.
-                    _ => return,
-                };
-                let item_id = self.mint_id();
-                let owner = self.owner_of(&parent);
-                let block = self.scopes.entry(parent).or_default().block.insert(Block {
-                    owner,
-                    index,
-                    prose,
-                    item_id,
-                    text: String::new(),
-                    started: false,
-                });
-                if prose == Prose::Text {
-                    block.start(out);
-                }
-                block.append(initial.unwrap_or_default(), out);
-            }
-            Some("content_block_delta") => {
-                let delta = event.get("delta").unwrap_or(&Value::Null);
-                let (prose, chunk) = match str_field(delta, "type") {
-                    Some("text_delta") => (Prose::Text, str_field(delta, "text")),
-                    Some("thinking_delta") => (Prose::Reasoning, str_field(delta, "thinking")),
-                    _ => return,
-                };
-                let open = self.scopes.get_mut(&parent).and_then(|s| s.block.as_mut());
-                if let Some(block) = open.filter(|b| b.prose == prose && b.index == index) {
-                    block.append(chunk.unwrap_or_default(), out);
-                }
-            }
-            Some("content_block_stop") => {
-                let open = self.scopes.get(&parent).and_then(|s| s.block.as_ref());
-                if open.is_some_and(|block| block.index == index) {
-                    self.close_block(&parent, out);
-                }
-            }
-            Some("message_stop") => self.close_block(&parent, out),
+            Some("message_start" | "message_stop") => self.close_block(&parent, out),
+            Some("content_block_start") => self.block_start(parent, index, event, out),
+            Some("content_block_delta") => self.block_delta(&parent, index, event, out),
+            Some("content_block_stop") => self.block_stop(&parent, index, out),
             _ => {}
+        }
+    }
+
+    /// Notes the API message whose events arrive in `parent`'s scope. Another
+    /// message: whatever the previous one left open is over.
+    fn enter_message(
+        &mut self,
+        parent: &Option<String>,
+        message_id: Option<&str>,
+        out: &mut Vec<RunnerOutput>,
+    ) {
+        let Some(id) = message_id else {
+            return;
+        };
+        let current = self
+            .scopes
+            .get(parent)
+            .and_then(|s| s.message_id.as_deref());
+        if current == Some(id) {
+            return;
+        }
+        self.close_block(parent, out);
+        self.scopes.entry(parent.clone()).or_default().message_id = Some(id.to_owned());
+    }
+
+    fn block_start(
+        &mut self,
+        parent: Option<String>,
+        index: Option<u64>,
+        event: &Value,
+        out: &mut Vec<RunnerOutput>,
+    ) {
+        self.close_block(&parent, out);
+        let block = event.get("content_block").unwrap_or(&Value::Null);
+        // Tool calls become items from their complete message, which has the input.
+        let Some((prose, initial)) = prose_in(block, &BLOCK_PROSE) else {
+            return;
+        };
+        let item_id = self.mint_id();
+        let owner = self.owner_of(&parent);
+        let block = self.scopes.entry(parent).or_default().block.insert(Block {
+            owner,
+            index,
+            prose,
+            item_id,
+            text: String::new(),
+            started: false,
+        });
+        if prose == Prose::Text {
+            block.start(out);
+        }
+        block.append(initial.unwrap_or_default(), out);
+    }
+
+    /// A chunk for the open block, if it is the block the delta names.
+    fn block_delta(
+        &mut self,
+        parent: &Option<String>,
+        index: Option<u64>,
+        event: &Value,
+        out: &mut Vec<RunnerOutput>,
+    ) {
+        let delta = event.get("delta").unwrap_or(&Value::Null);
+        let Some((prose, chunk)) = prose_in(delta, &DELTA_PROSE) else {
+            return;
+        };
+        let open = self.scopes.get_mut(parent).and_then(|s| s.block.as_mut());
+        if let Some(block) = open.filter(|b| b.prose == prose && b.index == index) {
+            block.append(chunk.unwrap_or_default(), out);
+        }
+    }
+
+    fn block_stop(
+        &mut self,
+        parent: &Option<String>,
+        index: Option<u64>,
+        out: &mut Vec<RunnerOutput>,
+    ) {
+        let open = self.scopes.get(parent).and_then(|s| s.block.as_ref());
+        if open.is_some_and(|block| block.index == index) {
+            self.close_block(parent, out);
         }
     }
 
@@ -440,24 +444,14 @@ impl Mapper {
             id.is_some() && id == streaming
         };
         for block in blocks {
-            match str_field(block, "type") {
-                Some("text") => {
-                    let text = str_field(block, "text").unwrap_or_default();
-                    self.prose(&parent, &owner, Prose::Text, text, streamed, out);
-                }
-                Some("thinking") => {
-                    let text = str_field(block, "thinking").unwrap_or_default();
-                    self.prose(&parent, &owner, Prose::Reasoning, text, streamed, out);
-                }
-                Some("tool_use") => {
-                    let (Some(id), Some(name)) = (str_field(block, "id"), str_field(block, "name"))
-                    else {
-                        continue;
-                    };
-                    let input = block.get("input").cloned().unwrap_or_else(|| json!({}));
-                    self.start_tool(id, name, input, &owner, out);
-                }
-                _ => {}
+            if let Some((prose, text)) = prose_in(block, &BLOCK_PROSE) {
+                let text = text.unwrap_or_default();
+                self.prose(&parent, &owner, prose, text, streamed, out);
+            } else if str_field(block, "type") == Some("tool_use")
+                && let (Some(id), Some(name)) = (str_field(block, "id"), str_field(block, "name"))
+            {
+                let input = block.get("input").cloned().unwrap_or_else(|| json!({}));
+                self.start_tool(id, name, input, &owner, out);
             }
         }
     }
@@ -563,61 +557,75 @@ impl Mapper {
             .and_then(|inner| inner.get("content"))
             .and_then(Value::as_array);
         for block in blocks.map(Vec::as_slice).unwrap_or_default() {
-            if str_field(block, "type") != Some("tool_result") {
-                continue;
+            if str_field(block, "type") == Some("tool_result") {
+                self.tool_result(message, block, out);
             }
-            let Some(id) = str_field(block, "tool_use_id") else {
-                continue;
-            };
-            let Some(position) = self.running.iter().position(|call| call.id == id) else {
-                tracing::debug!(
-                    tool_use_id = id,
-                    "result for a tool call that is not running"
-                );
-                continue;
-            };
-            let call = self.running.remove(position);
-            let failed = block.get("is_error").and_then(Value::as_bool) == Some(true);
-            let status = if self.denied.remove(id) || rejected(message, id) {
-                ItemStatus::Declined
-            } else if failed {
-                ItemStatus::Failed
-            } else {
-                ItemStatus::Completed
-            };
-            let ok = status == ItemStatus::Completed;
-            let launched = launched_in_background(message);
-            match self.subagents.iter_mut().find(|sub| sub.key == id) {
-                // Launched in the background: its call is over, it is not.
-                Some(subagent) if (subagent.background || launched) && ok => {
-                    subagent.background = true;
-                    subagent.detached = true;
-                }
-                // A subagent ends with the call that ran it.
-                Some(_) => self.end_subagent(id, ok, out),
-                None => {
-                    // Not a subagent, but its scope may have streamed.
-                    let scope = Some(id.to_owned());
-                    self.close_block(&scope, out);
-                    self.scopes.remove(&scope);
-                }
+        }
+    }
+
+    /// Completes the running call a `tool_result` block answers.
+    fn tool_result(&mut self, message: &Value, block: &Value, out: &mut Vec<RunnerOutput>) {
+        let Some(id) = str_field(block, "tool_use_id") else {
+            return;
+        };
+        let Some(position) = self.running.iter().position(|call| call.id == id) else {
+            tracing::debug!(
+                tool_use_id = id,
+                "result for a tool call that is not running"
+            );
+            return;
+        };
+        let call = self.running.remove(position);
+        let status = self.result_status(message, block, id);
+        let ok = status == ItemStatus::Completed;
+        self.call_returned(id, ok, launched_in_background(message), out);
+        let output = tools::result_text(block.get("content").unwrap_or(&Value::Null));
+        let plan = ok
+            .then(|| {
+                let result = message.get("tool_use_result").unwrap_or(&Value::Null);
+                self.tasks.apply(&call.name, &call.input, result, &output)
+            })
+            .flatten();
+        out.push(event_of(
+            &call.owner,
+            EventBody::ItemCompleted {
+                item: call.item(status, Some(tools::capped(output))),
+            },
+        ));
+        // After the call: the plan changed when the tool said so.
+        if let Some(entries) = plan {
+            out.push(event_of(&call.owner, EventBody::PlanUpdated { entries }));
+        }
+    }
+
+    /// Declined when its request was denied or refused, failed when the
+    /// result says it is an error, completed otherwise.
+    fn result_status(&mut self, message: &Value, block: &Value, id: &str) -> ItemStatus {
+        let failed = block.get("is_error").and_then(Value::as_bool) == Some(true);
+        if self.denied.remove(id) || rejected(message, id) {
+            ItemStatus::Declined
+        } else if failed {
+            ItemStatus::Failed
+        } else {
+            ItemStatus::Completed
+        }
+    }
+
+    /// What a returned call means for the subagent it ran, if it ran one.
+    fn call_returned(&mut self, id: &str, ok: bool, launched: bool, out: &mut Vec<RunnerOutput>) {
+        match self.subagents.iter_mut().find(|sub| sub.key == id) {
+            // Launched in the background: its call is over, it is not.
+            Some(subagent) if (subagent.background || launched) && ok => {
+                subagent.background = true;
+                subagent.detached = true;
             }
-            let output = tools::result_text(block.get("content").unwrap_or(&Value::Null));
-            let plan = (status == ItemStatus::Completed)
-                .then(|| {
-                    let result = message.get("tool_use_result").unwrap_or(&Value::Null);
-                    self.tasks.apply(&call.name, &call.input, result, &output)
-                })
-                .flatten();
-            out.push(event_of(
-                &call.owner,
-                EventBody::ItemCompleted {
-                    item: call.item(status, Some(tools::capped(output))),
-                },
-            ));
-            // After the call: the plan changed when the tool said so.
-            if let Some(entries) = plan {
-                out.push(event_of(&call.owner, EventBody::PlanUpdated { entries }));
+            // A subagent ends with the call that ran it.
+            Some(_) => self.end_subagent(id, ok, out),
+            None => {
+                // Not a subagent, but its scope may have streamed.
+                let scope = Some(id.to_owned());
+                self.close_block(&scope, out);
+                self.scopes.remove(&scope);
             }
         }
     }
@@ -679,6 +687,14 @@ impl Mapper {
             access: view.access,
             subagent: owner,
         }));
+    }
+
+    /// The CLI withdrawing a request of its own. Part of the SDK protocol;
+    /// no recording holds one.
+    fn cancel_request(&mut self, message: &Value) {
+        if let Some(request_id) = str_field(message, "request_id") {
+            self.pending.remove(request_id);
+        }
     }
 
     /// The end of a turn: totals, the error if it failed, `TurnEnded`.
@@ -1022,6 +1038,27 @@ fn permission_update(grant: &DirGrant) -> Value {
 
 fn str_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     value.get(key).and_then(Value::as_str)
+}
+
+/// Each prose `type` of a content block or a delta, its kind, and the field
+/// that holds its text.
+type ProseTypes = [(&'static str, Prose, &'static str); 2];
+
+const BLOCK_PROSE: ProseTypes = [
+    ("text", Prose::Text, "text"),
+    ("thinking", Prose::Reasoning, "thinking"),
+];
+
+const DELTA_PROSE: ProseTypes = [
+    ("text_delta", Prose::Text, "text"),
+    ("thinking_delta", Prose::Reasoning, "thinking"),
+];
+
+/// The kind and text of a block or delta whose `type` is one of `types`.
+fn prose_in<'a>(value: &'a Value, types: &ProseTypes) -> Option<(Prose, Option<&'a str>)> {
+    let kind = str_field(value, "type")?;
+    let (_, prose, field) = types.iter().find(|(name, ..)| *name == kind)?;
+    Some((*prose, str_field(value, field)))
 }
 
 /// The subagent a message belongs to: the tool-use id of the call that runs it.

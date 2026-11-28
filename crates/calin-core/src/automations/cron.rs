@@ -153,21 +153,7 @@ const ALIASES: [(&str, &str); 4] = [
 impl Cron {
     /// Parses an expression. The error says what is wrong, in words.
     pub(crate) fn parse(expr: &str) -> Result<Self, String> {
-        let mut fields: Vec<&str> = expr.split_whitespace().collect();
-        if let [first] = fields[..]
-            && first.starts_with('@')
-        {
-            let Some((_, expansion)) = ALIASES
-                .iter()
-                .find(|(name, _)| name.eq_ignore_ascii_case(first))
-            else {
-                return Err(format!(
-                    "unknown alias `{first}`; the supported aliases are @hourly, @daily, @weekly and @monthly"
-                ));
-            };
-            // Expanding here makes an alias identical to its expression everywhere.
-            fields = expansion.split(' ').collect();
-        }
+        let fields = expand(expr.split_whitespace().collect())?;
         if fields.is_empty() {
             return Err("the expression is empty".to_owned());
         }
@@ -184,29 +170,16 @@ impl Cron {
                 parse_field(text, spec).map_err(|why| format!("the {} field: {why}", spec.name))
             })
             .collect::<Result<Vec<_>, String>>()?;
-        let [minute, hour, day, month, mut weekday]: [Field; 5] = parsed
+        let [minute, hour, day, month, weekday]: [Field; 5] = parsed
             .try_into()
             .map_err(|_| "expected five fields".to_owned())?;
-        // Sunday is 0 and 7: keep it as 0 only.
-        if weekday.has(7) {
-            weekday.bits = (weekday.bits & !(1 << 7)) | 1;
-        }
-        if let Shape::Values(values) = &mut weekday.shape {
-            for value in values.iter_mut() {
-                if *value == 7 {
-                    *value = 0;
-                }
-            }
-            values.sort_unstable();
-            values.dedup();
-        }
         let cron = Self {
             source: fields.join(" "),
             minute,
             hour,
             day,
             month,
-            weekday,
+            weekday: sunday_once(weekday),
         };
         if !cron.can_fire() {
             return Err("it never fires: no month has that day".to_owned());
@@ -291,39 +264,55 @@ impl Cron {
     }
 
     fn words(&self) -> Option<String> {
-        use Shape::{Any, Every, Values};
-        let days_any = self.day.shape == Any && self.month.shape == Any;
-        let every_day = days_any && self.weekday.shape == Any;
-        match (&self.minute.shape, &self.hour.shape) {
-            (Any, Any) if every_day => return Some("Every minute".to_owned()),
-            (Every(n), Any) if every_day => return Some(format!("Every {n} minutes")),
-            (Values(minutes), Any) if every_day && minutes.len() == 1 => {
-                return Some(match minutes[0] {
-                    0 => "Every hour".to_owned(),
-                    minute => format!("Every hour at minute {minute}"),
-                });
-            }
-            (Values(minutes), Every(n)) if every_day && minutes == &[0] => {
-                return Some(format!("Every {n} hours"));
-            }
-            _ => {}
+        let every_day = [&self.day, &self.month, &self.weekday]
+            .iter()
+            .all(|field| field.shape == Shape::Any);
+        if every_day && let Some(words) = self.often() {
+            return Some(words);
         }
         // From here on: one minute, at one or a few hours.
-        let (Values(minutes), Values(hours)) = (&self.minute.shape, &self.hour.shape) else {
+        let times = self.times()?;
+        if every_day {
+            return Some(format!("Every day at {times}"));
+        }
+        self.on_days(&times)
+    }
+
+    /// Every day, more than a few times: every minute, every n minutes,
+    /// every hour, every n hours.
+    fn often(&self) -> Option<String> {
+        use Shape::{Any, Every, Values};
+        match (&self.minute.shape, &self.hour.shape) {
+            (Any, Any) => Some("Every minute".to_owned()),
+            (Every(n), Any) => Some(format!("Every {n} minutes")),
+            (Values(minutes), Any) if minutes.len() == 1 => Some(match minutes[0] {
+                0 => "Every hour".to_owned(),
+                minute => format!("Every hour at minute {minute}"),
+            }),
+            (Values(minutes), Every(n)) if minutes == &[0] => Some(format!("Every {n} hours")),
+            _ => None,
+        }
+    }
+
+    /// One minute at one to four hours, as `08:00 and 18:00`.
+    fn times(&self) -> Option<String> {
+        let (Shape::Values(minutes), Shape::Values(hours)) = (&self.minute.shape, &self.hour.shape)
+        else {
             return None;
         };
         if minutes.len() != 1 || hours.len() > 4 {
             return None;
         }
-        let times = list(
-            &hours
-                .iter()
-                .map(|hour| format!("{hour:02}:{:02}", minutes[0]))
-                .collect::<Vec<_>>(),
-        );
-        if every_day {
-            return Some(format!("Every day at {times}"));
-        }
+        let times: Vec<String> = hours
+            .iter()
+            .map(|hour| format!("{hour:02}:{:02}", minutes[0]))
+            .collect();
+        Some(list(&times))
+    }
+
+    /// The common shapes of days that are not every day.
+    fn on_days(&self, times: &str) -> Option<String> {
+        use Shape::{Any, Values};
         match (&self.day.shape, &self.month.shape, &self.weekday.shape) {
             (Any, Any, Values(days)) if days == &[1, 2, 3, 4, 5] => {
                 Some(format!("Every weekday at {times}"))
@@ -364,63 +353,108 @@ fn instant(zone: &TimeZone, local: DateTime) -> Option<i64> {
     Some(timestamp.as_millisecond())
 }
 
+/// An `@` alias as the five fields it stands for; other fields as they are.
+fn expand(fields: Vec<&str>) -> Result<Vec<&str>, String> {
+    let [first] = fields[..] else {
+        return Ok(fields);
+    };
+    if !first.starts_with('@') {
+        return Ok(fields);
+    }
+    let Some((_, expansion)) = ALIASES
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(first))
+    else {
+        return Err(format!(
+            "unknown alias `{first}`; the supported aliases are @hourly, @daily, @weekly and @monthly"
+        ));
+    };
+    // Expanding here makes an alias identical to its expression everywhere.
+    Ok(expansion.split(' ').collect())
+}
+
+/// Sunday is 0 and 7: keeps it as 0 only.
+fn sunday_once(mut weekday: Field) -> Field {
+    if weekday.has(7) {
+        weekday.bits = (weekday.bits & !(1 << 7)) | 1;
+    }
+    if let Shape::Values(values) = &mut weekday.shape {
+        for value in values.iter_mut().filter(|value| **value == 7) {
+            *value = 0;
+        }
+        values.sort_unstable();
+        values.dedup();
+    }
+    weekday
+}
+
 fn parse_field(text: &str, spec: &Spec) -> Result<Field, String> {
     let mut bits = 0u64;
     for item in text.split(',') {
-        if item.is_empty() {
-            return Err(format!("`{text}` has an empty item"));
-        }
-        let (base, step) = match item.split_once('/') {
-            Some((base, step)) => {
-                let step: u32 = step
-                    .parse()
-                    .map_err(|_| format!("the step of `{item}` is not a number"))?;
-                if step == 0 || step > spec.max - spec.min + 1 {
-                    return Err(format!(
-                        "the step of `{item}` must be between 1 and {}",
-                        spec.max - spec.min + 1
-                    ));
-                }
-                (base, Some(step))
-            }
-            None => (item, None),
-        };
-        let (from, to) = if base == "*" {
-            (spec.min, spec.max)
-        } else if let Some((from, to)) = base.split_once('-') {
-            let (from, to) = (value(from, spec)?, value(to, spec)?);
-            if from > to {
-                return Err(format!("the range `{base}` runs backwards"));
-            }
-            (from, to)
-        } else {
-            let from = value(base, spec)?;
-            // `5/10` steps from 5 to the end, as in Vixie cron.
-            (from, if step.is_some() { spec.max } else { from })
-        };
-        let step = step.unwrap_or(1);
-        let mut at = from;
-        while at <= to {
-            bits |= 1 << at;
-            at += step;
-        }
+        bits |= item_bits(item, text, spec)?;
     }
-    let shape = if text == "*" {
-        Shape::Any
-    } else if let Some(step) = text.strip_prefix("*/").and_then(|step| step.parse().ok()) {
-        Shape::Every(step)
-    } else {
-        Shape::Values(
-            (spec.min..=spec.max)
-                .filter(|v| bits & (1 << v) != 0)
-                .collect(),
-        )
-    };
     Ok(Field {
         bits,
-        shape,
+        shape: shape(text, bits, spec),
         star: text.starts_with('*'),
     })
+}
+
+/// The values one item of the field `text` allows, as bits.
+fn item_bits(item: &str, text: &str, spec: &Spec) -> Result<u64, String> {
+    if item.is_empty() {
+        return Err(format!("`{text}` has an empty item"));
+    }
+    let (base, step) = split_step(item, spec)?;
+    let (from, to) = range(base, step.is_some(), spec)?;
+    let every = step.unwrap_or(1) as usize;
+    Ok((from..=to)
+        .step_by(every)
+        .fold(0, |bits, at| bits | 1 << at))
+}
+
+/// An item without its step, and the step.
+fn split_step<'a>(item: &'a str, spec: &Spec) -> Result<(&'a str, Option<u32>), String> {
+    let Some((base, step)) = item.split_once('/') else {
+        return Ok((item, None));
+    };
+    let step: u32 = step
+        .parse()
+        .map_err(|_| format!("the step of `{item}` is not a number"))?;
+    let most = spec.max - spec.min + 1;
+    if step == 0 || step > most {
+        return Err(format!("the step of `{item}` must be between 1 and {most}"));
+    }
+    Ok((base, Some(step)))
+}
+
+/// The first and the last value an item allows, before its step.
+fn range(base: &str, stepped: bool, spec: &Spec) -> Result<(u32, u32), String> {
+    if base == "*" {
+        return Ok((spec.min, spec.max));
+    }
+    if let Some((from, to)) = base.split_once('-') {
+        let (from, to) = (value(from, spec)?, value(to, spec)?);
+        if from > to {
+            return Err(format!("the range `{base}` runs backwards"));
+        }
+        return Ok((from, to));
+    }
+    let from = value(base, spec)?;
+    // `5/10` steps from 5 to the end, as in Vixie cron.
+    Ok((from, if stepped { spec.max } else { from }))
+}
+
+/// How the field was written, for putting it in words.
+fn shape(text: &str, bits: u64, spec: &Spec) -> Shape {
+    if text == "*" {
+        return Shape::Any;
+    }
+    if let Some(step) = text.strip_prefix("*/").and_then(|step| step.parse().ok()) {
+        return Shape::Every(step);
+    }
+    let values = (spec.min..=spec.max).filter(|v| bits & (1 << v) != 0);
+    Shape::Values(values.collect())
 }
 
 fn value(text: &str, spec: &Spec) -> Result<u32, String> {

@@ -7,7 +7,7 @@
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use calin_git::{CommitOutcome, GitHub, PullRequestInfo};
 use calin_proto::{
@@ -15,6 +15,7 @@ use calin_proto::{
 };
 use tokio::sync::mpsc;
 
+use crate::clock::now_ms;
 use crate::store::Store;
 
 /// The remote a session's branches are pushed to and pull requests opened on.
@@ -77,6 +78,15 @@ struct Failure {
     error: String,
 }
 
+impl Failure {
+    fn new(step: &'static str, error: impl std::fmt::Display) -> Self {
+        Self {
+            step,
+            error: error.to_string(),
+        }
+    }
+}
+
 /// A repo whose branch is delivered.
 struct Pushed {
     /// The pull request on GitHub. `None` in dry run.
@@ -104,213 +114,221 @@ struct Delivered {
 /// description link the others. A repo that fails is reported and the rest
 /// carry on. Ends early, between two steps, once `cancel` is set.
 pub(super) async fn ship(plan: ShipPlan, results: mpsc::Sender<Shipped>, cancel: Arc<AtomicBool>) {
-    let plan = Arc::new(plan);
-    let mut delivered: Vec<Delivered> = Vec::new();
-    let mut failed = false;
-    for (index, (repo, known)) in plan.repos.iter().enumerate() {
-        if cancel.load(Ordering::Relaxed) {
-            return;
+    let ship = Ship {
+        plan: Arc::new(plan),
+        results,
+        cancel,
+    };
+    // A ship that stopped early has nothing left to say.
+    let _ = ship.run().await;
+}
+
+/// Why a ship ends before its last step: it was cancelled, or nobody reads
+/// its results any more.
+struct Stop;
+
+/// One ship under way.
+struct Ship {
+    plan: Arc<ShipPlan>,
+    results: mpsc::Sender<Shipped>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl Ship {
+    async fn run(&self) -> Result<(), Stop> {
+        let (delivered, failed) = self.deliver_all().await?;
+        if !delivered.is_empty() {
+            return self.settle(&delivered).await;
         }
-        // `live` and `read` repos are the user's own checkouts: never
-        // committed to, pushed or shipped.
-        if repo.mode != RepoMode::Write {
-            continue;
+        if failed {
+            return Ok(());
         }
+        let nothing = "nothing to ship: no repository attached for writing differs from its base";
+        self.send(Shipped::Failed(nothing.to_owned())).await
+    }
+
+    /// Links the delivered pull requests to each other and says what came
+    /// of each. Every repo was attempted: only now are all the siblings known.
+    async fn settle(&self, delivered: &[Delivered]) -> Result<(), Stop> {
+        let any_new = delivered.iter().any(|d| d.new);
+        for d in delivered {
+            self.go_on()?;
+            let described = self.link(delivered, d, any_new).await?;
+            if let Some(step) = last_step(d, described) {
+                self.send(step).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Delivers each `write` repo in turn and announces each pull request
+    /// it opens. Also says whether a repo failed.
+    async fn deliver_all(&self) -> Result<(Vec<Delivered>, bool), Stop> {
+        let mut delivered = Vec::new();
+        let mut failed = false;
+        for (index, (repo, known)) in self.plan.repos.iter().enumerate() {
+            self.go_on()?;
+            // `live` and `read` repos are the user's own checkouts: never
+            // committed to, pushed or shipped.
+            if repo.mode != RepoMode::Write {
+                continue;
+            }
+            match self.deliver_one(index, repo, known.as_ref()).await {
+                Ok(d) => delivered.extend(self.announce(d).await?),
+                Err(failure) => {
+                    failed = true;
+                    self.report(&repo.name, failure).await?;
+                }
+            }
+        }
+        Ok((delivered, failed))
+    }
+
+    /// Announces a pull request this ship opened.
+    async fn announce(&self, d: Option<Delivered>) -> Result<Option<Delivered>, Stop> {
+        if let Some(opened) = d.as_ref().filter(|d| d.new) {
+            self.send(Shipped::Opened(opened.pull_request.clone()))
+                .await?;
+        }
+        Ok(d)
+    }
+
+    /// Commits and pushes one repo, off the runtime, and finds its pull
+    /// request. `None` when the repo has nothing to deliver.
+    async fn deliver_one(
+        &self,
+        index: usize,
+        repo: &SessionRepo,
+        known: Option<&PullRequest>,
+    ) -> Result<Option<Delivered>, Failure> {
         let work = {
-            let (plan, repo) = (Arc::clone(&plan), repo.clone());
+            let (plan, repo) = (Arc::clone(&self.plan), repo.clone());
             tokio::task::spawn_blocking(move || deliver(&plan, &repo))
         };
-        let pushed = match work.await {
-            Ok(Ok(Some(pushed))) => pushed,
-            Ok(Ok(None)) => continue,
-            Ok(Err(failure)) => {
-                failed = true;
-                if report(&results, &repo.name, &failure).await.is_err() {
-                    return;
-                }
-                continue;
-            }
-            Err(panicked) => {
-                failed = true;
-                let failure = Failure {
-                    step: "delivery",
-                    error: panicked.to_string(),
-                };
-                if report(&results, &repo.name, &failure).await.is_err() {
-                    return;
-                }
-                continue;
-            }
+        let pushed = work
+            .await
+            .map_err(|panicked| Failure::new("delivery", panicked))??;
+        let Some(pushed) = pushed else {
+            return Ok(None);
         };
         let (pull_request, body) = match pushed.info {
             Some(info) => {
                 let body = info.body.clone();
                 (on_github(&repo.id, info), Some(body))
             }
-            None => match made_up(&plan, repo, known.as_ref()).await {
-                Ok(pull_request) => (pull_request, None),
-                Err(error) => {
-                    failed = true;
-                    let failure = Failure {
-                        step: "pull request",
-                        error: error.to_string(),
-                    };
-                    if report(&results, &repo.name, &failure).await.is_err() {
-                        return;
-                    }
-                    continue;
-                }
-            },
-        };
-        let on_record = known
-            .as_ref()
-            .filter(|known| known.number == pull_request.number && known.url == pull_request.url);
-        let new = on_record.is_none();
-        let changed =
-            on_record.is_some_and(|known| pushed.new_commits || !same(known, &pull_request));
-        if new
-            && results
-                .send(Shipped::Opened(pull_request.clone()))
-                .await
-                .is_err()
-        {
-            return;
-        }
-        delivered.push(Delivered {
-            index,
-            repo: repo.clone(),
-            pull_request,
-            body,
-            new,
-            changed,
-        });
-    }
-
-    if delivered.is_empty() {
-        if !failed {
-            let nothing = "nothing to ship: no repository attached for writing differs from \
-                           its base";
-            let _ = results.send(Shipped::Failed(nothing.to_owned())).await;
-        }
-        return;
-    }
-
-    // Every repo was attempted: only now are all the siblings known.
-    let any_new = delivered.iter().any(|d| d.new);
-    for d in &delivered {
-        if cancel.load(Ordering::Relaxed) {
-            return;
-        }
-        let repo = &d.repo;
-        let related = related(&plan, &delivered, d.index);
-        let described = match &d.body {
-            // Nothing is written anywhere in dry run; the events are the
-            // ones a real ship gives when a sibling appears.
-            None => any_new && !related.is_empty(),
-            Some(current) => {
-                let issue = issue_line(plan.issue.as_ref(), repo);
-                let wanted = describe(current, plan.body.as_deref(), issue.as_deref(), &related);
-                if same_text(&wanted, current) {
-                    false
-                } else {
-                    let (github, dir) = (plan.github.clone(), repo.path.clone());
-                    let number = d.pull_request.number;
-                    let edited = tokio::task::spawn_blocking(move || {
-                        github.edit_body(Path::new(&dir), number, &wanted)
-                    })
-                    .await;
-                    let error = match edited {
-                        Ok(Ok(())) => None,
-                        Ok(Err(error)) => Some(error.to_string()),
-                        Err(panicked) => Some(panicked.to_string()),
-                    };
-                    let rewritten = error.is_none();
-                    if let Some(error) = error {
-                        let failure = Failure {
-                            step: "description",
-                            error,
-                        };
-                        if report(&results, &repo.name, &failure).await.is_err() {
-                            return;
-                        }
-                    }
-                    rewritten
-                }
+            None => {
+                let made = made_up(&self.plan, repo, known).await;
+                let pull_request = made.map_err(|error| Failure::new("pull request", error))?;
+                (pull_request, None)
             }
         };
-        let step = if described || d.changed {
-            Shipped::Updated(PullRequest {
-                updated_at: now_ms(),
-                ..d.pull_request.clone()
-            })
-        } else if d.new {
-            // Already announced as opened, and nothing happened to it since.
-            continue;
-        } else {
-            Shipped::Kept
+        let on_record = known
+            .filter(|known| known.number == pull_request.number && known.url == pull_request.url);
+        let changed =
+            on_record.is_some_and(|known| pushed.new_commits || !same(known, &pull_request));
+        Ok(Some(Delivered {
+            index,
+            repo: repo.clone(),
+            new: on_record.is_none(),
+            pull_request,
+            body,
+            changed,
+        }))
+    }
+
+    /// Makes the description of `d` link its siblings. True when it changed
+    /// on GitHub, or, in dry run, when a real ship would have changed it.
+    async fn link(
+        &self,
+        delivered: &[Delivered],
+        d: &Delivered,
+        any_new: bool,
+    ) -> Result<bool, Stop> {
+        let related = related(&self.plan, delivered, d.index);
+        let Some(current) = &d.body else {
+            // Nothing is written anywhere in dry run; the events are the
+            // ones a real ship gives when a sibling appears.
+            return Ok(any_new && !related.is_empty());
         };
-        if results.send(step).await.is_err() {
-            return;
+        let issue = issue_line(self.plan.issue.as_ref(), &d.repo);
+        let wanted = describe(
+            current,
+            self.plan.body.as_deref(),
+            issue.as_deref(),
+            &related,
+        );
+        if same_text(&wanted, current) {
+            return Ok(false);
         }
+        let number = d.pull_request.number;
+        let Err(failure) = self.edit_body(&d.repo, number, wanted).await else {
+            return Ok(true);
+        };
+        self.report(&d.repo.name, failure).await?;
+        Ok(false)
+    }
+
+    /// Rewrites a pull request's description on GitHub, off the runtime.
+    async fn edit_body(
+        &self,
+        repo: &SessionRepo,
+        number: u32,
+        body: String,
+    ) -> Result<(), Failure> {
+        let (github, dir) = (self.plan.github.clone(), repo.path.clone());
+        let edited =
+            tokio::task::spawn_blocking(move || github.edit_body(Path::new(&dir), number, &body))
+                .await
+                .map_err(|panicked| Failure::new("description", panicked))?;
+        edited.map_err(|error| Failure::new("description", error))
+    }
+
+    fn go_on(&self) -> Result<(), Stop> {
+        if self.cancel.load(Ordering::Relaxed) {
+            return Err(Stop);
+        }
+        Ok(())
+    }
+
+    async fn send(&self, step: Shipped) -> Result<(), Stop> {
+        self.results.send(step).await.map_err(|_| Stop)
+    }
+
+    async fn report(&self, repo: &str, failure: Failure) -> Result<(), Stop> {
+        let message = format!(
+            "could not ship {repo}: {} failed: {}",
+            failure.step, failure.error
+        );
+        self.send(Shipped::Failed(message)).await
     }
 }
 
-async fn report(
-    results: &mpsc::Sender<Shipped>,
-    repo: &str,
-    failure: &Failure,
-) -> Result<(), mpsc::error::SendError<Shipped>> {
-    let message = format!(
-        "could not ship {repo}: {} failed: {}",
-        failure.step, failure.error
-    );
-    results.send(Shipped::Failed(message)).await
+/// What a ship says last about a pull request it delivered, once its
+/// description is settled. `None` for one it announced as opened that
+/// nothing happened to since.
+fn last_step(d: &Delivered, described: bool) -> Option<Shipped> {
+    if described || d.changed {
+        return Some(Shipped::Updated(PullRequest {
+            updated_at: now_ms(),
+            ..d.pull_request.clone()
+        }));
+    }
+    (!d.new).then_some(Shipped::Kept)
 }
 
 /// Blocking. Commits what is uncommitted, pushes the session's branch and
 /// finds or opens its pull request. `None` when the repo has nothing to
 /// deliver. In dry run it stops after the commit.
 fn deliver(plan: &ShipPlan, repo: &SessionRepo) -> Result<Option<Pushed>, Failure> {
-    let at = |step: &'static str| {
-        move |error: calin_git::Error| Failure {
-            step,
-            error: error.to_string(),
-        }
-    };
     // A `write` repo always has both; without them there is nothing to measure.
     let (Some(branch), Some(base)) = (&repo.branch, &repo.base_ref) else {
         return Ok(None);
     };
     let dir = Path::new(&repo.path);
-    // Changed files, or commits whose changes cancel out: either way the
-    // branch is not its base any more.
-    let differs = !calin_git::changes(dir, base)
-        .map_err(at("changes"))?
-        .is_empty()
-        || calin_git::commits_ahead(dir, base, branch).map_err(at("changes"))? > 0;
-    if !differs {
+    if !differs(dir, base, branch)? {
         return Ok(None);
     }
-
-    let mut committed = false;
-    if calin_git::is_dirty(dir).map_err(at("commit"))? {
-        // The commit lands on whatever is checked out, and what is pushed
-        // is the session's branch: they have to be the same.
-        let current = calin_git::current_branch(dir).map_err(at("commit"))?;
-        if current.as_deref() != Some(branch.as_str()) {
-            return Err(Failure {
-                step: "commit",
-                error: format!(
-                    "the worktree is on {}, not on the session's branch {branch}",
-                    current.as_deref().unwrap_or("a detached HEAD")
-                ),
-            });
-        }
-        let message = commit_message(&plan.title, &plan.session_id);
-        let outcome =
-            calin_git::commit_all(dir, &message, plan.commit_timeout).map_err(at("commit"))?;
-        committed = matches!(outcome, CommitOutcome::Committed(_));
-    }
+    let committed = commit(plan, dir, branch)?;
     // What differed may have been nothing a commit records.
     if calin_git::commits_ahead(dir, base, branch).map_err(at("changes"))? == 0 {
         return Ok(None);
@@ -321,41 +339,88 @@ fn deliver(plan: &ShipPlan, repo: &SessionRepo) -> Result<Option<Pushed>, Failur
             new_commits: committed,
         }));
     }
+    push(plan, repo, dir, branch).map(Some)
+}
 
+/// The failure of `step`, for an error of the library.
+fn at(step: &'static str) -> impl Fn(calin_git::Error) -> Failure {
+    move |error| Failure::new(step, error)
+}
+
+/// Changed files, or commits whose changes cancel out: either way the
+/// branch is not its base any more.
+fn differs(dir: &Path, base: &str, branch: &str) -> Result<bool, Failure> {
+    let changed = !calin_git::changes(dir, base)
+        .map_err(at("changes"))?
+        .is_empty();
+    Ok(changed || calin_git::commits_ahead(dir, base, branch).map_err(at("changes"))? > 0)
+}
+
+/// Commits what is uncommitted. True when that made a commit.
+fn commit(plan: &ShipPlan, dir: &Path, branch: &str) -> Result<bool, Failure> {
+    if !calin_git::is_dirty(dir).map_err(at("commit"))? {
+        return Ok(false);
+    }
+    // The commit lands on whatever is checked out, and what is pushed
+    // is the session's branch: they have to be the same.
+    let current = calin_git::current_branch(dir).map_err(at("commit"))?;
+    if current.as_deref() != Some(branch) {
+        let on = current.as_deref().unwrap_or("a detached HEAD");
+        return Err(Failure::new(
+            "commit",
+            format!("the worktree is on {on}, not on the session's branch {branch}"),
+        ));
+    }
+    let message = commit_message(&plan.title, &plan.session_id);
+    let outcome =
+        calin_git::commit_all(dir, &message, plan.commit_timeout).map_err(at("commit"))?;
+    Ok(matches!(outcome, CommitOutcome::Committed(_)))
+}
+
+/// Pushes the session's branch and finds or opens its pull request.
+fn push(plan: &ShipPlan, repo: &SessionRepo, dir: &Path, branch: &str) -> Result<Pushed, Failure> {
     if !calin_git::has_remote(dir, REMOTE).map_err(at("push"))? {
-        return Err(Failure {
-            step: "push",
-            error: format!("the repository has no `{REMOTE}` remote to push to"),
-        });
+        return Err(Failure::new(
+            "push",
+            format!("the repository has no `{REMOTE}` remote to push to"),
+        ));
     }
     let Some(default_branch) = calin_git::default_branch(dir, REMOTE).map_err(at("push"))? else {
-        return Err(Failure {
-            step: "push",
-            error: "the repository's default branch is not known".to_owned(),
-        });
+        return Err(Failure::new(
+            "push",
+            "the repository's default branch is not known",
+        ));
     };
     let new_commits = calin_git::has_unpushed_commits(dir, REMOTE, branch).map_err(at("push"))?;
     calin_git::push_branch(dir, REMOTE, branch, plan.push_timeout).map_err(at("push"))?;
+    let info = pull_request(plan, repo, dir, branch, &default_branch)?;
+    Ok(Pushed {
+        info: Some(info),
+        new_commits,
+    })
+}
 
+/// The open pull request of the branch, or a new one.
+fn pull_request(
+    plan: &ShipPlan,
+    repo: &SessionRepo,
+    dir: &Path,
+    branch: &str,
+    default_branch: &str,
+) -> Result<PullRequestInfo, Failure> {
     let open = plan
         .github
         .find_open_pull_request(dir, branch)
         .map_err(at("pull request"))?;
-    let info = match open {
-        Some(info) => info,
-        None => {
-            // The links come later, once every repo has its pull request.
-            let issue = issue_line(plan.issue.as_ref(), repo);
-            let body = describe("", plan.body.as_deref(), issue.as_deref(), &[]);
-            plan.github
-                .create_pull_request(dir, &default_branch, branch, &plan.title, &body, plan.draft)
-                .map_err(at("pull request"))?
-        }
-    };
-    Ok(Some(Pushed {
-        info: Some(info),
-        new_commits,
-    }))
+    if let Some(info) = open {
+        return Ok(info);
+    }
+    // The links come later, once every repo has its pull request.
+    let issue = issue_line(plan.issue.as_ref(), repo);
+    let body = describe("", plan.body.as_deref(), issue.as_deref(), &[]);
+    plan.github
+        .create_pull_request(dir, default_branch, branch, &plan.title, &body, plan.draft)
+        .map_err(at("pull request"))
 }
 
 /// The title, then a trailer that leads from the commit back to its session.
@@ -444,12 +509,6 @@ pub(super) fn same(a: &PullRequest, b: &PullRequest) -> bool {
     timeless(a) == timeless(b)
 }
 
-pub(super) fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_millis() as i64)
-}
-
 /// Looks at each pull request on GitHub and returns the ones that answered,
 /// as they are now. One that cannot be read is logged and left for the next
 /// look: a failed look says nothing about the pull request.
@@ -508,7 +567,18 @@ pub(super) fn describe(
     related: &[(String, String)],
 ) -> String {
     let found = find_block(current);
-    let text = match (body, &found) {
+    let block = block(&block_text(body, found.as_ref()), issue, related);
+    match found {
+        Some(found) => format!("{}{block}{}", found.before, found.after),
+        None if current.trim().is_empty() => block,
+        None => format!("{block}\n\n{current}"),
+    }
+}
+
+/// The user's text of Calin's block: `body` when given, else what the
+/// block on the pull request holds.
+fn block_text(body: Option<&str>, found: Option<&Block<'_>>) -> String {
+    match (body, found) {
         // The markers are Calin's: text that brings its own would cut the block short.
         (Some(body), _) => body.trim().replace("<!-- calin:", "<!-- calin "),
         (None, Some(block)) => {
@@ -521,33 +591,27 @@ pub(super) fn describe(
             block.inside[..end].trim().to_owned()
         }
         (None, None) => String::new(),
-    };
-    let mut block = format!("{BLOCK_BEGIN}\n");
+    }
+}
+
+/// Calin's block: the text, the issue line and the links, each that is
+/// there, a blank line apart.
+fn block(text: &str, issue: Option<&str>, related: &[(String, String)]) -> String {
+    let mut parts = Vec::new();
     if !text.is_empty() {
-        block.push_str(&text);
-        block.push('\n');
+        parts.push(format!("{text}\n"));
     }
     if let Some(issue) = issue {
-        if !text.is_empty() {
-            block.push('\n');
-        }
-        block.push_str(&format!("{BLOCK_ISSUE}\n{issue}\n"));
+        parts.push(format!("{BLOCK_ISSUE}\n{issue}\n"));
     }
     if !related.is_empty() {
-        if !text.is_empty() || issue.is_some() {
-            block.push('\n');
-        }
-        block.push_str(&format!("{BLOCK_RELATED}\n{RELATED_HEADING}\n\n"));
+        let mut links = format!("{BLOCK_RELATED}\n{RELATED_HEADING}\n\n");
         for (name, url) in related {
-            block.push_str(&format!("- {name}: {url}\n"));
+            links.push_str(&format!("- {name}: {url}\n"));
         }
+        parts.push(links);
     }
-    block.push_str(BLOCK_END);
-    match found {
-        Some(found) => format!("{}{block}{}", found.before, found.after),
-        None if current.trim().is_empty() => block,
-        None => format!("{block}\n\n{current}"),
-    }
+    format!("{BLOCK_BEGIN}\n{}{BLOCK_END}", parts.join("\n"))
 }
 
 /// True when two descriptions read the same. GitHub stores what its web

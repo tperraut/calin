@@ -12,7 +12,7 @@ use calin_proto::{EntryKind, FileContent, TreeEntry};
 use crate::cmd::Git;
 use crate::content::{decode, hash, read_hashed};
 use crate::error::{Error, Result};
-use crate::path::{is_dot_git, resolve, resolve_no_follow};
+use crate::path::{Resolved, is_dot_git, metadata_no_follow, resolve, resolve_no_follow};
 
 /// One level of the directory `path` inside the work directory `dir`.
 ///
@@ -26,11 +26,7 @@ use crate::path::{is_dot_git, resolve, resolve_no_follow};
 /// [`Error::InvalidPath`] when `path` is not a directory.
 pub fn list_dir(dir: &Path, path: &str) -> Result<Vec<TreeEntry>> {
     let at = resolve(dir, path)?;
-    let not_a_dir = || Error::invalid_path(path, "is not a directory");
-    let read = fs::read_dir(&at.abs).map_err(|e| match e.kind() {
-        ErrorKind::NotADirectory => not_a_dir(),
-        _ => Error::io(&at.abs, e),
-    })?;
+    let read = open_dir(&at, path)?;
 
     // Git refuses to look beyond a symlink, so it is asked about the real
     // location, which differs from `at.rel` when that goes through a link.
@@ -45,35 +41,13 @@ pub fn list_dir(dir: &Path, path: &str) -> Result<Vec<TreeEntry>> {
         if is_dot_git(&name) {
             continue;
         }
-        // Neither call follows a symlink.
-        let file_type = entry.file_type().map_err(|e| Error::io(&entry.path(), e))?;
-        let (kind, size) = if file_type.is_symlink() {
-            (EntryKind::Symlink, None)
-        } else if file_type.is_dir() {
-            (EntryKind::Dir, None)
-        } else {
-            // Gone already when an agent deletes it under us; then there is no size.
-            (EntryKind::File, entry.metadata().ok().map(|m| m.len()))
-        };
         // The `./` keeps a name that starts with `:` from being read as pathspec magic.
-        queries.push(format!("./{}", real_rel.join(&name).to_string_lossy()));
-        entries.push(TreeEntry {
-            path: if at.rel.is_empty() {
-                name.clone()
-            } else {
-                format!("{}/{name}", at.rel)
-            },
-            name,
-            kind,
-            size,
-            ignored: false,
-        });
+        let query = format!("./{}", real_rel.join(&name).to_string_lossy());
+        entries.push(tree_entry(&entry, &at.rel, name)?);
+        queries.push(query);
     }
 
-    let ignored = ignored_paths(&at.root, &queries)?;
-    for (entry, query) in entries.iter_mut().zip(&queries) {
-        entry.ignored = ignored.contains(query);
-    }
+    mark_ignored(&at.root, &mut entries, &queries)?;
     entries.sort_by_cached_key(|e| {
         (
             e.kind != EntryKind::Dir,
@@ -82,6 +56,49 @@ pub fn list_dir(dir: &Path, path: &str) -> Result<Vec<TreeEntry>> {
         )
     });
     Ok(entries)
+}
+
+/// The entries of the directory `at`; `path` is how the caller named it.
+fn open_dir(at: &Resolved, path: &str) -> Result<fs::ReadDir> {
+    fs::read_dir(&at.abs).map_err(|e| match e.kind() {
+        ErrorKind::NotADirectory => Error::invalid_path(path, "is not a directory"),
+        _ => Error::io(&at.abs, e),
+    })
+}
+
+/// Sets `ignored` on each entry, from what git says of its query.
+fn mark_ignored(root: &Path, entries: &mut [TreeEntry], queries: &[String]) -> Result<()> {
+    let ignored = ignored_paths(root, queries)?;
+    for (entry, query) in entries.iter_mut().zip(queries) {
+        entry.ignored = ignored.contains(query);
+    }
+    Ok(())
+}
+
+/// The listing entry for `entry`, called `name`, in the directory `rel`.
+/// Not yet checked against the ignore rules.
+fn tree_entry(entry: &fs::DirEntry, rel: &str, name: String) -> Result<TreeEntry> {
+    // Neither call follows a symlink.
+    let file_type = entry.file_type().map_err(|e| Error::io(&entry.path(), e))?;
+    let (kind, size) = if file_type.is_symlink() {
+        (EntryKind::Symlink, None)
+    } else if file_type.is_dir() {
+        (EntryKind::Dir, None)
+    } else {
+        // Gone already when an agent deletes it under us; then there is no size.
+        (EntryKind::File, entry.metadata().ok().map(|m| m.len()))
+    };
+    Ok(TreeEntry {
+        path: if rel.is_empty() {
+            name.clone()
+        } else {
+            format!("{rel}/{name}")
+        },
+        name,
+        kind,
+        size,
+        ignored: false,
+    })
 }
 
 /// Which of `paths` (relative to `root`) git ignores, in one process. The
@@ -131,13 +148,7 @@ pub fn read_file(dir: &Path, path: &str, max_bytes: u64) -> Result<FileContent> 
         ErrorKind::NotADirectory => Error::NotFound(at.abs.display().to_string()),
         _ => Error::io(&at.abs, e),
     })?;
-    if meta.is_dir() {
-        return Err(Error::invalid_path(path, "is a directory"));
-    }
-    if !meta.is_file() {
-        // Opening a pipe or a device could block for ever.
-        return Err(Error::invalid_path(path, "is not a regular file"));
-    }
+    require_file(path, &meta)?;
 
     let read = read_hashed(&at.abs, max_bytes)?;
     let too_large = read.bytes.is_none();
@@ -181,53 +192,15 @@ pub fn write_file(
 ) -> Result<FileContent> {
     // The last component stays unresolved: a link there is refused, not followed.
     let at = resolve_no_follow(dir, path)?;
-    let existing = match fs::symlink_metadata(&at.abs) {
-        Ok(meta) => Some(meta),
-        Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => None,
-        Err(e) => return Err(Error::io(&at.abs, e)),
-    };
+    let existing = metadata_no_follow(&at.abs)?;
     if let Some(meta) = &existing {
         if meta.is_symlink() {
             return Err(Error::invalid_path(path, "is a symlink"));
         }
-        if meta.is_dir() {
-            return Err(Error::invalid_path(path, "is a directory"));
-        }
-        if !meta.is_file() {
-            return Err(Error::invalid_path(path, "is not a regular file"));
-        }
+        require_file(path, meta)?;
     }
-    match (expected_hash, &existing) {
-        (None, None) => {}
-        (None, Some(_)) => {
-            return Err(Error::Conflict(format!("{} already exists", at.rel)));
-        }
-        (Some(_), None) => {
-            return Err(Error::Conflict(format!("{} no longer exists", at.rel)));
-        }
-        (Some(expected), Some(_)) => {
-            // Only the hash is needed, so keep none of the content.
-            let current = read_hashed(&at.abs, 0)?.hash;
-            if !current.eq_ignore_ascii_case(expected) {
-                return Err(Error::Conflict(format!(
-                    "{} changed since it was read",
-                    at.rel
-                )));
-            }
-        }
-    }
-
-    // `resolve_no_follow` appended a file name, so there is a parent.
-    let parent = at.abs.parent().unwrap_or(&at.root);
-    fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
-    let (temp, file) = create_temp(parent)?;
-    let written = fill(&temp, file, text.as_bytes(), existing.as_ref())
-        .and_then(|()| fs::rename(&temp, &at.abs).map_err(|e| Error::io(&at.abs, e)));
-    if let Err(e) = written {
-        // Best effort: the write already failed, and that is the error to report.
-        let _ = fs::remove_file(&temp);
-        return Err(e);
-    }
+    check_expected(&at, expected_hash, existing.is_some())?;
+    replace(&at, text.as_bytes(), existing.as_ref())?;
 
     let binary = text.contains('\0');
     Ok(FileContent {
@@ -238,6 +211,55 @@ pub fn write_file(
         size: text.len() as u64,
         hash: hash(text.as_bytes()),
     })
+}
+
+/// Refuses what is not a regular file: opening a pipe or a device could block for ever.
+fn require_file(path: &str, meta: &fs::Metadata) -> Result<()> {
+    if meta.is_dir() {
+        return Err(Error::invalid_path(path, "is a directory"));
+    }
+    if !meta.is_file() {
+        return Err(Error::invalid_path(path, "is not a regular file"));
+    }
+    Ok(())
+}
+
+/// Refuses the write unless the file is where the edit started: absent for
+/// a new file, else still with the content whose hash is `expected_hash`.
+fn check_expected(at: &Resolved, expected_hash: Option<&str>, exists: bool) -> Result<()> {
+    match (expected_hash, exists) {
+        (None, false) => Ok(()),
+        (None, true) => Err(Error::Conflict(format!("{} already exists", at.rel))),
+        (Some(_), false) => Err(Error::Conflict(format!("{} no longer exists", at.rel))),
+        (Some(expected), true) => {
+            // Only the hash is needed, so keep none of the content.
+            let current = read_hashed(&at.abs, 0)?.hash;
+            if current.eq_ignore_ascii_case(expected) {
+                Ok(())
+            } else {
+                Err(Error::Conflict(format!(
+                    "{} changed since it was read",
+                    at.rel
+                )))
+            }
+        }
+    }
+}
+
+/// Puts `bytes` at `at` through a temporary file in the same directory that
+/// is renamed over the target.
+fn replace(at: &Resolved, bytes: &[u8], existing: Option<&fs::Metadata>) -> Result<()> {
+    // `resolve_no_follow` appended a file name, so there is a parent.
+    let parent = at.abs.parent().unwrap_or(&at.root);
+    fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
+    let (temp, file) = create_temp(parent)?;
+    let written = fill(&temp, file, bytes, existing)
+        .and_then(|()| fs::rename(&temp, &at.abs).map_err(|e| Error::io(&at.abs, e)));
+    if written.is_err() {
+        // Best effort: the write already failed, and that is the error to report.
+        let _ = fs::remove_file(&temp);
+    }
+    written
 }
 
 /// Distinguishes the temporary files of concurrent writes in one process.
@@ -277,6 +299,7 @@ fn fill(temp: &Path, mut file: File, bytes: &[u8], existing: Option<&fs::Metadat
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::{PermissionsExt as _, symlink};
+    use std::os::unix::net::UnixListener;
 
     use super::*;
     use crate::testing::{Sandbox, commit_all, git, write};
@@ -829,6 +852,47 @@ mod tests {
         assert!(!sandbox.path().join("escape.txt").exists());
         assert!(!repo.join(".git/hooks/pre-commit").exists());
         assert_eq!(dir_names(&repo.join("dir")), Vec::<String>::new());
+    }
+
+    #[test]
+    fn write_refusals_say_what_is_in_the_way() {
+        let sandbox = Sandbox::new();
+        let repo = sandbox.repo("repo");
+        fs::create_dir(repo.join("dir")).unwrap();
+        symlink("README.md", repo.join("link")).unwrap();
+        let _socket = UnixListener::bind(repo.join("socket")).unwrap();
+        for (path, why) in [
+            ("link", "is a symlink"),
+            ("dir", "is a directory"),
+            ("socket", "is not a regular file"),
+        ] {
+            for expected_hash in [None, Some(HELLO_HASH)] {
+                match write_file(&repo, path, "x\n", expected_hash) {
+                    Err(Error::InvalidPath {
+                        path: refused,
+                        reason,
+                    }) => assert_eq!((refused.as_str(), reason.as_str()), (path, why)),
+                    other => panic!("{path}: {other:?}"),
+                }
+            }
+        }
+        assert!(repo.join("link").is_symlink());
+        assert_eq!(dir_names(&repo.join("dir")), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_file_in_an_unreadable_directory_is_an_io_error() {
+        let sandbox = Sandbox::new();
+        let repo = sandbox.repo("repo");
+        write(&repo, "locked/f.txt", "f\n");
+        fs::set_permissions(repo.join("locked"), fs::Permissions::from_mode(0o000)).unwrap();
+        let written = write_file(&repo, "locked/f.txt", "x\n", None);
+        fs::set_permissions(repo.join("locked"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(written, Err(Error::Io { .. })), "{written:?}");
+        assert_eq!(
+            fs::read_to_string(repo.join("locked/f.txt")).unwrap(),
+            "f\n"
+        );
     }
 
     #[test]

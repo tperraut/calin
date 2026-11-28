@@ -832,6 +832,161 @@ async fn a_runner_that_cannot_start_fails_the_session() {
     );
 }
 
+/// An agent that no longer takes input, while its output is still open.
+async fn deaf_agent(
+    manager: &SessionManager,
+    starts: &mut Starts,
+) -> (String, mpsc::Sender<RunnerOutput>) {
+    let id = manager
+        .create_session(request("work", Some("puppet")))
+        .await
+        .unwrap()
+        .session
+        .id;
+    let (_, io) = within(starts.recv()).await.unwrap();
+    let AgentIo { outputs, inputs } = io;
+    drop(inputs);
+    (id, outputs)
+}
+
+#[tokio::test]
+async fn a_message_for_an_agent_that_takes_no_input_fails_the_session() {
+    let Fixture {
+        manager,
+        mut starts,
+        dir: _dir,
+    } = fixture().await;
+    let (id, outputs) = deaf_agent(&manager, &mut starts).await;
+    outputs.send(RunnerOutput::TurnEnded).await.unwrap();
+    let before = events_until(&manager, &id, 0, is_status(SessionStatus::Review)).await;
+
+    manager.send_message(&id, "again").await.unwrap();
+    let after = before.len() as u64;
+    let events = events_until(&manager, &id, after, is_status(SessionStatus::Failed)).await;
+    assert_eq!(
+        labels(&events),
+        [
+            "user_message:again",
+            "session_status:running",
+            "error:the agent is no longer running",
+            "agent_status:failed",
+            "session_status:failed",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_message_that_waited_for_an_agent_that_takes_no_input_fails_the_session() {
+    let Fixture {
+        manager,
+        mut starts,
+        dir: _dir,
+    } = fixture().await;
+    let (id, outputs) = deaf_agent(&manager, &mut starts).await;
+    let item = RunnerOutput::Event(EventBody::ItemStarted { item: item("i1") });
+    outputs.send(item).await.unwrap();
+    let before = events_until(&manager, &id, 0, |event| {
+        matches!(event.body, EventBody::ItemStarted { .. })
+    })
+    .await;
+    // It waits for the turn, which then ends.
+    manager.send_message(&id, "next").await.unwrap();
+    outputs.send(RunnerOutput::TurnEnded).await.unwrap();
+    let after = before.len() as u64;
+    let events = events_until(&manager, &id, after, is_status(SessionStatus::Failed)).await;
+    assert_eq!(
+        labels(&events),
+        [
+            "user_message:next",
+            "agent_status:idle",
+            "agent_status:running",
+            "error:the agent is no longer running",
+            "agent_status:failed",
+            "session_status:failed",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_runner_gone_after_a_restart_fails_the_next_turn() {
+    let dir = TempDir::new().unwrap();
+    let (manager, mut starts) = manager_in(&dir, false).await;
+    let id = manager
+        .create_session(request("work", Some("puppet")))
+        .await
+        .unwrap()
+        .session
+        .id;
+    let (_, io) = within(starts.recv()).await.unwrap();
+    emit(&io, RunnerOutput::TurnEnded).await;
+    let before = events_until(&manager, &id, 0, is_status(SessionStatus::Review)).await;
+    manager.store().close().await;
+    drop((manager, io, starts));
+
+    // This server has no puppet runner.
+    let store = Store::open(Home::new(dir.path())).await.unwrap();
+    let registry = RunnerRegistry::new(RegistryConfig {
+        dry_run: false,
+        mock: MockConfig {
+            delay: Duration::ZERO,
+        },
+        claude: None,
+    });
+    let manager = SessionManager::start_with(store, registry, config())
+        .await
+        .unwrap();
+    manager.send_message(&id, "again").await.unwrap();
+    let after = before.len() as u64;
+    let events = events_until(&manager, &id, after, is_status(SessionStatus::Failed)).await;
+    assert_eq!(
+        labels(&events),
+        [
+            "user_message:again",
+            "session_status:running",
+            "error:runner puppet is not available",
+            "agent_status:failed",
+            "session_status:failed",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_working_directory_that_cannot_be_made_fails_the_turn() {
+    let Fixture {
+        manager,
+        mut starts,
+        dir,
+    } = fixture().await;
+    let id = manager
+        .create_session(request("work", Some("puppet")))
+        .await
+        .unwrap()
+        .session
+        .id;
+    let (_, io) = within(starts.recv()).await.unwrap();
+    emit(&io, RunnerOutput::Exited(Exit::Ok)).await;
+    let before = events_until(&manager, &id, 0, is_status(SessionStatus::Review)).await;
+    // Something that is not a folder took the place of the session's own.
+    let work_dir = Home::new(dir.path()).work_dir(&id);
+    std::fs::remove_dir_all(&work_dir).unwrap();
+    std::fs::write(&work_dir, "not a folder").unwrap();
+
+    manager.send_message(&id, "again").await.unwrap();
+    let after = before.len() as u64;
+    let events = events_until(&manager, &id, after, is_status(SessionStatus::Failed)).await;
+    let labels = labels(&events);
+    assert_eq!(
+        labels[..2],
+        ["user_message:again", "session_status:running"]
+    );
+    assert!(
+        labels[2].starts_with("error:the working directory cannot be used: "),
+        "{labels:?}"
+    );
+    assert_eq!(labels[3..], ["session_status:failed"]);
+    assert!(starts.try_recv().is_err());
+}
+
 #[tokio::test]
 async fn an_agent_that_exits_cleanly_leaves_the_session_in_review_and_can_be_resumed() {
     let Fixture {
@@ -967,6 +1122,28 @@ async fn invalid_input_and_unknown_sessions_are_rejected() {
         manager.terminal_dir(unknown, None).await,
         Err(Error::NotFound(_))
     ));
+}
+
+#[tokio::test]
+async fn a_command_queued_for_a_driver_that_cannot_go_on_is_refused() {
+    let Fixture {
+        manager, dir: _dir, ..
+    } = fixture().await;
+    // A driver that cannot load its session ends before it takes any command.
+    let unknown = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    let interrupted = manager.command(unknown, |reply| Command::Interrupt { reply });
+    let asked = manager.command(unknown, |reply| Command::Ask {
+        agent_id: "a".to_owned(),
+        question: "q".to_owned(),
+        options: Vec::new(),
+        reply,
+    });
+    for refused in [within(interrupted).await, within(asked).await.map(drop)] {
+        assert!(
+            matches!(&refused, Err(Error::Conflict(why)) if why == "the session is no longer active"),
+            "{refused:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -2342,6 +2519,54 @@ async fn completed_edits_become_file_changes_caused_by_their_tool_call() {
             change("m1", Some(&api_id), "a.txt", FileOp::Rename),
             change("m1", Some(&api_id), "deep/b.txt", FileOp::Rename),
         ]
+    );
+}
+
+#[tokio::test]
+async fn a_diff_shows_an_edited_file_against_the_base_and_a_renamed_one_against_its_old_path() {
+    let Fixture {
+        manager, dir: _dir, ..
+    } = fixture().await;
+    let clones = TempDir::new().unwrap();
+    let api = registered(&manager, clones.path(), "api").await;
+    // A clone without a commit has no base to compare with.
+    let empty = clones.path().join("docs");
+    std::fs::create_dir_all(&empty).unwrap();
+    git(&empty, &["init", "-q"]);
+    let path = empty.to_str().unwrap().to_owned();
+    let request_docs = RegisterRepoRequest { path, name: None };
+    let docs = manager.register_repo(request_docs).await.unwrap();
+    let mut wanted = request("Make a note", None);
+    wanted.repos = vec![attach(&api, None), attach(&docs, Some(RepoMode::Read))];
+    let id = manager.create_session(wanted).await.unwrap().session.id;
+    events_until(&manager, &id, 0, is_status(SessionStatus::Review)).await;
+    let detail = manager.get(&id).await.unwrap();
+    let (write, read) = (&detail.repos[0], &detail.repos[1]);
+    let dir = Path::new(&write.path);
+    let readme = std::fs::read_to_string(dir.join("README.md")).unwrap();
+    std::fs::write(dir.join("README.md"), format!("{readme}more\n")).unwrap();
+
+    let edited = manager
+        .file_diff(&id, &write.id, "README.md")
+        .await
+        .unwrap();
+    let more = format!("{readme}more\n");
+    assert_eq!(
+        (edited.old.as_deref(), edited.new.as_deref()),
+        (Some(readme.as_str()), Some(more.as_str()))
+    );
+
+    git(dir, &["mv", "README.md", "GUIDE.md"]);
+    let moved = manager.file_diff(&id, &write.id, "GUIDE.md").await.unwrap();
+    assert_eq!(
+        (moved.old.as_deref(), moved.new.as_deref()),
+        (Some(readme.as_str()), Some(more.as_str()))
+    );
+
+    let unbased = manager.file_diff(&id, &read.id, "README.md").await;
+    assert!(
+        matches!(&unbased, Err(Error::Conflict(why)) if why == "docs has no commit to compare with"),
+        "{unbased:?}"
     );
 }
 

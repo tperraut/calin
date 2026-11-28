@@ -1,7 +1,8 @@
 //! Reading file content: size limits, hashing, and telling text from binary.
 
 use std::fs::File;
-use std::io::{ErrorKind, Read as _};
+use std::io::{self, ErrorKind, Read};
+use std::ops::ControlFlow;
 use std::path::Path;
 
 use sha2::{Digest as _, Sha256};
@@ -42,6 +43,27 @@ pub(crate) fn read_capped(path: &Path, max_bytes: u64) -> Result<Option<Vec<u8>>
     Ok((bytes.len() as u64 <= max_bytes).then_some(bytes))
 }
 
+/// Hands what `reader` holds to `each`, one chunk at a time, until the end or
+/// until `each` breaks. An interrupted read is tried again.
+pub(crate) fn read_chunks(
+    mut reader: impl Read,
+    mut each: impl FnMut(&[u8]) -> ControlFlow<()>,
+) -> io::Result<()> {
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => return Ok(()),
+            Ok(n) => {
+                if each(&buf[..n]).is_break() {
+                    return Ok(());
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// A file read once, start to end.
 pub(crate) struct Hashed {
     /// The content, or `None` when it is larger than the limit.
@@ -54,26 +76,21 @@ pub(crate) struct Hashed {
 /// Size, hash and content come from the same pass, so they describe the same
 /// bytes even while an agent is writing the file.
 pub(crate) fn read_hashed(path: &Path, max_bytes: u64) -> Result<Hashed> {
-    let mut file = File::open(path).map_err(|e| Error::io(path, e))?;
+    let file = File::open(path).map_err(|e| Error::io(path, e))?;
     let mut hasher = Sha256::new();
     let mut kept = Some(Vec::new());
     let mut size = 0u64;
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let n = match file.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-            Err(e) => return Err(Error::io(path, e)),
-        };
-        hasher.update(&buf[..n]);
-        size += n as u64;
+    read_chunks(file, |chunk| {
+        hasher.update(chunk);
+        size += chunk.len() as u64;
         if size > max_bytes {
             kept = None;
         } else if let Some(bytes) = kept.as_mut() {
-            bytes.extend_from_slice(&buf[..n]);
+            bytes.extend_from_slice(chunk);
         }
-    }
+        ControlFlow::Continue(())
+    })
+    .map_err(|e| Error::io(path, e))?;
     Ok(Hashed {
         bytes: kept,
         size,

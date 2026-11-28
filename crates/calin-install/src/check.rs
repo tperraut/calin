@@ -155,29 +155,22 @@ pub struct CheckResult {
 }
 
 impl CheckResult {
-    fn pass(check: Check, reason: impl Into<String>) -> Self {
+    fn new(check: Check, status: Status, reason: impl Into<String>) -> Self {
         Self {
             check,
-            status: Status::Pass,
+            status,
             reason: reason.into(),
             remedy: None,
         }
+    }
+    fn pass(check: Check, reason: impl Into<String>) -> Self {
+        Self::new(check, Status::Pass, reason)
     }
     fn fail(check: Check, reason: impl Into<String>, remedy: impl Into<String>) -> Self {
-        Self {
-            check,
-            status: Status::Fail,
-            reason: reason.into(),
-            remedy: Some(remedy.into()),
-        }
+        Self::new(check, Status::Fail, reason).with_remedy(remedy)
     }
     fn unknown(check: Check, reason: impl Into<String>) -> Self {
-        Self {
-            check,
-            status: Status::CouldNotCheck,
-            reason: reason.into(),
-            remedy: None,
-        }
+        Self::new(check, Status::CouldNotCheck, reason)
     }
     fn with_remedy(mut self, remedy: impl Into<String>) -> Self {
         self.remedy = Some(remedy.into());
@@ -339,72 +332,99 @@ fn systemctl(probes: Probes<'_>, verb: &str, check: Check) -> CheckResult {
     }
 }
 
+const REINSTALL_ENV: &str = "install the calin.env that `calin server install` renders";
+
+/// The environment file in three steps; the first that fails gives the result.
 fn env_file(target: &CheckTarget, probes: Probes<'_>) -> CheckResult {
+    let checked = env_file_guarded(probes)
+        .and_then(|()| env_file_pairs(probes))
+        .and_then(|pairs| env_file_values(target, &pairs));
+    match checked {
+        Ok(()) => CheckResult::pass(
+            Check::EnvFile,
+            format!("{ENV_PATH} has mode 0600, owner root, and every required variable"),
+        ),
+        Err(result) => result,
+    }
+}
+
+/// The file exists with mode 0600 and owner root: it holds a secret.
+fn env_file_guarded(probes: Probes<'_>) -> Result<(), CheckResult> {
     let check = Check::EnvFile;
-    let path = Path::new(ENV_PATH);
-    let info = match probes.files.metadata(path) {
+    let info = match probes.files.metadata(Path::new(ENV_PATH)) {
         Ok(info) => info,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return CheckResult::fail(
+            return Err(CheckResult::fail(
                 check,
                 format!("{ENV_PATH} does not exist"),
                 "install it from the staged calin.env as `calin server install` prints",
-            );
+            ));
         }
         Err(error) => {
-            return CheckResult::unknown(check, format!("cannot inspect {ENV_PATH}: {error}"))
-                .with_remedy("run the check as root");
+            return Err(
+                CheckResult::unknown(check, format!("cannot inspect {ENV_PATH}: {error}"))
+                    .with_remedy("run the check as root"),
+            );
         }
     };
-    if info.mode & 0o7777 != 0o600 {
-        return CheckResult::fail(
+    let mode = info.mode & 0o7777;
+    if mode != 0o600 {
+        return Err(CheckResult::fail(
             check,
-            format!(
-                "{ENV_PATH} has mode {:04o}; it holds a secret and must be 0600",
-                info.mode & 0o7777
-            ),
+            format!("{ENV_PATH} has mode {mode:04o}; it holds a secret and must be 0600"),
             format!("chmod 600 {ENV_PATH}"),
-        );
+        ));
     }
     if info.uid != 0 {
-        return CheckResult::fail(
+        return Err(CheckResult::fail(
             check,
             format!("{ENV_PATH} is owned by uid {}, not root", info.uid),
             format!("chown root:root {ENV_PATH}"),
-        );
+        ));
     }
-    let bytes = match probes.files.read(path) {
+    Ok(())
+}
+
+/// The file's variables, read as systemd reads them.
+fn env_file_pairs(probes: Probes<'_>) -> Result<Vec<(String, String)>, CheckResult> {
+    let check = Check::EnvFile;
+    let bytes = match probes.files.read(Path::new(ENV_PATH)) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-            return CheckResult::unknown(
+            return Err(CheckResult::unknown(
                 check,
                 format!(
                     "{ENV_PATH} has mode 0600 and owner root, but only root can read its variables"
                 ),
             )
-            .with_remedy("run the check as root to verify the variables");
+            .with_remedy("run the check as root to verify the variables"));
         }
         Err(error) => {
-            return CheckResult::unknown(check, format!("cannot read {ENV_PATH}: {error}"));
+            return Err(CheckResult::unknown(
+                check,
+                format!("cannot read {ENV_PATH}: {error}"),
+            ));
         }
     };
-    let Ok(text) = String::from_utf8(bytes) else {
-        return CheckResult::fail(
+    let text = String::from_utf8(bytes).map_err(|_| {
+        CheckResult::fail(
             check,
             format!("{ENV_PATH} is not valid UTF-8"),
-            "install the calin.env that `calin server install` renders",
-        );
-    };
-    let pairs = match parse_env_file(&text) {
-        Ok(pairs) => pairs,
-        Err(error) => {
-            return CheckResult::fail(
-                check,
-                format!("{ENV_PATH} cannot be read as systemd reads it ({error})"),
-                "install the calin.env that `calin server install` renders",
-            );
-        }
-    };
+            REINSTALL_ENV,
+        )
+    })?;
+    parse_env_file(&text).map_err(|error| {
+        CheckResult::fail(
+            check,
+            format!("{ENV_PATH} cannot be read as systemd reads it ({error})"),
+            REINSTALL_ENV,
+        )
+    })
+}
+
+/// Every required variable is set, and the domain and issuer match the target.
+fn env_file_values(target: &CheckTarget, pairs: &[(String, String)]) -> Result<(), CheckResult> {
+    let check = Check::EnvFile;
     let value = |key: &str| {
         pairs
             .iter()
@@ -418,11 +438,11 @@ fn env_file(target: &CheckTarget, probes: Probes<'_>) -> CheckResult {
         .filter(|key| value(key).is_none())
         .collect();
     if !missing.is_empty() {
-        return CheckResult::fail(
+        return Err(CheckResult::fail(
             check,
             format!("{ENV_PATH} lacks {}", missing.join(", ")),
-            "install the calin.env that `calin server install` renders",
-        );
+            REINSTALL_ENV,
+        ));
     }
     // Compared, never printed.
     let mut mismatched = Vec::new();
@@ -433,16 +453,13 @@ fn env_file(target: &CheckTarget, probes: Probes<'_>) -> CheckResult {
         mismatched.push("CALIN_OIDC_ISSUER does not match the issuer");
     }
     if !mismatched.is_empty() {
-        return CheckResult::fail(
+        return Err(CheckResult::fail(
             check,
             format!("{ENV_PATH}: {}", mismatched.join("; ")),
             "check the domain and issuer given to check, or re-install calin.env",
-        );
+        ));
     }
-    CheckResult::pass(
-        check,
-        format!("{ENV_PATH} has mode 0600, owner root, and every required variable"),
-    )
+    Ok(())
 }
 
 fn is_public_health(body: &[u8]) -> Option<bool> {
@@ -639,8 +656,12 @@ fn as_service_user(
 }
 
 fn agent_clis(target: &CheckTarget, probes: Probes<'_>) -> [CheckResult; 2] {
+    [claude_cli(target, probes), gh_cli(target, probes)]
+}
+
+fn claude_cli(target: &CheckTarget, probes: Probes<'_>) -> CheckResult {
     let user = target.layout().user();
-    let claude = match as_service_user(target, probes, "claude", &["--version"]) {
+    match as_service_user(target, probes, "claude", &["--version"]) {
         Err(reason) => CheckResult::unknown(Check::Claude, reason),
         Ok(Ok(output)) if output.code == Some(0) => {
             let version = output.stdout.lines().next().unwrap_or_default().trim();
@@ -666,9 +687,13 @@ fn agent_clis(target: &CheckTarget, probes: Probes<'_>) -> [CheckResult; 2] {
         Ok(Err(error)) => {
             CheckResult::unknown(Check::Claude, format!("could not run claude: {error}"))
         }
-    };
-    // The output of `gh auth status` is not shown: it describes the token.
-    let gh = match as_service_user(target, probes, "gh", &["auth", "status"]) {
+    }
+}
+
+/// The output of `gh auth status` is not shown: it describes the token.
+fn gh_cli(target: &CheckTarget, probes: Probes<'_>) -> CheckResult {
+    let user = target.layout().user();
+    match as_service_user(target, probes, "gh", &["auth", "status"]) {
         Err(reason) => CheckResult::unknown(Check::Gh, reason),
         Ok(Ok(output)) if output.code == Some(0) => {
             CheckResult::pass(Check::Gh, format!("`gh auth status` succeeds as {user}"))
@@ -687,8 +712,7 @@ fn agent_clis(target: &CheckTarget, probes: Probes<'_>) -> [CheckResult; 2] {
             format!("sign in as {user}: in Calin's terminal, or `sudo -u {user} -H gh auth login`"),
         ),
         Ok(Err(error)) => CheckResult::unknown(Check::Gh, format!("could not run gh: {error}")),
-    };
-    [claude, gh]
+    }
 }
 
 fn exit_text(output: &CommandOutput) -> String {
@@ -1084,6 +1108,36 @@ mod tests {
         let other = case(root600(), Ok(other_domain.into_bytes()));
         assert_eq!(other.status, Status::Fail);
         assert!(other.reason.contains("CALIN_PUBLIC_URL does not match"));
+        assert!(!other.reason.contains("CALIN_OIDC_ISSUER"), "{other:?}");
+
+        let other_issuer = env.replace(ISSUER, "https://other.example.com/");
+        let other = case(root600(), Ok(other_issuer.into_bytes()));
+        assert_eq!(other.status, Status::Fail);
+        assert_eq!(
+            other.reason,
+            "/etc/calin/calin.env: CALIN_OIDC_ISSUER does not match the issuer"
+        );
+
+        let both = env
+            .replace("https://calin.example.com", "https://other.example.com")
+            .replace(ISSUER, "https://other.example.com/");
+        let both = case(root600(), Ok(both.into_bytes()));
+        assert_eq!(
+            both.reason,
+            "/etc/calin/calin.env: CALIN_PUBLIC_URL does not match the domain; CALIN_OIDC_ISSUER does not match the issuer"
+        );
+
+        let not_utf8 = case(root600(), Ok(b"CALIN_X=\xff\n".to_vec()));
+        assert_eq!(not_utf8.status, Status::Fail);
+        assert!(not_utf8.reason.contains("not valid UTF-8"), "{not_utf8:?}");
+
+        let read_error = case(root600(), Err(io_error(io::ErrorKind::InvalidData)));
+        assert_eq!(read_error.status, Status::CouldNotCheck);
+        assert!(
+            read_error.reason.starts_with("cannot read"),
+            "{read_error:?}"
+        );
+        assert!(read_error.remedy.is_none());
 
         let ok = case(root600(), Ok(env.into_bytes()));
         assert_eq!(ok.status, Status::Pass);
@@ -1116,6 +1170,11 @@ mod tests {
         assert_eq!(status(&report, Check::LoopbackHealth), Status::Fail);
         let report = run(&base().http(LOOPBACK, page(200, "not json")));
         assert_eq!(status(&report, Check::LoopbackHealth), Status::Fail);
+        let other = r#"{"name":"other","auth":"required"}"#;
+        let report = run(&base().http(LOOPBACK, page(200, other)));
+        let result = report.get(Check::LoopbackHealth).unwrap();
+        assert_eq!(result.status, Status::Fail);
+        assert!(result.reason.contains("without Calin's health body"));
     }
 
     #[test]
@@ -1250,6 +1309,21 @@ mod tests {
 
         let report = run(&base().command(CLAUDE, Err(CommandError::TimedOut)));
         assert_eq!(status(&report, Check::Claude), Status::CouldNotCheck);
+
+        let report = run(&base().command(GH, Err(CommandError::TimedOut)));
+        let result = report.get(Check::Gh).unwrap();
+        assert_eq!(result.status, Status::CouldNotCheck);
+        assert!(result.reason.starts_with("could not run gh"), "{result:?}");
+
+        let killed = Ok(CommandOutput {
+            code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+        });
+        let report = run(&base().command(CLAUDE, killed));
+        let result = report.get(Check::Claude).unwrap();
+        assert_eq!(result.status, Status::Fail);
+        assert_eq!(result.reason, "`claude --version` exited with a signal");
     }
 
     #[test]

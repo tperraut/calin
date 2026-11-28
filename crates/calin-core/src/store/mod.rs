@@ -26,6 +26,7 @@ use self::writer::{Cmd, Writer};
 use crate::error::{Error, Result};
 use crate::home::Home;
 
+pub(crate) use self::index::agent_ended;
 pub(crate) use self::usage::{UsageQuery, resolve_range};
 
 /// Commands waiting for the writer thread. A full queue slows callers down

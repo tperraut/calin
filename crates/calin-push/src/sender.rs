@@ -264,20 +264,8 @@ impl PushSender {
         kind: PushKind,
         payload: PushPayload,
     ) -> Result<SendReport, SendError> {
-        let payload = PushPayload {
-            kind,
-            title: clean_text(&payload.title, MAX_TITLE_CHARS),
-            body: clean_text(&payload.body, MAX_BODY_CHARS),
-            ..payload
-        };
-        // Encoding a struct of strings into JSON cannot fail; if it ever
-        // did, an empty object is refused by the app rather than misread.
-        let plaintext = serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec());
-        if plaintext.len() > MAX_PLAINTEXT_LEN {
-            return Err(SendError::PayloadTooLarge {
-                len: plaintext.len(),
-            });
-        }
+        let session_id = payload.session_id.clone();
+        let message = Message::new(kind, payload)?;
 
         let (preferences, targets) = self.inner.store.targets(identity);
         if !allows(preferences, kind) {
@@ -286,27 +274,22 @@ impl PushSender {
         if targets.is_empty() {
             return Ok(SendReport::Sent(Vec::new()));
         }
-        if !self.try_throttle(identity, kind, payload.session_id.as_deref()) {
+        if !self.try_throttle(identity, kind, session_id.as_deref()) {
             return Ok(SendReport::Throttled);
         }
+        Ok(SendReport::Sent(
+            self.deliver_all(identity, targets, Arc::new(message)).await,
+        ))
+    }
 
-        let urgency = if kind == PushKind::Waiting {
-            "high"
-        } else {
-            "normal"
-        };
-        // RFC 8030 section 5.4: at most 32 characters of the base64url
-        // alphabet. A hash, so the topic does not reveal the session id.
-        let topic = payload
-            .session_id
-            .as_deref()
-            .map(|session| base64url(&sha256(session.as_bytes())[..24]));
-        let message = Arc::new(Message {
-            plaintext,
-            urgency,
-            topic,
-        });
-
+    /// Delivers `message` to every target, at most `concurrency` at once.
+    /// The deliveries come back in the order of `targets`.
+    async fn deliver_all(
+        &self,
+        identity: &str,
+        targets: Vec<Target>,
+        message: Arc<Message>,
+    ) -> Vec<Delivery> {
         let limit = Arc::new(Semaphore::new(self.inner.config.concurrency));
         let mut tasks = JoinSet::new();
         for (index, target) in targets.into_iter().enumerate() {
@@ -332,12 +315,10 @@ impl PushSender {
             }
         }
         deliveries.sort_by_key(|(index, _)| *index);
-        Ok(SendReport::Sent(
-            deliveries
-                .into_iter()
-                .map(|(_, delivery)| delivery)
-                .collect(),
-        ))
+        deliveries
+            .into_iter()
+            .map(|(_, delivery)| delivery)
+            .collect()
     }
 
     /// Claims the throttle slot for this notification, or says it is taken.
@@ -391,6 +372,64 @@ struct Message {
     topic: Option<String>,
 }
 
+impl Message {
+    /// The message for `payload` as a notification of `kind`: text cut and
+    /// cleaned, encoded, and refused when it cannot fit in one push message.
+    fn new(kind: PushKind, payload: PushPayload) -> Result<Self, SendError> {
+        let payload = PushPayload {
+            kind,
+            title: clean_text(&payload.title, MAX_TITLE_CHARS),
+            body: clean_text(&payload.body, MAX_BODY_CHARS),
+            ..payload
+        };
+        // Encoding a struct of strings into JSON cannot fail; if it ever
+        // did, an empty object is refused by the app rather than misread.
+        let plaintext = serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec());
+        if plaintext.len() > MAX_PLAINTEXT_LEN {
+            return Err(SendError::PayloadTooLarge {
+                len: plaintext.len(),
+            });
+        }
+        let urgency = if kind == PushKind::Waiting {
+            "high"
+        } else {
+            "normal"
+        };
+        // RFC 8030 section 5.4: at most 32 characters of the base64url
+        // alphabet. A hash, so the topic does not reveal the session id.
+        let topic = payload
+            .session_id
+            .as_deref()
+            .map(|session| base64url(&sha256(session.as_bytes())[..24]));
+        Ok(Self {
+            plaintext,
+            urgency,
+            topic,
+        })
+    }
+
+    /// The request headers but `Authorization`.
+    fn headers(&self) -> Vec<(HeaderName, HeaderValue)> {
+        let mut headers = vec![
+            (HeaderName::from_static("ttl"), HeaderValue::from(TTL_SECS)),
+            (
+                header::CONTENT_ENCODING,
+                HeaderValue::from_static("aes128gcm"),
+            ),
+            (
+                HeaderName::from_static("urgency"),
+                HeaderValue::from_static(self.urgency),
+            ),
+        ];
+        if let Some(topic) = &self.topic
+            && let Ok(value) = HeaderValue::try_from(topic.as_str())
+        {
+            headers.push((HeaderName::from_static("topic"), value));
+        }
+        headers
+    }
+}
+
 impl Inner {
     async fn deliver(&self, identity: &str, target: Target, message: &Message) -> Delivery {
         let outcome = match self.post(&target, message).await {
@@ -439,8 +478,15 @@ impl Inner {
         // server accepted, and this sender's policy may be stricter.
         validate_endpoint(target.url.as_str(), self.config.endpoint_policy)
             .map_err(Failure::Endpoint)?;
-        let body = encrypt(&message.plaintext, &target.keys)
-            .map_err(|error| Failure::Crypto(error.to_string()))?;
+        let body = encrypt(&message.plaintext, &target.keys).map_err(crypto)?;
+        let mut headers = vec![(header::AUTHORIZATION, self.authorization(target)?)];
+        headers.extend(message.headers());
+        let response = self.http.post(&target.url, headers, body).await?;
+        status_outcome(response.status, response.excerpt)
+    }
+
+    /// The signed VAPID token for `target`'s push service.
+    fn authorization(&self, target: &Target) -> Result<HeaderValue, Failure> {
         let authorization = self
             .keys
             .authorization(
@@ -448,48 +494,37 @@ impl Inner {
                 &self.config.subject,
                 self.clock.now_secs(),
             )
-            .map_err(|error| Failure::Crypto(error.to_string()))?;
-        let mut authorization = HeaderValue::try_from(authorization)
-            .map_err(|error| Failure::Crypto(error.to_string()))?;
+            .map_err(crypto)?;
+        let mut authorization = HeaderValue::try_from(authorization).map_err(crypto)?;
         // Keeps the token out of any Debug output of the request.
         authorization.set_sensitive(true);
+        Ok(authorization)
+    }
+}
 
-        let mut headers = vec![
-            (header::AUTHORIZATION, authorization),
-            (HeaderName::from_static("ttl"), HeaderValue::from(TTL_SECS)),
-            (
-                header::CONTENT_ENCODING,
-                HeaderValue::from_static("aes128gcm"),
-            ),
-            (
-                HeaderName::from_static("urgency"),
-                HeaderValue::from_static(message.urgency),
-            ),
-        ];
-        if let Some(topic) = &message.topic
-            && let Ok(value) = HeaderValue::try_from(topic.as_str())
-        {
-            headers.push((HeaderName::from_static("topic"), value));
-        }
+fn crypto(error: impl fmt::Display) -> Failure {
+    Failure::Crypto(error.to_string())
+}
 
-        let response =
-            self.http
-                .post(&target.url, headers, body)
-                .await
-                .map_err(|error| match error {
-                    HttpError::Timeout(after) => Failure::Timeout(after),
-                    HttpError::Transport(text) => Failure::Transport(text),
-                })?;
-        let excerpt = response.excerpt;
-        match response.status {
-            201 | 202 => Ok(DeliveryOutcome::Accepted),
-            404 | 410 => Ok(DeliveryOutcome::Gone { removed: false }),
-            413 => Err(Failure::PayloadTooLarge { excerpt }),
-            429 => Err(Failure::RateLimited { excerpt }),
-            status @ 300..=399 => Err(Failure::Redirect { status }),
-            status @ 500..=599 => Err(Failure::ServiceError { status, excerpt }),
-            status => Err(Failure::Refused { status, excerpt }),
+impl From<HttpError> for Failure {
+    fn from(error: HttpError) -> Self {
+        match error {
+            HttpError::Timeout(after) => Self::Timeout(after),
+            HttpError::Transport(text) => Self::Transport(text),
         }
+    }
+}
+
+/// What a push service's answer means for the message.
+fn status_outcome(status: u16, excerpt: String) -> Result<DeliveryOutcome, Failure> {
+    match status {
+        201 | 202 => Ok(DeliveryOutcome::Accepted),
+        404 | 410 => Ok(DeliveryOutcome::Gone { removed: false }),
+        413 => Err(Failure::PayloadTooLarge { excerpt }),
+        429 => Err(Failure::RateLimited { excerpt }),
+        status @ 300..=399 => Err(Failure::Redirect { status }),
+        status @ 500..=599 => Err(Failure::ServiceError { status, excerpt }),
+        status => Err(Failure::Refused { status, excerpt }),
     }
 }
 

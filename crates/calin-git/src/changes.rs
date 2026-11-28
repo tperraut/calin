@@ -2,15 +2,15 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::io::{ErrorKind, Read as _};
+use std::ops::ControlFlow;
 use std::path::Path;
 
 use calin_proto::{ChangeStatus, ChangedFile, FileDiff};
 
 use crate::cmd::{Git, require_commit, work_dir};
-use crate::content::{decode, read_capped};
+use crate::content::{decode, read_capped, read_chunks};
 use crate::error::{Error, Result};
-use crate::path::{clean, resolve_no_follow};
+use crate::path::{clean, metadata_no_follow, resolve_no_follow};
 
 /// Git looks for a NUL in this many leading bytes to call a file binary.
 /// Untracked files are judged the same way so both kinds agree.
@@ -34,13 +34,24 @@ const BINARY_SNIFF: usize = 8000;
 pub fn changes(dir: &Path, base: &str) -> Result<Vec<ChangedFile>> {
     let dir = work_dir(dir)?;
     let base = require_commit(&dir, base)?;
+    let mut tracked = tracked_changes(&dir, &base)?;
+    let mut files = Vec::new();
+    for path in untracked_paths(&dir)? {
+        files.extend(settle_untracked(&dir, &mut tracked, path)?);
+    }
+    files.extend(tracked.into_values().map(|t| t.file));
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(files)
+}
 
+/// The tracked paths whose content differs from `base`, by path.
+fn tracked_changes(dir: &Path, base: &str) -> Result<BTreeMap<String, Tracked>> {
     // Base against the work tree, in one pass: `--raw` gives the status of
     // each path and `--numstat` its line counts. The plumbing command, not
     // `git diff`: that one rewrites the index to refresh it, whatever
     // `GIT_OPTIONAL_LOCKS` says, and an agent's `git add` at the same moment
     // would fail on `index.lock`.
-    let diff = Git::read(&dir)
+    let diff = Git::read(dir)
         .args([
             "diff-index",
             "--raw",
@@ -50,56 +61,62 @@ pub fn changes(dir: &Path, base: &str) -> Result<Vec<ChangedFile>> {
             "--find-renames",
             "--no-ext-diff",
             "--no-textconv",
-            &base,
+            base,
             "--",
         ])
         .run()?;
     let mut tracked = parse_diff(&diff)?;
-    drop_unchanged(&dir, &mut tracked)?;
+    drop_unchanged(dir, &mut tracked)?;
+    Ok(tracked)
+}
 
-    let untracked = Git::read(&dir)
+/// The untracked files git does not ignore, nested repositories left out.
+fn untracked_paths(dir: &Path) -> Result<Vec<String>> {
+    let untracked = Git::read(dir)
         .args(["ls-files", "--others", "--exclude-standard", "-z"])
         .run()?;
-    let mut files = Vec::new();
-    for path in untracked.split(|b| *b == 0) {
-        let path = String::from_utf8_lossy(path).into_owned();
+    Ok(untracked
+        .split(|b| *b == 0)
+        .map(|path| String::from_utf8_lossy(path).into_owned())
         // A trailing slash marks a nested repository.
-        if path.is_empty() || path.ends_with('/') {
-            continue;
-        }
-        match tracked
-            .get(&path)
-            .map(|t| (t.file.status, t.old_blob.clone()))
-        {
-            // In the base and on disk, but dropped from the index (`git rm
-            // --cached`). The diff calls it deleted; against the base it is
-            // modified, or not changed at all.
-            Some((ChangeStatus::Deleted, old_blob)) => {
-                match diff_blob_with_file(&dir, &old_blob, &path)? {
-                    Some(file) => tracked.insert(path, Tracked::settled(file, old_blob)),
-                    None => tracked.remove(&path),
-                };
-            }
-            // Already reported by the diff.
-            Some(_) => {}
-            None => {
-                if let Some((added, binary)) = untracked_stats(&dir.join(&path)) {
-                    files.push(ChangedFile {
-                        path,
-                        old_path: None,
-                        status: ChangeStatus::Untracked,
-                        added,
-                        removed: 0,
-                        binary,
-                    });
-                }
-            }
-        }
-    }
+        .filter(|path| !path.is_empty() && !path.ends_with('/'))
+        .collect())
+}
 
-    files.extend(tracked.into_values().map(|t| t.file));
-    files.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(files)
+/// An untracked `path` against what the diff said about it: the new file to
+/// list, or `None` when the diff accounts for it.
+fn settle_untracked(
+    dir: &Path,
+    tracked: &mut BTreeMap<String, Tracked>,
+    path: String,
+) -> Result<Option<ChangedFile>> {
+    match tracked
+        .get(&path)
+        .map(|t| (t.file.status, t.old_blob.clone()))
+    {
+        // In the base and on disk, but dropped from the index (`git rm
+        // --cached`). The diff calls it deleted; against the base it is
+        // modified, or not changed at all.
+        Some((ChangeStatus::Deleted, old_blob)) => {
+            match diff_blob_with_file(dir, &old_blob, &path)? {
+                Some(file) => tracked.insert(path, Tracked::settled(file, old_blob)),
+                None => tracked.remove(&path),
+            };
+            Ok(None)
+        }
+        // Already reported by the diff.
+        Some(_) => Ok(None),
+        None => Ok(
+            untracked_stats(&dir.join(&path)).map(|(added, binary)| ChangedFile {
+                path,
+                old_path: None,
+                status: ChangeStatus::Untracked,
+                added,
+                removed: 0,
+                binary,
+            }),
+        ),
+    }
 }
 
 /// Both sides of one changed file: its content at `base` and on disk.
@@ -126,10 +143,10 @@ pub fn file_diff(
     let dir = work_dir(dir)?;
     let base = require_commit(&dir, base)?;
     let on_disk = resolve_no_follow(&dir, path)?;
-    let old_rel = match old_path {
-        Some(old) => clean(old)?.join("/"),
-        None => on_disk.rel.clone(),
-    };
+    let old_rel = old_path.map_or_else(
+        || Ok(on_disk.rel.clone()),
+        |old| clean(old).map(|parts| parts.join("/")),
+    )?;
 
     let old = base_side(&dir, &base, &old_rel, max_bytes)?;
     let new = disk_side(&on_disk.abs, max_bytes)?;
@@ -138,18 +155,12 @@ pub fn file_diff(
             "{path} exists neither at the base nor on disk"
         )));
     }
-
-    let too_large = matches!(old, Side::TooLarge) || matches!(new, Side::TooLarge);
-    let binary = matches!(old, Side::Binary) || matches!(new, Side::Binary);
-    let shown = !too_large && !binary;
-    Ok(FileDiff {
-        path: on_disk.rel,
-        old_path: old_path.map(|_| old_rel),
-        old: old.text().filter(|_| shown),
-        new: new.text().filter(|_| shown),
-        binary,
-        too_large,
-    })
+    Ok(Side::compare(
+        old,
+        new,
+        on_disk.rel,
+        old_path.map(|_| old_rel),
+    ))
 }
 
 /// One side of a [`FileDiff`].
@@ -169,6 +180,22 @@ impl Side {
         match self {
             Self::Text(text) => Some(text),
             _ => None,
+        }
+    }
+
+    /// The diff of `path` from both sides: no text on either side as soon
+    /// as one is binary or too large.
+    fn compare(old: Self, new: Self, path: String, old_path: Option<String>) -> FileDiff {
+        let too_large = matches!(old, Self::TooLarge) || matches!(new, Self::TooLarge);
+        let binary = matches!(old, Self::Binary) || matches!(new, Self::Binary);
+        let shown = !too_large && !binary;
+        FileDiff {
+            path,
+            old_path,
+            old: old.text().filter(|_| shown),
+            new: new.text().filter(|_| shown),
+            binary,
+            too_large,
         }
     }
 }
@@ -209,12 +236,8 @@ fn base_side(dir: &Path, base: &str, rel: &str, max_bytes: u64) -> Result<Side> 
 
 /// The content at `path`, whose last component has not been resolved.
 fn disk_side(path: &Path, max_bytes: u64) -> Result<Side> {
-    let meta = match fs::symlink_metadata(path) {
-        Ok(meta) => meta,
-        Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
-            return Ok(Side::Absent);
-        }
-        Err(e) => return Err(Error::io(path, e)),
+    let Some(meta) = metadata_no_follow(path)? else {
+        return Ok(Side::Absent);
     };
     if meta.is_symlink() {
         // What git stores for a link, and it never reads through it.
@@ -234,6 +257,11 @@ fn disk_side(path: &Path, max_bytes: u64) -> Result<Side> {
     if meta.len() > max_bytes {
         return Ok(Side::TooLarge);
     }
+    file_side(path, max_bytes)
+}
+
+/// The content of the regular file at `path`.
+fn file_side(path: &Path, max_bytes: u64) -> Result<Side> {
     match read_capped(path, max_bytes) {
         Ok(Some(bytes)) => Ok(Side::of(bytes)),
         // It grew past the limit between the two looks.
@@ -264,14 +292,22 @@ impl Tracked {
             counted: true,
         }
     }
+
+    /// Records the line counts git reported; `None` marks a binary file.
+    fn count(&mut self, counts: Option<(u32, u32)>) {
+        self.counted = true;
+        match counts {
+            Some((added, removed)) => {
+                self.file.added = added;
+                self.file.removed = removed;
+            }
+            None => self.file.binary = true,
+        }
+    }
 }
 
 /// Parses `git diff-index --raw --numstat -z`: all raw records, then all numstat records.
 fn parse_diff(out: &[u8]) -> Result<BTreeMap<String, Tracked>> {
-    let malformed = || Error::Git {
-        command: "git diff-index --raw --numstat -z".into(),
-        stderr: "unexpected output".into(),
-    };
     let mut files: BTreeMap<String, Tracked> = BTreeMap::new();
     let mut fields = out
         .split(|b| *b == 0)
@@ -281,76 +317,94 @@ fn parse_diff(out: &[u8]) -> Result<BTreeMap<String, Tracked>> {
             continue;
         }
         if let Some(raw) = field.strip_prefix(':') {
-            // `<old mode> <new mode> <old id> <new id> <status><score>`, then
-            // the path, or the old and the new path for a rename or a copy.
-            let raw: Vec<&str> = raw.split(' ').collect();
-            let &[old_mode, new_mode, old_blob, new_blob, status] = raw.as_slice() else {
-                return Err(malformed());
-            };
-            let code = status.chars().next().ok_or_else(malformed)?;
-            let first = fields.next().ok_or_else(malformed)?;
-            let (status, old_path, path) = match code {
-                'R' => (
-                    ChangeStatus::Renamed,
-                    Some(first),
-                    fields.next().ok_or_else(malformed)?,
-                ),
-                // Copies are not asked for; should git report one, it is a new file.
-                'C' => (
-                    ChangeStatus::Added,
-                    None,
-                    fields.next().ok_or_else(malformed)?,
-                ),
-                'A' => (ChangeStatus::Added, None, first),
-                'D' => (ChangeStatus::Deleted, None, first),
-                // Content, mode or type changed, or the path is in a merge conflict.
-                _ => (ChangeStatus::Modified, None, first),
-            };
-            let file = ChangedFile {
-                path: path.clone(),
-                old_path,
-                status,
-                added: 0,
-                removed: 0,
-                binary: false,
-            };
-            let tracked = Tracked {
-                file,
-                old_blob: old_blob.to_owned(),
-                // An all-zero id stands for "whatever is on disk".
-                unverified: code == 'M'
-                    && old_mode == new_mode
-                    && new_blob.bytes().all(|b| b == b'0'),
-                counted: false,
-            };
-            files.insert(path, tracked);
+            let tracked = parse_raw(raw, &mut fields)?;
+            files.insert(tracked.file.path.clone(), tracked);
         } else {
-            // `<added>\t<removed>\t<path>`, or with an empty path followed by
-            // the old and the new path. Binary files have `-` for both counts.
-            let mut parts = field.splitn(3, '\t');
-            let added = parts.next().ok_or_else(malformed)?;
-            let removed = parts.next().ok_or_else(malformed)?;
-            let path = match parts.next().ok_or_else(malformed)? {
-                "" => {
-                    fields.next().ok_or_else(malformed)?;
-                    fields.next().ok_or_else(malformed)?
-                }
-                path => path.to_owned(),
-            };
-            let Some(tracked) = files.get_mut(&path) else {
-                return Err(malformed());
-            };
-            tracked.counted = true;
-            match (added.parse(), removed.parse()) {
-                (Ok(added), Ok(removed)) => {
-                    tracked.file.added = added;
-                    tracked.file.removed = removed;
-                }
-                _ => tracked.file.binary = true,
-            }
+            let (path, counts) = parse_numstat(&field, &mut fields)?;
+            files.get_mut(&path).ok_or_else(malformed)?.count(counts);
         }
     }
     Ok(files)
+}
+
+/// The error for diff output that is not what git writes.
+fn malformed() -> Error {
+    Error::Git {
+        command: "git diff-index --raw --numstat -z".into(),
+        stderr: "unexpected output".into(),
+    }
+}
+
+fn next_field(fields: &mut impl Iterator<Item = String>) -> Result<String> {
+    fields.next().ok_or_else(malformed)
+}
+
+/// A raw record: `<old mode> <new mode> <old id> <new id> <status><score>`,
+/// then the path, or the old and the new path for a rename or a copy.
+fn parse_raw(raw: &str, fields: &mut impl Iterator<Item = String>) -> Result<Tracked> {
+    let raw: Vec<&str> = raw.split(' ').collect();
+    let &[old_mode, new_mode, old_blob, new_blob, status] = raw.as_slice() else {
+        return Err(malformed());
+    };
+    let code = status.chars().next().ok_or_else(malformed)?;
+    let (status, old_path, path) = raw_paths(code, fields)?;
+    Ok(Tracked {
+        file: ChangedFile {
+            path,
+            old_path,
+            status,
+            added: 0,
+            removed: 0,
+            binary: false,
+        },
+        old_blob: old_blob.to_owned(),
+        // An all-zero id stands for "whatever is on disk".
+        unverified: code == 'M' && old_mode == new_mode && new_blob.bytes().all(|b| b == b'0'),
+        counted: false,
+    })
+}
+
+/// The status a raw record's status letter stands for, with its old path
+/// (for a rename) and its path.
+fn raw_paths(
+    code: char,
+    fields: &mut impl Iterator<Item = String>,
+) -> Result<(ChangeStatus, Option<String>, String)> {
+    let first = next_field(fields)?;
+    Ok(match code {
+        'R' => (ChangeStatus::Renamed, Some(first), next_field(fields)?),
+        // Copies are not asked for; should git report one, it is a new file.
+        'C' => (ChangeStatus::Added, None, next_field(fields)?),
+        'A' => (ChangeStatus::Added, None, first),
+        'D' => (ChangeStatus::Deleted, None, first),
+        // Content, mode or type changed, or the path is in a merge conflict.
+        _ => (ChangeStatus::Modified, None, first),
+    })
+}
+
+/// A numstat record: `<added>\t<removed>\t<path>`, or with an empty path
+/// followed by the old and the new path. The path, and its line counts.
+fn parse_numstat(
+    field: &str,
+    fields: &mut impl Iterator<Item = String>,
+) -> Result<(String, Option<(u32, u32)>)> {
+    let mut parts = field.splitn(3, '\t');
+    let added = parts.next().ok_or_else(malformed)?;
+    let removed = parts.next().ok_or_else(malformed)?;
+    let path = match parts.next().ok_or_else(malformed)? {
+        "" => {
+            next_field(fields)?;
+            next_field(fields)?
+        }
+        path => path.to_owned(),
+    };
+    Ok((path, line_counts(added, removed)))
+}
+
+/// Added and removed line counts as git prints them; `None` for a binary
+/// file, which has `-` for both.
+fn line_counts(added: &str, removed: &str) -> Option<(u32, u32)> {
+    added.parse().ok().zip(removed.parse().ok())
 }
 
 /// Removes the entries that only look modified. This is the work `git diff`
@@ -419,7 +473,7 @@ fn diff_blob_with_file(dir: &Path, blob: &str, path: &str) -> Result<Option<Chan
     let (Some(added), Some(removed)) = (counts.next(), counts.next()) else {
         return Ok(None);
     };
-    let counts = added.parse().ok().zip(removed.parse().ok());
+    let counts = line_counts(added, removed);
     let pair = [(path.to_owned(), blob.to_owned())];
     if counts.is_none() && !same_as_blob(dir, &pair)?.is_empty() {
         return Ok(None);
@@ -446,27 +500,27 @@ fn untracked_stats(path: &Path) -> Option<(u32, bool)> {
     if !meta.is_file() {
         return None;
     }
-    let mut file = File::open(path).ok()?;
-    let mut buf = vec![0u8; 64 * 1024];
-    let (mut seen, mut lines, mut last) = (0usize, 0u32, b'\n');
-    loop {
-        let n = match file.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-            Err(_) => return None,
-        };
-        let chunk = &buf[..n];
-        if seen < BINARY_SNIFF {
-            let sniffed = &chunk[..n.min(BINARY_SNIFF - seen)];
-            if sniffed.contains(&0) {
-                return Some((0, true));
-            }
+    count_lines(File::open(path).ok()?)
+}
+
+/// Line count and binary flag of what `file` holds. `None` when it cannot be read.
+fn count_lines(file: File) -> Option<(u32, bool)> {
+    let (mut seen, mut lines, mut last, mut binary) = (0usize, 0u32, b'\n', false);
+    read_chunks(file, |chunk| {
+        let sniffed = &chunk[..chunk.len().min(BINARY_SNIFF.saturating_sub(seen))];
+        if sniffed.contains(&0) {
+            binary = true;
+            return ControlFlow::Break(());
         }
-        seen = seen.saturating_add(n);
+        seen = seen.saturating_add(chunk.len());
         let newlines = chunk.iter().filter(|b| **b == b'\n').count();
         lines = lines.saturating_add(u32::try_from(newlines).unwrap_or(u32::MAX));
-        last = chunk[n - 1];
+        last = chunk.last().copied().unwrap_or(last);
+        ControlFlow::Continue(())
+    })
+    .ok()?;
+    if binary {
+        return Some((0, true));
     }
     // A last line without a newline is still a line.
     if last != b'\n' {
@@ -478,6 +532,7 @@ fn untracked_stats(path: &Path) -> Option<(u32, bool)> {
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::{PermissionsExt as _, symlink};
+    use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
     use std::time::{Duration, SystemTime};
 
@@ -644,6 +699,36 @@ mod tests {
             &wt,
             &base,
             vec![change("edited.txt", ChangeStatus::Modified, 1, 0)],
+        );
+    }
+
+    #[test]
+    fn untracked_files_are_counted_across_reads_and_sniffed_like_git() {
+        let sandbox = Sandbox::new();
+        let (wt, base) = session(&sandbox, &[]);
+        // Larger than one read, with a last line that has no newline.
+        let mut long = "line\n".repeat(30_000);
+        long.push_str("end");
+        write(&wt, "long.txt", &long);
+        // Git only looks for a NUL in the first 8000 bytes.
+        let mut late_nul = vec![b'a'; 8000];
+        late_nul.extend_from_slice(b"\0\n");
+        write(&wt, "late-nul.txt", &late_nul);
+        let mut early_nul = vec![b'a'; 7999];
+        early_nul.extend_from_slice(b"\0\n");
+        write(&wt, "early-nul.bin", &early_nul);
+
+        assert_changes(
+            &wt,
+            &base,
+            vec![
+                change("long.txt", ChangeStatus::Untracked, 30_001, 0),
+                change("late-nul.txt", ChangeStatus::Untracked, 1, 0),
+                ChangedFile {
+                    binary: true,
+                    ..change("early-nul.bin", ChangeStatus::Untracked, 0, 0)
+                },
+            ],
         );
     }
 
@@ -1033,6 +1118,71 @@ mod tests {
             file_diff(&wt, &base, "outside-dir/secret.txt", None, MIB),
             Err(Error::InvalidPath { .. })
         ));
+    }
+
+    #[test]
+    fn diff_output_that_is_not_what_git_writes_is_an_error() {
+        for out in [
+            &b":100644 100644 aaa bbb\0a.txt\0"[..],
+            b":100644 100644 aaa bbb \0a.txt\0",
+            b":100644 100644 aaa bbb M",
+            b":100644 100644 aaa bbb R100\0old.txt",
+            b":100644 100644 aaa bbb C100\0old.txt",
+            b"1\0",
+            b"1\t2\0",
+            b"1\t2\t\0old.txt\0",
+            b":100644 100644 aaa bbb M\0a.txt\x001\t2\tother.txt\0",
+        ] {
+            let parsed = parse_diff(out);
+            assert!(
+                matches!(
+                    &parsed,
+                    Err(Error::Git { command, stderr })
+                        if command == "git diff-index --raw --numstat -z"
+                            && stderr == "unexpected output"
+                ),
+                "{:?}",
+                String::from_utf8_lossy(out)
+            );
+        }
+    }
+
+    #[test]
+    fn a_copy_in_the_diff_is_a_new_file() {
+        let zero = "0".repeat(40);
+        let out = format!(
+            ":100644 100644 aaa {zero} C075\0src.txt\0copy.txt\0\
+             3\t0\t\0src.txt\0copy.txt\0"
+        );
+        let parsed = parse_diff(out.as_bytes()).unwrap();
+        let copy = &parsed["copy.txt"];
+        assert_eq!(copy.file, change("copy.txt", ChangeStatus::Added, 3, 0));
+        assert_eq!(copy.old_blob, "aaa");
+        assert!(copy.counted && !copy.unverified);
+        assert_eq!(parsed.len(), 1);
+    }
+
+    #[test]
+    fn a_socket_is_not_a_change_and_its_diff_is_binary() {
+        let sandbox = Sandbox::new();
+        let (wt, base) = session(&sandbox, &[("a.txt", "a\n")]);
+        let _socket = UnixListener::bind(wt.join("socket")).unwrap();
+
+        assert_changes(&wt, &base, vec![]);
+        let d = diff(&wt, &base, "socket");
+        assert!(d.binary && !d.too_large);
+        assert_eq!((d.old, d.new), (None, None));
+    }
+
+    #[test]
+    fn diff_of_a_file_in_an_unreadable_directory_is_an_io_error() {
+        let sandbox = Sandbox::new();
+        let (wt, base) = session(&sandbox, &[("a.txt", "a\n")]);
+        write(&wt, "locked/f.txt", "f\n");
+        fs::set_permissions(wt.join("locked"), fs::Permissions::from_mode(0o000)).unwrap();
+        let d = file_diff(&wt, &base, "locked/f.txt", None, MIB);
+        fs::set_permissions(wt.join("locked"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(d, Err(Error::Io { .. })), "{d:?}");
     }
 
     #[test]

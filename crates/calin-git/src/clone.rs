@@ -39,20 +39,22 @@ pub fn clone_repo(url: &str, dest: &Path) -> Result<CloneInfo> {
         .arg(url)
         .arg(&dest)
         .run();
-    match cloned.and_then(|_| inspect_clone(&dest)) {
-        Ok(info) => Ok(info),
-        Err(err) => {
-            // Best effort: the failure to report is the clone's.
-            let _ = fs::remove_dir_all(&dest);
-            Err(match err {
-                // git's words for a local path that is no repository.
-                Error::NotARepository { reason, .. } => Error::Git {
-                    command: format!("git clone {url}"),
-                    stderr: reason,
-                },
-                other => other,
-            })
-        }
+    cloned.and_then(|_| inspect_clone(&dest)).map_err(|err| {
+        // Best effort: the failure to report is the clone's.
+        let _ = fs::remove_dir_all(&dest);
+        clone_error(url, err)
+    })
+}
+
+/// The error a failed clone of `url` reports.
+fn clone_error(url: &str, err: Error) -> Error {
+    match err {
+        // git's words for a local path that is no repository.
+        Error::NotARepository { reason, .. } => Error::Git {
+            command: format!("git clone {url}"),
+            stderr: reason,
+        },
+        other => other,
     }
 }
 
@@ -105,6 +107,27 @@ mod tests {
         let err = clone_repo("--upload-pack=touch pwned", &dest).unwrap_err();
         assert!(matches!(err, Error::Git { .. }), "{err:?}");
         assert!(!sandbox.path().join("clones/pwned").exists());
+    }
+
+    #[test]
+    fn a_clone_that_is_no_repository_is_reported_as_the_clone_failing() {
+        let err = clone_error(
+            "/src/plain",
+            Error::NotARepository {
+                path: "/dest".into(),
+                reason: "no git repository here".into(),
+            },
+        );
+        assert!(
+            matches!(&err, Error::Git { command, stderr }
+                if command == "git clone /src/plain" && stderr == "no git repository here"),
+            "{err:?}"
+        );
+        let other = clone_error("/src", Error::Conflict("busy".into()));
+        assert!(
+            matches!(&other, Error::Conflict(why) if why == "busy"),
+            "{other:?}"
+        );
     }
 
     #[test]

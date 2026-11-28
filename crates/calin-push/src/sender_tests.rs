@@ -410,6 +410,32 @@ async fn a_slow_service_times_out() {
 }
 
 #[tokio::test]
+async fn a_service_that_refuses_the_connection_is_a_retryable_transport_failure() {
+    let f = fixture().await;
+    // A port nothing listens on any more.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = closed.local_addr().unwrap().port();
+    drop(closed);
+    let (_, keys) = subscriber();
+    let request = PushSubscriptionRequest {
+        endpoint: format!("http://127.0.0.1:{port}/gone"),
+        p256dh: base64url(&keys.p256dh),
+        auth: base64url(&keys.auth),
+        label: None,
+    };
+    f.store
+        .subscribe("alice", &request, None, DEV)
+        .await
+        .unwrap();
+    let report = f.send("alice", PushKind::Failed, Some("s")).await;
+    let DeliveryOutcome::Failed(failure) = single(&report) else {
+        panic!("{report:?}");
+    };
+    assert!(matches!(failure, Failure::Transport(_)), "{failure:?}");
+    assert!(failure.is_retryable());
+}
+
+#[tokio::test]
 async fn a_redirect_is_not_followed() {
     let mut f = fixture().await;
     f.device("alice", "/redirect/a").await;

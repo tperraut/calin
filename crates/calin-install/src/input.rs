@@ -474,26 +474,7 @@ impl InstallInputBuilder {
             .extra_dirs
             .clone()
             .unwrap_or_else(|| vec![DEFAULT_EXTRA_DIR.into()]);
-        let mut seen: Vec<&Path> = Vec::new();
-        for dir in &extra_dirs {
-            if let Err(message) = validate_state_dir(dir) {
-                push(errors, Field::ExtraDirs, message);
-            } else if dir == &data_dir || dir == &home_dir {
-                push(
-                    errors,
-                    Field::ExtraDirs,
-                    format!("{} is already the data or home directory", dir.display()),
-                );
-            } else if seen.contains(&dir.as_path()) {
-                push(
-                    errors,
-                    Field::ExtraDirs,
-                    format!("{} is listed twice", dir.display()),
-                );
-            } else {
-                seen.push(dir);
-            }
-        }
+        check_extra_dirs(&extra_dirs, [&data_dir, &home_dir], errors);
         ServiceLayout {
             user,
             home_dir,
@@ -501,6 +482,31 @@ impl InstallInputBuilder {
             binary,
             port,
             extra_dirs,
+        }
+    }
+}
+
+/// Each extra directory is a state directory of its own: not the data or
+/// home directory, and listed once.
+fn check_extra_dirs(dirs: &[PathBuf], taken: [&PathBuf; 2], errors: &mut Vec<FieldError>) {
+    let mut seen: Vec<&Path> = Vec::new();
+    for dir in dirs {
+        if let Err(message) = validate_state_dir(dir) {
+            push(errors, Field::ExtraDirs, message);
+        } else if taken.contains(&dir) {
+            push(
+                errors,
+                Field::ExtraDirs,
+                format!("{} is already the data or home directory", dir.display()),
+            );
+        } else if seen.contains(&dir.as_path()) {
+            push(
+                errors,
+                Field::ExtraDirs,
+                format!("{} is listed twice", dir.display()),
+            );
+        } else {
+            seen.push(dir);
         }
     }
 }
@@ -524,6 +530,17 @@ pub(crate) fn validate_domain(domain: &str) -> Result<(), String> {
     if domain.is_empty() {
         return Err("is required, for example calin.example.com".into());
     }
+    host_alone(domain)?;
+    domain_characters(domain)?;
+    domain_labels(domain)
+}
+
+fn ip_address(domain: &str) -> String {
+    format!("`{domain}` is an IP address; a domain name is needed for a certificate")
+}
+
+/// A host name with nothing around it: no scheme, path, IP literal or port.
+fn host_alone(domain: &str) -> Result<(), String> {
     if domain.contains("://") {
         return Err(format!(
             "`{domain}` has a scheme; give the host name alone, for example calin.example.com"
@@ -533,15 +550,17 @@ pub(crate) fn validate_domain(domain: &str) -> Result<(), String> {
         return Err(format!("`{domain}` has a path; give the host name alone"));
     }
     if domain.contains('[') || domain.contains(']') {
-        return Err(format!(
-            "`{domain}` is an IP address; a domain name is needed for a certificate"
-        ));
+        return Err(ip_address(domain));
     }
     if domain.contains(':') {
         return Err(format!(
             "`{domain}` has a port; give the host name alone (HTTPS uses 443)"
         ));
     }
+    Ok(())
+}
+
+fn domain_characters(domain: &str) -> Result<(), String> {
     if domain.chars().any(|c| c.is_ascii_uppercase()) {
         return Err(format!("`{domain}` must be lowercase"));
     }
@@ -562,6 +581,11 @@ pub(crate) fn validate_domain(domain: &str) -> Result<(), String> {
     if domain.len() > 253 {
         return Err("is longer than 253 characters".into());
     }
+    Ok(())
+}
+
+/// The parts between the dots.
+fn domain_labels(domain: &str) -> Result<(), String> {
     let labels: Vec<&str> = domain.split('.').collect();
     if labels.iter().any(|label| label.is_empty()) {
         return Err(format!(
@@ -584,9 +608,7 @@ pub(crate) fn validate_domain(domain: &str) -> Result<(), String> {
         .last()
         .is_some_and(|label| label.chars().all(|c| c.is_ascii_digit()))
     {
-        return Err(format!(
-            "`{domain}` is an IP address; a domain name is needed for a certificate"
-        ));
+        return Err(ip_address(domain));
     }
     Ok(())
 }
@@ -604,7 +626,11 @@ pub(crate) fn validate_issuer(issuer: &str) -> Result<(), String> {
     if issuer.contains('?') || issuer.contains('#') {
         return Err(format!("`{issuer}` must not have a query or a fragment"));
     }
-    let authority = rest.split('/').next().unwrap_or_default();
+    validate_authority(issuer, rest.split('/').next().unwrap_or_default())
+}
+
+/// The issuer's host and port, between `https://` and the path.
+fn validate_authority(issuer: &str, authority: &str) -> Result<(), String> {
     if authority.is_empty() {
         return Err(format!("`{issuer}` has no host"));
     }
@@ -638,18 +664,33 @@ pub(crate) fn validate_allowed_user(entry: &str) -> Result<(), String> {
         }
         return Ok(());
     }
+    validate_email(entry)
+}
+
+fn validate_email(entry: &str) -> Result<(), String> {
     let Some((local, domain)) = entry.split_once('@') else {
         return Err(format!(
             "`{entry}` is neither an email address nor sub:<subject>"
         ));
     };
-    if local.is_empty() || domain.is_empty() || domain.contains('@') || !domain.contains('.') {
-        return Err(format!("`{entry}` is not a valid email address"));
-    }
-    if domain.starts_with('.') || domain.ends_with('.') {
+    // A domain with a dot is not empty.
+    let domain_ok = domain.contains('.')
+        && !domain.contains('@')
+        && !domain.starts_with('.')
+        && !domain.ends_with('.');
+    if local.is_empty() || !domain_ok {
         return Err(format!("`{entry}` is not a valid email address"));
     }
     Ok(())
+}
+
+/// `[a-z_][a-z0-9_-]*`, the portable shape of a system user name.
+fn is_user_name(user: &str) -> bool {
+    let mut chars = user.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
 }
 
 pub(crate) fn validate_user(user: &str) -> Result<(), String> {
@@ -659,13 +700,7 @@ pub(crate) fn validate_user(user: &str) -> Result<(), String> {
     if user.len() > 32 {
         return Err(format!("`{user}` is longer than 32 characters"));
     }
-    let mut chars = user.chars();
-    let first_ok = chars
-        .next()
-        .is_some_and(|c| c.is_ascii_lowercase() || c == '_');
-    let rest_ok =
-        chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
-    if !first_ok || !rest_ok {
+    if !is_user_name(user) {
         return Err(format!(
             "`{}` must start with a lowercase letter or _ and contain only lowercase letters, digits, _ and -",
             user.escape_debug()
@@ -698,6 +733,11 @@ pub(crate) fn validate_path(path: &Path) -> Result<(), String> {
             text.escape_debug()
         ));
     }
+    path_components(text)
+}
+
+/// A path with real components: not the root, no empty, `.` or `..` part.
+fn path_components(text: &str) -> Result<(), String> {
     if text == "/" {
         return Err("must not be the root directory".into());
     }
@@ -800,6 +840,42 @@ mod tests {
         }
         let long_label = format!("{}.com", "a".repeat(64));
         assert!(validate_domain(&long_label).unwrap_err().contains("63"));
+        let long = format!("{}.com", vec!["a".repeat(60); 5].join("."));
+        assert!(validate_domain(&long).unwrap_err().contains("253"));
+    }
+
+    #[test]
+    fn client_id_table() {
+        for (id, expected) in [
+            (" abc", "spaces"),
+            ("abc ", "spaces"),
+            ("a\tb", "line breaks"),
+        ] {
+            let errors = typical().client_id(id).build().unwrap_err();
+            assert_eq!(errors.errors().len(), 1, "{errors}");
+            assert!(errors.has(Field::ClientId), "{errors}");
+            assert!(errors.to_string().contains(expected), "{id:?}: {errors}");
+        }
+    }
+
+    #[test]
+    fn a_path_that_is_not_utf8_is_refused() {
+        use std::os::unix::ffi::OsStrExt;
+        let path = Path::new(std::ffi::OsStr::from_bytes(b"/srv/\xff"));
+        assert_eq!(validate_path(path), Err("is not valid UTF-8".into()));
+    }
+
+    #[test]
+    fn an_invalid_extra_directory_is_reported_once() {
+        let errors = typical()
+            .extra_dirs(["/srv/repos", "/etc/repos", "relative"])
+            .build()
+            .unwrap_err();
+        let messages: Vec<&str> = errors.errors().iter().map(|e| e.message.as_str()).collect();
+        assert_eq!(errors.errors().len(), 2, "{errors}");
+        assert!(errors.errors().iter().all(|e| e.field == Field::ExtraDirs));
+        assert!(messages[0].contains("system location"), "{errors}");
+        assert!(messages[1].contains("absolute"), "{errors}");
     }
 
     #[test]

@@ -7,6 +7,7 @@
 
 mod claude;
 mod mock;
+mod prose;
 mod registry;
 mod runner;
 

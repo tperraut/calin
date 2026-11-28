@@ -37,12 +37,15 @@ use self::driver::Driver;
 use self::queue::Queue;
 use crate::automations::AutomationStore;
 use crate::briefing;
-use crate::clock::{SharedClock, TimeZone};
+use crate::clock::{SharedClock, TimeZone, now_ms};
 use crate::error::{Error, Result};
 use crate::limits::LimitBoard;
 use crate::repos::{RepoRegistry, Reservation};
-use crate::settings::{DEFAULT_MAX_PARALLEL, SettingsStore};
-use crate::store::{EventDraft, NewSession, Store, UsageQuery, resolve_range};
+use crate::settings::{DEFAULT_MAX_PARALLEL, SettingsStore, filled};
+use crate::store::{
+    EventDraft, NewSession, OpenPermission, OpenQuestion, Store, UsageQuery, agent_ended,
+    resolve_range,
+};
 use crate::title::default_title;
 use crate::tokens::{AgentRef, Tokens};
 use crate::workflows::WorkflowCatalog;
@@ -370,41 +373,6 @@ enum ChildEnd {
     Failed,
 }
 
-impl Command {
-    fn refuse(self, err: Error) {
-        // The caller may have stopped waiting.
-        match self {
-            Self::Start { reply, .. } => {
-                let _ = reply.send(Err(err));
-            }
-            Self::Attach { reply, .. } => {
-                let _ = reply.send(Err(err));
-            }
-            Self::Dispatch { reply, .. } => {
-                let _ = reply.send(Err(err));
-            }
-            Self::Note { reply, .. } => {
-                let _ = reply.send(Err(err));
-            }
-            Self::Ask { reply, .. } => {
-                let _ = reply.send(Err(err));
-            }
-            Self::Message { reply, .. }
-            | Self::Interrupt { reply }
-            | Self::Stop { reply, .. }
-            | Self::Ship { reply, .. }
-            | Self::Poll { reply }
-            | Self::Report { reply, .. }
-            | Self::Answer { reply, .. }
-            | Self::Permission { reply, .. } => {
-                let _ = reply.send(Err(err));
-            }
-            // Nobody waits for these.
-            Self::Deliver { .. } | Self::Spent => {}
-        }
-    }
-}
-
 impl SessionManager {
     /// Wraps the store, loads the settings and the repo registry, scans for
     /// the repos the home repo declares, and settles the sessions that a
@@ -673,70 +641,16 @@ impl SessionManager {
             .workflows
             .resolve(request.workflow.as_deref())
             .await?;
-        let requested = request.runner.as_deref().filter(|id| !id.trim().is_empty());
-        let runner = self.inner.registry.resolve(requested).ok_or_else(|| {
-            Error::Invalid(format!("unknown runner {}", requested.unwrap_or_default()))
-        })?;
-        let model = request
-            .model
-            .map(|model| model.trim().to_owned())
-            .filter(|model| !model.is_empty());
-        let (issue, context) = match request.issue.take() {
-            None => (None, None),
-            Some(from) => {
-                // The request names something that is not there: its fault, not the state's.
-                let detail =
-                    self.issue(&from.repo_id, from.number)
-                        .await
-                        .map_err(|err| match err {
-                            Error::Missing(what) => Error::Invalid(what),
-                            other => other,
-                        })?;
-                if !request
-                    .repos
-                    .iter()
-                    .any(|repo| repo.repo_id == from.repo_id)
-                {
-                    let primary = AttachRepoRequest {
-                        repo_id: from.repo_id.clone(),
-                        mode: None,
-                    };
-                    request.repos.insert(0, primary);
-                }
-                let context = briefing::issue_context(&detail);
-                if blank_prompt {
-                    // The transcript and the title need something to show.
-                    request.prompt = format!(
-                        "Work on issue #{}: {}",
-                        detail.issue.number, detail.issue.title
-                    );
-                }
-                let issue = IssueRef {
-                    repo_id: from.repo_id,
-                    number: detail.issue.number,
-                    title: detail.issue.title,
-                    url: detail.issue.url,
-                };
-                (Some(issue), Some(context))
-            }
-        };
-        let title = request
-            .title
-            .take()
-            .map(|title| title.trim().to_owned())
-            .filter(|title| !title.is_empty())
-            .unwrap_or_else(|| default_title(&request.prompt));
+        let runner = self.runner(request.runner.as_deref())?;
+        let model = filled(request.model.take());
+        let (issue, context) = self.start_from_issue(&mut request, blank_prompt).await?;
+        let title = filled(request.title.take()).unwrap_or_else(|| default_title(&request.prompt));
         // Before anything is created: every repo must exist, once.
-        let reservation = if request.repos.is_empty() {
-            None
-        } else {
-            let ids: Vec<&str> = request
-                .repos
-                .iter()
-                .map(|repo| repo.repo_id.as_str())
-                .collect();
-            Some(self.inner.repos.reserve(&ids).await?)
-        };
+        let reservation = self
+            .inner
+            .repos
+            .reserve_named(request.repos.iter().map(|repo| repo.repo_id.as_str()))
+            .await?;
         let session = self
             .inner
             .store
@@ -765,6 +679,51 @@ impl SessionManager {
             reply,
         })
         .await
+    }
+
+    /// The runner a request names, or the default one for a blank name.
+    fn runner(&self, requested: Option<&str>) -> Result<Arc<dyn Runner>> {
+        let requested = requested.filter(|id| !id.trim().is_empty());
+        self.inner.registry.resolve(requested).ok_or_else(|| {
+            Error::Invalid(format!("unknown runner {}", requested.unwrap_or_default()))
+        })
+    }
+
+    /// For a request that names an issue: fetches it, puts its repo first
+    /// unless the request lists it, and gives a blank prompt something to
+    /// show. Returns the issue and its text for the agent.
+    async fn start_from_issue(
+        &self,
+        request: &mut CreateSessionRequest,
+        blank_prompt: bool,
+    ) -> Result<(Option<IssueRef>, Option<String>)> {
+        let Some(from) = request.issue.take() else {
+            return Ok((None, None));
+        };
+        // The request names something that is not there: its fault, not the state's.
+        let detail = self
+            .issue(&from.repo_id, from.number)
+            .await
+            .map_err(|err| match err {
+                Error::Missing(what) => Error::Invalid(what),
+                other => other,
+            })?;
+        put_first(&mut request.repos, &from.repo_id);
+        if blank_prompt {
+            // The transcript and the title need something to show.
+            request.prompt = format!(
+                "Work on issue #{}: {}",
+                detail.issue.number, detail.issue.title
+            );
+        }
+        let context = briefing::issue_context(&detail);
+        let issue = IssueRef {
+            repo_id: from.repo_id,
+            number: detail.issue.number,
+            title: detail.issue.title,
+            url: detail.issue.url,
+        };
+        Ok((Some(issue), Some(context)))
     }
 
     /// Sends user text to the session's lead agent. It starts a turn right
@@ -1062,10 +1021,7 @@ impl SessionManager {
     /// for a title of more than one line.
     pub async fn ship(&self, session_id: &str, request: ShipRequest) -> Result<()> {
         let status = self.get(session_id).await?.session.status;
-        let title = request
-            .title
-            .map(|title| title.trim().to_owned())
-            .filter(|title| !title.is_empty());
+        let title = filled(request.title);
         // It becomes the subject of a commit and the title of a pull request.
         if title
             .as_ref()
@@ -1216,27 +1172,10 @@ impl SessionManager {
     /// permission request left open has nobody waiting for its answer.
     async fn recover(&self) -> Result<()> {
         let store = &self.inner.store;
-        let mut open: HashMap<String, Vec<_>> = HashMap::new();
-        for request in store.open_permissions(None).await? {
-            open.entry(request.session_id.clone())
-                .or_default()
-                .push(request);
-        }
-        let mut asked: HashMap<String, Vec<_>> = HashMap::new();
-        for question in store.open_questions(None).await? {
-            asked
-                .entry(question.session_id.clone())
-                .or_default()
-                .push(question);
-        }
+        let mut open = by_session(store.open_permissions(None).await?, |r| &r.session_id);
+        let mut asked = by_session(store.open_questions(None).await?, |q| &q.session_id);
         for session in store.sessions().await? {
-            let lost = matches!(
-                session.status,
-                SessionStatus::Queued
-                    | SessionStatus::Preparing
-                    | SessionStatus::Running
-                    | SessionStatus::Waiting
-            );
+            let lost = at_work(session.status);
             let requests = open.remove(&session.id).unwrap_or_default();
             // A question only outlives its agent with the session: one that
             // is not lost keeps its question for the user to answer.
@@ -1247,64 +1186,7 @@ impl SessionManager {
             if !lost && requests.is_empty() {
                 continue;
             }
-            let result = async {
-                for request in requests {
-                    let mut closing =
-                        EventDraft::new(expired(request.request_id)).parent(Some(request.event_id));
-                    closing.agent_id = request.agent_id;
-                    store.append(&session.id, closing).await?;
-                }
-                if !lost {
-                    return Ok(());
-                }
-                for question in questions {
-                    let mut closing = EventDraft::new(unanswered(question.question_id))
-                        .parent(Some(question.event_id));
-                    closing.agent_id = question.agent_id;
-                    store.append(&session.id, closing).await?;
-                }
-                // A workflow run is not resumed: it ends where the restart
-                // cut it, so that its picture agrees with the session's.
-                let run = store.workflow_run(&session.id).await?;
-                if let Some(run) = run.filter(|run| run.status == WorkflowStatus::Running) {
-                    for node in run.nodes {
-                        if node.state != NodeRunState::Active {
-                            continue;
-                        }
-                        let cut = EventBody::WorkflowNode {
-                            node_id: node.id,
-                            phase: NodePhase::Finished,
-                            port: None,
-                            outcome: Some(format!("stopped: {RESTART_REASON}")),
-                        };
-                        store.append(&session.id, EventDraft::new(cut)).await?;
-                    }
-                    let finished = EventBody::WorkflowFinished {
-                        status: WorkflowStatus::Failed,
-                        reason: Some(RESTART_REASON.to_owned()),
-                    };
-                    store.append(&session.id, EventDraft::new(finished)).await?;
-                }
-                for agent in store.session(&session.id).await?.agents {
-                    if !agent_ended(agent.status) {
-                        let failed = EventBody::AgentStatus {
-                            status: AgentStatus::Failed,
-                        };
-                        store
-                            .append(&session.id, EventDraft::new(failed).agent(agent.id))
-                            .await?;
-                    }
-                }
-                let failed = EventBody::SessionStatus {
-                    status: SessionStatus::Failed,
-                    reason: Some(RESTART_REASON.to_owned()),
-                };
-                let failed = store.append(&session.id, EventDraft::new(failed)).await?;
-                report_restart(store, &session.id, &failed.id).await?;
-                Ok::<(), Error>(())
-            }
-            .await;
-            match result {
+            match settle_restarted(store, &session.id, lost, requests, questions).await {
                 Ok(()) => {
                     tracing::info!(session = %session.id, "settled a session cut short by a restart");
                 }
@@ -1316,6 +1198,120 @@ impl SessionManager {
         }
         Ok(())
     }
+}
+
+/// What a store lists, grouped by the session it belongs to.
+fn by_session<T>(items: Vec<T>, session_id: impl Fn(&T) -> &String) -> HashMap<String, Vec<T>> {
+    let mut grouped: HashMap<String, Vec<T>> = HashMap::new();
+    for item in items {
+        grouped
+            .entry(session_id(&item).clone())
+            .or_default()
+            .push(item);
+    }
+    grouped
+}
+
+/// Closes what a restart left open in a session: its permission requests,
+/// and, when the session was at work (`lost`), its questions, its workflow
+/// run, its agents and the session itself.
+async fn settle_restarted(
+    store: &Store,
+    session_id: &str,
+    lost: bool,
+    requests: Vec<OpenPermission>,
+    questions: Vec<OpenQuestion>,
+) -> Result<()> {
+    for request in requests {
+        let closing = expired(request.request_id);
+        close(
+            store,
+            session_id,
+            closing,
+            request.event_id,
+            request.agent_id,
+        )
+        .await?;
+    }
+    if !lost {
+        return Ok(());
+    }
+    for question in questions {
+        let closing = unanswered(question.question_id);
+        close(
+            store,
+            session_id,
+            closing,
+            question.event_id,
+            question.agent_id,
+        )
+        .await?;
+    }
+    cut_workflow_run(store, session_id).await?;
+    fail_agents(store, session_id).await?;
+    let failed = EventBody::SessionStatus {
+        status: SessionStatus::Failed,
+        reason: Some(RESTART_REASON.to_owned()),
+    };
+    let failed = store.append(session_id, EventDraft::new(failed)).await?;
+    report_restart(store, session_id, &failed.id).await
+}
+
+/// Appends `body`, which closes the event `opened`, as the agent that opened it.
+async fn close(
+    store: &Store,
+    session_id: &str,
+    body: EventBody,
+    opened: String,
+    agent_id: Option<String>,
+) -> Result<()> {
+    let mut closing = EventDraft::new(body).parent(Some(opened));
+    closing.agent_id = agent_id;
+    store.append(session_id, closing).await?;
+    Ok(())
+}
+
+/// A workflow run is not resumed: it ends where the restart cut it, so that
+/// its picture agrees with the session's.
+async fn cut_workflow_run(store: &Store, session_id: &str) -> Result<()> {
+    let run = store.workflow_run(session_id).await?;
+    let Some(run) = run.filter(|run| run.status == WorkflowStatus::Running) else {
+        return Ok(());
+    };
+    let active = run
+        .nodes
+        .into_iter()
+        .filter(|node| node.state == NodeRunState::Active);
+    for node in active {
+        let cut = EventBody::WorkflowNode {
+            node_id: node.id,
+            phase: NodePhase::Finished,
+            port: None,
+            outcome: Some(format!("stopped: {RESTART_REASON}")),
+        };
+        store.append(session_id, EventDraft::new(cut)).await?;
+    }
+    let finished = EventBody::WorkflowFinished {
+        status: WorkflowStatus::Failed,
+        reason: Some(RESTART_REASON.to_owned()),
+    };
+    store.append(session_id, EventDraft::new(finished)).await?;
+    Ok(())
+}
+
+/// Every agent of the session that had not ended fails with the restart.
+async fn fail_agents(store: &Store, session_id: &str) -> Result<()> {
+    for agent in store.session(session_id).await?.agents {
+        if agent_ended(agent.status) {
+            continue;
+        }
+        let failed = EventBody::AgentStatus {
+            status: AgentStatus::Failed,
+        };
+        let failed = EventDraft::new(failed).agent(agent.id);
+        store.append(session_id, failed).await?;
+    }
+    Ok(())
 }
 
 /// A child session the restart failed tells the agent that dispatched it,
@@ -1432,16 +1428,34 @@ fn no_attaching(status: SessionStatus) -> Error {
     ))
 }
 
+/// Adds the repo first, as the session's primary one, unless the list has
+/// it already: then it stays where it is.
+fn put_first(repos: &mut Vec<AttachRepoRequest>, repo_id: &str) {
+    if repos.iter().any(|repo| repo.repo_id == repo_id) {
+        return;
+    }
+    let primary = AttachRepoRequest {
+        repo_id: repo_id.to_owned(),
+        mode: None,
+    };
+    repos.insert(0, primary);
+}
+
+/// Queued, preparing, running or waiting: a session still at work, whose
+/// agent a restart takes with it.
+fn at_work(status: SessionStatus) -> bool {
+    matches!(
+        status,
+        SessionStatus::Queued
+            | SessionStatus::Preparing
+            | SessionStatus::Running
+            | SessionStatus::Waiting
+    )
+}
+
 /// True while an agent's turn is in progress.
 fn has_turn(status: SessionStatus) -> bool {
     matches!(status, SessionStatus::Running | SessionStatus::Waiting)
-}
-
-fn agent_ended(status: AgentStatus) -> bool {
-    matches!(
-        status,
-        AgentStatus::Done | AgentStatus::Failed | AgentStatus::Stopped
-    )
 }
 
 fn status_name(status: SessionStatus) -> String {
@@ -1480,13 +1494,6 @@ fn unanswered(question_id: String) -> EventBody {
         answer: String::new(),
         by: DecisionSource::Expired,
     }
-}
-
-/// Now, in Unix milliseconds: the time a message says it was sent at.
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_millis() as i64)
 }
 
 #[cfg(test)]

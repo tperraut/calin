@@ -231,20 +231,8 @@ pub(crate) async fn authenticate(
     if !is_api_path(path) || is_tool_endpoint(path) {
         return next.run(request).await;
     }
-    let who = {
-        let cookies = header_values(request.headers(), COOKIE);
-        let authorizations = header_values(request.headers(), AUTHORIZATION);
-        sign_in
-            .store
-            .authenticate_request(cookies, authorizations)
-            .await
-    };
-    let caller = match who {
-        Some(who) => Caller::SignedIn(who),
-        None if path == API_HEALTH && matches!(*request.method(), Method::GET | Method::HEAD) => {
-            Caller::Anonymous
-        }
-        None => return unauthorized(),
+    let Some(caller) = identify(&sign_in, request.headers(), path, request.method()).await else {
+        return unauthorized();
     };
     // The daily re-issue of the session cookie (spec section 3).
     let reissue = match &caller {
@@ -252,9 +240,35 @@ pub(crate) async fn authenticate(
         _ => None,
     };
     request.extensions_mut().insert(caller);
-    let mut response = next.run(request).await;
-    // Not over a handler's own word on the cookie: revoking the current
-    // session clears it.
+    with_reissued_cookie(next.run(request).await, reissue)
+}
+
+/// The caller of a request under `/api`: signed in, anonymous on the open
+/// health check, or `None` to refuse.
+async fn identify(
+    sign_in: &SignIn,
+    headers: &HeaderMap,
+    path: &str,
+    method: &Method,
+) -> Option<Caller> {
+    let cookies = header_values(headers, COOKIE);
+    let authorizations = header_values(headers, AUTHORIZATION);
+    let who = sign_in
+        .store
+        .authenticate_request(cookies, authorizations)
+        .await;
+    match who {
+        Some(who) => Some(Caller::SignedIn(who)),
+        None if path == API_HEALTH && matches!(*method, Method::GET | Method::HEAD) => {
+            Some(Caller::Anonymous)
+        }
+        None => None,
+    }
+}
+
+/// Adds the re-issued session cookie, unless the handler had its own word
+/// on the cookie: revoking the current session clears it.
+fn with_reissued_cookie(mut response: Response, reissue: Option<HeaderValue>) -> Response {
     if let Some(cookie) = reissue
         && !sets_session_cookie(&response)
     {

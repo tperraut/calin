@@ -129,6 +129,84 @@ fn graph_for_display() {
 }
 
 #[test]
+fn labels_and_templates_of_every_type() {
+    let w = ok(&doc(
+        "  - { id: start, type: start }
+  - { id: a, type: agent, prompt: \"\\n  Fix it  \\nthen test\" }
+  - { id: c, type: check, command: make test }
+  - { id: c2, type: check }
+  - { id: l, type: loop, max: 2 }
+  - { id: g, type: gate, message: Approve? }
+  - { id: q, type: ask, question: Which one? }
+  - { id: p, type: parallel, branches: [{ id: x, prompt: px }, { id: y, prompt: py }] }
+  - { id: m, type: commit, message: Save work }
+  - { id: s, type: ship, title: Add flag }
+  - { id: s2, type: ship }
+  - { id: ok, type: end }
+  - { id: bad, type: end, status: failed }
+",
+        "  - { from: start, to: a }
+  - { from: a.done, to: c }
+  - { from: c.pass, to: c2 }
+  - { from: c2.pass, to: l }
+  - { from: l.repeat, to: g }
+  - { from: l.exhausted, to: bad }
+  - { from: g.approve, to: q }
+  - { from: q, to: p }
+  - { from: p.done, to: m }
+  - { from: m.done, to: s }
+  - { from: s.done, to: s2 }
+  - { from: s2.done, to: ok }
+",
+    ));
+    let labels: Vec<(String, String)> = w
+        .graph()
+        .nodes
+        .into_iter()
+        .map(|n| (n.id, n.label))
+        .collect();
+    let expected = [
+        ("start", "Start"),
+        ("a", "Fix it"),
+        ("c", "make test"),
+        ("c2", "Repository checks"),
+        ("l", "Up to 2 times"),
+        ("g", "Approve?"),
+        ("q", "Which one?"),
+        ("p", "2 branches"),
+        ("m", "Save work"),
+        ("s", "Add flag"),
+        ("s2", "Open pull requests"),
+        ("ok", "End: success"),
+        ("bad", "End: failed"),
+    ]
+    .map(|(id, label)| (id.to_owned(), label.to_owned()));
+    assert_eq!(labels, expected);
+
+    let keys = |id: &str| -> Vec<String> {
+        w.node(id)
+            .unwrap()
+            .templates()
+            .into_iter()
+            .map(|(key, t)| format!("{key}={}", t.source()))
+            .collect()
+    };
+    assert_eq!(keys("a"), ["prompt=\n  Fix it  \nthen test"]);
+    assert_eq!(keys("c"), ["command=make test"]);
+    assert_eq!(keys("g"), ["message=Approve?"]);
+    assert_eq!(keys("q"), ["question=Which one?"]);
+    assert_eq!(
+        keys("p"),
+        ["branches[x].prompt=px", "branches[y].prompt=py"]
+    );
+    assert_eq!(keys("m"), ["message=Save work"]);
+    assert_eq!(keys("s"), ["title=Add flag"]);
+    for id in ["start", "c2", "l", "s2", "ok"] {
+        assert!(keys(id).is_empty(), "{id}");
+    }
+}
+
+#[test]
 fn ports_and_outputs_per_type() {
     for t in NodeType::ALL {
         assert_eq!(NodeType::from_name(t.as_str()), Some(t));
@@ -830,6 +908,146 @@ fn graph_rules() {
 ",
     ));
     assert_eq!(p.len(), 1, "{p}");
+}
+
+#[test]
+fn blank_fields_are_reported() {
+    for (node, id, fragments) in [
+        (
+            "{ id: a, type: agent, prompt: p, fresh: true, runner: \" \" }",
+            "a",
+            ["node `a`", "`runner` must not be empty"],
+        ),
+        (
+            "{ id: c, type: check, command: make, repo: \" \" }",
+            "c",
+            ["node `c`", "`repo` must not be empty"],
+        ),
+        (
+            "{ id: q, type: ask, question: q, options: [a, \" \"] }",
+            "q",
+            ["node `q`", "`options` has an empty option"],
+        ),
+        (
+            "{ id: p, type: parallel, branches: [{ id: a, prompt: \" \" }, { id: b, prompt: y }] }",
+            "p",
+            ["node `p`: branch `a`", "`prompt` must not be empty"],
+        ),
+    ] {
+        let yaml = with_node(node, id);
+        let p = problems(&yaml);
+        assert_eq!(p.len(), 1, "{p}");
+        assert_mentions(&p, &fragments, &yaml);
+    }
+}
+
+#[test]
+fn a_branch_whose_id_was_reported_is_not_checked_again() {
+    let yaml = with_node(
+        "{ id: p, type: parallel, branches: [{ id: 5, prompt: \" \" }, { id: b, prompt: y }] }",
+        "p",
+    );
+    let p = problems(&yaml);
+    assert_eq!(p.len(), 1, "{p}");
+    assert_mentions(&p, &["branch #1", "`id` must be a string"], &yaml);
+}
+
+/// Ranges the YAML reader checks itself are checked again on the JSON path.
+#[test]
+fn json_form_ranges() {
+    for (node, key, value, fragment) in [
+        (
+            "{ id: c, type: check }",
+            "timeout_seconds",
+            0,
+            "node `c`: `timeout_seconds` must be from 1 to 86400, found 0",
+        ),
+        (
+            "{ id: c, type: loop, max: 2 }",
+            "max",
+            21,
+            "node `c`: `max` must be from 1 to 20, found 21",
+        ),
+    ] {
+        let w = ok(&with_node(node, "c"));
+        let mut json: serde_json::Value = serde_json::to_value(&w).unwrap();
+        json["nodes"][3][key] = value.into();
+        let err = serde_json::from_value::<Workflow>(json).unwrap_err();
+        assert!(err.to_string().contains(fragment), "{err}");
+    }
+}
+
+#[test]
+fn edges_that_fail_still_count_for_reachability() {
+    let more = format!("{BASE_NODES}  - {{ id: more, type: commit, message: m }}\n");
+    // A second edge from one port.
+    let p = problems(&doc(
+        &more,
+        &format!("{BASE_EDGES}  - {{ from: work.done, to: more }}\n"),
+    ));
+    assert_eq!(p.len(), 1, "{p}");
+    assert_mentions(&p, &["port `work.done` already has an outgoing edge"], "");
+    // An edge without a port from a node with two.
+    let p = problems(&doc(
+        &more,
+        &format!("{BASE_EDGES}  - {{ from: work, to: more }}\n"),
+    ));
+    assert_eq!(p.len(), 1, "{p}");
+    assert_mentions(&p, &["more than one port"], "");
+}
+
+#[test]
+fn a_node_of_unknown_type_raises_nothing_else() {
+    // An edge without a port from it, and a template naming its output.
+    let p = problems(&doc(
+        "  - { id: start, type: start }
+  - { id: x, type: bogus }
+  - { id: a, type: agent, prompt: \"{{nodes.x.anything}}\" }
+  - { id: e, type: end }
+",
+        "  - { from: start, to: x }
+  - { from: x, to: a }
+  - { from: a.done, to: e }
+",
+    ));
+    assert_eq!(p.len(), 1, "{p}");
+    assert_mentions(&p, &["unknown type `bogus`"], "");
+}
+
+#[test]
+fn shapes_the_reader_refuses() {
+    for (node, id, fragments) in [
+        (
+            "{ id: p, type: parallel, branches: x }",
+            "p",
+            vec!["node `p`", "`branches` must be a list, found a string"],
+        ),
+        (
+            "{ id: a, type: agent, prompt: p, verdicts: yes }",
+            "a",
+            vec!["node `a`", "`verdicts` must be a list of strings"],
+        ),
+        (
+            "{ id: p, type: parallel, branches: [x, { id: b, prompt: y }] }",
+            "p",
+            vec!["node `p`: branch #1 must be a mapping, found a string"],
+        ),
+        (
+            "{ id: p, type: parallel, branches: [{ prompt: x }, { id: b, prompt: y }] }",
+            "p",
+            vec!["node `p`: branch #1", "missing required key `id`"],
+        ),
+    ] {
+        let yaml = with_node(node, id);
+        let p = problems(&yaml);
+        assert_eq!(p.len(), 1, "{p}");
+        assert_mentions(&p, &fragments, &yaml);
+    }
+    let yaml = doc(BASE_NODES, &format!("{BASE_EDGES}  - x\n"));
+    let p = problems(&yaml);
+    assert_mentions(&p, &["edge #3 must be a mapping, found a string"], &yaml);
+    let w = ok(&format!("{}budget_usd: 2.5\n", doc(BASE_NODES, BASE_EDGES)));
+    assert_eq!(w.budget_usd(), Some(2.5));
 }
 
 #[test]

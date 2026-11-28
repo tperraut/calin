@@ -413,17 +413,79 @@ async fn by_session_lists_the_200_most_expensive_roots() {
     assert!(!usage.rows.iter().any(|row| ids[..5].contains(&row.key)));
 }
 
+#[tokio::test]
+async fn usage_of_an_agent_the_log_never_announced_is_all_new_on_the_sessions_runner() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir).await;
+    let id = store.create_session(new_session("ghost")).await.unwrap().id;
+    store.close().await;
+    let home = Home::new(dir.path());
+    let at = local("2026-11-11T10:00:00");
+    write_log(&home, &id, vec![(at, Some("ghost"), totals(0.5, 50, 5))]);
+
+    let store = Store::open(home).await.unwrap();
+    let by = |by| store.usage(query(FROM, TO, by));
+    assert_eq!(
+        by(UsageBy::Runner).await.unwrap().rows,
+        [row("mock", "mock", 0.5, (50, 5), 1)]
+    );
+    assert_eq!(
+        by(UsageBy::Model).await.unwrap().rows,
+        [row("", "Unknown model", 0.5, (50, 5), 1)]
+    );
+}
+
+#[tokio::test]
+async fn an_agent_the_log_never_announced_is_counted_by_what_its_totals_grew() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir).await;
+    let id = store.create_session(new_session("ghost")).await.unwrap().id;
+    store.close().await;
+    let home = Home::new(dir.path());
+    let at = local("2026-11-11T10:00:00");
+    write_log(
+        &home,
+        &id,
+        vec![
+            (at, Some("ghost"), totals(0.5, 50, 5)),
+            (at + 1_000, Some("ghost"), totals(0.75, 80, 8)),
+        ],
+    );
+
+    let store = Store::open(home).await.unwrap();
+    let usage = store.usage(query(FROM, TO, UsageBy::Runner)).await.unwrap();
+    // Totals are cumulative per agent: the second report adds what grew.
+    assert_eq!(usage.rows, [row("mock", "mock", 0.75, (80, 8), 1)]);
+}
+
+#[tokio::test]
+async fn the_default_range_includes_what_was_spent_just_now() {
+    let spent = spent().await;
+    // The moment `d` reported its usage.
+    let now = local("2026-10-01T09:00:00");
+    let (from, to) = resolve_range(None, None, now).unwrap();
+    let query = UsageQuery {
+        from,
+        to,
+        by: UsageBy::Runner,
+        zone: zone(),
+    };
+    let usage = spent.store.usage(query).await.unwrap();
+    assert_eq!(usage.totals.sessions, 1);
+    assert_eq!((usage.totals.tokens_in, usage.totals.tokens_out), (900, 90));
+}
+
 #[test]
 fn the_range_defaults_to_30_days_and_is_cut_to_366() {
     const DAY: i64 = 24 * 60 * 60 * 1000;
     let now = 1_800_000_000_000;
     assert_eq!(
         resolve_range(None, None, now).unwrap(),
-        (now - 30 * DAY, now)
+        (now + 1 - 30 * DAY, now + 1)
     );
     assert_eq!(
         resolve_range(Some(now - DAY), None, now).unwrap(),
-        (now - DAY, now)
+        (now - DAY, now + 1)
     );
     assert_eq!(
         resolve_range(None, Some(now - 10 * DAY), now).unwrap(),

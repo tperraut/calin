@@ -65,23 +65,10 @@ pub(crate) fn parse_metadata(
     if !same_issuer(configured_issuer, &document.issuer) {
         return Err(MetadataError::IssuerMismatch);
     }
-    // Present and without S256 means the challenge would be ignored or
-    // refused. Absent means the provider does not say; several real ones
-    // that support S256 do not.
-    if let Some(methods) = &document.code_challenge_methods_supported
-        && !methods.iter().any(|method| method == "S256")
-    {
+    if !document.may_support_s256() {
         return Err(MetadataError::NoS256);
     }
-    let endpoint = |name: &'static str, text: &str| -> Result<Url, MetadataError> {
-        let invalid = |reason| MetadataError::Endpoint { name, reason };
-        let url = parse_strict_url(text).map_err(invalid)?;
-        check_scheme(&url, loopback_http).map_err(invalid)?;
-        if url.fragment().is_some() {
-            return Err(invalid("must not have a fragment"));
-        }
-        Ok(url)
-    };
+    let endpoint = |name, text: &str| endpoint(name, text, loopback_http);
     Ok(ProviderMetadata {
         authorization_endpoint: endpoint(
             "authorization_endpoint",
@@ -91,6 +78,33 @@ pub(crate) fn parse_metadata(
         jwks_uri: endpoint("jwks_uri", &document.jwks_uri)?,
         issuer: document.issuer,
     })
+}
+
+impl Document {
+    /// Present and without S256 means the challenge would be ignored or
+    /// refused. Absent means the provider does not say; several real ones
+    /// that support S256 do not.
+    fn may_support_s256(&self) -> bool {
+        self.code_challenge_methods_supported
+            .as_ref()
+            .is_none_or(|methods| methods.iter().any(|method| method == "S256"))
+    }
+}
+
+/// One of the provider's endpoints: a strict URL sign-in may contact, with
+/// no fragment.
+fn endpoint(
+    name: &'static str,
+    text: &str,
+    loopback_http: LoopbackHttp,
+) -> Result<Url, MetadataError> {
+    let invalid = |reason| MetadataError::Endpoint { name, reason };
+    let url = parse_strict_url(text).map_err(invalid)?;
+    check_scheme(&url, loopback_http).map_err(invalid)?;
+    if url.fragment().is_some() {
+        return Err(invalid("must not have a fragment"));
+    }
+    Ok(url)
 }
 
 #[cfg(test)]
@@ -270,6 +284,69 @@ mod tests {
                 "{name} = {value}"
             );
         }
+    }
+
+    #[test]
+    fn the_first_failing_check_names_the_error() {
+        let endpoint = |name, reason| MetadataError::Endpoint { name, reason };
+        // Bad in every way; each step fixes what the last error named.
+        let mut doc = document("https://evil.example.com");
+        doc["code_challenge_methods_supported"] = serde_json::json!(["plain"]);
+        doc["authorization_endpoint"] = serde_json::json!("http://user:pw@idp.example.com/a#x");
+        doc["token_endpoint"] = serde_json::json!("http://idp.example.com/token#x");
+        doc["jwks_uri"] = serde_json::json!("https://idp.example.com/jwks#x");
+        let https = "must be an https URL";
+        let fragment = "must not have a fragment";
+        let steps = [
+            (
+                MetadataError::IssuerMismatch,
+                "issuer",
+                "https://idp.example.com",
+            ),
+            (
+                MetadataError::NoS256,
+                "code_challenge_methods_supported",
+                "",
+            ),
+            (
+                endpoint("authorization_endpoint", "must not contain credentials"),
+                "authorization_endpoint",
+                "http://idp.example.com/a#x",
+            ),
+            (
+                endpoint("authorization_endpoint", https),
+                "authorization_endpoint",
+                "https://idp.example.com/a#x",
+            ),
+            (
+                endpoint("authorization_endpoint", fragment),
+                "authorization_endpoint",
+                "https://idp.example.com/a",
+            ),
+            (
+                endpoint("token_endpoint", https),
+                "token_endpoint",
+                "https://idp.example.com/token",
+            ),
+            (
+                endpoint("jwks_uri", fragment),
+                "jwks_uri",
+                "https://idp.example.com/jwks",
+            ),
+        ];
+        for (error, name, fixed) in steps {
+            assert_eq!(
+                parse(&doc, "https://idp.example.com").unwrap_err(),
+                error,
+                "before fixing {name}"
+            );
+            if fixed.is_empty() {
+                doc.as_object_mut().unwrap().remove(name);
+            } else {
+                doc[name] = serde_json::json!(fixed);
+            }
+        }
+        assert!(parse(&doc, "https://idp.example.com").is_ok());
     }
 
     #[test]

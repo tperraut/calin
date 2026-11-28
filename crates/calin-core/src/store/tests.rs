@@ -592,6 +592,13 @@ async fn agent_sessions_repos_and_permissions_are_projected() {
     let lead = store.session(&id).await.unwrap().agents.remove(0);
     assert_eq!(lead.native_session_id.as_deref(), Some("n2"));
     assert_eq!(lead.model.as_deref(), Some("mock-9"));
+    // A report no agent made changes no agent.
+    let unowned = EventBody::AgentSession {
+        native_session_id: "n3".to_owned(),
+        model: Some("mock-0".to_owned()),
+    };
+    store.append(&id, EventDraft::new(unowned)).await.unwrap();
+    assert_eq!(store.session(&id).await.unwrap().agents, [lead]);
 
     // Repos keep their order; the branch is the first one any repo has.
     assert!(store.session(&id).await.unwrap().repos.is_empty());
@@ -981,6 +988,78 @@ async fn events_logged_but_not_indexed_are_caught_up_on_startup() {
     assert_eq!(log.len(), 3);
     assert_eq!(log[1], orphan);
     assert_eq!(reopened.subscribe(&id, 1).await.unwrap().backlog, log[1..]);
+}
+
+#[tokio::test]
+async fn a_corrupt_line_stops_the_catch_up_and_what_precedes_it_stays_indexed() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir).await;
+    let id = store.create_session(new_session("rot")).await.unwrap().id;
+    let last = store.append(&id, message(1)).await.unwrap();
+    store.close().await;
+
+    let next = Event {
+        id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+        seq: last.seq + 1,
+        body: EventBody::SessionStatus {
+            status: SessionStatus::Running,
+            reason: None,
+        },
+        ..(*last).clone()
+    };
+    let mut log = std::fs::OpenOptions::new()
+        .append(true)
+        .open(store.home().log_path(&id))
+        .unwrap();
+    writeln!(log, "{}", serde_json::to_string(&next).unwrap()).unwrap();
+    writeln!(log, "not an event").unwrap();
+    drop(log);
+
+    let reopened = open(&dir).await;
+    let session = reopened.session(&id).await.unwrap().session;
+    assert_eq!(session.head_seq, 2);
+    assert_eq!(session.status, SessionStatus::Running);
+    assert!(matches!(
+        reopened.append(&id, message(2)).await,
+        Err(Error::Corrupt { .. })
+    ));
+}
+
+#[tokio::test]
+async fn a_log_shorter_than_its_index_is_indexed_again_from_the_log() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir).await;
+    let id = store.create_session(new_session("cut")).await.unwrap().id;
+    let first = store.append(&id, message(1)).await.unwrap();
+    store
+        .append(&id, status(SessionStatus::Running))
+        .await
+        .unwrap();
+    let spawned = EventBody::AgentSpawned {
+        agent: agent("a1", &id),
+    };
+    store.append(&id, EventDraft::new(spawned)).await.unwrap();
+    store.close().await;
+
+    // The log lost everything after its first line; the index still has it.
+    let path = store.home().log_path(&id);
+    let first_line = serde_json::to_vec(&*first).unwrap().len() as u64 + 1;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(first_line)
+        .unwrap();
+
+    let reopened = open(&dir).await;
+    let detail = reopened.session(&id).await.unwrap();
+    assert_eq!(detail.session.head_seq, 1);
+    assert_eq!(detail.session.status, SessionStatus::Queued);
+    assert_eq!(detail.session.title, "title of cut");
+    assert!(detail.agents.is_empty());
+    let next = reopened.append(&id, message(2)).await.unwrap();
+    assert_eq!(next.seq, 2);
+    assert_eq!(read_log(&reopened, &id).len(), 2);
 }
 
 #[tokio::test]

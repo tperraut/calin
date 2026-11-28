@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::process::Output;
 
@@ -33,6 +35,10 @@ fn git(dir: &Path, args: &[&str]) -> String {
             "commit.gpgsign=false",
             "-c",
             "init.defaultBranch=main",
+            // A commit may start maintenance in the background, whose lock
+            // file would show up in a snapshot taken after it.
+            "-c",
+            "maintenance.auto=false",
         ])
         .arg("-C")
         .arg(dir)
@@ -868,4 +874,202 @@ fn the_examples_in_the_user_guide_are_valid() {
         .collect();
     assert_eq!(names, ["api", "web", "notes"]);
     assert_eq!(file.sets["storefront"], ["api", "web"]);
+}
+
+fn found(name: &str) -> Found {
+    Found {
+        name: name.to_owned(),
+        path: PathBuf::from("/code").join(name),
+        url: None,
+        renamed_from: None,
+        guess: Guess::default(),
+    }
+}
+
+#[test]
+fn the_summary_says_how_many_repos_the_list_holds() {
+    let note = |scan: &[&str], repos: &[&str]| {
+        let report = Report {
+            root: "/home/u/home".into(),
+            created: vec![REPOS_FILE.to_owned()],
+            scan_roots: scan.iter().map(PathBuf::from).collect(),
+            repos: repos.iter().map(|name| found(name)).collect(),
+            ..Report::default()
+        };
+        let text = summary(&report, "http://127.0.0.1:4680");
+        let line = text.lines().find(|l| l.starts_with("  .calin/repos.yaml"));
+        line.unwrap().to_owned()
+    };
+    assert_eq!(note(&[], &[]), "  .calin/repos.yaml (a commented example)");
+    assert_eq!(
+        note(&["/code"], &[]),
+        "  .calin/repos.yaml (no clone found; a commented example)"
+    );
+    assert_eq!(note(&["/code"], &["api"]), "  .calin/repos.yaml (1 repo)");
+    assert_eq!(
+        note(&["/code"], &["api", "web"]),
+        "  .calin/repos.yaml (2 repos)"
+    );
+}
+
+#[test]
+fn the_whole_summary() {
+    let report = Report {
+        root: "/home/u/home".into(),
+        initialized: true,
+        created: vec![
+            REPOS_FILE.to_owned(),
+            "README.md".to_owned(),
+            "skills/.gitkeep".to_owned(),
+        ],
+        kept: vec![WORKFLOWS[0].to_owned(), "agents/".to_owned()],
+        scan_roots: vec!["/code".into(), "/more code".into()],
+        repos: vec![found("api")],
+        notes: vec!["skipped /code/x: not a clone".to_owned()],
+    };
+    let text = summary(&report, "http://127.0.0.1:4680");
+    assert_eq!(
+        text,
+        r#"Initialized a git repository in /home/u/home.
+Home repo: /home/u/home
+
+Created:
+  .calin/repos.yaml (1 repo)
+  README.md
+  skills/.gitkeep
+
+Kept as they were:
+  .calin/workflows/implement-and-check.yaml
+  agents/
+
+Note: skipped /code/x: not a clone
+
+Next steps:
+  1. Review .calin/repos.yaml: names, URLs, and the commented setup and checks lines.
+  2. Commit:
+       cd /home/u/home
+       git add .calin README.md skills
+       git commit -m "Calin home repo"
+  3. Start Calin (`calin serve`), open Settings, set these and save:
+       Home repo:  /home/u/home
+       Scan roots: /code, /more code
+     Or, from this machine (this replaces all of Calin's settings):
+       curl -X PUT http://127.0.0.1:4680/api/v1/settings -H 'Content-Type: application/json' \
+         -d '{"home_repo":"/home/u/home","scan_roots":["/code","/more code"]}'
+  4. Optionally, see how scripts/link-claude.sh would link skills/, agents/, commands/ and
+     CLAUDE.md into ~/.claude:
+       /home/u/home/scripts/link-claude.sh --dry-run
+"#
+    );
+    let nothing_new = Report {
+        root: "/home/u/home".into(),
+        kept: vec![REPOS_FILE.to_owned()],
+        ..Report::default()
+    };
+    let text = summary(&nothing_new, "http://127.0.0.1:4680");
+    assert!(
+        text.starts_with(
+            "Home repo: /home/u/home\n\nKept as they were:\n  .calin/repos.yaml\n\nNext steps:\n"
+        ),
+        "{text}"
+    );
+    for line in [
+        "  2. Commit any changes you made.",
+        "       Scan roots: the folders that hold your clones",
+    ] {
+        assert!(text.lines().any(|l| l == line), "{line:?} not in\n{text}");
+    }
+}
+
+#[test]
+fn folders_that_cannot_be_described_are_skipped_with_a_note() {
+    let parent = TempDir::new().unwrap();
+    let code = parent.path().join("code");
+    clone_at(&code.join("api"), None);
+    fs::create_dir_all(code.join("broken")).unwrap();
+    fs::write(code.join("broken/.git"), "gitdir: /nowhere\n").unwrap();
+    fs::create_dir(code.join(OsStr::from_bytes(b"bad\xff"))).unwrap();
+    let code = fs::canonicalize(&code).unwrap();
+    let mut notes = Vec::new();
+    let found = repos_yaml::scan(
+        std::slice::from_ref(&code),
+        &parent.path().join("home"),
+        &mut notes,
+    )
+    .unwrap();
+    let names: Vec<&str> = found.iter().map(|repo| repo.name.as_str()).collect();
+    assert_eq!(names, ["api"]);
+    assert_eq!(notes.len(), 2, "{notes:?}");
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.ends_with("its name is not valid UTF-8")),
+        "{notes:?}"
+    );
+    let broken = format!("skipped {}: ", code.join("broken").display());
+    assert!(
+        notes.iter().any(|note| note.starts_with(&broken)),
+        "{notes:?}"
+    );
+}
+
+#[test]
+fn the_list_says_why_a_repo_has_no_url_and_what_was_guessed() {
+    let empty = repos_yaml::render(&[], &[PathBuf::from("/code"), PathBuf::from("/more")]);
+    assert!(
+        empty.contains("#\n# No git clone was found directly under /code, /more.\n"),
+        "{empty}"
+    );
+    let mut api = found("api");
+    api.url = Some("git@example.com:you/api.git".to_owned());
+    api.guess = Guess {
+        from: vec!["Cargo.toml".to_owned()],
+        setup: Some("cargo fetch".to_owned()),
+        checks: vec!["cargo test".to_owned()],
+    };
+    let mut renamed = found("api-2");
+    renamed.renamed_from = Some("api".to_owned());
+    renamed.guess = Guess {
+        from: vec!["pytest.ini".to_owned()],
+        setup: None,
+        checks: vec!["pytest".to_owned()],
+    };
+    let mut web = found("web");
+    web.guess = Guess {
+        from: vec!["go.mod".to_owned()],
+        setup: Some("go mod download".to_owned()),
+        checks: Vec::new(),
+    };
+    let text = repos_yaml::render(
+        &[api, renamed, web, found("docs")],
+        &[PathBuf::from("/code")],
+    );
+    let body = text.split_once("\nrepos:\n").unwrap().1;
+    assert_eq!(
+        body,
+        r#"  api:
+    url: "git@example.com:you/api.git"
+    # Guessed from Cargo.toml:
+    # setup: "cargo fetch"
+    # checks: ["cargo test"]
+  api-2:
+    # /code/api-2: renamed because an earlier repo is named api.
+    # It has no origin remote either, and a repo without `url:` is found
+    # by a folder of its own name: add a `url:` or rename the folder.
+    # Guessed from pytest.ini:
+    # checks: ["pytest"]
+  web:
+    # No origin remote: found by its folder name under a scan root.
+    # Add `url:` to find it by its remote instead.
+    # Guessed from go.mod:
+    # setup: "go mod download"
+  docs:
+    # No origin remote: found by its folder name under a scan root.
+    # Add `url:` to find it by its remote instead.
+
+# Named sets attach several repos in one step:
+# sets:
+#   main: [api, api-2, web]
+"#
+    );
 }

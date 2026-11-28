@@ -8,6 +8,7 @@ use serde::Deserialize;
 use serde::de::{DeserializeOwned, MapAccess, Visitor};
 
 use super::check_name;
+use crate::settings::filled;
 
 /// The file's path inside the home repo.
 pub(crate) const HOME_FILE: &str = ".calin/repos.yaml";
@@ -106,31 +107,10 @@ pub(crate) fn parse(text: &str) -> Result<HomeFile, String> {
     let raw = raw.unwrap_or_default();
     let mut file = HomeFile::default();
     for (name, repo) in raw.repos.0 {
-        if let Err(err) = check_name(&name) {
-            file.skipped.push(format!("repo {name:?}: {err}"));
-            continue;
+        match skipped(&name, &file.repos) {
+            Some(why) => file.skipped.push(why),
+            None => file.repos.push(from_raw(name, repo.unwrap_or_default())),
         }
-        if file.repos.iter().any(|known| known.name == name) {
-            file.skipped.push(format!("repo {name} is declared twice"));
-            continue;
-        }
-        let repo = repo.unwrap_or_default();
-        let filled = |value: Option<String>| {
-            value
-                .map(|value| value.trim().to_owned())
-                .filter(|value| !value.is_empty())
-        };
-        let checks = match repo.checks {
-            None => Vec::new(),
-            Some(Checks::One(check)) => vec![check],
-            Some(Checks::Many(checks)) => checks,
-        };
-        file.repos.push(Declared {
-            name,
-            url: filled(repo.url),
-            setup: filled(repo.setup),
-            checks: checks.into_iter().filter_map(|c| filled(Some(c))).collect(),
-        });
     }
     for (name, members) in raw.sets.0 {
         if !file.sets.iter().any(|(known, _)| *known == name) {
@@ -138,6 +118,31 @@ pub(crate) fn parse(text: &str) -> Result<HomeFile, String> {
         }
     }
     Ok(file)
+}
+
+/// Why a repo of the file is left out: a name that cannot be a folder, or
+/// one declared before.
+fn skipped(name: &str, repos: &[Declared]) -> Option<String> {
+    if let Err(err) = check_name(name) {
+        return Some(format!("repo {name:?}: {err}"));
+    }
+    let twice = repos.iter().any(|known| known.name == name);
+    twice.then(|| format!("repo {name} is declared twice"))
+}
+
+/// A repo as the file declares it, without blank values.
+fn from_raw(name: String, repo: RawRepo) -> Declared {
+    let checks = match repo.checks {
+        None => Vec::new(),
+        Some(Checks::One(check)) => vec![check],
+        Some(Checks::Many(checks)) => checks,
+    };
+    Declared {
+        name,
+        url: filled(repo.url),
+        setup: filled(repo.setup),
+        checks: checks.into_iter().filter_map(|c| filled(Some(c))).collect(),
+    }
 }
 
 fn one_line(text: &str) -> String {
@@ -255,6 +260,12 @@ workflows: { nightly: {} }
         assert_eq!(file.repos, [declared("ok", None, None, &[])]);
         assert_eq!(file.skipped.len(), 2);
         assert!(file.skipped[0].contains("a/b"), "{:?}", file.skipped);
+        // The first of a repeated name or set counts.
+        let file =
+            parse("repos:\n  ok: {}\n  ok: {url: x}\nsets:\n  pair: [a]\n  pair: [b]\n").unwrap();
+        assert_eq!(file.repos, [declared("ok", None, None, &[])]);
+        assert_eq!(file.skipped, ["repo ok is declared twice"]);
+        assert_eq!(file.sets, [("pair".to_owned(), vec!["a".to_owned()])]);
     }
 
     #[test]

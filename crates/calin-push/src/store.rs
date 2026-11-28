@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -211,54 +211,12 @@ impl SubscriptionStore {
     }
 
     fn open_blocking(path: PathBuf, clock: Arc<dyn Clock>) -> Result<Self, StoreError> {
-        let io_error = |source| StoreError::Io {
-            path: path.clone(),
-            source,
-        };
         // Found out now rather than at the first subscription.
-        let probe = write_temporary(&path, b"").map_err(io_error)?;
-        std::fs::remove_file(probe).map_err(io_error)?;
+        let probe = write_temporary(&path, b"").map_err(io_error(&path))?;
+        std::fs::remove_file(probe).map_err(io_error(&path))?;
 
-        let mut report = LoadReport {
-            file: LoadedFile::Missing,
-            permissions_corrected: false,
-            invalid_dropped: 0,
-        };
-        let mut identities = BTreeMap::new();
-        match std::fs::read(&path) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(io_error(error)),
-            Ok(bytes) => {
-                report.permissions_corrected = tighten_permissions(&path).map_err(io_error)?;
-                match parse_file(&bytes) {
-                    Ok(file) => {
-                        identities = file.identities;
-                        report.file = LoadedFile::Loaded {
-                            subscriptions: identities.values().map(|i| i.subscriptions.len()).sum(),
-                        };
-                    }
-                    Err(reason) => {
-                        // Kept, not overwritten: it may be a newer version's
-                        // file, and its subscriptions are worth recovering.
-                        let kept_as = corrupt_path(&path);
-                        std::fs::rename(&path, &kept_as).map_err(io_error)?;
-                        tracing::warn!(
-                            path = %path.display(),
-                            kept_as = %kept_as.display(),
-                            %reason,
-                            "the push subscription store was unreadable; starting empty"
-                        );
-                        report.file = LoadedFile::Corrupt { reason, kept_as };
-                    }
-                }
-            }
-        }
-        for record in identities.values_mut() {
-            let before = record.subscriptions.len();
-            record.subscriptions.retain(|s| s.target().is_some());
-            report.invalid_dropped += before - record.subscriptions.len();
-        }
-
+        let (mut identities, mut report) = load(&path)?;
+        report.invalid_dropped = drop_invalid(&mut identities);
         let dropped = report.invalid_dropped > 0;
         let store = Self {
             inner: Arc::new(Inner {
@@ -308,68 +266,20 @@ impl SubscriptionStore {
         let auth = base64url_decode_browser(&request.auth)
             .filter(|bytes| bytes.len() == AUTH_LEN)
             .ok_or(SubscribeError::InvalidAuth)?;
-        let label = request
-            .label
-            .as_deref()
-            .map(|label| clean_text(label, MAX_LABEL_CHARS))
-            .filter(|label| !label.is_empty())
-            .unwrap_or_else(|| {
-                clean_text(
-                    &describe_user_agent(user_agent.unwrap_or("")),
-                    MAX_LABEL_CHARS,
-                )
-            });
-        let new_id = random_id()?;
-        let now = self.inner.now();
-        // Stored as the URL serializes it, so the same endpoint written two
-        // ways is recognized as one.
-        let endpoint = url.to_string();
-
+        let candidate = SubscriptionRecord {
+            id: random_id()?,
+            // Stored as the URL serializes it, so the same endpoint written
+            // two ways is recognized as one.
+            endpoint: url.to_string(),
+            p256dh: base64url(&p256dh),
+            auth: base64url(&auth),
+            label: subscription_label(request.label.as_deref(), user_agent),
+            created_at: self.inner.now(),
+            last_sent_at: None,
+        };
         let (info, generation) = {
             let mut state = self.inner.state();
-            for (other, record) in state.identities.iter_mut() {
-                if other != identity {
-                    record.subscriptions.retain(|s| s.endpoint != endpoint);
-                }
-            }
-            let record = state.identities.entry(identity.to_owned()).or_default();
-            let subscription = match record
-                .subscriptions
-                .iter_mut()
-                .find(|s| s.endpoint == endpoint)
-            {
-                Some(existing) => {
-                    existing.p256dh = base64url(&p256dh);
-                    existing.auth = base64url(&auth);
-                    existing.label = label;
-                    existing.clone()
-                }
-                None => {
-                    let subscription = SubscriptionRecord {
-                        id: new_id,
-                        endpoint,
-                        p256dh: base64url(&p256dh),
-                        auth: base64url(&auth),
-                        label,
-                        created_at: now,
-                        last_sent_at: None,
-                    };
-                    record.subscriptions.push(subscription.clone());
-                    // Oldest first, so the one dropped is the front; a stable
-                    // sort keeps the new one last among equal times.
-                    record.subscriptions.sort_by_key(|s| s.created_at);
-                    while record.subscriptions.len() > MAX_SUBSCRIPTIONS_PER_IDENTITY {
-                        let oldest = record
-                            .subscriptions
-                            .iter()
-                            .position(|s| s.id != subscription.id)
-                            .unwrap_or(0);
-                        record.subscriptions.remove(oldest);
-                    }
-                    subscription
-                }
-            };
-            state.identities.retain(|_, record| !record.is_empty());
+            let subscription = state.subscribe(identity, candidate);
             (subscription.info(), state.changed())
         };
         self.persist(Persist::Now(generation)).await?;
@@ -587,10 +497,7 @@ impl Inner {
             };
             (file, state.generation)
         };
-        let io_error = |source| StoreError::Io {
-            path: self.path.clone(),
-            source,
-        };
+        let io_error = io_error(&self.path);
         let mut bytes =
             serde_json::to_vec_pretty(&file).map_err(|error| io_error(io::Error::other(error)))?;
         bytes.push(b'\n');
@@ -607,11 +514,73 @@ impl State {
         self.generation += 1;
         self.generation
     }
+
+    /// Gives `candidate`'s endpoint to `identity` alone: taken away from
+    /// every other identity, and added to or updated in this one's. Returns
+    /// the subscription as stored.
+    fn subscribe(&mut self, identity: &str, candidate: SubscriptionRecord) -> SubscriptionRecord {
+        for (other, record) in self.identities.iter_mut() {
+            if other != identity {
+                record
+                    .subscriptions
+                    .retain(|s| s.endpoint != candidate.endpoint);
+            }
+        }
+        let subscription = self
+            .identities
+            .entry(identity.to_owned())
+            .or_default()
+            .upsert(candidate);
+        self.identities.retain(|_, record| !record.is_empty());
+        subscription
+    }
+}
+
+/// The request's label, cleaned, or one derived from the user agent.
+fn subscription_label(label: Option<&str>, user_agent: Option<&str>) -> String {
+    label
+        .map(|label| clean_text(label, MAX_LABEL_CHARS))
+        .filter(|label| !label.is_empty())
+        .unwrap_or_else(|| {
+            clean_text(
+                &describe_user_agent(user_agent.unwrap_or("")),
+                MAX_LABEL_CHARS,
+            )
+        })
 }
 
 impl IdentityRecord {
     fn is_empty(&self) -> bool {
         self.subscriptions.is_empty() && self.preferences == PushPreferences::default()
+    }
+
+    /// Updates the keys and label of the subscription with `candidate`'s
+    /// endpoint, keeping its id, or adds `candidate` and drops the oldest
+    /// past [`MAX_SUBSCRIPTIONS_PER_IDENTITY`].
+    fn upsert(&mut self, candidate: SubscriptionRecord) -> SubscriptionRecord {
+        if let Some(existing) = self
+            .subscriptions
+            .iter_mut()
+            .find(|s| s.endpoint == candidate.endpoint)
+        {
+            existing.p256dh = candidate.p256dh;
+            existing.auth = candidate.auth;
+            existing.label = candidate.label;
+            return existing.clone();
+        }
+        self.subscriptions.push(candidate.clone());
+        // Oldest first, so the one dropped is the front; a stable sort keeps
+        // the new one last among equal times.
+        self.subscriptions.sort_by_key(|s| s.created_at);
+        while self.subscriptions.len() > MAX_SUBSCRIPTIONS_PER_IDENTITY {
+            let oldest = self
+                .subscriptions
+                .iter()
+                .position(|s| s.id != candidate.id)
+                .unwrap_or(0);
+            self.subscriptions.remove(oldest);
+        }
+        candidate
     }
 
     fn remove_where(&mut self, matches: impl Fn(&SubscriptionRecord) -> bool) -> bool {
@@ -659,6 +628,72 @@ impl SubscriptionRecord {
             url,
             keys: SubscriberKeys { p256dh, auth },
         })
+    }
+}
+
+/// What the store's file at `path` holds, and what reading it found. A
+/// missing file is an empty store; an unreadable one is set aside.
+fn load(path: &Path) -> Result<(BTreeMap<String, IdentityRecord>, LoadReport), StoreError> {
+    let mut report = LoadReport {
+        file: LoadedFile::Missing,
+        permissions_corrected: false,
+        invalid_dropped: 0,
+    };
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok((BTreeMap::new(), report));
+        }
+        Err(error) => return Err(io_error(path)(error)),
+    };
+    report.permissions_corrected = tighten_permissions(path).map_err(io_error(path))?;
+    match parse_file(&bytes) {
+        Ok(file) => {
+            report.file = LoadedFile::Loaded {
+                subscriptions: file
+                    .identities
+                    .values()
+                    .map(|i| i.subscriptions.len())
+                    .sum(),
+            };
+            Ok((file.identities, report))
+        }
+        Err(reason) => {
+            report.file = set_aside(path, reason)?;
+            Ok((BTreeMap::new(), report))
+        }
+    }
+}
+
+/// Moves an unreadable store file aside. Kept, not overwritten: it may be
+/// a newer version's file, and its subscriptions are worth recovering.
+fn set_aside(path: &Path, reason: String) -> Result<LoadedFile, StoreError> {
+    let kept_as = corrupt_path(path);
+    std::fs::rename(path, &kept_as).map_err(io_error(path))?;
+    tracing::warn!(
+        path = %path.display(),
+        kept_as = %kept_as.display(),
+        %reason,
+        "the push subscription store was unreadable; starting empty"
+    );
+    Ok(LoadedFile::Corrupt { reason, kept_as })
+}
+
+/// Drops the subscriptions that no longer pass validation. Returns how many.
+fn drop_invalid(identities: &mut BTreeMap<String, IdentityRecord>) -> usize {
+    let mut dropped = 0;
+    for record in identities.values_mut() {
+        let before = record.subscriptions.len();
+        record.subscriptions.retain(|s| s.target().is_some());
+        dropped += before - record.subscriptions.len();
+    }
+    dropped
+}
+
+fn io_error(path: &Path) -> impl Fn(io::Error) -> StoreError + '_ {
+    move |source| StoreError::Io {
+        path: path.to_owned(),
+        source,
     }
 }
 

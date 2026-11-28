@@ -141,25 +141,37 @@ impl Driver {
         };
         // The group outlives its leader when a tool left something running.
         self.group.kill();
+        if !self.flush().await {
+            return;
+        }
+        let exit = self.exit(status).await;
+        let _ = self.io.outputs.send(RunnerOutput::Exited(exit)).await;
+    }
 
-        // Lines the CLI wrote just before it went.
+    /// Forwards the lines the CLI wrote just before it went, then completes
+    /// what the mapper still has open. False when nobody listens any more.
+    async fn flush(&mut self) -> bool {
         while let Ok(Some(line)) = timeout(DRAIN, self.lines.recv()).await {
             if !self.forward(&line).await {
-                return;
+                return false;
             }
         }
         for output in self.mapper.finish() {
             if self.io.outputs.send(output).await.is_err() {
-                return;
+                return false;
             }
         }
-        let exit = if self.stopping || (!self.in_turn && status.is_some_and(|s| s.success())) {
-            Exit::Ok
-        } else {
-            let _ = timeout(DRAIN, &mut self.stderr_reader).await;
-            Exit::Error(self.failure(status))
-        };
-        let _ = self.io.outputs.send(RunnerOutput::Exited(exit)).await;
+        true
+    }
+
+    /// How the run ended: fine when it was stopped, or exited cleanly
+    /// between turns; otherwise an error that quotes stderr.
+    async fn exit(&mut self, status: Option<ExitStatus>) -> Exit {
+        if self.stopping || (!self.in_turn && status.is_some_and(|s| s.success())) {
+            return Exit::Ok;
+        }
+        let _ = timeout(DRAIN, &mut self.stderr_reader).await;
+        Exit::Error(self.failure(status))
     }
 
     /// Moves lines and inputs until the process is gone or nobody listens.

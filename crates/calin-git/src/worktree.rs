@@ -58,88 +58,142 @@ pub fn create_worktree(
     branch: &str,
     start_point: Option<&str>,
 ) -> Result<Worktree> {
-    let clone = work_dir(clone)?;
-    let target = absolutize(path)?;
-    let start = match start_point {
-        Some(rev) => require_commit(&clone, rev)?,
-        None => resolve_commit(&clone, "HEAD")?
-            .ok_or_else(|| Error::Conflict(format!("{} has no commits yet", clone.display())))?,
-    };
-    let full_ref = format!("refs/heads/{branch}");
-    check_branch_name(&clone, branch, &full_ref)?;
+    let request = Request::new(clone, path, branch, start_point)?;
+    let worktrees = request.registered()?;
+    if let Some(at_path) = worktrees.iter().find(|w| w.path == request.target) {
+        return request.already_present(at_path);
+    }
+    request.check_free(&worktrees)?;
+    request.add()
+}
 
-    let mut worktrees = list(&clone)?;
-    let stale =
-        |w: &Registered| w.prunable && (w.path == target || w.branch.as_deref() == Some(&full_ref));
-    if worktrees.iter().any(stale) {
-        // A deleted directory still holds its path and its branch until pruned.
-        prune(&clone)?;
-        worktrees = list(&clone)?;
+/// A checked [`create_worktree`] call.
+struct Request<'a> {
+    clone: PathBuf,
+    target: PathBuf,
+    branch: &'a str,
+    /// `refs/heads/<branch>`.
+    full_ref: String,
+    /// The commit id of the start point.
+    start: String,
+}
+
+impl<'a> Request<'a> {
+    fn new(clone: &Path, path: &Path, branch: &'a str, start_point: Option<&str>) -> Result<Self> {
+        let clone = work_dir(clone)?;
+        let target = absolutize(path)?;
+        let start = match start_point {
+            Some(rev) => require_commit(&clone, rev)?,
+            None => resolve_commit(&clone, "HEAD")?.ok_or_else(|| {
+                Error::Conflict(format!("{} has no commits yet", clone.display()))
+            })?,
+        };
+        let full_ref = format!("refs/heads/{branch}");
+        check_branch_name(&clone, branch, &full_ref)?;
+        Ok(Self {
+            clone,
+            target,
+            branch,
+            full_ref,
+            start,
+        })
     }
 
-    if let Some(at_path) = worktrees.iter().find(|w| w.path == target) {
-        if at_path.main {
-            return Err(Error::Conflict(format!(
-                "{} is the clone itself, not a worktree of it",
-                target.display()
-            )));
+    fn is_on_branch(&self, worktree: &Registered) -> bool {
+        worktree.branch.as_deref() == Some(&self.full_ref)
+    }
+
+    /// The registered worktrees, once those that are gone and hold the target
+    /// path or the branch are pruned.
+    fn registered(&self) -> Result<Vec<Registered>> {
+        let worktrees = list(&self.clone)?;
+        let stale = |w: &Registered| w.prunable && (w.path == self.target || self.is_on_branch(w));
+        if !worktrees.iter().any(stale) {
+            return Ok(worktrees);
         }
-        if at_path.branch.as_deref() != Some(&full_ref) {
+        // A deleted directory still holds its path and its branch until pruned.
+        prune(&self.clone)?;
+        list(&self.clone)
+    }
+
+    /// The answer when the target path already is a worktree.
+    fn already_present(self, at_path: &Registered) -> Result<Worktree> {
+        refuse_main(at_path, &self.target)?;
+        if !self.is_on_branch(at_path) {
             return Err(Error::Conflict(format!(
                 "{} is already a worktree, on {}",
-                target.display(),
+                self.target.display(),
                 at_path.branch.as_deref().unwrap_or("a detached HEAD")
             )));
         }
-        return Ok(Worktree {
-            base_ref: merge_base(&clone, &full_ref, &start)?,
-            path: target,
-            branch: branch.to_owned(),
+        Ok(Worktree {
+            base_ref: merge_base(&self.clone, &self.full_ref, &self.start)?,
+            path: self.target,
+            branch: self.branch.to_owned(),
             outcome: WorktreeOutcome::AlreadyPresent,
-        });
+        })
     }
-    if let Some(user) = worktrees
-        .iter()
-        .find(|w| w.branch.as_deref() == Some(&full_ref))
-    {
-        return Err(Error::Conflict(format!(
-            "branch {branch} is checked out at {}",
-            user.path.display()
-        )));
+
+    /// Refuses a branch checked out elsewhere and a target that is in use.
+    fn check_free(&self, worktrees: &[Registered]) -> Result<()> {
+        if let Some(user) = worktrees.iter().find(|w| self.is_on_branch(w)) {
+            return Err(Error::Conflict(format!(
+                "branch {} is checked out at {}",
+                self.branch,
+                user.path.display()
+            )));
+        }
+        if is_occupied(&self.target)? {
+            return Err(Error::Conflict(format!(
+                "{} already exists and is not an empty directory",
+                self.target.display()
+            )));
+        }
+        Ok(())
     }
-    if is_occupied(&target)? {
+
+    /// Adds the worktree: on the existing branch, or on a new one at the start point.
+    fn add(self) -> Result<Worktree> {
+        let add = Git::write(&self.clone).args(["worktree", "add"]);
+        let (add, base_ref, outcome) = if resolve_commit(&self.clone, &self.full_ref)?.is_some() {
+            // The short name, not the full ref: git only attaches HEAD to a name
+            // it finds under refs/heads.
+            (
+                add.arg(&self.target).arg(self.branch),
+                merge_base(&self.clone, &self.full_ref, &self.start)?,
+                WorktreeOutcome::Resumed,
+            )
+        } else {
+            // Starting from a commit id rather than a branch name also keeps git
+            // from setting an upstream on the session's branch.
+            (
+                add.args(["-b", self.branch])
+                    .arg(&self.target)
+                    .arg(&self.start),
+                self.start,
+                WorktreeOutcome::Created,
+            )
+        };
+        add.run()?;
+
+        Ok(Worktree {
+            path: fs::canonicalize(&self.target).map_err(|e| Error::io(&self.target, e))?,
+            branch: self.branch.to_owned(),
+            base_ref,
+            outcome,
+        })
+    }
+}
+
+/// [`Error::Conflict`] when `worktree` is the clone's own work tree.
+fn refuse_main(worktree: &Registered, target: &Path) -> Result<()> {
+    if worktree.main {
         return Err(Error::Conflict(format!(
-            "{} already exists and is not an empty directory",
+            "{} is the clone itself, not a worktree of it",
             target.display()
         )));
     }
-
-    let add = Git::write(&clone).args(["worktree", "add"]);
-    let (add, base_ref, outcome) = if resolve_commit(&clone, &full_ref)?.is_some() {
-        // The short name, not the full ref: git only attaches HEAD to a name
-        // it finds under refs/heads.
-        (
-            add.arg(&target).arg(branch),
-            merge_base(&clone, &full_ref, &start)?,
-            WorktreeOutcome::Resumed,
-        )
-    } else {
-        // Starting from a commit id rather than a branch name also keeps git
-        // from setting an upstream on the session's branch.
-        (
-            add.args(["-b", branch]).arg(&target).arg(&start),
-            start,
-            WorktreeOutcome::Created,
-        )
-    };
-    add.run()?;
-
-    Ok(Worktree {
-        path: fs::canonicalize(&target).map_err(|e| Error::io(&target, e))?,
-        branch: branch.to_owned(),
-        base_ref,
-        outcome,
-    })
+    Ok(())
 }
 
 /// Removes the worktree at `path` from `clone`: its directory, with whatever
@@ -153,22 +207,9 @@ pub fn remove_worktree(clone: &Path, path: &Path) -> Result<()> {
     let target = absolutize(path)?;
     let worktrees = list(&clone)?;
     let Some(registered) = worktrees.iter().find(|w| w.path == target) else {
-        return match fs::symlink_metadata(&target) {
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(Error::io(&target, e)),
-            Ok(_) => Err(Error::Conflict(format!(
-                "{} exists but is not a worktree of {}",
-                target.display(),
-                clone.display()
-            ))),
-        };
+        return check_gone(&clone, &target);
     };
-    if registered.main {
-        return Err(Error::Conflict(format!(
-            "{} is the clone itself, not a worktree of it",
-            target.display()
-        )));
-    }
+    refuse_main(registered, &target)?;
     // When only the registration is left, pruning is all there is to do.
     if !registered.prunable {
         Git::write(&clone)
@@ -177,6 +218,19 @@ pub fn remove_worktree(clone: &Path, path: &Path) -> Result<()> {
             .run()?;
     }
     prune(&clone)
+}
+
+/// `Ok` when nothing is at `target`, which is not a worktree of `clone`.
+fn check_gone(clone: &Path, target: &Path) -> Result<()> {
+    match fs::symlink_metadata(target) {
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(Error::io(target, e)),
+        Ok(_) => Err(Error::Conflict(format!(
+            "{} exists but is not a worktree of {}",
+            target.display(),
+            clone.display()
+        ))),
+    }
 }
 
 fn prune(clone: &Path) -> Result<()> {

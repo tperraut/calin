@@ -303,17 +303,20 @@ pub fn summary(report: &Report, server: &str) -> String {
         out.push_str(&format!("Initialized a git repository in {root}.\n"));
     }
     out.push_str(&format!("Home repo: {root}\n"));
+    out.push_str(&changes(report));
+    out.push_str(&next_steps(report, server));
+    out
+}
+
+/// What was created and kept, and the notes.
+fn changes(report: &Report) -> String {
+    let mut out = String::new();
     if !report.created.is_empty() {
         out.push_str("\nCreated:\n");
         for path in &report.created {
             out.push_str(&format!("  {path}"));
             if path == REPOS_FILE {
-                out.push_str(&match report.repos.len() {
-                    0 if report.scan_roots.is_empty() => " (a commented example)".to_owned(),
-                    0 => " (no clone found; a commented example)".to_owned(),
-                    1 => " (1 repo)".to_owned(),
-                    n => format!(" ({n} repos)"),
-                });
+                out.push_str(&repos_count(report));
             }
             out.push('\n');
         }
@@ -327,7 +330,22 @@ pub fn summary(report: &Report, server: &str) -> String {
     for note in &report.notes {
         out.push_str(&format!("\nNote: {note}\n"));
     }
+    out
+}
 
+/// What a new `repos.yaml` holds, said after its path.
+fn repos_count(report: &Report) -> String {
+    match report.repos.len() {
+        0 if report.scan_roots.is_empty() => " (a commented example)".to_owned(),
+        0 => " (no clone found; a commented example)".to_owned(),
+        1 => " (1 repo)".to_owned(),
+        n => format!(" ({n} repos)"),
+    }
+}
+
+fn next_steps(report: &Report, server: &str) -> String {
+    let mut out = String::new();
+    let root = report.root.display();
     let quoted_root = shell_quote(&report.root.to_string_lossy());
     let mut tops: Vec<&str> = report
         .created

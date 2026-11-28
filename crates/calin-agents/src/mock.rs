@@ -16,6 +16,7 @@ use calin_proto::{
 use serde_json::json;
 use tokio::sync::mpsc::error::TryRecvError;
 
+use crate::prose::Prose;
 use crate::runner::{
     AgentHandle, AgentIo, Exit, PermissionAsk, Runner, RunnerError, RunnerInput, RunnerOutput,
     StartParams, SubagentStart, ToolAccess,
@@ -237,12 +238,20 @@ impl MockAgent {
             return self.demo(script).await;
         }
         let quote = quote(user_text);
+        self.think(&quote).await?;
+        self.run_tests().await?;
+        self.make_the_change(&quote).await?;
+        self.summarize(&quote).await?;
+        self.report_usage().await
+    }
 
+    /// The fixed turn's opening: what it makes of the request, then the plan.
+    async fn think(&mut self, quote: &str) -> Result<(), Cut> {
         self.streamed(
             Prose::Reasoning,
             &[
                 "The request is: ",
-                &quote,
+                quote,
                 ". ",
                 "I should look at the tests first, ",
                 "then make the smallest change that satisfies it.",
@@ -259,8 +268,11 @@ impl MockAgent {
             ],
         )
         .await?;
-        self.plan(0).await?;
+        self.plan(0).await
+    }
 
+    /// Plan step 1.
+    async fn run_tests(&mut self) -> Result<(), Cut> {
         self.tool(
             "Bash",
             ToolKind::Execute,
@@ -275,30 +287,33 @@ impl MockAgent {
             None,
         )
         .await?;
-        self.plan(1).await?;
+        self.plan(1).await
+    }
 
-        let locations: Vec<String> = self
-            .edited
-            .iter()
-            .map(|path| path.to_string_lossy().into_owned())
-            .collect();
-        self.subagent(locations).await?;
-        self.edit_notes(&quote).await?;
-        self.plan(2).await?;
+    /// Plan step 2: a subagent reads the notes, then the agent adds one.
+    async fn make_the_change(&mut self, quote: &str) -> Result<(), Cut> {
+        self.subagent(self.edited_locations()).await?;
+        self.edit_notes(quote).await?;
+        self.plan(2).await
+    }
 
+    /// Plan step 3.
+    async fn summarize(&mut self, quote: &str) -> Result<(), Cut> {
         self.streamed(
             Prose::Text,
             &[
                 "Done. ",
                 "You asked: \"",
-                &quote,
+                quote,
                 "\". ",
                 "The tests pass and the change is in calin-mock-notes.md.",
             ],
         )
         .await?;
-        self.plan(3).await?;
+        self.plan(3).await
+    }
 
+    async fn report_usage(&mut self) -> Result<(), Cut> {
         self.emit(EventBody::Usage {
             cost_usd: 0.0125 * self.turns as f64,
             tokens_in: 1200 * self.turns,
@@ -313,13 +328,17 @@ impl MockAgent {
         .await
     }
 
-    /// Appends a line naming the turn to the notes file: a real change.
-    async fn edit_notes(&mut self, quote: &str) -> Result<(), Cut> {
-        let locations: Vec<String> = self
-            .edited
+    /// The edited file as a tool call's locations: none without a directory.
+    fn edited_locations(&self) -> Vec<String> {
+        self.edited
             .iter()
             .map(|path| path.to_string_lossy().into_owned())
-            .collect();
+            .collect()
+    }
+
+    /// Appends a line naming the turn to the notes file: a real change.
+    async fn edit_notes(&mut self, quote: &str) -> Result<(), Cut> {
+        let locations = self.edited_locations();
         let note = format!("- turn {}: {quote}\n", self.turns);
         self.tool(
             "Edit",
@@ -444,47 +463,16 @@ impl MockAgent {
             },
         })
         .await?;
-        if self.asks_before(tool_kind) {
-            let access = match (tool_kind, &self.edited) {
-                (ToolKind::Edit, Some(path)) => ToolAccess::Files {
-                    paths: vec![path.clone()],
-                    write: true,
-                },
-                _ => ToolAccess::Other,
-            };
-            let request = PermissionAsk {
-                request: PermissionRequest {
-                    id: format!("{id}-permission"),
-                    tool_name: name.to_owned(),
-                    tool_kind,
-                    title: title.to_owned(),
-                    input,
-                    item_id: Some(id),
-                },
-                access,
-                subagent: self.inside.clone(),
-            };
-            if let (PermissionDecision::Deny, message) = self.ask(request).await? {
-                if let Some(Item {
-                    content: ItemContent::Tool { output, .. },
-                    ..
-                }) = &mut self.open
-                {
-                    *output = message;
-                }
-                return self.complete_item(ItemStatus::Declined).await;
-            }
-        }
-        if let (Some(note), Some(path)) = (note, self.edited.clone())
-            && let Err(reason) = append_line(path, note).await
+        if self.asks_before(tool_kind)
+            && let (PermissionDecision::Deny, message) = self
+                .ask_about(id, name, tool_kind, title, input, self.access_of(tool_kind))
+                .await?
         {
-            if let Some(Item {
-                content: ItemContent::Tool { output, .. },
-                ..
-            }) = &mut self.open
-            {
-                *output = Some(reason);
-            }
+            self.set_tool_output(message);
+            return self.complete_item(ItemStatus::Declined).await;
+        }
+        if let Err(reason) = self.append_note(note).await {
+            self.set_tool_output(Some(reason));
             return self.complete_item(ItemStatus::Failed).await;
         }
         for chunk in output {
@@ -493,15 +481,73 @@ impl MockAgent {
             })
             .await?;
         }
-        if let Some(Item {
-            content: ItemContent::Tool { output, .. },
-            ..
-        }) = &mut self.open
-        {
+        if let Some(output) = self.open_tool_output() {
             // A completed call always has an output, even an empty one.
             output.get_or_insert_default();
         }
         self.complete_item(ItemStatus::Completed).await
+    }
+
+    /// What a permission request for a scripted call of `tool_kind` is about.
+    fn access_of(&self, tool_kind: ToolKind) -> ToolAccess {
+        match (tool_kind, &self.edited) {
+            (ToolKind::Edit, Some(path)) => ToolAccess::Files {
+                paths: vec![path.clone()],
+                write: true,
+            },
+            _ => ToolAccess::Other,
+        }
+    }
+
+    /// Asks for the tool call `id`, as the agent or the subagent at work,
+    /// and waits for the decision.
+    async fn ask_about(
+        &mut self,
+        id: String,
+        name: &str,
+        tool_kind: ToolKind,
+        title: &str,
+        input: serde_json::Value,
+        access: ToolAccess,
+    ) -> Result<(PermissionDecision, Option<String>), Cut> {
+        let request = PermissionAsk {
+            request: PermissionRequest {
+                id: format!("{id}-permission"),
+                tool_name: name.to_owned(),
+                tool_kind,
+                title: title.to_owned(),
+                input,
+                item_id: Some(id),
+            },
+            access,
+            subagent: self.inside.clone(),
+        };
+        self.ask(request).await
+    }
+
+    /// Appends `note` to the edited file, when there is a note and a file.
+    async fn append_note(&self, note: Option<String>) -> Result<(), String> {
+        let (Some(note), Some(path)) = (note, self.edited.clone()) else {
+            return Ok(());
+        };
+        append_line(path, note).await
+    }
+
+    /// The output of the open item, when it is a tool call.
+    fn open_tool_output(&mut self) -> Option<&mut Option<String>> {
+        match &mut self.open {
+            Some(Item {
+                content: ItemContent::Tool { output, .. },
+                ..
+            }) => Some(output),
+            _ => None,
+        }
+    }
+
+    fn set_tool_output(&mut self, text: Option<String>) {
+        if let Some(output) = self.open_tool_output() {
+            *output = text;
+        }
     }
 
     fn asks_before(&self, tool_kind: ToolKind) -> bool {
@@ -661,28 +707,6 @@ impl MockAgent {
     fn next_item_id(&mut self) -> String {
         self.items += 1;
         format!("mock-{}-{}", self.start_seq, self.items)
-    }
-}
-
-#[derive(Clone, Copy)]
-enum Prose {
-    Text,
-    Reasoning,
-}
-
-impl Prose {
-    fn content(self, text: String) -> ItemContent {
-        match self {
-            Self::Text => ItemContent::Text { text },
-            Self::Reasoning => ItemContent::Reasoning { text },
-        }
-    }
-
-    fn delta(self, text: String) -> ItemDelta {
-        match self {
-            Self::Text => ItemDelta::Text { text },
-            Self::Reasoning => ItemDelta::Reasoning { text },
-        }
     }
 }
 

@@ -557,6 +557,39 @@ async fn a_repeated_or_oversized_query_is_refused() {
     }
 }
 
+#[tokio::test]
+async fn the_callback_checks_run_in_a_fixed_order() {
+    let harness = Harness::new().await;
+    let state_of = |url: &str| query_of(url)["state"].clone();
+    let cases: [(&str, LoginError); 4] = [
+        // Malformed first, even with a wrong state and an error.
+        (
+            "state=wrong&state=wrong&error=x",
+            LoginError::MalformedCallback,
+        ),
+        // A provider error with the right state wins over a code.
+        (
+            "state=STATE&error=access_denied&code=c",
+            LoginError::ProviderRefused("access_denied".to_owned()),
+        ),
+        (
+            "state=STATE&error=access_denied&code=",
+            LoginError::ProviderRefused("access_denied".to_owned()),
+        ),
+        ("state=wrong&code=", LoginError::StateMismatch),
+    ];
+    for (query, error) in cases {
+        let (url, reference) = harness.begin(None).await;
+        let query = query.replace("STATE", &state_of(&url));
+        assert_eq!(
+            harness.finish(&reference, &query).await.unwrap_err(),
+            error,
+            "{query}"
+        );
+    }
+    assert_eq!(harness.provider.state().hits.token, 0);
+}
+
 #[test]
 fn callback_parameters_are_decoded_and_unknown_ones_ignored() {
     let params = CallbackParams::from_query("code=a%2Fb+c&state=s%3D1&session_state=x&iss=y");

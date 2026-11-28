@@ -133,6 +133,8 @@ struct Scene {
     /// The user's prompt and the brief as the child received it.
     prompt: Arc<Event>,
     brief: Arc<Event>,
+    /// The root lead going idle: the end of its turn.
+    lead_idle: Arc<Event>,
 }
 
 const LONG_NOTE: &str = "This second note is deliberately much longer than eighty characters so that its excerpt has to be cut";
@@ -308,7 +310,7 @@ async fn scene(store: &Store) -> Scene {
     add(store, r, asked).await;
     tick().await;
     add(store, r, status(SessionStatus::Running)).await;
-    add(store, r, by_lead(agent_status(AgentStatus::Idle))).await;
+    let lead_idle = add(store, r, by_lead(agent_status(AgentStatus::Idle))).await;
     let last = add(store, r, status(SessionStatus::Review)).await;
     Scene {
         root,
@@ -316,6 +318,7 @@ async fn scene(store: &Store) -> Scene {
         moments: [first.ts, second.ts, third, fourth.ts, last.ts],
         prompt,
         brief,
+        lead_idle,
     }
 }
 
@@ -639,7 +642,7 @@ async fn the_timeline_has_a_lane_per_agent_spans_that_nest_and_arrows_between_la
     // A turn runs from the input that started it to the end of the turn.
     let turn = &lead[0];
     assert_eq!(turn.start, scene.prompt.ts);
-    assert!(turn.end.unwrap() >= scene.moments[4] - 1);
+    assert_eq!(turn.end, Some(scene.lead_idle.ts));
     assert_eq!(lead[1].tool_kind, Some(ToolKind::Edit));
     assert_eq!((turn.tool_kind, turn.status), (None, None));
     for lane in &timeline.lanes {
@@ -834,6 +837,33 @@ async fn open_spans_have_no_end_and_a_queued_input_starts_its_turn_where_the_las
     assert!(queued.ts < ended.ts);
     assert_eq!(lead[3].start, ended.ts);
     assert!(lead[3].id.starts_with("turn:"));
+}
+
+#[tokio::test]
+async fn a_starting_agent_keeps_its_turn_and_a_wait_without_a_reason_is_plain_waiting() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir).await;
+    let id = store.create_session(new_session("w")).await.unwrap().id;
+    let s = id.as_str();
+    let first = add(&store, s, message(1)).await;
+    let lead = EventDraft::new(spawned(agent("L", s))).parent(Some(first.id.clone()));
+    add(&store, s, lead).await;
+    let starting = EventDraft::new(agent_status(AgentStatus::Starting)).agent("L");
+    add(&store, s, starting).await;
+    let waiting = EventDraft::new(EventBody::SessionStatus {
+        status: SessionStatus::Waiting,
+        reason: None,
+    });
+    add(&store, s, waiting).await;
+
+    let timeline = store.timeline(s).await.unwrap();
+    assert_eq!(
+        span_shapes(spans(&timeline, "L")),
+        [
+            (SpanKind::Turn, "message 1", None, false),
+            (SpanKind::Waiting, "Waiting", None, false),
+        ]
+    );
 }
 
 /// Tool calls per session of the large tree.

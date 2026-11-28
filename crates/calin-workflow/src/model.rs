@@ -140,57 +140,31 @@ impl Node {
 
     /// Every template field of the node with its key, branch prompts as `branches[<id>].prompt`.
     pub fn templates(&self) -> Vec<(String, &Template)> {
-        let mut out = Vec::new();
-        match &self.kind {
-            NodeKind::Start | NodeKind::End { .. } | NodeKind::Loop { .. } => {}
-            NodeKind::Agent(a) => out.push(("prompt".to_owned(), &a.prompt)),
-            NodeKind::Check(c) => {
-                if let Some(cmd) = &c.command {
-                    out.push(("command".to_owned(), cmd));
-                }
-            }
-            NodeKind::Gate { message } | NodeKind::Commit { message } => {
-                out.push(("message".to_owned(), message))
-            }
-            NodeKind::Ask { question, .. } => out.push(("question".to_owned(), question)),
-            NodeKind::Parallel { branches } => {
-                for b in branches {
-                    out.push((format!("branches[{}].prompt", b.id), &b.prompt));
-                }
-            }
-            NodeKind::Ship { title, .. } => {
-                if let Some(t) = title {
-                    out.push(("title".to_owned(), t));
-                }
-            }
+        if let NodeKind::Parallel { branches } = &self.kind {
+            return branches
+                .iter()
+                .map(|b| (format!("branches[{}].prompt", b.id), &b.prompt))
+                .collect();
         }
-        out
+        self.kind
+            .main_template()
+            .map(|(key, t)| (key.to_owned(), t))
+            .into_iter()
+            .collect()
     }
 
     /// A short label for a picture of the graph: the first line of the node's main text,
     /// at most 60 characters.
     pub fn label(&self) -> String {
-        let text = match &self.kind {
-            NodeKind::Start => "Start".to_owned(),
-            NodeKind::End { status } => match status {
-                EndStatus::Success => "End: success".to_owned(),
-                EndStatus::Failed => "End: failed".to_owned(),
-            },
-            NodeKind::Agent(a) => a.prompt.source().to_owned(),
-            NodeKind::Check(c) => match &c.command {
-                Some(cmd) => cmd.source().to_owned(),
-                None => "Repository checks".to_owned(),
-            },
-            NodeKind::Loop { max } => format!("Up to {max} times"),
-            NodeKind::Gate { message } | NodeKind::Commit { message } => {
-                message.source().to_owned()
-            }
-            NodeKind::Ask { question, .. } => question.source().to_owned(),
-            NodeKind::Parallel { branches } => format!("{} branches", branches.len()),
-            NodeKind::Ship { title, .. } => match title {
-                Some(t) => t.source().to_owned(),
-                None => "Open pull requests".to_owned(),
-            },
+        let text = match (&self.kind, self.kind.main_template()) {
+            (_, Some((_, template))) => template.source().to_owned(),
+            (NodeKind::Start, None) => "Start".to_owned(),
+            (NodeKind::End { status }, None) => format!("End: {}", status.as_str()),
+            (NodeKind::Loop { max }, None) => format!("Up to {max} times"),
+            (NodeKind::Parallel { branches }, None) => format!("{} branches", branches.len()),
+            (NodeKind::Check(_), None) => "Repository checks".to_owned(),
+            // A `ship` node without a title: every other type always has its main text.
+            (_, None) => "Open pull requests".to_owned(),
         };
         shorten(&text, 60)
     }
@@ -448,6 +422,22 @@ impl NodeKind {
             NodeKind::Parallel { .. } => NodeType::Parallel,
             NodeKind::Commit { .. } => NodeType::Commit,
             NodeKind::Ship { .. } => NodeType::Ship,
+        }
+    }
+
+    /// The node's one main template with its key, when it has one; a `parallel` node's
+    /// prompts are per branch, so it has none.
+    fn main_template(&self) -> Option<(&'static str, &Template)> {
+        match self {
+            NodeKind::Agent(a) => Some(("prompt", &a.prompt)),
+            NodeKind::Check(c) => c.command.as_ref().map(|t| ("command", t)),
+            NodeKind::Gate { message } | NodeKind::Commit { message } => Some(("message", message)),
+            NodeKind::Ask { question, .. } => Some(("question", question)),
+            NodeKind::Ship { title, .. } => title.as_ref().map(|t| ("title", t)),
+            NodeKind::Start
+            | NodeKind::End { .. }
+            | NodeKind::Loop { .. }
+            | NodeKind::Parallel { .. } => None,
         }
     }
 

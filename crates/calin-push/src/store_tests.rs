@@ -455,14 +455,24 @@ async fn invalid_records_are_dropped_on_load() {
         )
         .await
         .unwrap();
+    f.store
+        .subscribe(
+            "alice",
+            &request("https://push.example.net/bad2"),
+            None,
+            STRICT,
+        )
+        .await
+        .unwrap();
     let file = std::fs::read_to_string(&f.path).unwrap();
+    // Both `bad` endpoints, in the one identity.
     std::fs::write(
         &f.path,
         file.replace("https://push.example.net/bad", "https://localhost/bad"),
     )
     .unwrap();
     let store = f.reopen().await;
-    assert_eq!(store.load_report().invalid_dropped, 1);
+    assert_eq!(store.load_report().invalid_dropped, 2);
     assert_eq!(store.list("alice").len(), 1);
     assert!(
         !std::fs::read_to_string(&f.path)
@@ -555,6 +565,23 @@ async fn an_unwritable_directory_fails_at_open() {
     .await
     .unwrap_err();
     assert!(matches!(error, StoreError::Io { .. }));
+}
+
+#[tokio::test]
+async fn a_store_file_that_cannot_be_read_fails_at_open_and_is_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    // A directory where the file should be: there, but not readable as one.
+    let path = dir.path().join("push.json");
+    std::fs::create_dir(&path).unwrap();
+    let error = SubscriptionStore::open(&path, Arc::new(ManualClock::new(START)))
+        .await
+        .unwrap_err();
+    let StoreError::Io { path: named, .. } = &error else {
+        panic!("{error:?}");
+    };
+    assert_eq!(named, &path);
+    assert!(path.is_dir());
+    assert!(!corrupt_path(&path).exists());
 }
 
 #[tokio::test]

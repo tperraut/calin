@@ -84,46 +84,9 @@ fn read(path: &Path) -> Settings {
 /// Blocking. Checks the settings against the disk and puts every path in
 /// its canonical form, so that later comparisons are plain string ones.
 fn validate(wanted: Settings) -> Result<Settings> {
-    let home_repo = match filled(wanted.home_repo) {
-        None => None,
-        Some(path) => {
-            let path = absolute("the home repo", &path)?;
-            let clone = calin_git::inspect_clone(&path)
-                .map_err(|err| Error::Invalid(format!("the home repo: {err}")))?;
-            Some(utf8("the home repo", &clone.root)?)
-        }
-    };
-    let mut scan_roots: Vec<String> = Vec::new();
-    for root in wanted.scan_roots {
-        // A blank line of a form is not a root.
-        let Some(root) = filled(Some(root)) else {
-            continue;
-        };
-        let path = absolute("a scan root", &root)?;
-        let real = std::fs::canonicalize(&path)
-            .ok()
-            .filter(|real| real.is_dir())
-            .ok_or_else(|| {
-                Error::Invalid(format!("the scan root {root} is not an existing directory"))
-            })?;
-        let real = utf8("a scan root", &real)?;
-        if !scan_roots.contains(&real) {
-            scan_roots.push(real);
-        }
-    }
-    let clone_root = match filled(wanted.clone_root) {
-        None => None,
-        Some(root) => {
-            let path = absolute("the clone root", &root)?;
-            // It may not exist yet: the first clone creates it.
-            if path.exists() && !path.is_dir() {
-                return Err(Error::Invalid(format!(
-                    "the clone root {root} is not a directory"
-                )));
-            }
-            Some(utf8("the clone root", &path)?)
-        }
-    };
+    let home_repo = filled(wanted.home_repo).map(home_repo).transpose()?;
+    let scan_roots = scan_roots(wanted.scan_roots)?;
+    let clone_root = filled(wanted.clone_root).map(clone_root).transpose()?;
     if let Some(limit) = wanted.max_parallel
         && !(1..=MAX_MAX_PARALLEL).contains(&limit)
     {
@@ -139,8 +102,48 @@ fn validate(wanted: Settings) -> Result<Settings> {
     })
 }
 
-/// The trimmed value, or `None` when there is nothing in it.
-fn filled(value: Option<String>) -> Option<String> {
+/// The root of the clone at `path`.
+fn home_repo(path: String) -> Result<String> {
+    let path = absolute("the home repo", &path)?;
+    let clone = calin_git::inspect_clone(&path)
+        .map_err(|err| Error::Invalid(format!("the home repo: {err}")))?;
+    utf8("the home repo", &clone.root)
+}
+
+/// The scan roots as real directories, each once, in their order.
+fn scan_roots(wanted: Vec<String>) -> Result<Vec<String>> {
+    let mut scan_roots: Vec<String> = Vec::new();
+    // A blank line of a form is not a root.
+    for root in wanted.into_iter().filter_map(|root| filled(Some(root))) {
+        let path = absolute("a scan root", &root)?;
+        let real = std::fs::canonicalize(&path)
+            .ok()
+            .filter(|real| real.is_dir())
+            .ok_or_else(|| {
+                Error::Invalid(format!("the scan root {root} is not an existing directory"))
+            })?;
+        let real = utf8("a scan root", &real)?;
+        if !scan_roots.contains(&real) {
+            scan_roots.push(real);
+        }
+    }
+    Ok(scan_roots)
+}
+
+fn clone_root(root: String) -> Result<String> {
+    let path = absolute("the clone root", &root)?;
+    // It may not exist yet: the first clone creates it.
+    if path.exists() && !path.is_dir() {
+        return Err(Error::Invalid(format!(
+            "the clone root {root} is not a directory"
+        )));
+    }
+    utf8("the clone root", &path)
+}
+
+/// The trimmed value, or `None` when there is nothing in it: how every
+/// optional text of a request or a file is read.
+pub(crate) fn filled(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())

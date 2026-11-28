@@ -40,63 +40,138 @@ pub(crate) struct ToolView {
     pub access: ToolAccess,
 }
 
+/// What Calin knows of one of Claude Code's tools.
+struct ToolShape {
+    names: &'static [&'static str],
+    kind: ToolKind,
+    /// The inputs a title comes from, the first one set winning.
+    title_from: &'static [&'static str],
+    /// The inputs that name the file the call touches, the first one set winning.
+    file_from: &'static [&'static str],
+}
+
+const TOOL_SHAPES: [ToolShape; 8] = [
+    ToolShape {
+        names: &["Read"],
+        kind: ToolKind::Read,
+        title_from: &[],
+        file_from: &["file_path"],
+    },
+    ToolShape {
+        names: &["Edit", "Write", "MultiEdit"],
+        kind: ToolKind::Edit,
+        title_from: &[],
+        file_from: &["file_path"],
+    },
+    ToolShape {
+        names: &["NotebookEdit"],
+        kind: ToolKind::Edit,
+        title_from: &[],
+        file_from: &["notebook_path", "file_path"],
+    },
+    ToolShape {
+        names: &["Bash"],
+        kind: ToolKind::Execute,
+        title_from: &["command"],
+        file_from: &[],
+    },
+    ToolShape {
+        names: &["Grep", "Glob"],
+        kind: ToolKind::Search,
+        title_from: &["pattern"],
+        file_from: &[],
+    },
+    ToolShape {
+        names: &["WebFetch"],
+        kind: ToolKind::Fetch,
+        title_from: &["url"],
+        file_from: &[],
+    },
+    ToolShape {
+        names: &["WebSearch"],
+        kind: ToolKind::Fetch,
+        title_from: &["query"],
+        file_from: &[],
+    },
+    ToolShape {
+        names: &["Task", "Agent"],
+        kind: ToolKind::Task,
+        title_from: &["description", "subagent_type"],
+        file_from: &[],
+    },
+];
+
+/// Any other tool: no title but its name, no file.
+const OTHER_TOOL: ToolShape = ToolShape {
+    names: &[],
+    kind: ToolKind::Other,
+    title_from: &[],
+    file_from: &[],
+};
+
 /// Describes a call of `name` with `input`, made by an agent working in `cwd`.
 pub(crate) fn describe(name: &str, input: &Value, cwd: &Path) -> ToolView {
-    let text = |key: &str| {
-        input
-            .get(key)
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
+    let shape = TOOL_SHAPES
+        .iter()
+        .find(|shape| shape.names.contains(&name))
+        .unwrap_or(&OTHER_TOOL);
+    let file = first_text(input, shape.file_from).map(|path| absolute(path, cwd));
+    let title = match (&file, first_text(input, shape.title_from)) {
+        (Some(path), _) => relative(path, cwd),
+        (None, Some(title)) => one_line(title),
+        (None, None) => name.to_owned(),
     };
-    let (kind, title, file) = match name {
-        "Read" => (ToolKind::Read, None, text("file_path")),
-        "Edit" | "Write" | "MultiEdit" => (ToolKind::Edit, None, text("file_path")),
-        "NotebookEdit" => (
-            ToolKind::Edit,
-            None,
-            text("notebook_path").or_else(|| text("file_path")),
-        ),
-        "Bash" => (ToolKind::Execute, text("command"), None),
-        "Grep" | "Glob" => (ToolKind::Search, text("pattern"), None),
-        "WebFetch" => (ToolKind::Fetch, text("url"), None),
-        "WebSearch" => (ToolKind::Fetch, text("query"), None),
-        "Task" | "Agent" => (
-            ToolKind::Task,
-            text("description").or_else(|| text("subagent_type")),
-            None,
-        ),
-        _ => (ToolKind::Other, None, None),
-    };
-    let file = file.map(|path| absolute(path, cwd));
-    let access = match (name, &file) {
+    ToolView {
+        kind: shape.kind,
+        title,
+        locations: file
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect(),
+        access: access(name, shape.kind, file, input, cwd),
+    }
+}
+
+/// What a permission request for the call is about.
+fn access(
+    name: &str,
+    kind: ToolKind,
+    file: Option<PathBuf>,
+    input: &Value,
+    cwd: &Path,
+) -> ToolAccess {
+    match (name, file) {
         (_, Some(path)) => ToolAccess::Files {
-            paths: vec![path.clone()],
+            paths: vec![path],
             write: kind == ToolKind::Edit,
         },
         // A search reads below `path`, or below the working directory. No
         // recording holds a permission request for one; the CLI's rules for
         // reading cover them.
         ("Grep" | "Glob", None) => ToolAccess::Files {
-            paths: vec![absolute(text("path").unwrap_or("."), cwd)],
+            paths: vec![absolute(text(input, "path").unwrap_or("."), cwd)],
             write: false,
         },
         _ if name.starts_with(TOOL_SERVER_PREFIX) => ToolAccess::Orchestrator,
         _ => ToolAccess::Other,
-    };
-    let title = match (&file, title) {
-        (Some(path), _) => relative(path, cwd),
-        (None, Some(title)) => one_line(title),
-        (None, None) => name.to_owned(),
-    };
-    ToolView {
-        kind,
-        title,
-        locations: file
-            .iter()
-            .map(|path| path.to_string_lossy().into_owned())
-            .collect(),
-        access,
     }
+}
+
+/// The string input `key`, unless it is missing or blank.
+fn text<'a>(input: &'a Value, key: &str) -> Option<&'a str> {
+    input
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn owned_text(input: &Value, key: &str) -> Option<String> {
+    text(input, key).map(str::to_owned)
+}
+
+/// The first of the inputs `keys` that is set.
+fn first_text<'a>(input: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter().find_map(|key| text(input, key))
 }
 
 /// Told about a subagent whose call names no type.
@@ -120,13 +195,8 @@ pub(crate) fn subagent(name: &str, input: &Value) -> Option<SubagentView> {
     if !matches!(name, "Task" | "Agent") {
         return None;
     }
-    let text = |key: &str| {
-        input
-            .get(key)
-            .and_then(Value::as_str)
-            .map(one_line)
-            .filter(|value| !value.is_empty())
-    };
+    // A text that is not blank has a first line that is not empty.
+    let text = |key: &str| text(input, key).map(one_line);
     let role = text("subagent_type").unwrap_or_else(|| DEFAULT_SUBAGENT_ROLE.to_owned());
     Some(SubagentView {
         description: text("description")
@@ -179,48 +249,49 @@ impl TaskList {
         result: &Value,
         output: &str,
     ) -> Option<Vec<PlanEntry>> {
-        let text = |value: &Value, key: &str| {
-            value
-                .get(key)
-                .and_then(Value::as_str)
-                .filter(|text| !text.trim().is_empty())
-                .map(str::to_owned)
+        let applied = match name {
+            TASK_CREATE_TOOL => self.create(input, result, output),
+            TASK_UPDATE_TOOL => self.update(input, result),
+            _ => None,
         };
-        match name {
-            TASK_CREATE_TOOL => {
-                let task = result.get("task").unwrap_or(&Value::Null);
-                let id = text(task, "id").or_else(|| created_id(output))?;
-                let content = text(input, "subject").or_else(|| text(task, "subject"))?;
-                if self.tasks.iter().any(|(known, _)| *known == id) {
-                    return None;
-                }
-                let status = PlanStatus::Pending;
-                self.tasks.push((id, PlanEntry { content, status }));
-            }
-            TASK_UPDATE_TOOL => {
-                if result.get("success").and_then(Value::as_bool) == Some(false) {
-                    return None;
-                }
-                let id = text(input, "taskId")?;
-                // A task of an earlier process of this conversation is not
-                // known here: its subject was never seen.
-                let index = self.tasks.iter().position(|(known, _)| *known == id)?;
-                let status = input.get("status").and_then(Value::as_str);
-                if status == Some("deleted") {
-                    self.tasks.remove(index);
-                } else {
-                    let entry = &mut self.tasks[index].1;
-                    if status.is_some() {
-                        entry.status = plan_status(status);
-                    }
-                    if let Some(subject) = text(input, "subject") {
-                        entry.content = subject;
-                    }
-                }
-            }
-            _ => return None,
+        applied.map(|()| self.entries())
+    }
+
+    /// Adds the task a `TaskCreate` call made, unless it is known already.
+    fn create(&mut self, input: &Value, result: &Value, output: &str) -> Option<()> {
+        let task = result.get("task").unwrap_or(&Value::Null);
+        let id = owned_text(task, "id").or_else(|| created_id(output))?;
+        let content = owned_text(input, "subject").or_else(|| owned_text(task, "subject"))?;
+        if self.tasks.iter().any(|(known, _)| *known == id) {
+            return None;
         }
-        Some(self.entries())
+        let status = PlanStatus::Pending;
+        self.tasks.push((id, PlanEntry { content, status }));
+        Some(())
+    }
+
+    /// Applies a successful `TaskUpdate` call to a known task.
+    fn update(&mut self, input: &Value, result: &Value) -> Option<()> {
+        if result.get("success").and_then(Value::as_bool) == Some(false) {
+            return None;
+        }
+        let id = text(input, "taskId")?;
+        // A task of an earlier process of this conversation is not known
+        // here: its subject was never seen.
+        let index = self.tasks.iter().position(|(known, _)| *known == id)?;
+        let status = input.get("status").and_then(Value::as_str);
+        if status == Some("deleted") {
+            self.tasks.remove(index);
+            return Some(());
+        }
+        let entry = &mut self.tasks[index].1;
+        if status.is_some() {
+            entry.status = plan_status(status);
+        }
+        if let Some(subject) = owned_text(input, "subject") {
+            entry.content = subject;
+        }
+        Some(())
     }
 
     /// Applies statuses the CLI set by itself, with no task tool call to show
@@ -467,6 +538,52 @@ mod tests {
         assert_eq!(
             view("Edit", json!({ "file_path": 7 })).2,
             Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn a_missing_or_blank_first_input_falls_back_to_the_next() {
+        assert_eq!(
+            view("NotebookEdit", json!({ "file_path": "n.ipynb" })),
+            (ToolKind::Edit, "n.ipynb".into(), at("/work/n.ipynb"))
+        );
+        assert_eq!(
+            view(
+                "NotebookEdit",
+                json!({ "notebook_path": " ", "file_path": "/work/m.ipynb" })
+            ),
+            (ToolKind::Edit, "m.ipynb".into(), at("/work/m.ipynb"))
+        );
+        assert_eq!(
+            view("Agent", json!({ "subagent_type": "reviewer\nmore" })),
+            (ToolKind::Task, "reviewer".into(), vec![])
+        );
+        assert_eq!(
+            view("Task", json!({ "description": "", "subagent_type": "x" })).1,
+            "x"
+        );
+        // A search names what it reads below for a permission request.
+        let grep = describe("Grep", &json!({ "pattern": "p" }), Path::new("/work"));
+        assert_eq!(
+            grep.access,
+            ToolAccess::Files {
+                paths: vec![PathBuf::from("/work")],
+                write: false
+            }
+        );
+        let edit = describe("Edit", &json!({ "file_path": "a" }), Path::new("/work"));
+        assert_eq!(
+            edit.access,
+            ToolAccess::Files {
+                paths: vec![PathBuf::from("/work/a")],
+                write: true
+            }
+        );
+        let calin = describe("mcp__calin__dispatch", &json!({}), Path::new("/work"));
+        assert_eq!(calin.access, ToolAccess::Orchestrator);
+        assert_eq!(
+            describe("Bash", &json!({}), Path::new("/work")).access,
+            ToolAccess::Other
         );
     }
 

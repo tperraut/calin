@@ -4,8 +4,9 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use crate::cmd::{Git, no_ssh_prompt, require_commit, resolve_commit, work_dir};
+use crate::cmd::{Done, Git, no_ssh_prompt, require_commit, resolve_commit, work_dir};
 use crate::error::{Error, Result};
+use crate::repo::{checked_out_branch, remote_head_branch, remote_url};
 use crate::worktree::main_branch;
 
 /// Makes git refuse to invent an identity from the user and host names: a
@@ -42,19 +43,29 @@ pub fn commit_all(worktree: &Path, message: &str, limit: Duration) -> Result<Com
     }
     let deadline = Instant::now() + limit;
     let run = |git: Git| git.exec_until(deadline, limit);
-    let added = run(Git::write(&dir).args(["add", "--all"]))?;
-    if !added.status.success() {
-        return Err(added.into_error());
+    if !stage_all(&dir, &run)? {
+        return Ok(CommitOutcome::NothingToCommit);
     }
+    commit_staged(&dir, message, &run).map(CommitOutcome::Committed)
+}
+
+/// Stages everything that is not ignored. True when the index then differs
+/// from `HEAD`.
+fn stage_all(dir: &Path, run: &impl Fn(Git) -> Result<Done>) -> Result<bool> {
+    run(Git::write(dir).args(["add", "--all"]))?.succeeded()?;
     // Status 1 says the index differs from `HEAD`.
-    let staged = run(Git::read(&dir).args(["diff", "--cached", "--quiet"]))?;
+    let staged = run(Git::read(dir).args(["diff", "--cached", "--quiet"]))?;
     match staged.status.code() {
-        Some(0) => return Ok(CommitOutcome::NothingToCommit),
-        Some(1) => {}
-        _ => return Err(staged.into_error()),
+        Some(0) => Ok(false),
+        Some(1) => Ok(true),
+        _ => Err(staged.into_error()),
     }
+}
+
+/// Commits the index with git's configured identity; the new commit's id.
+fn commit_staged(dir: &Path, message: &str, run: &impl Fn(Git) -> Result<Done>) -> Result<String> {
     for who in ["GIT_AUTHOR_IDENT", "GIT_COMMITTER_IDENT"] {
-        let known = run(Git::read(&dir)
+        let known = run(Git::read(dir)
             .args(CONFIGURED_IDENTITY_ONLY)
             .args(["var", who]))?;
         if !known.status.success() {
@@ -67,16 +78,13 @@ pub fn commit_all(worktree: &Path, message: &str, limit: Duration) -> Result<Com
     }
     // One argument, whatever the message holds; stdin stays closed so that
     // a hook reading it ends at once instead of waiting.
-    let committed = run(Git::write(&dir)
+    run(Git::write(dir)
         .args(CONFIGURED_IDENTITY_ONLY)
         .args(["commit", "--quiet"])
-        .arg_shown_as(format!("--message={message}"), "--message=<message>"))?;
-    if !committed.status.success() {
-        return Err(committed.into_error());
-    }
-    let head = resolve_commit(&dir, "HEAD")?
-        .ok_or_else(|| Error::NotFound("the commit that was just made".to_owned()))?;
-    Ok(CommitOutcome::Committed(head))
+        .arg_shown_as(format!("--message={message}"), "--message=<message>"))?
+    .succeeded()?;
+    resolve_commit(dir, "HEAD")?
+        .ok_or_else(|| Error::NotFound("the commit that was just made".to_owned()))
 }
 
 /// Pushes `branch` to the branch of the same name on `remote` and makes that
@@ -104,14 +112,12 @@ pub fn push_branch(worktree: &Path, remote: &str, branch: &str, limit: Duration)
     require_commit(&dir, &full_ref)?;
     // Both sides spelled out: a refspec that cannot start with `+` (which
     // would force) and cannot be read as an option or a tag.
-    let pushed = no_ssh_prompt(Git::write(&dir))
+    no_ssh_prompt(Git::write(&dir))
         .args(["push", "--set-upstream", remote])
         .arg(format!("{full_ref}:{full_ref}"))
-        .exec_until(Instant::now() + limit, limit)?;
-    if !pushed.status.success() {
-        return Err(pushed.into_error());
-    }
-    Ok(())
+        .exec_until(Instant::now() + limit, limit)?
+        .succeeded()
+        .map(drop)
 }
 
 /// True when `dir` has a remote called `remote`.
@@ -121,10 +127,7 @@ pub fn has_remote(dir: &Path, remote: &str) -> Result<bool> {
     if remote.is_empty() || remote.starts_with('-') || remote.contains(['.', '\n', ' ']) {
         return Ok(false);
     }
-    let url = Git::read(&dir)
-        .args(["config", "--get", &format!("remote.{remote}.url")])
-        .probe()?;
-    Ok(url.is_some())
+    Ok(remote_url(&dir, remote)?.is_some())
 }
 
 /// The branch pull requests of this repository go to: the one `remote`'s
@@ -133,12 +136,7 @@ pub fn has_remote(dir: &Path, remote: &str) -> Result<bool> {
 /// known.
 pub fn default_branch(dir: &Path, remote: &str) -> Result<Option<String>> {
     let dir = work_dir(dir)?;
-    let prefix = format!("refs/remotes/{remote}/");
-    let remote_head = Git::read(&dir)
-        .args(["symbolic-ref", "--quiet", &format!("{prefix}HEAD")])
-        .probe()?
-        .and_then(|name| name.strip_prefix(&prefix).map(str::to_owned));
-    match remote_head {
+    match remote_head_branch(&dir, remote)? {
         Some(branch) => Ok(Some(branch)),
         None => main_branch(&dir),
     }
@@ -146,11 +144,7 @@ pub fn default_branch(dir: &Path, remote: &str) -> Result<Option<String>> {
 
 /// The branch checked out in `dir`. `None` when `HEAD` is detached.
 pub fn current_branch(dir: &Path) -> Result<Option<String>> {
-    let dir = work_dir(dir)?;
-    Ok(Git::read(&dir)
-        .args(["symbolic-ref", "--quiet", "HEAD"])
-        .probe()?
-        .and_then(|name| name.strip_prefix("refs/heads/").map(str::to_owned)))
+    checked_out_branch(&work_dir(dir)?)
 }
 
 /// How many commits `branch` has that `base` does not.
@@ -329,6 +323,28 @@ mod tests {
             Err(Error::Conflict(_))
         ));
         assert_eq!(git(&d.worktree, &["diff", "--cached", "--name-only"]), "");
+    }
+
+    #[test]
+    fn a_file_git_cannot_read_fails_the_commit_with_gits_words() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let d = delivery();
+        let head = git(&d.worktree, &["rev-parse", "HEAD"]);
+        write(&d.worktree, "secret.txt", "s\n");
+        let secret = d.worktree.join("secret.txt");
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let committed = commit_all(&d.worktree, "add the secret", LIMIT);
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        match committed {
+            Err(Error::Git { command, stderr }) => {
+                assert_eq!(command, "git add --all");
+                assert!(stderr.contains("Permission denied"), "{stderr}");
+            }
+            other => panic!("expected git's error, got {other:?}"),
+        }
+        assert_eq!(git(&d.worktree, &["rev-parse", "HEAD"]), head);
     }
 
     #[test]

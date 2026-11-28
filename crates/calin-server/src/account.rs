@@ -157,40 +157,51 @@ pub(crate) async fn create_device_token(
             "a device token cannot create device tokens: sign in with a browser",
         ));
     }
-    let invalid_name = || {
-        ApiFailure::new(
-            StatusCode::BAD_REQUEST,
-            format!(
-                "the name must be 1 to {MAX_TOKEN_NAME_CHARS} characters, without control characters"
-            ),
-        )
-    };
-    let name = request.name.trim();
-    let length = name.chars().count();
-    if length == 0 || length > MAX_TOKEN_NAME_CHARS || name.chars().any(char::is_control) {
-        return Err(invalid_name());
-    }
+    let name = token_name(&request.name)?;
     let created = sign_in
         .store()
         .create_device_token(&who.identity, name)
         .await
-        .map_err(|error| match error {
-            StoreError::InvalidName => invalid_name(),
-            StoreError::TooManyDeviceTokens => {
-                ApiFailure::new(StatusCode::CONFLICT, error.to_string())
-            }
-            // The identity left the allow-list between the two checks.
-            StoreError::NotAllowed(_) => session_required(),
-            error => {
-                tracing::error!(%error, "could not create a device token");
-                ApiFailure::new(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
-            }
-        })?;
+        .map_err(creation_failure)?;
     let body = CreatedDeviceToken {
         token: created.token.expose().to_owned(),
         info: token_info(created.info),
     };
     Ok((StatusCode::CREATED, Json(body)))
+}
+
+fn invalid_token_name() -> ApiFailure {
+    ApiFailure::new(
+        StatusCode::BAD_REQUEST,
+        format!(
+            "the name must be 1 to {MAX_TOKEN_NAME_CHARS} characters, without control characters"
+        ),
+    )
+}
+
+/// The name a token is created with: trimmed, 1 to 80 characters, none of
+/// them a control character.
+fn token_name(name: &str) -> ApiResult<&str> {
+    let name = name.trim();
+    let length = name.chars().count();
+    if length == 0 || length > MAX_TOKEN_NAME_CHARS || name.chars().any(char::is_control) {
+        return Err(invalid_token_name());
+    }
+    Ok(name)
+}
+
+/// Why the store did not create a token, as the caller hears it.
+fn creation_failure(error: StoreError) -> ApiFailure {
+    match error {
+        StoreError::InvalidName => invalid_token_name(),
+        StoreError::TooManyDeviceTokens => ApiFailure::new(StatusCode::CONFLICT, error.to_string()),
+        // The identity left the allow-list between the two checks.
+        StoreError::NotAllowed(_) => session_required(),
+        error => {
+            tracing::error!(%error, "could not create a device token");
+            ApiFailure::new(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+        }
+    }
 }
 
 pub(crate) async fn revoke_device_token(
@@ -216,6 +227,41 @@ pub(crate) async fn revoke_device_token(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn each_store_refusal_of_a_new_token_has_its_answer() {
+        let alice = calin_auth::Identity::email("alice@example.com").unwrap();
+        for (error, status, message) in [
+            (
+                StoreError::InvalidName,
+                StatusCode::BAD_REQUEST,
+                "the name must be 1 to 80 characters, without control characters",
+            ),
+            (
+                StoreError::TooManyDeviceTokens,
+                StatusCode::CONFLICT,
+                "this identity already has 100 device tokens",
+            ),
+            (
+                StoreError::NotAllowed(alice),
+                StatusCode::UNAUTHORIZED,
+                "sign-in is required",
+            ),
+            (
+                StoreError::Task,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error",
+            ),
+        ] {
+            let response = creation_failure(error).into_response();
+            assert_eq!(response.status(), status);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: calin_proto::ApiError = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body.error, message);
+        }
+    }
 
     #[test]
     fn seconds_become_milliseconds_without_overflow() {

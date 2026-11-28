@@ -6,6 +6,7 @@ mod run;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -21,6 +22,7 @@ use calin_proto::{
     Repo, RepoMode, SessionDetail, SessionRepo, SessionStatus, ToolKind,
 };
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::Sleep;
 use ulid::Ulid;
 
 use self::run::{Abort, Run, Worked, next_worked};
@@ -29,14 +31,15 @@ use super::queue::Slot;
 use super::unreported::{self, MAX_CHANGES_PER_TURN, Tracker};
 use super::{
     ChildEnd, Command, Dispatched, DispatchedRepo, Inner, NoteOutcome, NoteTarget, Reply,
-    SessionManager, agent_ended, closed, expired, is_closed, no_attaching, no_longer_active,
-    no_shipping, no_turn, now_ms, ships, status_name, takes_messages, takes_repos, unanswered,
+    SessionManager, closed, expired, is_closed, no_attaching, no_longer_active, no_shipping,
+    no_turn, ships, status_name, takes_messages, takes_repos, unanswered,
 };
 use crate::briefing::{self, ChildOf, MAX_RUNNING_CHILDREN, ReportedBranch};
+use crate::clock::now_ms;
 use crate::error::{Error, Result};
 use crate::policy::{self, Target, Verdict};
 use crate::repos::{Reservation, blocking};
-use crate::store::{Dispatch, EventDraft, NewSession, OpenQuestion, SessionSetup};
+use crate::store::{Dispatch, EventDraft, NewSession, OpenQuestion, SessionSetup, agent_ended};
 use crate::tokens::{AgentRef, Token};
 use crate::workspace::{locate, primary, working_directory};
 
@@ -209,6 +212,14 @@ struct ChildWith {
     cause: Option<String>,
 }
 
+/// Where a note goes: the session, its agent, and what that agent is
+/// handed; nothing is handed to the user, who reads it where it is sent.
+struct NoteRoute {
+    session: String,
+    agent: Option<String>,
+    handed: Option<String>,
+}
+
 /// The driver hit a storage error and cannot go on.
 struct Halt;
 
@@ -321,24 +332,29 @@ async fn next_output(handle: &mut Option<AgentHandle>) -> Option<RunnerOutput> {
     }
 }
 
-async fn next_prepared(preparation: &mut Option<Preparation>) -> Option<Prepared> {
-    match preparation {
-        Some(preparation) => preparation.results.recv().await,
+/// The next report of a background task; a task that is not there never reports.
+async fn next_result<T>(results: Option<&mut mpsc::Receiver<T>>) -> Option<T> {
+    match results {
+        Some(results) => results.recv().await,
         None => std::future::pending().await,
     }
 }
 
-async fn next_attached(attaching: &mut Option<Attaching>) -> Option<Prepared> {
-    match attaching {
-        Some(attaching) => attaching.results.recv().await,
-        None => std::future::pending().await,
-    }
-}
+/// The time work that was asked to stop still has to report: what it says
+/// before [`STOP_GRACE`] runs out is kept, the rest is dropped.
+struct Grace(Pin<Box<Sleep>>);
 
-async fn next_shipped(shipping: &mut Option<Shipping>) -> Option<Shipped> {
-    match shipping {
-        Some(shipping) => shipping.results.recv().await,
-        None => std::future::pending().await,
+impl Grace {
+    fn start() -> Self {
+        Self(Box::pin(tokio::time::sleep(STOP_GRACE)))
+    }
+
+    /// What `next` yields, or `None` once the grace ran out.
+    async fn within<T>(&mut self, next: impl Future<Output = Option<T>>) -> Option<T> {
+        tokio::select! {
+            item = next => item,
+            () = &mut self.0 => None,
+        }
     }
 }
 
@@ -416,112 +432,150 @@ impl Driver {
         self.abort_shipping();
         self.end_polling(Err(no_longer_active()));
         // Off the map, so nothing new arrives; what is queued came too late.
+        // A dropped command drops its reply, which its sender reads as
+        // "no longer active" (`SessionManager::command`).
         self.commands.close();
         while let Ok(command) = self.commands.try_recv() {
-            command.refuse(no_longer_active());
+            drop(command);
         }
     }
 
     /// Runs until the session has no agent, no preparation and nothing to do.
     /// Returns true when the driver already took itself off the map.
     async fn drive(&mut self) -> bool {
-        if let Err(err) = self.load().await {
-            tracing::error!(session = %self.session_id, %err, "could not load the session");
+        let loaded = self.load().await;
+        if self.or_halt(loaded, "could not load the session").is_err() {
             return false;
         }
         loop {
-            // A run and a place in the queue only exist in this task.
-            let idle = self.handle.is_none()
-                && self.preparation.is_none()
-                && self.attaching.is_none()
-                && self.shipping.is_none()
-                && self.polling.is_none()
-                && self.parked.is_none()
-                && self.run.is_none();
-            let step = if idle {
-                match self.commands.try_recv() {
-                    Ok(command) => Step::Command(command),
-                    Err(_) => {
-                        let mut drivers = self.inner.drivers();
-                        if self.commands.is_empty() {
-                            // A driver with nothing to do runs nothing.
-                            if self.setup.dispatch.is_none() {
-                                self.inner.queue.leave(&self.session_id);
-                            }
-                            drivers.remove(&self.session_id);
-                            return true;
-                        }
-                        continue;
-                    }
-                }
+            let step = if self.idle() {
+                let Some(command) = self.idle_command() else {
+                    return true;
+                };
+                Step::Command(command)
             } else {
-                tokio::select! {
-                    command = self.commands.recv() => match command {
-                        Some(command) => Step::Command(command),
-                        None => return false,
-                    },
-                    output = next_output(&mut self.handle) => Step::Output(output),
-                    prepared = next_prepared(&mut self.preparation) => Step::Prepared(prepared),
-                    attached = next_attached(&mut self.attaching) => Step::Attached(attached),
-                    shipped = next_shipped(&mut self.shipping) => Step::Shipped(shipped),
-                    polled = next_polled(&mut self.polling) => Step::Polled(polled),
-                    granted = next_granted(&mut self.parked) => Step::Granted(granted),
-                    worked = next_worked(&mut self.run) => Step::Worked(worked),
-                }
+                let Some(step) = self.next_step().await else {
+                    return false;
+                };
+                step
             };
-            let result = match step {
-                Step::Command(command) => self.on_command(command).await,
-                Step::Output(output) => self.on_output(output).await.map_err(|err| {
-                    tracing::error!(session = %self.session_id, %err, "could not record agent output");
-                    Halt
-                }),
-                Step::Prepared(prepared) => self.on_prepared(prepared).await.map_err(|err| {
-                    tracing::error!(session = %self.session_id, %err, "could not record the session's repos");
-                    Halt
-                }),
-                Step::Attached(attached) => self.on_attached(attached).await.map_err(|err| {
-                    tracing::error!(session = %self.session_id, %err, "could not record an attached repo");
-                    Halt
-                }),
-                Step::Shipped(shipped) => self.on_shipped(shipped).await.map_err(|err| {
-                    tracing::error!(session = %self.session_id, %err, "could not record a step of the ship");
-                    Halt
-                }),
-                Step::Polled(observed) => self.on_polled(observed).await.map_err(|err| {
-                    tracing::error!(session = %self.session_id, %err, "could not record the pull requests");
-                    Halt
-                }),
-                Step::Granted(granted) => self.on_granted(granted).await.map_err(|err| {
-                    tracing::error!(session = %self.session_id, %err, "could not start the session from the queue");
-                    Halt
-                }),
-                Step::Worked(worked) => self.on_worked(worked).await.map_err(|err| {
-                    tracing::error!(session = %self.session_id, %err, "could not record a step of the workflow");
-                    Halt
-                }),
-            };
-            if result.is_err() {
+            if self.on_step(step).await.is_err() || self.after_step().await.is_err() {
                 return false;
-            }
-            // Whatever the step ended of the workflow run, the run goes on from.
-            if let Err(err) = self.advance_run().await {
-                tracing::error!(session = %self.session_id, %err, "could not go on with the workflow");
-                return false;
-            }
-            if std::mem::take(&mut self.flush_pending)
-                && !self.defers_input()
-                && let Err(err) = self.run_pending().await
-            {
-                tracing::error!(session = %self.session_id, %err, "could not go on after the workflow");
-                return false;
-            }
-            // A slot is for a session that prepares or runs. Every path
-            // above gives it back with the status; this holds for the one
-            // that does not.
-            if !self.status.is_active() && self.parked.is_none() {
-                self.leave_queue();
             }
         }
+    }
+
+    /// True when nothing but a command can wake the driver. A run and a
+    /// place in the queue only exist in this task.
+    fn idle(&self) -> bool {
+        self.handle.is_none()
+            && self.preparation.is_none()
+            && self.attaching.is_none()
+            && self.shipping.is_none()
+            && self.polling.is_none()
+            && self.parked.is_none()
+            && self.run.is_none()
+    }
+
+    /// The next command of an idle driver, or `None` once it took itself
+    /// off the map: a driver with nothing to do runs nothing.
+    fn idle_command(&mut self) -> Option<Command> {
+        loop {
+            if let Ok(command) = self.commands.try_recv() {
+                return Some(command);
+            }
+            let mut drivers = self.inner.drivers();
+            if self.commands.is_empty() {
+                if self.setup.dispatch.is_none() {
+                    self.inner.queue.leave(&self.session_id);
+                }
+                drivers.remove(&self.session_id);
+                return None;
+            }
+        }
+    }
+
+    /// Waits for whatever comes first; `None` once the manager dropped the
+    /// session's command channel.
+    async fn next_step(&mut self) -> Option<Step> {
+        let step = tokio::select! {
+            command = self.commands.recv() => Step::Command(command?),
+            output = next_output(&mut self.handle) => Step::Output(output),
+            prepared = next_result(self.preparation.as_mut().map(|task| &mut task.results)) => {
+                Step::Prepared(prepared)
+            }
+            attached = next_result(self.attaching.as_mut().map(|task| &mut task.results)) => {
+                Step::Attached(attached)
+            }
+            shipped = next_result(self.shipping.as_mut().map(|task| &mut task.results)) => {
+                Step::Shipped(shipped)
+            }
+            polled = next_polled(&mut self.polling) => Step::Polled(polled),
+            granted = next_granted(&mut self.parked) => Step::Granted(granted),
+            worked = next_worked(&mut self.run) => Step::Worked(worked),
+        };
+        Some(step)
+    }
+
+    async fn on_step(&mut self, step: Step) -> std::result::Result<(), Halt> {
+        let (result, what) = match step {
+            Step::Command(command) => return self.on_command(command).await,
+            Step::Output(output) => (
+                self.on_output(output).await,
+                "could not record agent output",
+            ),
+            Step::Prepared(prepared) => (
+                self.on_prepared(prepared).await,
+                "could not record the session's repos",
+            ),
+            Step::Attached(attached) => (
+                self.on_attached(attached).await,
+                "could not record an attached repo",
+            ),
+            Step::Shipped(shipped) => (
+                self.on_shipped(shipped).await,
+                "could not record a step of the ship",
+            ),
+            Step::Polled(observed) => (
+                self.on_polled(observed).await,
+                "could not record the pull requests",
+            ),
+            Step::Granted(granted) => (
+                self.on_granted(granted).await,
+                "could not start the session from the queue",
+            ),
+            Step::Worked(worked) => (
+                self.on_worked(worked).await,
+                "could not record a step of the workflow",
+            ),
+        };
+        self.or_halt(result, what)
+    }
+
+    /// What follows every step, whichever it was.
+    async fn after_step(&mut self) -> std::result::Result<(), Halt> {
+        // Whatever the step ended of the workflow run, the run goes on from.
+        let advanced = self.advance_run().await;
+        self.or_halt(advanced, "could not go on with the workflow")?;
+        if std::mem::take(&mut self.flush_pending) && !self.defers_input() {
+            let ran = self.run_pending().await;
+            self.or_halt(ran, "could not go on after the workflow")?;
+        }
+        // A slot is for a session that prepares or runs. Every path above
+        // gives it back with the status; this holds for the one that does not.
+        if !self.status.is_active() && self.parked.is_none() {
+            self.leave_queue();
+        }
+        Ok(())
+    }
+
+    /// A storage error the driver cannot go on after: it is logged, saying
+    /// `what` failed.
+    fn or_halt<T>(&self, result: Result<T>, what: &str) -> std::result::Result<T, Halt> {
+        result.map_err(|err| {
+            tracing::error!(session = %self.session_id, %err, "{what}");
+            Halt
+        })
     }
 
     async fn load(&mut self) -> Result<()> {
@@ -628,14 +682,14 @@ impl Driver {
                 cause,
                 text,
                 ended,
-            } => self.deliver(message, cause, text, ended).await.map_err(|err| {
-                tracing::error!(session = %self.session_id, %err, "could not record a delivered message");
-                Halt
-            }),
-            Command::Spent => self.check_budget().await.map_err(|err| {
-                tracing::error!(session = %self.session_id, %err, "could not check the workflow's budget");
-                Halt
-            }),
+            } => {
+                let delivered = self.deliver(message, cause, text, ended).await;
+                self.or_halt(delivered, "could not record a delivered message")
+            }
+            Command::Spent => {
+                let checked = self.check_budget().await;
+                self.or_halt(checked, "could not check the workflow's budget")
+            }
             Command::Message { text, reply } => {
                 let result = self.message(text).await;
                 self.answer(reply, result)
@@ -667,11 +721,7 @@ impl Driver {
                     agent_id,
                     reply,
                 };
-                if self.attaching.is_some() {
-                    self.attach_queue.push_back(queued);
-                    return Ok(());
-                }
-                self.begin_attach(queued).await
+                self.attach_or_queue(queued).await
             }
             Command::Ship {
                 title,
@@ -682,10 +732,10 @@ impl Driver {
                 let result = self.begin_ship(title, body, draft);
                 self.answer(reply, result)
             }
-            Command::Poll { reply } => self.begin_poll(reply).await.map_err(|err| {
-                tracing::error!(session = %self.session_id, %err, "could not record the pull requests");
-                Halt
-            }),
+            Command::Poll { reply } => {
+                let polled = self.begin_poll(reply).await;
+                self.or_halt(polled, "could not record the pull requests")
+            }
         }
     }
 
@@ -696,9 +746,19 @@ impl Driver {
     }
 
     fn answer_with<T>(&self, reply: Reply<T>, result: Result<T>) -> std::result::Result<(), Halt> {
+        self.answer_as(reply, result, "session command failed")
+    }
+
+    /// [`Self::answer_with`], logging a failure as `what`.
+    fn answer_as<T>(
+        &self,
+        reply: Reply<T>,
+        result: Result<T>,
+        what: &str,
+    ) -> std::result::Result<(), Halt> {
         let halt = match &result {
             Err(err) if !err.is_refusal() => {
-                tracing::error!(session = %self.session_id, %err, "session command failed");
+                tracing::error!(session = %self.session_id, %err, "{what}");
                 Err(Halt)
             }
             _ => Ok(()),
@@ -773,12 +833,8 @@ impl Driver {
         } else {
             self.task()
         };
-        self.launch(prompt, cause, reservation)
-            .await
-            .map_err(|err| {
-                tracing::error!(session = %self.session_id, %err, "could not start the session");
-                Halt
-            })
+        let launched = self.launch(prompt, cause, reservation).await;
+        self.or_halt(launched, "could not start the session")
     }
 
     /// What the session asks of its agent: the prompt the user wrote, then
@@ -818,10 +874,17 @@ impl Driver {
                 text: text.clone(),
             }))
             .await?;
-        self.pending.push_back(Queued {
+        let queued = Queued {
             text,
             event_id: message.id.clone(),
-        });
+        };
+        self.hand_on(queued).await
+    }
+
+    /// Queues an input for the lead, and starts a turn on it unless input
+    /// has to wait.
+    async fn hand_on(&mut self, queued: Queued) -> Result<()> {
+        self.pending.push_back(queued);
         if self.defers_input() {
             return Ok(());
         }
@@ -1055,24 +1118,27 @@ impl Driver {
     /// The setup command shows in the transcript as a tool call nobody but
     /// the orchestrator made.
     async fn setup_started(&mut self, item: Item) -> Result<()> {
-        let started = EventBody::ItemStarted { item };
-        self.append(EventDraft::new(started).parent(self.cause.clone()))
-            .await?;
+        self.record(EventBody::ItemStarted { item }).await?;
         Ok(())
     }
 
     /// A setup that failed is said, and the session goes on: the agent can
     /// often work without it, or run it again itself.
     async fn setup_ended(&mut self, item: Item, failure: Option<String>) -> Result<()> {
-        let completed = EventBody::ItemCompleted { item };
-        self.append(EventDraft::new(completed).parent(self.cause.clone()))
-            .await?;
+        self.record(EventBody::ItemCompleted { item }).await?;
         if let Some(message) = failure {
-            let error = EventBody::Error { message };
-            self.append(EventDraft::new(error).parent(self.cause.clone()))
-                .await?;
+            self.record(EventBody::Error { message }).await?;
         }
         Ok(())
+    }
+
+    /// Takes up an attach request, or queues it behind the one in progress.
+    async fn attach_or_queue(&mut self, queued: QueuedAttach) -> std::result::Result<(), Halt> {
+        if self.attaching.is_some() {
+            self.attach_queue.push_back(queued);
+            return Ok(());
+        }
+        self.begin_attach(queued).await
     }
 
     /// Starts making a repo ready for a session that is already at work.
@@ -1099,14 +1165,7 @@ impl Driver {
                 });
                 Ok(())
             }
-            Err(err) => {
-                let halt = if err.is_refusal() { Ok(()) } else { Err(Halt) };
-                if halt.is_err() {
-                    tracing::error!(session = %self.session_id, %err, "could not attach a repo");
-                }
-                let _ = reply.send(Err(err));
-                halt
-            }
+            Err(err) => self.answer_as(reply, Err(err), "could not attach a repo"),
         }
     }
 
@@ -1139,14 +1198,7 @@ impl Driver {
 
     async fn on_attached(&mut self, prepared: Option<Prepared>) -> Result<()> {
         match prepared {
-            Some(Prepared::Repo(repo)) => {
-                let agent_id = self.attaching.as_ref().and_then(|a| a.agent_id.clone());
-                self.attach(repo.clone(), agent_id.as_deref()).await?;
-                if let Some(attaching) = &mut self.attaching {
-                    attaching.attached = Some(repo);
-                }
-                Ok(())
-            }
+            Some(Prepared::Repo(repo)) => self.attach_recorded(repo).await,
             Some(Prepared::SetupStarted(item)) => self.setup_started(item).await,
             Some(Prepared::SetupEnded { item, failure }) => self.setup_ended(item, failure).await,
             Some(Prepared::Failed { repo, error }) => {
@@ -1157,26 +1209,42 @@ impl Driver {
                 self.next_attach().await
             }
             None => {
-                if let Some(attaching) = self.attaching.take() {
-                    let result = attaching.attached.ok_or_else(no_longer_active);
-                    // An agent that asked is told by its tool's result. One
-                    // that did not is told with the next message, unless it
-                    // is not running: its next start names every repo.
-                    if let (Ok(repo), None, true) =
-                        (&result, &attaching.agent_id, self.handle.is_some())
-                    {
-                        self.notes.push(briefing::attach_note(repo));
-                    }
-                    // Tracked from now on, before anyone is told it is there.
-                    let tracker = unreported::tracker(&self.inner.trackers, &self.session_id);
-                    if let (Ok(repo), Some(tracker)) = (&result, tracker) {
-                        tracker.lock().await.attached(&self.session_id, repo).await;
-                    }
-                    let _ = attaching.reply.send(result);
-                }
+                self.attach_ended().await;
                 self.next_attach().await
             }
         }
+    }
+
+    /// The repo being attached is on record, by the agent that asked for
+    /// it, if one did; its setup may still be running.
+    async fn attach_recorded(&mut self, repo: SessionRepo) -> Result<()> {
+        let agent_id = self.attaching.as_ref().and_then(|a| a.agent_id.clone());
+        self.attach(repo.clone(), agent_id.as_deref()).await?;
+        if let Some(attaching) = &mut self.attaching {
+            attaching.attached = Some(repo);
+        }
+        Ok(())
+    }
+
+    /// The attach in progress is over: its caller is answered with the
+    /// repo, once the repo is tracked.
+    async fn attach_ended(&mut self) {
+        let Some(attaching) = self.attaching.take() else {
+            return;
+        };
+        let result = attaching.attached.ok_or_else(no_longer_active);
+        // An agent that asked is told by its tool's result. One that did
+        // not is told with the next message, unless it is not running: its
+        // next start names every repo.
+        if let (Ok(repo), None, true) = (&result, &attaching.agent_id, self.handle.is_some()) {
+            self.notes.push(briefing::attach_note(repo));
+        }
+        // Tracked from now on, before anyone is told it is there.
+        let tracker = unreported::tracker(&self.inner.trackers, &self.session_id);
+        if let (Ok(repo), Some(tracker)) = (&result, tracker) {
+            tracker.lock().await.attached(&self.session_id, repo).await;
+        }
+        let _ = attaching.reply.send(result);
     }
 
     /// Takes up the next attach request that waited for the one that ended.
@@ -1228,128 +1296,159 @@ impl Driver {
         let mut tracker = unreported::fresh(&self.inner.trackers, &self.session_id).await;
         unreported::baseline(&mut tracker, &self.session_id, &self.repos).await;
         drop(tracker);
-        if let Some(handle) = &self.handle {
-            let sent = handle.send_message(text);
-            if sent.is_err() {
-                return self.fail("the agent is no longer running".to_owned()).await;
-            }
-            self.set_agent_status(AgentStatus::Running).await?;
-        } else {
-            let runner = self
-                .runner
-                .clone()
-                .or_else(|| self.inner.registry.resolve(Some(&self.runner_id)));
-            let Some(runner) = runner else {
-                let message = format!("runner {} is not available", self.runner_id);
-                return self.fail(message).await;
-            };
-            let work_dir = self.inner.store.home().work_dir(&self.session_id);
-            let cwd = match working_directory(&work_dir, &self.repos).await {
-                Ok(cwd) => cwd,
-                Err(err) => {
-                    let message = format!("the working directory cannot be used: {err}");
-                    return self.fail(message).await;
-                }
-            };
-            let main = primary(&self.repos).map(|repo| repo.id.clone());
-            // A repo attached `read` is not a directory to work in: the
-            // agent asks before it touches one, and the policy answers.
-            let open: Vec<&SessionRepo> = self
-                .repos
-                .iter()
-                .filter(|repo| Some(&repo.id) == main.as_ref() || repo.mode != RepoMode::Read)
-                .collect();
-            let add_dirs = open
-                .iter()
-                .filter(|repo| Some(&repo.id) != main.as_ref())
-                .map(|repo| PathBuf::from(&repo.path))
-                .collect();
-            let granted = open.iter().map(|repo| repo.id.clone()).collect();
-            // An agent that accepts edits does not ask about the directory
-            // it works in. When that is a repo attached `read`, it has to ask
-            // about every edit, so that the policy can refuse those.
-            let read_only_home = primary(&self.repos).is_some_and(|r| r.mode == RepoMode::Read);
-            let asks = match self.permission_mode {
-                PermissionMode::AcceptEdits if read_only_home => PermissionMode::Ask,
-                mode => mode,
-            };
-            let agent_id = match (&self.lead, &self.setup.dispatch) {
-                (Some(lead), _) => Some(lead.id.clone()),
-                // The id its dispatch message was addressed to.
-                (None, Some(dispatch)) => Some(dispatch.lead_agent_id.clone()),
-                (None, None) => None,
-            };
-            let agent_id = agent_id.unwrap_or_else(|| self.lead_agent_id());
-            // A token of its own for every start; the previous one is revoked here.
-            self.token = self.inner.tool_endpoint().and_then(|_| {
-                self.inner.tokens.issue(AgentRef {
-                    session_id: self.session_id.clone(),
-                    agent_id: agent_id.clone(),
-                })
-            });
-            let tool_endpoint = match (self.inner.tool_endpoint(), &self.token) {
-                (Some(base), Some(token)) => Some(format!("{base}/{}", token.value())),
-                _ => None,
-            };
-            let parent_title = self.parent_title().await;
-            let child = self.setup.dispatch.as_ref().map(|_| ChildOf {
-                parent_title: parent_title.as_deref().unwrap_or_default(),
-            });
-            let system_prompt =
-                briefing::system_prompt(&self.repos, &cwd, tool_endpoint.is_some(), child);
-            let started = runner.start(StartParams {
-                session_id: self.session_id.clone(),
-                agent_id: agent_id.clone(),
-                prompt: text,
-                cwd,
-                add_dirs,
-                permission_mode: asks,
-                model: self.setup.model.clone(),
-                resume: self
-                    .lead
-                    .as_ref()
-                    .and_then(|lead| lead.native_session_id.clone()),
-                start_seq: self.head_seq,
-                tool_endpoint,
-                system_prompt: Some(system_prompt),
-            });
-            match started {
-                Ok(handle) => {
-                    self.handle = Some(handle);
-                    self.granted = granted;
-                }
-                Err(err) => return self.fail(err.to_string()).await,
-            }
-            if self.lead.is_some() {
-                self.set_agent_status(AgentStatus::Running).await?;
-            } else {
-                let model = self.setup.model.clone().or_else(|| runner.model());
-                let agent = Agent {
-                    id: agent_id.clone(),
-                    session_id: self.session_id.clone(),
-                    parent_agent_id: None,
-                    kind: AgentKind::Process,
-                    role: LEAD_ROLE.to_owned(),
-                    runner: runner.id().to_owned(),
-                    model: model.clone(),
-                    native_session_id: None,
-                    status: AgentStatus::Running,
-                    cost_usd: 0.0,
-                    tokens_in: 0,
-                    tokens_out: 0,
-                };
-                let spawned = EventBody::AgentSpawned { agent };
-                self.append(EventDraft::new(spawned).parent(self.cause.clone()))
-                    .await?;
-                self.lead = Some(Lead {
-                    id: agent_id,
-                    status: AgentStatus::Running,
-                    native_session_id: None,
-                    model,
-                });
-            }
+        let Some(handle) = &self.handle else {
+            return self.start_agent(text).await;
+        };
+        if handle.send_message(text).is_err() {
+            return self.fail("the agent is no longer running".to_owned()).await;
         }
+        self.set_agent_status(AgentStatus::Running).await?;
         self.in_turn = true;
+        Ok(())
+    }
+
+    /// Starts the lead agent on `text` in the session's working directory,
+    /// with what it may reach; its first start puts it on record.
+    async fn start_agent(&mut self, text: String) -> Result<()> {
+        let Some(runner) = self.session_runner() else {
+            let message = format!("runner {} is not available", self.runner_id);
+            return self.fail(message).await;
+        };
+        let work_dir = self.inner.store.home().work_dir(&self.session_id);
+        let cwd = match working_directory(&work_dir, &self.repos).await {
+            Ok(cwd) => cwd,
+            Err(err) => {
+                let message = format!("the working directory cannot be used: {err}");
+                return self.fail(message).await;
+            }
+        };
+        let (add_dirs, granted) = self.start_dirs();
+        let permission_mode = self.start_mode();
+        let agent_id = self.start_agent_id();
+        let tool_endpoint = self.issue_token(&agent_id);
+        let system_prompt = self.start_prompt(&cwd, tool_endpoint.is_some()).await;
+        let started = runner.start(StartParams {
+            session_id: self.session_id.clone(),
+            agent_id: agent_id.clone(),
+            prompt: text,
+            cwd,
+            add_dirs,
+            permission_mode,
+            model: self.setup.model.clone(),
+            resume: self
+                .lead
+                .as_ref()
+                .and_then(|lead| lead.native_session_id.clone()),
+            start_seq: self.head_seq,
+            tool_endpoint,
+            system_prompt: Some(system_prompt),
+        });
+        match started {
+            Ok(handle) => {
+                self.handle = Some(handle);
+                self.granted = granted;
+            }
+            Err(err) => return self.fail(err.to_string()).await,
+        }
+        self.record_lead(&runner, agent_id).await?;
+        self.in_turn = true;
+        Ok(())
+    }
+
+    /// The directories the agent gets besides its working directory, and
+    /// the ids of the repos it works in without asking. A repo attached
+    /// `read` is not a directory to work in: the agent asks before it
+    /// touches one, and the policy answers.
+    fn start_dirs(&self) -> (Vec<PathBuf>, HashSet<String>) {
+        let main = primary(&self.repos).map(|repo| repo.id.clone());
+        let open: Vec<&SessionRepo> = self
+            .repos
+            .iter()
+            .filter(|repo| Some(&repo.id) == main.as_ref() || repo.mode != RepoMode::Read)
+            .collect();
+        let add_dirs = open
+            .iter()
+            .filter(|repo| Some(&repo.id) != main.as_ref())
+            .map(|repo| PathBuf::from(&repo.path))
+            .collect();
+        let granted = open.iter().map(|repo| repo.id.clone()).collect();
+        (add_dirs, granted)
+    }
+
+    /// An agent that accepts edits does not ask about the directory it
+    /// works in. When that is a repo attached `read`, it has to ask about
+    /// every edit, so that the policy can refuse those.
+    fn start_mode(&self) -> PermissionMode {
+        let read_only_home = primary(&self.repos).is_some_and(|r| r.mode == RepoMode::Read);
+        match self.permission_mode {
+            PermissionMode::AcceptEdits if read_only_home => PermissionMode::Ask,
+            mode => mode,
+        }
+    }
+
+    /// The id the lead starts as: its own, the one its dispatch message was
+    /// addressed to, or the one kept for it.
+    fn start_agent_id(&mut self) -> String {
+        match (&self.lead, &self.setup.dispatch) {
+            (Some(lead), _) => lead.id.clone(),
+            (None, Some(dispatch)) => dispatch.lead_agent_id.clone(),
+            (None, None) => self.lead_agent_id(),
+        }
+    }
+
+    /// A token of its own for every start; the previous one is revoked
+    /// here. Returns the address of Calin's tools for it, when there is one.
+    fn issue_token(&mut self, agent_id: &str) -> Option<String> {
+        self.token = self.inner.tool_endpoint().and_then(|_| {
+            self.inner.tokens.issue(AgentRef {
+                session_id: self.session_id.clone(),
+                agent_id: agent_id.to_owned(),
+            })
+        });
+        match (self.inner.tool_endpoint(), &self.token) {
+            (Some(base), Some(token)) => Some(format!("{base}/{}", token.value())),
+            _ => None,
+        }
+    }
+
+    /// The system prompt of an agent that starts in `cwd`.
+    async fn start_prompt(&self, cwd: &Path, tools: bool) -> String {
+        let parent_title = self.parent_title().await;
+        let child = self.setup.dispatch.as_ref().map(|_| ChildOf {
+            parent_title: parent_title.as_deref().unwrap_or_default(),
+        });
+        briefing::system_prompt(&self.repos, cwd, tools, child)
+    }
+
+    /// The lead that just started runs again, or, at its first start, is
+    /// put on record.
+    async fn record_lead(&mut self, runner: &Arc<dyn Runner>, agent_id: String) -> Result<()> {
+        if self.lead.is_some() {
+            self.set_agent_status(AgentStatus::Running).await?;
+            return Ok(());
+        }
+        let model = self.setup.model.clone().or_else(|| runner.model());
+        let agent = Agent {
+            id: agent_id.clone(),
+            session_id: self.session_id.clone(),
+            parent_agent_id: None,
+            kind: AgentKind::Process,
+            role: LEAD_ROLE.to_owned(),
+            runner: runner.id().to_owned(),
+            model: model.clone(),
+            native_session_id: None,
+            status: AgentStatus::Running,
+            cost_usd: 0.0,
+            tokens_in: 0,
+            tokens_out: 0,
+        };
+        self.record(EventBody::AgentSpawned { agent }).await?;
+        self.lead = Some(Lead {
+            id: agent_id,
+            status: AgentStatus::Running,
+            native_session_id: None,
+            model,
+        });
         Ok(())
     }
 
@@ -1363,43 +1462,67 @@ impl Driver {
         self.turn_items.clear();
         let interrupted = std::mem::take(&mut self.interrupted);
         self.capture_lead(interrupted);
+        // An interrupted turn holds what waits until the next message.
+        if interrupted || self.pending.is_empty() {
+            return self.rest_after_turn().await;
+        }
         // The next turn follows at once when the session may run. One that
         // may not waits for a slot, with what it was handed.
-        let follows = !interrupted && !self.pending.is_empty();
-        let runs = self.waits_on_user()
+        if !self.next_turn_runs() {
+            return self.hold_next_turn().await;
+        }
+        let Some(next) = self.pending.pop_front() else {
+            return self.rest_after_turn().await;
+        };
+        self.next_turn(next).await
+    }
+
+    /// True when a turn on what waits may begin now: the session waits on
+    /// the user (and stays `waiting`), runs already, or takes a free slot.
+    fn next_turn_runs(&self) -> bool {
+        self.waits_on_user()
             || (self.parked.is_none()
-                && (self.status == SessionStatus::Running || (follows && self.take_slot())));
-        if follows && !runs {
-            self.in_turn = false;
-            let ended = self.set_agent_status(AgentStatus::Idle).await?;
-            self.report_unreported(ended).await?;
-            if self.parked.is_none() {
-                self.park(Resume::Turn).await?;
-            }
-            return Ok(());
-        }
-        if !interrupted && let Some(next) = self.pending.pop_front() {
-            // The log has no event for the end of a turn but the agent's
-            // status: one turn ends and the next begins, each with its cause.
-            let ended = self.set_agent_status(AgentStatus::Idle).await?;
-            self.report_unreported(ended).await?;
-            self.cause = Some(next.event_id);
-            self.set_agent_status(AgentStatus::Running).await?;
-            self.resume_status().await?;
-            let text = briefing::with_notes(std::mem::take(&mut self.notes), next.text);
-            let sent = self
-                .handle
-                .as_ref()
-                .is_some_and(|handle| handle.send_message(text).is_ok());
-            if !sent {
-                return self.fail("the agent is no longer running".to_owned()).await;
-            }
-            return Ok(());
-        }
-        self.in_turn = false;
+                && (self.status == SessionStatus::Running || self.take_slot()))
+    }
+
+    /// The lead is idle, and the changes of the turn it ended are on record.
+    async fn end_lead_turn(&mut self) -> Result<()> {
         let ended = self.set_agent_status(AgentStatus::Idle).await?;
-        self.report_unreported(ended).await?;
+        self.report_unreported(ended).await
+    }
+
+    async fn rest_after_turn(&mut self) -> Result<()> {
+        self.in_turn = false;
+        self.end_lead_turn().await?;
         self.rest().await
+    }
+
+    /// Ends the turn and waits for a slot with what is to follow it.
+    async fn hold_next_turn(&mut self) -> Result<()> {
+        self.in_turn = false;
+        self.end_lead_turn().await?;
+        if self.parked.is_none() {
+            self.park(Resume::Turn).await?;
+        }
+        Ok(())
+    }
+
+    /// The log has no event for the end of a turn but the agent's status:
+    /// one turn ends and the next begins, each with its cause.
+    async fn next_turn(&mut self, next: Queued) -> Result<()> {
+        self.end_lead_turn().await?;
+        self.cause = Some(next.event_id);
+        self.set_agent_status(AgentStatus::Running).await?;
+        self.resume_status().await?;
+        let text = briefing::with_notes(std::mem::take(&mut self.notes), next.text);
+        let sent = self
+            .handle
+            .as_ref()
+            .is_some_and(|handle| handle.send_message(text).is_ok());
+        if !sent {
+            return self.fail("the agent is no longer running".to_owned()).await;
+        }
+        Ok(())
     }
 
     /// Appends a `file_changed` for each change the turn made that no tool
@@ -1453,11 +1576,7 @@ impl Driver {
     /// keeps waiting for its answer instead.
     async fn rest(&mut self) -> Result<()> {
         if self.question.is_some() {
-            if self.status != SessionStatus::Waiting {
-                let reason = Some(WAITING_FOR_ANSWER.to_owned());
-                self.set_status(SessionStatus::Waiting, reason).await?;
-            }
-            return Ok(());
+            return self.wait_for_user(WAITING_FOR_ANSWER).await;
         }
         if self.run.is_some() {
             // The lead resting ends its node, not the session.
@@ -1523,17 +1642,11 @@ impl Driver {
             let interrupted = self.interrupted;
             self.capture_lead(interrupted);
         }
-        self.in_turn = false;
-        self.interrupted = false;
-        self.turn_items.clear();
-        self.held.clear();
+        self.forget_turn();
         self.expire_permissions().await?;
         // Whatever it left running inside its process went with it.
-        self.close_subagents(AgentStatus::Stopped).await?;
-        let ended = self.set_agent_status(AgentStatus::Done).await?;
-        if let Some(tracker) = tracker {
-            self.report_unreported_with(tracker, ended).await?;
-        }
+        self.close_agents(tracker, AgentStatus::Stopped, AgentStatus::Done)
+            .await?;
         // A workflow node that is not the lead's holds what waits for it.
         if self.run_holds_lead() {
             return Ok(());
@@ -1557,6 +1670,12 @@ impl Driver {
         if self.parked.is_none() && !self.waits_on_user() && self.take_slot() {
             self.resume_status().await?;
         }
+        self.ask_to_end_turn().await
+    }
+
+    /// Asks the agent to end its turn; the session rests once it has. An
+    /// agent that is gone fails the session.
+    async fn ask_to_end_turn(&mut self) -> Result<()> {
         self.interrupted = true;
         let asked = self
             .handle
@@ -1565,6 +1684,38 @@ impl Driver {
         if !asked {
             return self.fail("the agent is no longer running".to_owned()).await;
         }
+        Ok(())
+    }
+
+    /// Forgets the turn in progress: nothing of it runs any more.
+    fn forget_turn(&mut self) {
+        self.in_turn = false;
+        self.interrupted = false;
+        self.turn_items.clear();
+        self.held.clear();
+    }
+
+    /// Closes the subagents as `subagents` and the lead as `lead`, then
+    /// reports the changes of the turn `tracker` followed, caused by how
+    /// the lead ended.
+    async fn close_agents(
+        &mut self,
+        tracker: Option<tokio::sync::OwnedMutexGuard<Tracker>>,
+        subagents: AgentStatus,
+        lead: AgentStatus,
+    ) -> Result<()> {
+        self.close_subagents(subagents).await?;
+        let ended = self.set_agent_status(lead).await?;
+        if let Some(tracker) = tracker {
+            self.report_unreported_with(tracker, ended).await?;
+        }
+        Ok(())
+    }
+
+    /// Records why the agent cannot go on, said by the lead when there is one.
+    async fn record_error(&mut self, message: String) -> Result<()> {
+        let error = self.by_agent(EventBody::Error { message });
+        self.append(error.parent(self.cause.clone())).await?;
         Ok(())
     }
 
@@ -1579,105 +1730,100 @@ impl Driver {
         // The run ends with the session (workflows spec, section 6).
         self.abort_run(Abort::Stopped).await?;
         self.workflow = None;
-        // First: an agent waiting for a repo it asked for would otherwise
-        // hold up its own stop.
-        self.abort_attaching();
-        if let Some(mut preparation) = self.preparation.take() {
-            preparation.cancel.store(true, Ordering::Relaxed);
-            // The git command already running cannot be recalled. Wait for
-            // it, so its repo is on record and a later message can go on
-            // from there.
-            let grace = tokio::time::sleep(STOP_GRACE);
-            tokio::pin!(grace);
-            loop {
-                tokio::select! {
-                    prepared = preparation.results.recv() => match prepared {
-                        Some(Prepared::Repo(repo)) => self.attach(repo, None).await?,
-                        Some(Prepared::SetupStarted(item)) => self.setup_started(item).await?,
-                        Some(Prepared::SetupEnded { item, failure }) => {
-                            self.setup_ended(item, failure).await?;
-                        }
-                        Some(Prepared::Failed { .. }) | None => break,
-                    },
-                    () = &mut grace => break,
-                }
-            }
-        }
-        if let Some(mut shipping) = self.shipping.take() {
-            shipping.cancel.store(true, Ordering::Relaxed);
-            // The push or the `gh` call already running cannot be recalled.
-            // Wait for it, so a pull request it opens is on record.
-            let grace = tokio::time::sleep(STOP_GRACE);
-            tokio::pin!(grace);
-            loop {
-                tokio::select! {
-                    shipped = shipping.results.recv() => match shipped {
-                        Some(shipped) => self.record_shipped(shipped).await?,
-                        None => break,
-                    },
-                    () = &mut grace => break,
-                }
-            }
-        }
-        self.end_polling(Ok(()));
-        self.expire_permissions().await?;
-        self.expire_question().await?;
-        if let Some(mut handle) = self.handle.take()
-            && handle.stop().is_ok()
-        {
-            // Keep what the agent said before it noticed the request.
-            let grace = tokio::time::sleep(STOP_GRACE);
-            tokio::pin!(grace);
-            loop {
-                tokio::select! {
-                    output = handle.next_output() => match output {
-                        Some(RunnerOutput::Event(body)) => self.agent_event(body, None).await?,
-                        Some(RunnerOutput::SubagentEvent { key, body }) => {
-                            self.agent_event(body, Some(&key)).await?;
-                        }
-                        Some(RunnerOutput::SubagentStarted(start)) => {
-                            self.subagent_started(start).await?;
-                        }
-                        Some(RunnerOutput::SubagentEnded { key, ok }) => {
-                            self.subagent_ended(&key, ok).await?;
-                        }
-                        Some(RunnerOutput::PermissionRequest(ask)) => {
-                            // Asked while stopping: nobody will answer it.
-                            let open = self
-                                .record_request(ask.request, ask.subagent.as_deref())
-                                .await?;
-                            self.expire(open).await?;
-                        }
-                        Some(RunnerOutput::Limits(windows)) => self.limits(windows).await?,
-                        Some(RunnerOutput::NativeSession { id, model }) => {
-                            self.native_session(id, model).await?;
-                        }
-                        Some(RunnerOutput::TurnEnded) => {}
-                        Some(RunnerOutput::Exited(_)) | None => break,
-                    },
-                    // Dropping the handle ends an agent that ignores the request.
-                    () = &mut grace => break,
-                }
-            }
-        }
+        self.stop_work().await?;
         let tracker = self.turn_tracker().await;
         self.drop_agent();
-        self.in_turn = false;
-        self.interrupted = false;
+        self.forget_turn();
         self.pending.clear();
-        self.held.clear();
-        self.turn_items.clear();
-        self.close_subagents(AgentStatus::Stopped).await?;
-        let ended = self.set_agent_status(AgentStatus::Stopped).await?;
         // Before the session's last status: the changes belong to the turn.
-        if let Some(tracker) = tracker {
-            self.report_unreported_with(tracker, ended).await?;
-        }
+        self.close_agents(tracker, AgentStatus::Stopped, AgentStatus::Stopped)
+            .await?;
         self.set_status(SessionStatus::Cancelled, None).await?;
         if owes_report && !cascade {
             self.send_report(Ending::Stopped).await?;
         }
         Ok(())
+    }
+
+    /// Ends what the session has at work, keeping on record what each part
+    /// still reports within the grace period.
+    async fn stop_work(&mut self) -> Result<()> {
+        // First: an agent waiting for a repo it asked for would otherwise
+        // hold up its own stop.
+        self.abort_attaching();
+        self.stop_preparation().await?;
+        self.stop_shipping().await?;
+        self.end_polling(Ok(()));
+        self.expire_permissions().await?;
+        self.expire_question().await?;
+        self.stop_agent().await
+    }
+
+    /// The git command already running cannot be recalled. Waits for it, so
+    /// its repo is on record and a later message can go on from there.
+    async fn stop_preparation(&mut self) -> Result<()> {
+        let Some(mut preparation) = self.preparation.take() else {
+            return Ok(());
+        };
+        preparation.cancel.store(true, Ordering::Relaxed);
+        let mut grace = Grace::start();
+        while let Some(prepared) = grace.within(preparation.results.recv()).await {
+            if matches!(prepared, Prepared::Failed { .. }) {
+                break;
+            }
+            self.on_prepared(Some(prepared)).await?;
+        }
+        Ok(())
+    }
+
+    /// The push or the `gh` call already running cannot be recalled. Waits
+    /// for it, so a pull request it opens is on record.
+    async fn stop_shipping(&mut self) -> Result<()> {
+        let Some(mut shipping) = self.shipping.take() else {
+            return Ok(());
+        };
+        shipping.cancel.store(true, Ordering::Relaxed);
+        let mut grace = Grace::start();
+        while let Some(shipped) = grace.within(shipping.results.recv()).await {
+            self.record_shipped(shipped).await?;
+        }
+        Ok(())
+    }
+
+    /// Asks the agent to stop and keeps what it says before it notices.
+    /// Dropping the handle ends an agent that ignores the request.
+    async fn stop_agent(&mut self) -> Result<()> {
+        let Some(mut handle) = self.handle.take() else {
+            return Ok(());
+        };
+        if handle.stop().is_err() {
+            return Ok(());
+        }
+        let mut grace = Grace::start();
+        while let Some(output) = grace.within(handle.next_output()).await {
+            if !self.on_output_while_stopping(output).await? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Keeps what a stopping agent says; `false` once it exited.
+    async fn on_output_while_stopping(&mut self, output: RunnerOutput) -> Result<bool> {
+        match output {
+            RunnerOutput::PermissionRequest(ask) => {
+                // Asked while stopping: nobody will answer it.
+                let open = self
+                    .record_request(ask.request, ask.subagent.as_deref())
+                    .await?;
+                self.expire(open).await?;
+            }
+            RunnerOutput::TurnEnded => {}
+            RunnerOutput::Exited(_) => return Ok(false),
+            // Recorded as it is mid-turn.
+            output => self.on_output(Some(output)).await?,
+        }
+        Ok(true)
     }
 
     /// Records that the session cannot go on and fails it.
@@ -1694,26 +1840,13 @@ impl Driver {
         self.abort_attaching();
         self.abort_shipping();
         self.preparation = None;
-        self.in_turn = false;
-        self.interrupted = false;
+        self.forget_turn();
         self.pending.clear();
-        self.held.clear();
-        self.turn_items.clear();
         self.expire_permissions().await?;
         self.expire_question().await?;
-        let mut error = EventDraft::new(EventBody::Error {
-            message: message.clone(),
-        })
-        .parent(self.cause.clone());
-        if let Some(lead) = &self.lead {
-            error = error.agent(lead.id.clone());
-        }
-        self.append(error).await?;
-        self.close_subagents(AgentStatus::Failed).await?;
-        let ended = self.set_agent_status(AgentStatus::Failed).await?;
-        if let Some(tracker) = tracker {
-            self.report_unreported_with(tracker, ended).await?;
-        }
+        self.record_error(message.clone()).await?;
+        self.close_agents(tracker, AgentStatus::Failed, AgentStatus::Failed)
+            .await?;
         self.set_status(SessionStatus::Failed, Some(message.clone()))
             .await?;
         if owes_report {
@@ -1737,18 +1870,38 @@ impl Driver {
         if let Target::Files { repos, .. } = &target {
             open.repos = repos.iter().flatten().copied().collect();
         }
-        let (decision, message) = match policy::decide(self.permission_mode, &target, &self.repos) {
-            Verdict::Allow => (PermissionDecision::Allow, None),
-            Verdict::Deny(message) => (PermissionDecision::Deny, Some(message)),
+        match policy::decide(self.permission_mode, &target, &self.repos) {
+            Verdict::Allow => {
+                self.policy_decided(open, PermissionDecision::Allow, None)
+                    .await
+            }
+            Verdict::Deny(message) => {
+                self.policy_decided(open, PermissionDecision::Deny, Some(message))
+                    .await
+            }
             Verdict::Ask => {
                 self.open.push(open);
-                if self.status != SessionStatus::Waiting {
-                    let reason = Some(WAITING_FOR_PERMISSION.to_owned());
-                    self.set_status(SessionStatus::Waiting, reason).await?;
-                }
-                return Ok(());
+                self.wait_for_user(WAITING_FOR_PERMISSION).await
             }
-        };
+        }
+    }
+
+    /// The session waits for the user, for `reason`, unless it already does.
+    async fn wait_for_user(&mut self, reason: &str) -> Result<()> {
+        if self.status != SessionStatus::Waiting {
+            let reason = Some(reason.to_owned());
+            self.set_status(SessionStatus::Waiting, reason).await?;
+        }
+        Ok(())
+    }
+
+    /// Records the policy's answer to a request and hands it to the agent.
+    async fn policy_decided(
+        &mut self,
+        open: OpenRequest,
+        decision: PermissionDecision,
+        message: Option<String>,
+    ) -> Result<()> {
         let resolved = EventBody::PermissionResolved {
             request_id: open.request_id.clone(),
             decision,
@@ -1804,39 +1957,15 @@ impl Driver {
         decision: PermissionDecision,
         message: Option<String>,
     ) -> Result<()> {
-        let store = &self.inner.store;
-        // The `permission_requested` event: the cause of the answer.
         let waiting = self
             .open
             .iter()
             .position(|open| open.request_id == request_id)
             .map(|index| self.open.remove(index));
-        let lead = self.lead.as_ref().map(|lead| lead.id.clone());
+        // The `permission_requested` event: the cause of the answer.
         let (asked, asker) = match &waiting {
             Some(open) => (Some(open.event_id.clone()), open.agent_id.clone()),
-            None => match store
-                .permission_resolved(&self.session_id, &request_id)
-                .await?
-            {
-                None => {
-                    return Err(Error::Missing(format!(
-                        "unknown permission request {request_id}"
-                    )));
-                }
-                Some(true) => {
-                    return Err(Error::Conflict(
-                        "this permission request was already answered".to_owned(),
-                    ));
-                }
-                // Open in the log but not waiting here: its agent is gone.
-                // The answer is still recorded, so the card closes.
-                Some(false) => store
-                    .open_permissions(Some(&self.session_id))
-                    .await?
-                    .into_iter()
-                    .find(|open| open.request_id == request_id)
-                    .map_or((None, lead), |open| (Some(open.event_id), open.agent_id)),
-            },
+            None => self.unheld_request(&request_id).await?,
         };
         let resolved = EventBody::PermissionResolved {
             request_id: request_id.clone(),
@@ -1845,17 +1974,46 @@ impl Driver {
             message: message.clone(),
         };
         self.append(as_agent(asker, resolved).parent(asked)).await?;
-        if let Some(open) = waiting {
-            // The last answer the session waited for lets it run again,
-            // which takes a slot. Without one the decision waits with the
-            // session: handing it over is what lets the agent go on.
-            let resumes = self.status == SessionStatus::Waiting && !self.waits_on_user();
-            if resumes && !self.take_slot() {
-                self.held.push((open, decision, message));
-                return self.park(Resume::Turn).await;
-            }
-            self.forward_decision(open, decision, message);
+        let Some(open) = waiting else {
+            return self.resume_if_waiting().await;
+        };
+        // The last answer the session waited for lets it run again, which
+        // takes a slot. Without one the decision waits with the session:
+        // handing it over is what lets the agent go on.
+        let resumes = self.status == SessionStatus::Waiting && !self.waits_on_user();
+        if resumes && !self.take_slot() {
+            self.held.push((open, decision, message));
+            return self.park(Resume::Turn).await;
         }
+        self.forward_decision(open, decision, message);
+        self.resume_if_waiting().await
+    }
+
+    /// The cause and the asker of a request no agent waits on here. One the
+    /// log still has open belongs to an agent that is gone: the answer is
+    /// still recorded, so that its card closes.
+    async fn unheld_request(&self, request_id: &str) -> Result<(Option<String>, Option<String>)> {
+        let store = &self.inner.store;
+        match store
+            .permission_resolved(&self.session_id, request_id)
+            .await?
+        {
+            None => Err(Error::Missing(format!(
+                "unknown permission request {request_id}"
+            ))),
+            Some(true) => Err(Error::Conflict(
+                "this permission request was already answered".to_owned(),
+            )),
+            Some(false) => {
+                let lead = self.lead.as_ref().map(|lead| lead.id.clone());
+                let open = store.open_permissions(Some(&self.session_id)).await?;
+                let open = open.into_iter().find(|open| open.request_id == request_id);
+                Ok(open.map_or((None, lead), |open| (Some(open.event_id), open.agent_id)))
+            }
+        }
+    }
+
+    async fn resume_if_waiting(&mut self) -> Result<()> {
         if self.status == SessionStatus::Waiting {
             self.resume_status().await?;
         }
@@ -1937,10 +2095,16 @@ impl Driver {
     }
 
     async fn set_status(&mut self, status: SessionStatus, reason: Option<String>) -> Result<()> {
-        let body = EventBody::SessionStatus { status, reason };
-        self.append(EventDraft::new(body).parent(self.cause.clone()))
+        self.record(EventBody::SessionStatus { status, reason })
             .await?;
         Ok(())
+    }
+
+    /// Appends what the orchestrator itself says, caused by the input the
+    /// current turn answers.
+    async fn record(&mut self, body: EventBody) -> Result<Arc<Event>> {
+        self.append(EventDraft::new(body).parent(self.cause.clone()))
+            .await
     }
 
     /// Moves the lead agent to `status`, unless it has none, is already
@@ -1983,39 +2147,55 @@ impl Driver {
         let draft = self.by(subagent, body).parent(self.cause.clone());
         let event = self.append(draft).await?;
         match &event.body {
-            EventBody::ItemStarted { item } => {
-                let tool = match &item.content {
-                    ItemContent::Tool { name, .. } => Some(name.clone()),
-                    _ => None,
-                };
-                let started = TurnItem {
-                    event_id: event.id.clone(),
-                    tool,
-                };
-                self.turn_items.insert(item.id.clone(), started);
-            }
+            EventBody::ItemStarted { item } => self.item_started(&event, item),
             EventBody::ItemCompleted { item } => {
-                self.turn_items.remove(&item.id);
-                if let (None, ItemContent::Text { text }) = (subagent, &item.content)
-                    && !text.trim().is_empty()
-                {
-                    self.last_text = Some(text.clone());
-                    self.lead_said(text);
-                }
-                self.file_changes(&event, item).await?;
+                self.item_completed(&event, item, subagent).await?
             }
-            // The tree costs more now: a workflow's budget is checked here,
-            // and in the session that dispatched this one.
-            EventBody::Usage { .. } => {
-                if let Some(dispatch) = &self.setup.dispatch {
-                    self.manager()
-                        .post(&dispatch.parent_session_id, Command::Spent);
-                }
-                self.check_budget().await?;
-            }
+            EventBody::Usage { .. } => self.spent().await?,
             _ => {}
         }
         Ok(())
+    }
+
+    /// Keeps a running item of the turn, recorded by `event`.
+    fn item_started(&mut self, event: &Event, item: &Item) {
+        let tool = match &item.content {
+            ItemContent::Tool { name, .. } => Some(name.clone()),
+            _ => None,
+        };
+        let started = TurnItem {
+            event_id: event.id.clone(),
+            tool,
+        };
+        self.turn_items.insert(item.id.clone(), started);
+    }
+
+    /// An item of the turn is over. The lead's text is what it said last;
+    /// an edit records the files it changed.
+    async fn item_completed(
+        &mut self,
+        event: &Event,
+        item: &Item,
+        subagent: Option<&str>,
+    ) -> Result<()> {
+        self.turn_items.remove(&item.id);
+        if let (None, ItemContent::Text { text }) = (subagent, &item.content)
+            && !text.trim().is_empty()
+        {
+            self.last_text = Some(text.clone());
+            self.lead_said(text);
+        }
+        self.file_changes(event, item).await
+    }
+
+    /// The tree costs more now: a workflow's budget is checked here, and in
+    /// the session that dispatched this one.
+    async fn spent(&mut self) -> Result<()> {
+        if let Some(dispatch) = &self.setup.dispatch {
+            self.manager()
+                .post(&dispatch.parent_session_id, Command::Spent);
+        }
+        self.check_budget().await
     }
 
     /// The agent started a subagent inside its process: it becomes an agent
@@ -2112,64 +2292,16 @@ impl Driver {
         repos: Option<Vec<String>>,
         with: ChildWith,
     ) -> Result<Dispatched> {
-        if self.setup.dispatch.is_some() {
-            return Err(Error::Conflict(
-                "this session is itself a child session, and a child session cannot dispatch. \
-                 Do the work yourself, or say in your report what else should be dispatched."
-                    .to_owned(),
-            ));
-        }
-        if is_closed(self.status) {
-            return Err(closed(self.status));
-        }
-        let sessions = self.inner.store.sessions().await?;
-        let running = sessions
-            .iter()
-            .filter(|session| session.parent_session_id.as_deref() == Some(&self.session_id))
-            .filter(|session| !session.status.is_settled())
-            .count();
-        if running >= MAX_RUNNING_CHILDREN {
-            return Err(Error::Conflict(format!(
-                "{running} child sessions of this session are still running, which is the \
-                 limit. End your turn: their reports arrive as messages. Dispatch again once \
-                 one of them has reported."
-            )));
-        }
+        self.may_dispatch().await?;
         let given = self.child_repos(repos)?;
-        let mut start_points = BTreeMap::new();
-        let mut dispatched = Vec::with_capacity(given.len());
-        for repo in &given {
-            let dir = PathBuf::from(&repo.path);
-            // Never committed on the agent's behalf: the child starts from
-            // the last commit, and the agent is told when that leaves work behind.
-            let (commit, dirty) =
-                blocking(move || Ok((calin_git::head_commit(&dir)?, calin_git::is_dirty(&dir)?)))
-                    .await?;
-            start_points.insert(repo.repo_id.clone(), commit.clone());
-            dispatched.push(DispatchedRepo {
-                name: repo.name.clone(),
-                commit,
-                dirty,
-            });
-        }
-        let ids: Vec<&str> = given.iter().map(|repo| repo.repo_id.as_str()).collect();
-        let reservation = match ids.is_empty() {
-            true => None,
-            false => Some(self.inner.repos.reserve(&ids).await?),
-        };
-        let runner = match &with.runner {
-            Some(id) => self.inner.registry.resolve(Some(id)).ok_or_else(|| {
-                let known = self.inner.registry.ids().join(", ");
-                Error::Invalid(format!("unknown runner {id}; this server has {known}"))
-            })?,
-            None => self
-                .runner
-                .clone()
-                .or_else(|| self.inner.registry.resolve(Some(&self.runner_id)))
-                .ok_or_else(|| {
-                    Error::Conflict(format!("runner {} is not available", self.runner_id))
-                })?,
-        };
+        let (start_points, dispatched) = start_points(&given).await?;
+        // Holds the repos in place until the child that is given them has them.
+        let reservation = self
+            .inner
+            .repos
+            .reserve_named(given.iter().map(|repo| repo.repo_id.as_str()))
+            .await?;
+        let runner = self.child_runner(with.runner.as_deref())?;
         let link = Dispatch {
             parent_session_id: self.session_id.clone(),
             root_session_id: self.root_session_id.clone(),
@@ -2240,6 +2372,58 @@ impl Driver {
         })
     }
 
+    /// Refuses a dispatch the "Child sessions" semantics do not allow: from
+    /// a child, from a session that is over, or past the running children's
+    /// limit.
+    async fn may_dispatch(&self) -> Result<()> {
+        if self.setup.dispatch.is_some() {
+            return Err(Error::Conflict(
+                "this session is itself a child session, and a child session cannot dispatch. \
+                 Do the work yourself, or say in your report what else should be dispatched."
+                    .to_owned(),
+            ));
+        }
+        if is_closed(self.status) {
+            return Err(closed(self.status));
+        }
+        let sessions = self.inner.store.sessions().await?;
+        let running = sessions
+            .iter()
+            .filter(|session| session.parent_session_id.as_deref() == Some(&self.session_id))
+            .filter(|session| !session.status.is_settled())
+            .count();
+        if running >= MAX_RUNNING_CHILDREN {
+            return Err(Error::Conflict(format!(
+                "{running} child sessions of this session are still running, which is the \
+                 limit. End your turn: their reports arrive as messages. Dispatch again once \
+                 one of them has reported."
+            )));
+        }
+        Ok(())
+    }
+
+    /// The runner a child runs on: the one a workflow node names, else the
+    /// session's own.
+    fn child_runner(&self, named: Option<&str>) -> Result<Arc<dyn Runner>> {
+        let Some(id) = named else {
+            return self.session_runner().ok_or_else(|| {
+                Error::Conflict(format!("runner {} is not available", self.runner_id))
+            });
+        };
+        self.inner.registry.resolve(Some(id)).ok_or_else(|| {
+            let known = self.inner.registry.ids().join(", ");
+            Error::Invalid(format!("unknown runner {id}; this server has {known}"))
+        })
+    }
+
+    /// The session's runner: the one it was started with, else the one of
+    /// its name this server has.
+    fn session_runner(&self) -> Option<Arc<dyn Runner>> {
+        self.runner
+            .clone()
+            .or_else(|| self.inner.registry.resolve(Some(&self.runner_id)))
+    }
+
     /// The repos a child is given: the named ones, which must be `write`
     /// repos of this session, or every `write` repo of it.
     fn child_repos(&self, names: Option<Vec<String>>) -> Result<Vec<SessionRepo>> {
@@ -2282,54 +2466,11 @@ impl Driver {
         text: String,
     ) -> Result<NoteOutcome> {
         let store = self.inner.store.clone();
-        // Where it goes: the session, its agent, and what that agent is handed.
-        let (to_session, to_agent, delivery) = match &to {
-            NoteTarget::User => (self.session_id.clone(), None, None),
-            NoteTarget::Parent => {
-                let Some(dispatch) = &self.setup.dispatch else {
-                    return Err(Error::Missing(
-                        "this session was not dispatched by another session, so it has no \
-                         parent. Use `user` to leave a note for the user."
-                            .to_owned(),
-                    ));
-                };
-                let handed = briefing::note_from_child(&self.title, &self.session_id, &text);
-                let parent = dispatch.parent_session_id.clone();
-                (parent, Some(dispatch.agent_id.clone()), Some(handed))
-            }
-            NoteTarget::Child(child_id) => {
-                let sessions = store.sessions().await?;
-                let children: Vec<String> = sessions
-                    .iter()
-                    .rev()
-                    .filter(|session| {
-                        session.parent_session_id.as_deref() == Some(&self.session_id)
-                    })
-                    .map(|session| format!("{} (\"{}\")", session.id, session.title))
-                    .collect();
-                let known = sessions.iter().any(|session| {
-                    session.id == *child_id
-                        && session.parent_session_id.as_deref() == Some(&self.session_id)
-                });
-                if !known {
-                    let children = match children.is_empty() {
-                        true => "This session has no child sessions.".to_owned(),
-                        false => format!("Its child sessions: {}.", children.join(", ")),
-                    };
-                    return Err(Error::Missing(format!(
-                        "{child_id} is not `parent`, `user` or the id of a child session of \
-                         this session. {children}"
-                    )));
-                }
-                let lead = store.setup(child_id).await?.dispatch;
-                let handed = briefing::note_from_parent(&self.title, &text);
-                (
-                    child_id.clone(),
-                    lead.map(|dispatch| dispatch.lead_agent_id),
-                    Some(handed),
-                )
-            }
-        };
+        let NoteRoute {
+            session: to_session,
+            agent: to_agent,
+            handed: delivery,
+        } = self.note_route(&to, &text).await?;
         let message = AgentMessage {
             id: Ulid::generate().to_string(),
             kind: MessageKind::Note,
@@ -2369,6 +2510,68 @@ impl Driver {
         })
     }
 
+    /// Where a note to `to` goes.
+    async fn note_route(&self, to: &NoteTarget, text: &str) -> Result<NoteRoute> {
+        match to {
+            NoteTarget::User => Ok(NoteRoute {
+                session: self.session_id.clone(),
+                agent: None,
+                handed: None,
+            }),
+            NoteTarget::Parent => {
+                let Some(dispatch) = &self.setup.dispatch else {
+                    return Err(Error::Missing(
+                        "this session was not dispatched by another session, so it has no \
+                         parent. Use `user` to leave a note for the user."
+                            .to_owned(),
+                    ));
+                };
+                let handed = briefing::note_from_child(&self.title, &self.session_id, text);
+                Ok(NoteRoute {
+                    session: dispatch.parent_session_id.clone(),
+                    agent: Some(dispatch.agent_id.clone()),
+                    handed: Some(handed),
+                })
+            }
+            NoteTarget::Child(child_id) => self.child_route(child_id, text).await,
+        }
+    }
+
+    /// Where a note to the child session `child_id` goes; refused, with
+    /// the children there are, when it is no child of this session.
+    async fn child_route(&self, child_id: &str, text: &str) -> Result<NoteRoute> {
+        let sessions = self.inner.store.sessions().await?;
+        let mine = |session: &&calin_proto::Session| {
+            session.parent_session_id.as_deref() == Some(&self.session_id)
+        };
+        if !sessions
+            .iter()
+            .filter(mine)
+            .any(|session| session.id == child_id)
+        {
+            let children: Vec<String> = sessions
+                .iter()
+                .rev()
+                .filter(mine)
+                .map(|session| format!("{} (\"{}\")", session.id, session.title))
+                .collect();
+            let children = match children.is_empty() {
+                true => "This session has no child sessions.".to_owned(),
+                false => format!("Its child sessions: {}.", children.join(", ")),
+            };
+            return Err(Error::Missing(format!(
+                "{child_id} is not `parent`, `user` or the id of a child session of \
+                 this session. {children}"
+            )));
+        }
+        let lead = self.inner.store.setup(child_id).await?.dispatch;
+        Ok(NoteRoute {
+            session: child_id.to_owned(),
+            agent: lead.map(|dispatch| dispatch.lead_agent_id),
+            handed: Some(briefing::note_from_parent(&self.title, text)),
+        })
+    }
+
     /// A message from another session: recorded, then handed to the agent
     /// as its next input, at once when it is idle. A session that is over
     /// records it and starts nothing.
@@ -2398,14 +2601,11 @@ impl Driver {
         {
             return self.child_ended(&from, body, ended).await;
         }
-        self.pending.push_back(Queued {
+        let queued = Queued {
             text,
             event_id: received.id.clone(),
-        });
-        if self.defers_input() {
-            return Ok(());
-        }
-        self.run_pending().await
+        };
+        self.hand_on(queued).await
     }
 
     /// Keeps what a child's agent wants reported when its turn ends.
@@ -2505,37 +2705,40 @@ impl Driver {
             .await?
             .backlog;
         let lead = self.lead.as_ref().map(|lead| lead.id.as_str());
-        // A turn begins with the lead's `running` (or its spawn): what it was
-        // handed is on record before that.
-        let handed = events.iter().rposition(|event| match &event.body {
-            EventBody::AgentStatus {
-                status: AgentStatus::Running,
-            } => lead.is_some() && event.agent_id.as_deref() == lead,
-            EventBody::AgentSpawned { agent } => lead == Some(agent.id.as_str()),
-            _ => false,
-        });
+        let handed = last_handed(&events, lead);
         let mut notes = Vec::new();
         for event in &events[handed.map_or(0, |at| at + 1)..] {
-            let EventBody::MessageReceived { message } = &event.body else {
-                continue;
-            };
-            if message.kind != MessageKind::Report {
-                continue;
+            if let Some(note) = self.report_note(event).await {
+                notes.push(note);
             }
-            let Ok(child) = self.inner.store.session(&message.from_session_id).await else {
-                continue;
-            };
-            let branches = reported_branches(&child.repos).await;
-            let status = status_name(child.session.status);
-            let title = &child.session.title;
-            notes.push(briefing::report_text(
-                title,
-                &status,
-                &message.body,
-                &branches,
-            ));
         }
         Ok(notes)
+    }
+
+    /// The note for the lead of the report `event` received, when it is one
+    /// and its child can still be read.
+    async fn report_note(&self, event: &Event) -> Option<String> {
+        let EventBody::MessageReceived { message } = &event.body else {
+            return None;
+        };
+        if message.kind != MessageKind::Report {
+            return None;
+        }
+        let child = self
+            .inner
+            .store
+            .session(&message.from_session_id)
+            .await
+            .ok()?;
+        let branches = reported_branches(&child.repos).await;
+        let status = status_name(child.session.status);
+        let title = &child.session.title;
+        Some(briefing::report_text(
+            title,
+            &status,
+            &message.body,
+            &branches,
+        ))
     }
 
     /// Puts the agent's question to the user (the "Questions" semantics in
@@ -2574,11 +2777,36 @@ impl Driver {
             agent_id: Some(agent_id),
             event_id: asked.id.clone(),
         });
-        if self.status != SessionStatus::Waiting {
-            let reason = Some(WAITING_FOR_ANSWER.to_owned());
-            self.set_status(SessionStatus::Waiting, reason).await?;
-        }
+        self.wait_for_user(WAITING_FOR_ANSWER).await?;
         Ok(question_id)
+    }
+
+    /// The open question `answer` answers, taken off the session. Refused,
+    /// with the question still open, when it is unknown, already answered,
+    /// or a gate that cannot take `answer`.
+    async fn take_question(&mut self, question_id: &str, answer: &str) -> Result<OpenQuestion> {
+        if self
+            .question
+            .as_ref()
+            .is_some_and(|open| open.question_id == question_id)
+        {
+            // Refused before anything is on record: the gate stays open.
+            self.check_answer(question_id, answer)?;
+        }
+        if let Some(open) = self
+            .question
+            .take_if(|open| open.question_id == question_id)
+        {
+            return Ok(open);
+        }
+        let answered = self
+            .inner
+            .store
+            .question_answered(&self.session_id, question_id);
+        Err(match answered.await? {
+            None => Error::Missing(format!("unknown question {question_id}")),
+            Some(_) => Error::Conflict("this question was already answered".to_owned()),
+        })
     }
 
     /// Records the user's answer and hands it to the agent as its next
@@ -2590,27 +2818,7 @@ impl Driver {
         answer: String,
         comment: Option<String>,
     ) -> Result<()> {
-        if self
-            .question
-            .as_ref()
-            .is_some_and(|open| open.question_id == question_id)
-        {
-            // Refused before anything is on record: the gate stays open.
-            self.check_answer(&question_id, &answer)?;
-        }
-        let Some(open) = self
-            .question
-            .take_if(|open| open.question_id == question_id)
-        else {
-            let answered = self
-                .inner
-                .store
-                .question_answered(&self.session_id, &question_id);
-            return Err(match answered.await? {
-                None => Error::Missing(format!("unknown question {question_id}")),
-                Some(_) => Error::Conflict("this question was already answered".to_owned()),
-            });
-        };
+        let open = self.take_question(&question_id, &answer).await?;
         let answered = EventBody::QuestionAnswered {
             question_id: question_id.clone(),
             answer: answer.clone(),
@@ -2647,47 +2855,67 @@ impl Driver {
         else {
             return Ok(());
         };
-        let op = match tool_kind {
-            ToolKind::Edit => FileOp::Edit,
-            ToolKind::Delete => FileOp::Delete,
-            ToolKind::Move => FileOp::Rename,
-            _ => return Ok(()),
+        let Some(op) = file_op(*tool_kind) else {
+            return Ok(());
         };
         if item.status != ItemStatus::Completed {
             return Ok(());
         }
         let tracker = unreported::tracker(&self.inner.trackers, &self.session_id);
         for location in locations {
-            let (session_repo_id, path) = locate(&self.repos, location);
-            // The file as the call left it, so that the turn's end reports
-            // it again only if it changed after this.
-            let repo = session_repo_id
-                .as_ref()
-                .and_then(|id| self.repos.iter().find(|repo| repo.id == *id))
-                .filter(|repo| tracker.is_some() && unreported::is_tracked(repo))
-                .cloned();
-            let state = match repo {
-                Some(repo) => {
-                    let (repo_id, rel) = (repo.id.clone(), path.clone());
-                    let state = blocking(move || Ok(unreported::state_of(&repo, &rel)));
-                    state.await.ok().flatten().map(|state| (repo_id, state))
-                }
-                None => None,
-            };
-            let changed = EventBody::FileChanged {
-                session_repo_id,
-                path: path.clone(),
-                op,
-            };
-            // By whoever made the call: the lead or one of its subagents.
-            let draft = as_agent(completed.agent_id.clone(), changed);
-            self.append(draft.parent(Some(completed.id.clone())))
+            self.file_changed(completed, location, op, tracker.as_ref())
                 .await?;
-            if let (Some(tracker), Some((repo_id, state))) = (&tracker, state) {
-                tracker.lock().await.reported(&repo_id, &path, state);
-            }
         }
         Ok(())
+    }
+
+    /// One `file_changed` for `location`, by whoever made the call: the
+    /// lead or one of its subagents.
+    async fn file_changed(
+        &mut self,
+        completed: &Event,
+        location: &str,
+        op: FileOp,
+        tracker: Option<&Arc<tokio::sync::Mutex<Tracker>>>,
+    ) -> Result<()> {
+        let (session_repo_id, path) = locate(&self.repos, location);
+        let state = match tracker {
+            Some(_) => self.file_state(session_repo_id.as_deref(), &path).await,
+            None => None,
+        };
+        let changed = EventBody::FileChanged {
+            session_repo_id,
+            path: path.clone(),
+            op,
+        };
+        let draft = as_agent(completed.agent_id.clone(), changed);
+        self.append(draft.parent(Some(completed.id.clone())))
+            .await?;
+        if let (Some(tracker), Some((repo_id, state))) = (tracker, state) {
+            tracker.lock().await.reported(&repo_id, &path, state);
+        }
+        Ok(())
+    }
+
+    /// The file as the call left it, with the id of its repo, so that the
+    /// turn's end reports it again only if it changed after this. `None`
+    /// outside the repos whose changes are followed.
+    async fn file_state(
+        &self,
+        session_repo_id: Option<&str>,
+        path: &str,
+    ) -> Option<(String, calin_git::FileState)> {
+        let repo = self
+            .repos
+            .iter()
+            .find(|repo| Some(repo.id.as_str()) == session_repo_id)?;
+        if !unreported::is_tracked(repo) {
+            return None;
+        }
+        let (repo, rel) = (repo.clone(), path.to_owned());
+        let state = blocking(move || Ok(unreported::state_of(&repo, &rel)));
+        let state = state.await.ok().flatten()?;
+        session_repo_id.map(|id| (id.to_owned(), state))
     }
 
     /// Appends to the session's log and keeps the driver's view of the
@@ -2695,49 +2923,66 @@ impl Driver {
     async fn append(&mut self, draft: EventDraft) -> Result<Arc<Event>> {
         let event = self.inner.store.append(&self.session_id, draft).await?;
         self.head_seq = event.seq;
-        let from_lead = |lead: &Lead| event.agent_id.as_deref() == Some(lead.id.as_str());
         match &event.body {
-            EventBody::SessionStatus { status, .. } => {
-                self.status = *status;
-                // Only a session that prepares or runs holds a slot, and
-                // only a `queued` one waits for one.
-                if !status.is_active() && *status != SessionStatus::Queued {
-                    self.leave_queue();
-                    // What waited for a slot with the session is the
-                    // agent's to have: its turn, if any, goes on.
-                    self.forward_held();
-                }
-            }
-            EventBody::AgentStatus { status } => {
-                if let Some(lead) = self.lead.as_mut().filter(|lead| from_lead(lead)) {
-                    lead.status = *status;
-                }
-            }
-            EventBody::AgentSession {
-                native_session_id,
-                model,
-            } => {
-                if let Some(lead) = self.lead.as_mut().filter(|lead| from_lead(lead)) {
-                    lead.native_session_id = Some(native_session_id.clone());
-                    if model.is_some() {
-                        lead.model.clone_from(model);
-                    }
-                }
+            EventBody::SessionStatus { status, .. } => self.status_recorded(*status),
+            EventBody::AgentStatus { .. } | EventBody::AgentSession { .. } => {
+                self.lead_recorded(&event);
             }
             EventBody::RepoAttached { repo } => self.repos.push(repo.clone()),
             EventBody::PullRequestOpened { pull_request }
             | EventBody::PullRequestUpdated { pull_request } => {
-                let same_repo = |known: &&mut PullRequest| {
-                    known.session_repo_id == pull_request.session_repo_id
-                };
-                match self.pull_requests.iter_mut().find(same_repo) {
-                    Some(known) => *known = pull_request.clone(),
-                    None => self.pull_requests.push(pull_request.clone()),
-                }
+                self.keep_pull_request(pull_request)
             }
             _ => {}
         }
         Ok(event)
+    }
+
+    /// Keeps the lead as `event` says it is now, when the event is the lead's.
+    fn lead_recorded(&mut self, event: &Event) {
+        let by = event.agent_id.as_deref();
+        let Some(lead) = self
+            .lead
+            .as_mut()
+            .filter(|lead| by == Some(lead.id.as_str()))
+        else {
+            return;
+        };
+        match &event.body {
+            EventBody::AgentStatus { status } => lead.status = *status,
+            EventBody::AgentSession {
+                native_session_id,
+                model,
+            } => {
+                lead.native_session_id = Some(native_session_id.clone());
+                if model.is_some() {
+                    lead.model.clone_from(model);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The session is in `status` now. Only a session that prepares or runs
+    /// holds a slot, and only a `queued` one waits for one.
+    fn status_recorded(&mut self, status: SessionStatus) {
+        self.status = status;
+        if !status.is_active() && status != SessionStatus::Queued {
+            self.leave_queue();
+            // What waited for a slot with the session is the agent's to
+            // have: its turn, if any, goes on.
+            self.forward_held();
+        }
+    }
+
+    /// Keeps the pull request on record, one per repo.
+    fn keep_pull_request(&mut self, pull_request: &PullRequest) {
+        let same_repo =
+            |known: &&mut PullRequest| known.session_repo_id == pull_request.session_repo_id;
+        match self.pull_requests.iter_mut().find(same_repo) {
+            Some(known) => *known = pull_request.clone(),
+            None => self.pull_requests.push(pull_request.clone()),
+        }
     }
 
     /// Starts delivering the session in the background (the "Shipping"
@@ -2980,6 +3225,30 @@ enum Ending<'a> {
     Stopped,
 }
 
+/// Where a child starts in each of `repos`: the commit each is at, by repo
+/// id, and what the dispatching agent is told of each. Never committed on
+/// the agent's behalf: the child starts from the last commit, and the agent
+/// is told when that leaves work behind.
+async fn start_points(
+    repos: &[SessionRepo],
+) -> Result<(BTreeMap<String, String>, Vec<DispatchedRepo>)> {
+    let mut start_points = BTreeMap::new();
+    let mut dispatched = Vec::with_capacity(repos.len());
+    for repo in repos {
+        let dir = PathBuf::from(&repo.path);
+        let (commit, dirty) =
+            blocking(move || Ok((calin_git::head_commit(&dir)?, calin_git::is_dirty(&dir)?)))
+                .await?;
+        start_points.insert(repo.repo_id.clone(), commit.clone());
+        dispatched.push(DispatchedRepo {
+            name: repo.name.clone(),
+            commit,
+            dirty,
+        });
+    }
+    Ok((start_points, dispatched))
+}
+
 /// A session's branches as a report describes them: where each stands
 /// against the commit it started from.
 async fn reported_branches(repos: &[SessionRepo]) -> Vec<ReportedBranch> {
@@ -3003,6 +3272,30 @@ async fn reported_branches(repos: &[SessionRepo]) -> Vec<ReportedBranch> {
         });
     }
     branches
+}
+
+/// Where the lead was last handed an input in `events`: a turn begins with
+/// the lead's `running` (or its spawn), and what it was handed is on record
+/// before that.
+fn last_handed(events: &[Event], lead: Option<&str>) -> Option<usize> {
+    events.iter().rposition(|event| match &event.body {
+        EventBody::AgentStatus {
+            status: AgentStatus::Running,
+        } => lead.is_some() && event.agent_id.as_deref() == lead,
+        EventBody::AgentSpawned { agent } => lead == Some(agent.id.as_str()),
+        _ => false,
+    })
+}
+
+/// What a completed tool call of `kind` did to the files it names, when it
+/// changed them.
+fn file_op(kind: ToolKind) -> Option<FileOp> {
+    match kind {
+        ToolKind::Edit => Some(FileOp::Edit),
+        ToolKind::Delete => Some(FileOp::Delete),
+        ToolKind::Move => Some(FileOp::Rename),
+        _ => None,
+    }
 }
 
 fn as_agent(agent_id: Option<String>, body: EventBody) -> EventDraft {
@@ -3031,83 +3324,106 @@ fn one_line(title: &str) -> String {
 /// the first failure, or early when cancelled.
 async fn prepare(plans: Vec<AttachPlan>, results: mpsc::Sender<Prepared>, cancel: Arc<AtomicBool>) {
     for plan in plans {
-        if cancel.load(Ordering::Relaxed) {
-            return;
-        }
-        let name = plan.repo.name.clone();
-        let setup = plan.repo.setup.clone();
-        let limit = plan.setup_limit;
-        let (repo, fresh) = match blocking(move || attach(plan)).await {
-            Ok(attached) => attached,
-            Err(error) => {
-                let _ = results.send(Prepared::Failed { repo: name, error }).await;
-                return;
-            }
-        };
-        let dir = PathBuf::from(&repo.path);
-        if results.send(Prepared::Repo(repo)).await.is_err() {
-            return;
-        }
-        // Setup is for a worktree that was just made (design spec, section
-        // 3): one that was already there has had it.
-        let Some(command) = setup.filter(|_| fresh) else {
-            continue;
-        };
-        let mut item = setup_item(&name, &command);
-        if results
-            .send(Prepared::SetupStarted(item.clone()))
-            .await
-            .is_err()
-        {
-            return;
-        }
-        let stop = Arc::clone(&cancel);
-        let ran = blocking(move || Ok(calin_git::run_setup(&dir, &command, limit, &stop)?)).await;
-        let (output, failure) = match ran {
-            Ok(run) => {
-                let failure = match run.end {
-                    calin_git::SetupEnd::Succeeded => None,
-                    calin_git::SetupEnd::Failed(how) => Some(format!("failed ({how})")),
-                    calin_git::SetupEnd::TimedOut => {
-                        Some(format!("was stopped: it ran longer than {limit:?}"))
-                    }
-                    calin_git::SetupEnd::Cancelled => Some("was cancelled".to_owned()),
-                };
-                (run.output, failure)
-            }
-            Err(err) => (String::new(), Some(format!("could not be run: {err}"))),
-        };
-        item.status = match failure {
-            None => ItemStatus::Completed,
-            Some(_) => ItemStatus::Failed,
-        };
-        if let ItemContent::Tool { output: slot, .. } = &mut item.content {
-            *slot = Some(output);
-        }
-        let failure = failure.map(|how| format!("the setup command of {name} {how}"));
-        if results
-            .send(Prepared::SetupEnded { item, failure })
-            .await
-            .is_err()
-        {
+        if cancel.load(Ordering::Relaxed) || prepare_one(plan, &results, &cancel).await.is_none() {
             return;
         }
     }
 }
 
-/// The tool item a setup command shows as. Its id is new for every run.
-fn setup_item(repo: &str, command: &str) -> Item {
+/// Makes one repo ready, then runs the setup of a worktree that is new.
+/// `None` when the preparation ends here: the repo failed, or nobody
+/// listens any more.
+async fn prepare_one(
+    plan: AttachPlan,
+    results: &mpsc::Sender<Prepared>,
+    cancel: &Arc<AtomicBool>,
+) -> Option<()> {
+    let name = plan.repo.name.clone();
+    let setup = plan.repo.setup.clone();
+    let limit = plan.setup_limit;
+    let (repo, fresh) = match blocking(move || attach(plan)).await {
+        Ok(attached) => attached,
+        Err(error) => {
+            let _ = results.send(Prepared::Failed { repo: name, error }).await;
+            return None;
+        }
+    };
+    let dir = PathBuf::from(&repo.path);
+    results.send(Prepared::Repo(repo)).await.ok()?;
+    // Setup is for a worktree that was just made (design spec, section
+    // 3): one that was already there has had it.
+    match setup.filter(|_| fresh) {
+        Some(command) => run_setup(&name, dir, command, limit, results, cancel).await,
+        None => Some(()),
+    }
+}
+
+/// Runs the setup command of `repo` in `dir`, its tool item started then
+/// ended. `None` once nobody listens any more.
+async fn run_setup(
+    repo: &str,
+    dir: PathBuf,
+    command: String,
+    limit: Duration,
+    results: &mpsc::Sender<Prepared>,
+    cancel: &Arc<AtomicBool>,
+) -> Option<()> {
+    let mut item = tool_item("setup", repo, &command);
+    results
+        .send(Prepared::SetupStarted(item.clone()))
+        .await
+        .ok()?;
+    let stop = Arc::clone(cancel);
+    let ran = blocking(move || Ok(calin_git::run_setup(&dir, &command, limit, &stop)?)).await;
+    let (output, failure) = setup_outcome(ran, limit);
+    finish_item(&mut item, output, failure.is_some());
+    let failure = failure.map(|how| format!("the setup command of {repo} {how}"));
+    results
+        .send(Prepared::SetupEnded { item, failure })
+        .await
+        .ok()
+}
+
+/// What a setup command printed, and how it failed when it did.
+fn setup_outcome(ran: Result<calin_git::SetupRun>, limit: Duration) -> (String, Option<String>) {
+    let run = match ran {
+        Ok(run) => run,
+        Err(err) => return (String::new(), Some(format!("could not be run: {err}"))),
+    };
+    let failure = match run.end {
+        calin_git::SetupEnd::Succeeded => None,
+        calin_git::SetupEnd::Failed(how) => Some(format!("failed ({how})")),
+        calin_git::SetupEnd::TimedOut => Some(format!("was stopped: it ran longer than {limit:?}")),
+        calin_git::SetupEnd::Cancelled => Some("was cancelled".to_owned()),
+    };
+    (run.output, failure)
+}
+
+/// The tool item a command the orchestrator runs shows as, nobody's tool
+/// call: `name` is `setup` or `check`. Its id is new for every run.
+fn tool_item(name: &str, repo: &str, command: &str) -> Item {
     Item {
-        id: format!("setup-{}", Ulid::generate()),
+        id: format!("{name}-{}", Ulid::generate()),
         status: ItemStatus::Running,
         content: ItemContent::Tool {
-            name: "setup".to_owned(),
+            name: name.to_owned(),
             tool_kind: ToolKind::Execute,
             title: command.to_owned(),
             input: serde_json::json!({ "command": command, "repo": repo }),
             output: None,
             locations: Vec::new(),
         },
+    }
+}
+
+/// Ends the tool item of such a command with what it printed.
+fn finish_item(item: &mut Item, output: String, failed: bool) {
+    item.status = match failed {
+        true => ItemStatus::Failed,
+        false => ItemStatus::Completed,
+    };
+    if let ItemContent::Tool { output: slot, .. } = &mut item.content {
+        *slot = Some(output);
     }
 }
 

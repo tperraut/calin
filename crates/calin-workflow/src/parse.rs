@@ -93,6 +93,15 @@ impl<'a> MapView<'a> {
         self.entries.iter().find(|e| e.0 == key).map(|e| e.2)
     }
 
+    /// The string at `key`, without reporting anything: for names in messages, before the
+    /// [`Reader`] checks the key.
+    fn text(&self, key: &str) -> Option<String> {
+        match self.get(key).map(|r| &r.value) {
+            Some(RawValue::Str(s)) => Some(s.clone()),
+            _ => None,
+        }
+    }
+
     fn line(&self, key: &str) -> Option<u32> {
         self.entries.iter().find(|e| e.0 == key).and_then(|e| e.1)
     }
@@ -158,21 +167,37 @@ impl<'a> Reader<'a, '_> {
         self.fail(key, line, msg);
     }
 
-    fn string(&mut self, key: &str) -> Option<String> {
-        let raw = self.view.get(key)?;
-        match &raw.value {
-            RawValue::Str(s) => Some(s.clone()),
-            _ => {
-                self.wrong(key, "a string", raw);
-                None
-            }
-        }
-    }
-
-    fn required_string(&mut self, key: &str) -> Option<String> {
+    /// Reports `key` as missing when it is.
+    fn require(&mut self, key: &str) {
         if self.view.get(key).is_none() {
             self.missing(key);
         }
+    }
+
+    /// The value at `key` when `pick` takes it; reported as not `expected` when it does not.
+    fn typed<T>(
+        &mut self,
+        key: &str,
+        expected: &str,
+        pick: impl FnOnce(&RawValue) -> Option<T>,
+    ) -> Option<T> {
+        let raw = self.view.get(key)?;
+        let value = pick(&raw.value);
+        if value.is_none() {
+            self.wrong(key, expected, raw);
+        }
+        value
+    }
+
+    fn string(&mut self, key: &str) -> Option<String> {
+        self.typed(key, "a string", |v| match v {
+            RawValue::Str(s) => Some(s.clone()),
+            _ => None,
+        })
+    }
+
+    fn required_string(&mut self, key: &str) -> Option<String> {
+        self.require(key);
         self.string(key)
     }
 
@@ -191,21 +216,15 @@ impl<'a> Reader<'a, '_> {
 
     /// A required template; a placeholder when missing or broken (already reported).
     fn required_template(&mut self, key: &str) -> Template {
-        if self.view.get(key).is_none() {
-            self.missing(key);
-        }
+        self.require(key);
         self.template(key).unwrap_or_else(placeholder)
     }
 
     fn boolean(&mut self, key: &str) -> Option<bool> {
-        let raw = self.view.get(key)?;
-        match raw.value {
-            RawValue::Bool(b) => Some(b),
-            _ => {
-                self.wrong(key, "`true` or `false`", raw);
-                None
-            }
-        }
+        self.typed(key, "`true` or `false`", |v| match v {
+            RawValue::Bool(b) => Some(*b),
+            _ => None,
+        })
     }
 
     /// An integer in `range`; out-of-range values are reported here with the range.
@@ -231,14 +250,29 @@ impl<'a> Reader<'a, '_> {
     }
 
     fn number(&mut self, key: &str) -> Option<f64> {
-        let raw = self.view.get(key)?;
-        match raw.value {
+        self.typed(key, "a number", |v| match v {
             // Precision loss only beyond 2^53 dollars.
-            RawValue::Int(v) => Some(v as f64),
-            RawValue::Float(v) => Some(v),
-            _ => {
-                self.wrong(key, "a number", raw);
-                None
+            RawValue::Int(v) => Some(*v as f64),
+            RawValue::Float(v) => Some(*v),
+            _ => None,
+        })
+    }
+
+    /// The entries of the required list at `key`; none, reported, when it is missing or not
+    /// a list.
+    fn list(&mut self, key: &str) -> &'a [Raw] {
+        match self.view.get(key) {
+            None => {
+                self.missing(key);
+                &[]
+            }
+            Some(Raw {
+                value: RawValue::Seq(items),
+                ..
+            }) => items,
+            Some(other) => {
+                self.wrong(key, "a list", other);
+                &[]
             }
         }
     }
@@ -304,9 +338,7 @@ fn read_document(id: &str, doc: &Raw, c: &mut Collector) -> Option<Draft> {
         line: doc.line,
         extra_lines: HashMap::new(),
     };
-    if r.view.get("version").is_none() {
-        r.missing("version");
-    }
+    r.require("version");
     let version = r.integer("version", i128::MIN, i128::MAX);
     let name = r.required_string("name");
     let description = r.string("description");
@@ -314,42 +346,18 @@ fn read_document(id: &str, doc: &Raw, c: &mut Collector) -> Option<Draft> {
     let mut lines = HashMap::new();
     r.lines(&mut lines);
 
-    let nodes = match r.view.get("nodes") {
-        None => {
-            r.missing("nodes");
-            Vec::new()
-        }
-        Some(Raw {
-            value: RawValue::Seq(items),
-            ..
-        }) => items
-            .iter()
-            .enumerate()
-            .map(|(i, item)| read_node(i, item, r.c))
-            .collect(),
-        Some(other) => {
-            r.wrong("nodes", "a list", other);
-            Vec::new()
-        }
-    };
-    let edges = match r.view.get("edges") {
-        None => {
-            r.missing("edges");
-            Vec::new()
-        }
-        Some(Raw {
-            value: RawValue::Seq(items),
-            ..
-        }) => items
-            .iter()
-            .enumerate()
-            .map(|(k, item)| read_edge(k, item, r.c))
-            .collect(),
-        Some(other) => {
-            r.wrong("edges", "a list", other);
-            Vec::new()
-        }
-    };
+    let nodes = r
+        .list("nodes")
+        .iter()
+        .enumerate()
+        .map(|(i, item)| read_node(i, item, r.c))
+        .collect();
+    let edges = r
+        .list("edges")
+        .iter()
+        .enumerate()
+        .map(|(k, item)| read_edge(k, item, r.c))
+        .collect();
     Some(Draft {
         id: id.to_owned(),
         version,
@@ -377,10 +385,7 @@ fn read_node(i: usize, raw: &Raw, c: &mut Collector) -> DraftNode {
     let Some(view) = MapView::new(raw, &fallback, &subject, c) else {
         return node;
     };
-    let id = match view.get("id").map(|r| &r.value) {
-        Some(RawValue::Str(s)) => Some(s.clone()),
-        _ => None,
-    };
+    let id = view.text("id");
     let (what, subject) = match &id {
         Some(id) => (format!("node `{id}`"), Subject::Node { id: id.clone() }),
         None => (fallback, subject),
@@ -432,66 +437,12 @@ fn read_node(i: usize, raw: &Raw, c: &mut Collector) -> DraftNode {
 fn read_kind(t: NodeType, r: &mut Reader) -> NodeKind {
     match t {
         NodeType::Start => NodeKind::Start,
-        NodeType::End => {
-            let status = match r.string("status").as_deref() {
-                None => EndStatus::Success,
-                Some("success") => EndStatus::Success,
-                Some("failed") => EndStatus::Failed,
-                Some(other) => {
-                    let line = r.view.line("status");
-                    let msg = format!(
-                        "{}: `status` must be `success` or `failed`, found `{other}`",
-                        r.what
-                    );
-                    r.fail("status", line, msg);
-                    EndStatus::Success
-                }
-            };
-            NodeKind::End { status }
-        }
-        NodeType::Agent => {
-            let prompt = r.required_template("prompt");
-            let fresh = r.boolean("fresh").unwrap_or(false);
-            let verdicts = r.string_list("verdicts");
-            if verdicts.as_ref().is_some_and(Vec::is_empty) {
-                let line = r.view.line("verdicts");
-                let msg = format!(
-                    "{}: `verdicts` must not be an empty list; leave it out for `done`/`failed` ports",
-                    r.what
-                );
-                r.fail("verdicts", line, msg);
-            }
-            NodeKind::Agent(AgentNode {
-                prompt,
-                fresh,
-                verdicts: verdicts.unwrap_or_default(),
-                runner: r.string("runner"),
-                model: r.string("model"),
-            })
-        }
-        NodeType::Check => {
-            let command = r.template("command");
-            let repo = r.string("repo");
-            let timeout = r
-                .integer("timeout_seconds", 1, MAX_TIMEOUT_SECONDS.into())
-                .and_then(|v| u64::try_from(v).ok())
-                .unwrap_or(DEFAULT_TIMEOUT_SECONDS);
-            NodeKind::Check(CheckNode {
-                command,
-                repo,
-                timeout_seconds: timeout,
-            })
-        }
-        NodeType::Loop => {
-            if r.view.get("max").is_none() {
-                r.missing("max");
-            }
-            let max = r
-                .integer("max", 1, MAX_LOOP.into())
-                .and_then(|v| u32::try_from(v).ok())
-                .unwrap_or(1);
-            NodeKind::Loop { max }
-        }
+        NodeType::End => NodeKind::End {
+            status: read_end_status(r),
+        },
+        NodeType::Agent => NodeKind::Agent(read_agent(r)),
+        NodeType::Check => NodeKind::Check(read_check(r)),
+        NodeType::Loop => NodeKind::Loop { max: read_max(r) },
         NodeType::Gate => NodeKind::Gate {
             message: r.required_template("message"),
         },
@@ -506,30 +457,79 @@ fn read_kind(t: NodeType, r: &mut Reader) -> NodeKind {
             title: r.template("title"),
             draft: r.boolean("draft").unwrap_or(true),
         },
-        NodeType::Parallel => {
-            let branches = match r.view.get("branches") {
-                None => {
-                    r.missing("branches");
-                    Vec::new()
-                }
-                Some(Raw {
-                    value: RawValue::Seq(items),
-                    ..
-                }) => {
-                    let mut out = Vec::with_capacity(items.len());
-                    for (j, item) in items.iter().enumerate() {
-                        out.push(read_branch(j, item, r));
-                    }
-                    out
-                }
-                Some(other) => {
-                    r.wrong("branches", "a list", other);
-                    Vec::new()
-                }
-            };
-            NodeKind::Parallel { branches }
+        NodeType::Parallel => NodeKind::Parallel {
+            branches: read_branches(r),
+        },
+    }
+}
+
+/// `success` when absent, or when wrong (reported).
+fn read_end_status(r: &mut Reader) -> EndStatus {
+    match r.string("status").as_deref() {
+        None | Some("success") => EndStatus::Success,
+        Some("failed") => EndStatus::Failed,
+        Some(other) => {
+            let line = r.view.line("status");
+            let msg = format!(
+                "{}: `status` must be `success` or `failed`, found `{other}`",
+                r.what
+            );
+            r.fail("status", line, msg);
+            EndStatus::Success
         }
     }
+}
+
+fn read_agent(r: &mut Reader) -> AgentNode {
+    let prompt = r.required_template("prompt");
+    let fresh = r.boolean("fresh").unwrap_or(false);
+    let verdicts = r.string_list("verdicts");
+    if verdicts.as_ref().is_some_and(Vec::is_empty) {
+        let line = r.view.line("verdicts");
+        let msg = format!(
+            "{}: `verdicts` must not be an empty list; leave it out for `done`/`failed` ports",
+            r.what
+        );
+        r.fail("verdicts", line, msg);
+    }
+    AgentNode {
+        prompt,
+        fresh,
+        verdicts: verdicts.unwrap_or_default(),
+        runner: r.string("runner"),
+        model: r.string("model"),
+    }
+}
+
+fn read_check(r: &mut Reader) -> CheckNode {
+    let command = r.template("command");
+    let repo = r.string("repo");
+    let timeout = r
+        .integer("timeout_seconds", 1, MAX_TIMEOUT_SECONDS.into())
+        .and_then(|v| u64::try_from(v).ok())
+        .unwrap_or(DEFAULT_TIMEOUT_SECONDS);
+    CheckNode {
+        command,
+        repo,
+        timeout_seconds: timeout,
+    }
+}
+
+/// A loop's `max`; 1 when missing or out of range (reported).
+fn read_max(r: &mut Reader) -> u32 {
+    r.require("max");
+    r.integer("max", 1, MAX_LOOP.into())
+        .and_then(|v| u32::try_from(v).ok())
+        .unwrap_or(1)
+}
+
+fn read_branches(r: &mut Reader) -> Vec<Branch> {
+    let items = r.list("branches");
+    items
+        .iter()
+        .enumerate()
+        .map(|(j, item)| read_branch(j, item, r))
+        .collect()
 }
 
 fn read_branch(j: usize, raw: &Raw, parent: &mut Reader) -> Branch {
@@ -546,10 +546,7 @@ fn read_branch(j: usize, raw: &Raw, parent: &mut Reader) -> Branch {
             repos: None,
         };
     };
-    let id = match view.get("id").map(|r| &r.value) {
-        Some(RawValue::Str(s)) => Some(s.clone()),
-        _ => None,
-    };
+    let id = view.text("id");
     let what = match &id {
         Some(id) => format!("{}: branch `{id}`", parent.what),
         None => fallback,
@@ -599,11 +596,7 @@ fn read_edge(k: usize, raw: &Raw, c: &mut Collector) -> DraftEdge {
     let Some(view) = MapView::new(raw, &fallback, &subject, c) else {
         return edge;
     };
-    let text = |key: &str| match view.get(key).map(|r| &r.value) {
-        Some(RawValue::Str(s)) => Some(s.clone()),
-        _ => None,
-    };
-    let what = match (text("from"), text("to")) {
+    let what = match (view.text("from"), view.text("to")) {
         (Some(f), Some(t)) => format!("edge `{f} -> {t}`"),
         _ => fallback,
     };

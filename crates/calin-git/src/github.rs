@@ -4,7 +4,7 @@
 //! Every invocation runs without prompts, with a time limit, and with its
 //! standard error kept for the error message.
 
-use std::io::{self, Read, Write as _};
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc;
@@ -14,9 +14,9 @@ use std::time::{Duration, Instant};
 use calin_proto::{CheckState, PullRequestState, ReviewState};
 use serde::Deserialize;
 
-use crate::cmd::{INHERITED, work_dir};
+use crate::cmd::{INHERITED, collect, failure_words, work_dir};
 use crate::error::{Error, Result};
-use crate::setup::{kill, kill_group};
+use crate::setup::{Ended, in_own_group, kill_group, wait_until};
 
 mod issues;
 
@@ -195,11 +195,7 @@ impl GitHub {
             Ok(ran) if ran.status.success() => Ok(ran),
             Ok(ran) => Err(Error::Git {
                 command,
-                stderr: if ran.stderr.is_empty() {
-                    ran.status.to_string()
-                } else {
-                    ran.stderr
-                },
+                stderr: failure_words(ran.status, ran.stderr),
             }),
             Err(Failure::TimedOut) => Err(Error::Git {
                 command,
@@ -220,32 +216,10 @@ impl GitHub {
         args: &[&str],
         stdin: Option<&str>,
     ) -> std::result::Result<Ran, Failure> {
-        let mut cmd = Command::new(&self.program);
-        cmd.args(args)
-            .env("GH_PROMPT_DISABLED", "1")
-            .env("GH_NO_UPDATE_NOTIFIER", "1")
-            .env("NO_COLOR", "1")
-            // `gh` runs git to find the repository, which must be `dir`'s.
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .stdin(if stdin.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        for name in INHERITED {
-            cmd.env_remove(name);
-        }
-        if let Some(dir) = dir {
-            cmd.current_dir(dir);
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt as _;
-            cmd.process_group(0);
-        }
-        let mut child = cmd.spawn().map_err(Failure::Start)?;
+        let mut child = self
+            .command(dir, args, stdin.is_some())
+            .spawn()
+            .map_err(Failure::Start)?;
 
         if let (Some(mut pipe), Some(text)) = (child.stdin.take(), stdin) {
             let bytes = text.as_bytes().to_vec();
@@ -258,49 +232,49 @@ impl GitHub {
         let stdout = collect(child.stdout.take());
         let stderr = collect(child.stderr.take());
 
-        let deadline = Instant::now() + self.timeout;
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) => {}
-                Err(err) => {
-                    kill(&mut child);
-                    return Err(Failure::Wait(err));
-                }
-            }
-            if Instant::now() >= deadline {
-                kill(&mut child);
-                return Err(Failure::TimedOut);
-            }
-            thread::sleep(POLL);
+        let status = match wait_until(&mut child, Instant::now() + self.timeout, POLL, None) {
+            Ok(Ended::Exited(status)) => status,
+            Ok(Ended::TimedOut | Ended::Cancelled) => return Err(Failure::TimedOut),
+            Err(err) => return Err(Failure::Wait(err)),
         };
         // Something it left running would hold the pipes open.
         kill_group(&child);
+        let text = |stream: mpsc::Receiver<Vec<u8>>| {
+            String::from_utf8_lossy(&stream.recv_timeout(DRAIN).unwrap_or_default()).into_owned()
+        };
         Ok(Ran {
             status,
-            stdout: stdout.recv_timeout(DRAIN).unwrap_or_default(),
-            stderr: stderr
-                .recv_timeout(DRAIN)
-                .unwrap_or_default()
-                .trim()
-                .to_owned(),
+            stdout: text(stdout),
+            stderr: text(stderr).trim().to_owned(),
         })
     }
-}
 
-/// Reads a stream to its end on a thread of its own and hands over the text.
-fn collect(stream: Option<impl Read + Send + 'static>) -> mpsc::Receiver<String> {
-    let (done, text) = mpsc::channel();
-    if let Some(mut stream) = stream {
-        thread::spawn(move || {
-            let mut bytes = Vec::new();
-            // What was read before an error is still what `gh` said.
-            let _ = stream.read_to_end(&mut bytes);
-            // Nobody listens once the drain was given up.
-            let _ = done.send(String::from_utf8_lossy(&bytes).into_owned());
-        });
+    /// `gh` with `args`, in `dir` when given, with nothing to prompt on, in
+    /// a process group of its own. Its input is a pipe when `piped_stdin`.
+    fn command(&self, dir: Option<&Path>, args: &[&str], piped_stdin: bool) -> Command {
+        let mut cmd = Command::new(&self.program);
+        cmd.args(args)
+            .env("GH_PROMPT_DISABLED", "1")
+            .env("GH_NO_UPDATE_NOTIFIER", "1")
+            .env("NO_COLOR", "1")
+            // `gh` runs git to find the repository, which must be `dir`'s.
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(if piped_stdin {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for name in INHERITED {
+            cmd.env_remove(name);
+        }
+        if let Some(dir) = dir {
+            cmd.current_dir(dir);
+        }
+        in_own_group(&mut cmd);
+        cmd
     }
-    text
 }
 
 /// A finished invocation.

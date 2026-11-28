@@ -761,6 +761,56 @@ async fn a_commit_or_a_push_that_hangs_times_out_and_the_others_carry_on() {
 }
 
 #[tokio::test]
+async fn a_description_that_cannot_be_rewritten_is_reported_and_the_ship_goes_on() {
+    let d = delivery().await;
+    let api = d.repo("api").await;
+    let web = d.repo("web").await;
+    let detail = d
+        .reviewed(vec![attach(&api, None), attach(&web, None)])
+        .await;
+    let id = detail.session.id.clone();
+    write_file(Path::new(&detail.repos[1].path), "change.txt", "changed\n");
+    d.gh.switch("fail-edit-web", true);
+
+    let events = d
+        .ship(&id, titled("Add the thing", "Body."), is_shipping())
+        .await;
+    let labels = labels(&events);
+    let refused = "error:could not ship web: description failed: ";
+    assert_eq!(labels.len(), 5, "{labels:?}");
+    assert_eq!(
+        labels[..3],
+        [opened("api", 1), opened("web", 1), updated("api", 1)]
+    );
+    // Already announced as opened: web gets no update of its own.
+    assert!(labels[3].starts_with(refused), "{labels:?}");
+    assert_eq!(labels[4], "session_status:shipping");
+    assert!(!d.gh.read("web", 1, "body").contains("Related"));
+
+    // Nothing new: api is kept as it is, and web is refused again.
+    let events = d
+        .ship(&id, titled("Add the thing", "Body."), is_error)
+        .await;
+    let labels = super::labels(&events);
+    assert_eq!(labels.len(), 1, "{labels:?}");
+    assert!(labels[0].starts_with(refused), "{labels:?}");
+
+    // Once GitHub takes the edit, web links api.
+    d.gh.switch("fail-edit-web", false);
+    let last = updated("web", 1);
+    let events = d
+        .ship(&id, titled("Add the thing", "Body."), |event| {
+            label(event) == last
+        })
+        .await;
+    assert_eq!(super::labels(&events), [last]);
+    assert!(
+        d.gh.read("web", 1, "body")
+            .contains(&format!("- api: {}", url("api", 1)))
+    );
+}
+
+#[tokio::test]
 async fn with_nothing_to_ship_the_session_stays_in_review() {
     let mut d = delivery().await;
     let api = d.repo("api").await;
