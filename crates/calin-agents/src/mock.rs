@@ -464,8 +464,9 @@ impl MockAgent {
         })
         .await?;
         if self.asks_before(tool_kind)
-            && let (PermissionDecision::Deny, message) =
-                self.ask_about(id, name, tool_kind, title, input).await?
+            && let (PermissionDecision::Deny, message) = self
+                .ask_about(id, name, tool_kind, title, input, self.access_of(tool_kind))
+                .await?
         {
             self.set_tool_output(message);
             return self.complete_item(ItemStatus::Declined).await;
@@ -487,7 +488,19 @@ impl MockAgent {
         self.complete_item(ItemStatus::Completed).await
     }
 
-    /// Asks for the tool call `id` and waits for the decision.
+    /// What a permission request for a scripted call of `tool_kind` is about.
+    fn access_of(&self, tool_kind: ToolKind) -> ToolAccess {
+        match (tool_kind, &self.edited) {
+            (ToolKind::Edit, Some(path)) => ToolAccess::Files {
+                paths: vec![path.clone()],
+                write: true,
+            },
+            _ => ToolAccess::Other,
+        }
+    }
+
+    /// Asks for the tool call `id`, as the agent or the subagent at work,
+    /// and waits for the decision.
     async fn ask_about(
         &mut self,
         id: String,
@@ -495,14 +508,8 @@ impl MockAgent {
         tool_kind: ToolKind,
         title: &str,
         input: serde_json::Value,
+        access: ToolAccess,
     ) -> Result<(PermissionDecision, Option<String>), Cut> {
-        let access = match (tool_kind, &self.edited) {
-            (ToolKind::Edit, Some(path)) => ToolAccess::Files {
-                paths: vec![path.clone()],
-                write: true,
-            },
-            _ => ToolAccess::Other,
-        };
         let request = PermissionAsk {
             request: PermissionRequest {
                 id: format!("{id}-permission"),
