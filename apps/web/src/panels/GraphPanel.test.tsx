@@ -247,6 +247,30 @@ describe("GraphPanel: the graph", () => {
     expect(host.querySelector('section[aria-label="Details"]')).toBeNull();
   });
 
+  it("opens a child's subagent's details with its session's title and status, and no model it lacks", async () => {
+    const { host } = await open();
+    await tap(node(host, "agent:sub3"));
+    expect(facts(host)).toEqual({
+      Role: "tester",
+      Status: "Running",
+      Runner: "mock",
+      Cost: "$0.00",
+      Tokens: "0 in · 0 out",
+      Session: "Web: status badge",
+      "Session status": "Running",
+    });
+    expect(find<HTMLAnchorElement>(details(host), "a.btn").getAttribute("href")).toBe("/s/s3");
+  });
+
+  it("opens the user's details: where requests come from, and no relations for the tree line", async () => {
+    const { host } = await open();
+    await tap(node(host, "user"));
+    expect(find(details(host), "h2").textContent).toBe("You");
+    expect(details(host).textContent).toContain("You: where this session's requests come from.");
+    expect(details(host).querySelector('ul[aria-label="Relations"]')).toBeNull();
+    expect(details(host).querySelector("dl")).toBeNull();
+  });
+
   it("opens a repo's details: name, mode, who changed it and how much, and the way to its changes", async () => {
     const { host, panels } = await open();
     await tap(node(host, "repo:api"));
