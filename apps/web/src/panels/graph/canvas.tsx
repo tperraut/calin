@@ -53,7 +53,8 @@ export function createTabStop(
 export function createCalmScene(onPulses: (ids: readonly string[]) => void): Scene {
   const reducedMotion = createMediaQuery(REDUCED_MOTION_QUERY);
   // A plain mirror: the scene asks from effects and frames, where a signal must not be read.
-  let calm = typeof matchMedia === "function" && matchMedia(REDUCED_MOTION_QUERY).matches;
+  // The effect below sets it before the scene first asks: the first layout neither tweens nor pulses.
+  let calm = false;
   createEffect(reducedMotion, (reduced) => {
     calm = reduced;
   });
