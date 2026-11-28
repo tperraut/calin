@@ -424,9 +424,11 @@ impl Driver {
         self.abort_shipping();
         self.end_polling(Err(no_longer_active()));
         // Off the map, so nothing new arrives; what is queued came too late.
+        // A dropped command drops its reply, which its sender reads as
+        // "no longer active" (`SessionManager::command`).
         self.commands.close();
         while let Ok(command) = self.commands.try_recv() {
-            command.refuse(no_longer_active());
+            drop(command);
         }
     }
 

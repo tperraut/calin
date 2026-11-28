@@ -370,41 +370,6 @@ enum ChildEnd {
     Failed,
 }
 
-impl Command {
-    fn refuse(self, err: Error) {
-        // The caller may have stopped waiting.
-        match self {
-            Self::Start { reply, .. } => {
-                let _ = reply.send(Err(err));
-            }
-            Self::Attach { reply, .. } => {
-                let _ = reply.send(Err(err));
-            }
-            Self::Dispatch { reply, .. } => {
-                let _ = reply.send(Err(err));
-            }
-            Self::Note { reply, .. } => {
-                let _ = reply.send(Err(err));
-            }
-            Self::Ask { reply, .. } => {
-                let _ = reply.send(Err(err));
-            }
-            Self::Message { reply, .. }
-            | Self::Interrupt { reply }
-            | Self::Stop { reply, .. }
-            | Self::Ship { reply, .. }
-            | Self::Poll { reply }
-            | Self::Report { reply, .. }
-            | Self::Answer { reply, .. }
-            | Self::Permission { reply, .. } => {
-                let _ = reply.send(Err(err));
-            }
-            // Nobody waits for these.
-            Self::Deliver { .. } | Self::Spent => {}
-        }
-    }
-}
-
 impl SessionManager {
     /// Wraps the store, loads the settings and the repo registry, scans for
     /// the repos the home repo declares, and settles the sessions that a

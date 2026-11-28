@@ -1125,6 +1125,28 @@ async fn invalid_input_and_unknown_sessions_are_rejected() {
 }
 
 #[tokio::test]
+async fn a_command_queued_for_a_driver_that_cannot_go_on_is_refused() {
+    let Fixture {
+        manager, dir: _dir, ..
+    } = fixture().await;
+    // A driver that cannot load its session ends before it takes any command.
+    let unknown = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    let interrupted = manager.command(unknown, |reply| Command::Interrupt { reply });
+    let asked = manager.command(unknown, |reply| Command::Ask {
+        agent_id: "a".to_owned(),
+        question: "q".to_owned(),
+        options: Vec::new(),
+        reply,
+    });
+    for refused in [within(interrupted).await, within(asked).await.map(drop)] {
+        assert!(
+            matches!(&refused, Err(Error::Conflict(why)) if why == "the session is no longer active"),
+            "{refused:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn titles_come_from_the_request_or_the_prompt() {
     let Fixture {
         manager, dir: _dir, ..
