@@ -6,6 +6,7 @@ import {
   createThemeState,
   pageTheme,
   resolveTheme,
+  themeState,
   watchTheme,
   type ThemeChoice,
 } from "./theme";
@@ -94,6 +95,22 @@ describe("the theme state", () => {
     expect(pageTheme()).toBe("light");
     state.setChoice("dark");
     expect(pageTheme()).toBe("dark");
+  });
+});
+
+describe("the page's one theme state", () => {
+  it("follows the system's setting, and is started once", () => {
+    const system = fakeSystem(true);
+    vi.stubGlobal("matchMedia", () => system.list);
+    try {
+      const state = themeState();
+      expect(pageTheme()).toBe("dark");
+      system.set(false);
+      expect(pageTheme()).toBe("light");
+      expect(themeState()).toBe(state);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });
 
