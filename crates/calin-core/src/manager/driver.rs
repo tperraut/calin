@@ -31,14 +31,14 @@ use super::queue::Slot;
 use super::unreported::{self, MAX_CHANGES_PER_TURN, Tracker};
 use super::{
     ChildEnd, Command, Dispatched, DispatchedRepo, Inner, NoteOutcome, NoteTarget, Reply,
-    SessionManager, agent_ended, closed, expired, is_closed, no_attaching, no_longer_active,
-    no_shipping, no_turn, now_ms, ships, status_name, takes_messages, takes_repos, unanswered,
+    SessionManager, closed, expired, is_closed, no_attaching, no_longer_active, no_shipping,
+    no_turn, now_ms, ships, status_name, takes_messages, takes_repos, unanswered,
 };
 use crate::briefing::{self, ChildOf, MAX_RUNNING_CHILDREN, ReportedBranch};
 use crate::error::{Error, Result};
 use crate::policy::{self, Target, Verdict};
 use crate::repos::{Reservation, blocking};
-use crate::store::{Dispatch, EventDraft, NewSession, OpenQuestion, SessionSetup};
+use crate::store::{Dispatch, EventDraft, NewSession, OpenQuestion, SessionSetup, agent_ended};
 use crate::tokens::{AgentRef, Token};
 use crate::workspace::{locate, primary, working_directory};
 

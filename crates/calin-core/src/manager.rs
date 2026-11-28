@@ -43,7 +43,8 @@ use crate::limits::LimitBoard;
 use crate::repos::{RepoRegistry, Reservation};
 use crate::settings::{DEFAULT_MAX_PARALLEL, SettingsStore, filled};
 use crate::store::{
-    EventDraft, NewSession, OpenPermission, OpenQuestion, Store, UsageQuery, resolve_range,
+    EventDraft, NewSession, OpenPermission, OpenQuestion, Store, UsageQuery, agent_ended,
+    resolve_range,
 };
 use crate::title::default_title;
 use crate::tokens::{AgentRef, Tokens};
@@ -1455,13 +1456,6 @@ fn at_work(status: SessionStatus) -> bool {
 /// True while an agent's turn is in progress.
 fn has_turn(status: SessionStatus) -> bool {
     matches!(status, SessionStatus::Running | SessionStatus::Waiting)
-}
-
-fn agent_ended(status: AgentStatus) -> bool {
-    matches!(
-        status,
-        AgentStatus::Done | AgentStatus::Failed | AgentStatus::Stopped
-    )
 }
 
 fn status_name(status: SessionStatus) -> String {

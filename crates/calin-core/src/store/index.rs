@@ -771,7 +771,7 @@ fn open_first_turn(
     agent: &Agent,
     label: Option<String>,
 ) -> Result<()> {
-    if ended(agent.status) {
+    if agent_ended(agent.status) {
         return Ok(());
     }
     match agent.kind {
@@ -1230,7 +1230,8 @@ fn input_label(body: &EventBody) -> Option<String> {
     Some(excerpt(text)).filter(|label| !label.is_empty())
 }
 
-fn ended(status: AgentStatus) -> bool {
+/// True once the agent is gone for good: done, failed or stopped.
+pub(crate) fn agent_ended(status: AgentStatus) -> bool {
     matches!(
         status,
         AgentStatus::Done | AgentStatus::Failed | AgentStatus::Stopped
