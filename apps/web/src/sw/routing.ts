@@ -24,6 +24,24 @@ function underNever(pathname: string): boolean {
   return NEVER.some((prefix) => pathname === prefix || pathname.startsWith(`${prefix}/`));
 }
 
+/** False for what is not this app's own to serve: another origin, the API, sign-in, sockets. */
+function servedHere(request: RequestLike, url: URL, origin: string): boolean {
+  return (
+    url.origin === origin &&
+    !underNever(url.pathname) &&
+    request.headers.get("upgrade")?.toLowerCase() !== "websocket"
+  );
+}
+
+/** A file request: the shell, a fingerprinted file, or something else. */
+function fileRoute(url: URL, precached: ReadonlySet<string>): Route {
+  // A query string asks for something else than the file the build made.
+  if (url.search !== "") return "pass";
+  if (precached.has(url.pathname)) return "precached";
+  if (url.pathname.startsWith("/assets/")) return "on-use";
+  return "pass";
+}
+
 export function routeRequest(
   request: RequestLike,
   origin: string,
@@ -31,13 +49,7 @@ export function routeRequest(
 ): Route {
   if (request.method !== "GET") return "pass";
   const url = new URL(request.url);
-  if (url.origin !== origin) return "pass";
-  if (underNever(url.pathname)) return "pass";
-  if (request.headers.get("upgrade")?.toLowerCase() === "websocket") return "pass";
+  if (!servedHere(request, url, origin)) return "pass";
   if (request.mode === "navigate") return "navigate";
-  // A query string asks for something else than the file the build made.
-  if (url.search !== "") return "pass";
-  if (precached.has(url.pathname)) return "precached";
-  if (url.pathname.startsWith("/assets/")) return "on-use";
-  return "pass";
+  return fileRoute(url, precached);
 }

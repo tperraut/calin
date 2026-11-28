@@ -33,6 +33,26 @@ const PUBLIC_SHELL =
  * loaded on demand are left to be cached on first use. Sorted, so the list
  * (and so the worker) only changes when the build does.
  */
+/** Adds `name` when the build made it and, for a chunk, everything it loads before it runs. */
+function addStatic(
+  name: string,
+  byName: ReadonlyMap<string, OutputFile>,
+  wanted: Set<string>,
+): void {
+  if (wanted.has(name)) return;
+  const file = byName.get(name);
+  if (!file) return;
+  wanted.add(name);
+  if (file.type !== "chunk") return;
+  for (const imported of file.imports) addStatic(imported, byName, wanted);
+  for (const css of file.importedCss) wanted.add(css);
+  for (const asset of file.importedAssets) wanted.add(asset);
+}
+
+const isEntry = (file: OutputFile): boolean => file.type === "chunk" && file.isEntry;
+
+const isServed = (name: string): boolean => !name.endsWith(".map") && name !== WORKER_FILE;
+
 export function precacheList(
   files: readonly OutputFile[],
   publicFiles: readonly string[],
@@ -40,24 +60,11 @@ export function precacheList(
   const byName = new Map(files.map((file) => [file.fileName, file]));
   const wanted = new Set<string>();
   if (byName.has(SHELL_PAGE)) wanted.add(SHELL_PAGE);
-
-  const visit = (name: string): void => {
-    if (wanted.has(name)) return;
-    const file = byName.get(name);
-    if (!file) return;
-    wanted.add(name);
-    if (file.type !== "chunk") return;
-    for (const imported of file.imports) visit(imported);
-    for (const css of file.importedCss) wanted.add(css);
-    for (const asset of file.importedAssets) wanted.add(asset);
-  };
-  for (const file of files) {
-    if (file.type === "chunk" && file.isEntry) visit(file.fileName);
-  }
+  for (const file of files.filter(isEntry)) addStatic(file.fileName, byName, wanted);
   for (const name of publicFiles) if (PUBLIC_SHELL.test(name)) wanted.add(name);
 
   return [...wanted]
-    .filter((name) => !name.endsWith(".map") && name !== WORKER_FILE)
+    .filter(isServed)
     .map((name) => `/${name}`)
     .sort();
 }
