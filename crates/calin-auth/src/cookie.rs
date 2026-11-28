@@ -535,6 +535,21 @@ mod tests {
             (format!("Bearer {}", "A".repeat(100_000)), None),
             (format!("Bearer {token}{}", " ".repeat(300)), None),
         ];
+        // The header is looked at up to 256 bytes, padding included.
+        let padded =
+            |total: usize| format!("Bearer {token}{}", " ".repeat(total - 7 - token.len()));
+        assert_eq!(
+            padded(MAX_AUTHORIZATION_BYTES).len(),
+            MAX_AUTHORIZATION_BYTES
+        );
+        let cases = [
+            cases,
+            vec![
+                (padded(MAX_AUTHORIZATION_BYTES), ok.clone()),
+                (padded(MAX_AUTHORIZATION_BYTES + 1), None),
+            ],
+        ]
+        .concat();
         for (header, expected) in cases {
             let shown: String = header.chars().take(80).collect();
             assert_eq!(
