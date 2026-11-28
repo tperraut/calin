@@ -13,6 +13,13 @@ import { dollars, kindIcon, kindWord, runStatusWords } from "../../lib/workflow"
 import { DetailsSheet } from "./Details";
 import { clip } from "./model";
 import { REDUCED_MOTION_QUERY } from "./GraphView";
+import {
+  alongOrder,
+  CanvasControls,
+  createCanvasGestures,
+  observeCanvas,
+  onCanvasKey,
+} from "./canvas";
 import { createScene } from "./scene";
 import { layoutWorkflow, type Orientation, type WorkflowLayout } from "./workflowLayout";
 import {
@@ -29,7 +36,6 @@ import {
 } from "./workflowModel";
 
 const ZOOM_STEP = 1.3;
-const DRAG_SLOP = 4;
 
 /** Kinds whose work shows in the transcript, so a node of theirs can be found there. */
 const IN_TRANSCRIPT = new Set(["agent", "check", "gate", "ask"]);
@@ -204,8 +210,6 @@ export function WorkflowView(props: {
   });
   const scene = createScene({ reducedMotion: () => calm, onPulses: () => {} });
   const markerBase = createUniqueId();
-  const legendId = createUniqueId();
-  const [legend, setLegend] = createSignal(false);
   // The graph is fixed for a run: only the orientation lays it out again.
   const layout = createMemo(() => layoutWorkflow(props.run.graph, props.orientation));
   const overlay = createMemo((): RunOverlay => runOverlay(props.run));
@@ -240,65 +244,7 @@ export function WorkflowView(props: {
   });
   createEffect(tabStop, (id) => scene.pin(id));
 
-  const pointers = new Map<number, { x: number; y: number }>();
-  let dragged = false;
-  let pinch: { distance: number } | undefined;
-  const [dragging, setDragging] = createSignal(false);
-  const local = (event: { clientX: number; clientY: number }): { x: number; y: number } => {
-    const bounds = canvas?.getBoundingClientRect();
-    return { x: event.clientX - (bounds?.left ?? 0), y: event.clientY - (bounds?.top ?? 0) };
-  };
-
-  function onPointerDown(event: PointerEvent): void {
-    if (event.pointerType === "mouse" && event.button !== 0) return;
-    pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
-    if (pointers.size === 1) dragged = false;
-    if (pointers.size === 2) {
-      const [a, b] = [...pointers.values()];
-      pinch = { distance: Math.hypot(a.x - b.x, a.y - b.y) };
-      dragged = true;
-    }
-  }
-
-  function onPointerMove(event: PointerEvent): void {
-    const last = pointers.get(event.pointerId);
-    if (!last) return;
-    const dx = event.clientX - last.x;
-    const dy = event.clientY - last.y;
-    if (pointers.size === 1) {
-      if (!dragged && Math.hypot(dx, dy) < DRAG_SLOP) return;
-      if (!dragged) {
-        dragged = true;
-        setDragging(true);
-        canvas?.setPointerCapture?.(event.pointerId);
-      }
-      pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
-      scene.panBy(dx, dy);
-      return;
-    }
-    pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
-    if (pointers.size === 2 && pinch) {
-      const [a, b] = [...pointers.values()];
-      const distance = Math.hypot(a.x - b.x, a.y - b.y);
-      const middle = local({ clientX: (a.x + b.x) / 2, clientY: (a.y + b.y) / 2 });
-      scene.panBy(dx / 2, dy / 2);
-      if (pinch.distance > 0 && distance > 0)
-        scene.zoomAt(middle.x, middle.y, distance / pinch.distance);
-      pinch.distance = distance;
-    }
-  }
-
-  function onPointerEnd(event: PointerEvent): void {
-    pointers.delete(event.pointerId);
-    if (pointers.size < 2) pinch = undefined;
-    if (pointers.size === 0) setDragging(false);
-  }
-
-  function tapped(): boolean {
-    const was = dragged;
-    dragged = false;
-    return !was;
-  }
+  const gestures = createCanvasGestures(scene, () => canvas);
 
   function moveFocus(to: string | undefined): void {
     if (to === undefined) return;
@@ -309,81 +255,35 @@ export function WorkflowView(props: {
   }
 
   function onKeyDown(event: KeyboardEvent): void {
-    if (event.altKey || event.ctrlKey || event.metaKey) return;
     const { order } = layout();
-    const target = event.target instanceof Element ? event.target.closest("[data-node]") : null;
-    const at = target?.getAttribute("data-node") ?? undefined;
-    const index = at === undefined ? -1 : order.indexOf(at);
-    switch (event.key) {
-      case "+":
-      case "=":
-        scene.zoomBy(ZOOM_STEP);
-        break;
-      case "-":
-      case "_":
-        scene.zoomBy(1 / ZOOM_STEP);
-        break;
-      case "0":
-        scene.fit();
-        break;
-      case "Escape":
-        if (props.selection === undefined) return;
-        props.onSelect(undefined);
-        break;
-      case "ArrowDown":
-      case "ArrowRight":
-        if (index === -1) return;
-        moveFocus(order.at(Math.min(order.length - 1, index + 1)));
-        break;
-      case "ArrowUp":
-      case "ArrowLeft":
-        if (index === -1) return;
-        moveFocus(order.at(Math.max(0, index - 1)));
-        break;
-      case "Home":
-        if (index === -1) return;
-        moveFocus(order.at(0));
-        break;
-      case "End":
-        if (index === -1) return;
-        moveFocus(order.at(-1));
-        break;
-      case "Enter":
-      case " ":
-        if (at === undefined) return;
-        props.onSelect(at);
-        break;
-      default:
-        return;
-    }
-    event.preventDefault();
+    onCanvasKey(
+      event,
+      // The run reads in one direction: the side arrows step through it too.
+      { order, selected: props.selection !== undefined, step: ZOOM_STEP, side: alongOrder(order) },
+      {
+        zoomBy: (factor) => scene.zoomBy(factor),
+        fit: () => scene.fit(),
+        select: (id) => props.onSelect(id),
+        focus: moveFocus,
+      },
+    );
   }
 
   onSettled(() => {
     const element = canvas;
     if (!element) return () => scene.dispose();
-    const measure = (): void => {
-      const bounds = element.getBoundingClientRect();
-      if (bounds.width > 0 && bounds.height > 0) {
-        scene.setViewport({ w: bounds.width, h: bounds.height });
+    const stop = observeCanvas(
+      element,
+      (size) => {
+        scene.setViewport(size);
         // Fit on open: the whole run at a glance.
         if (!measured) scene.fit(true);
         measured = true;
-      }
-    };
-    measure();
-    const observer = typeof ResizeObserver === "function" ? new ResizeObserver(measure) : undefined;
-    observer?.observe(element);
-    const onWheel = (event: WheelEvent): void => {
-      event.preventDefault();
-      const point = local(event);
-      const scale = event.deltaMode === 1 ? 0.05 : 0.0015;
-      scene.zoomAt(point.x, point.y, Math.exp(-event.deltaY * scale));
-    };
-    element.addEventListener("wheel", onWheel, { passive: false });
+      },
+      gestures.onWheel,
+    );
     return () => {
-      observer?.disconnect();
-      element.removeEventListener("wheel", onWheel);
+      stop();
       scene.dispose();
     };
   });
@@ -403,14 +303,14 @@ export function WorkflowView(props: {
         role="group"
         aria-label="Workflow graph"
         data-orientation={props.orientation}
-        data-dragging={dragging() ? "" : undefined}
-        onPointerDown={onPointerDown}
-        onPointerMove={onPointerMove}
-        onPointerUp={onPointerEnd}
-        onPointerCancel={onPointerEnd}
+        data-dragging={gestures.dragging() ? "" : undefined}
+        onPointerDown={gestures.onPointerDown}
+        onPointerMove={gestures.onPointerMove}
+        onPointerUp={gestures.onPointerEnd}
+        onPointerCancel={gestures.onPointerEnd}
         onKeyDown={onKeyDown}
         onClick={(event) => {
-          if (tapped() && event.target === event.currentTarget) props.onSelect(undefined);
+          if (gestures.tapped() && event.target === event.currentTarget) props.onSelect(undefined);
         }}
       >
         <defs>
@@ -490,7 +390,7 @@ export function WorkflowView(props: {
                   onFocus={() => setFocusId(node().id)}
                   onClick={(event) => {
                     event.stopPropagation();
-                    if (tapped()) props.onSelect(node().id);
+                    if (gestures.tapped()) props.onSelect(node().id);
                   }}
                 >
                   <NodeCard node={node()} layout={layout()} />
@@ -500,101 +400,62 @@ export function WorkflowView(props: {
           </g>
         </g>
       </svg>
-      <div class="absolute top-2 right-2 flex gap-1">
-        <button
-          type="button"
-          class="btn bg-surface px-0 text-lg"
-          aria-label="Zoom out"
-          title="Zoom out (−)"
-          onClick={() => scene.zoomBy(1 / ZOOM_STEP)}
+      <CanvasControls
+        step={ZOOM_STEP}
+        zoomBy={(factor) => scene.zoomBy(factor)}
+        fit={() => scene.fit()}
+        fitTitle="Show the whole workflow (0)"
+      >
+        <For
+          each={
+            [
+              ["active", "Running now: thick outline, “Running”"],
+              ["finished", "Finished: “→ port” it left through, “×2” when it ran twice"],
+              ["failed", "Left through a failure port: “✕ port”"],
+              ["idle", "Not run yet: faint"],
+            ] as const
+          }
         >
-          <span aria-hidden="true">−</span>
-        </button>
-        <button
-          type="button"
-          class="btn bg-surface px-0 text-lg"
-          aria-label="Zoom in"
-          title="Zoom in (+)"
-          onClick={() => scene.zoomBy(ZOOM_STEP)}
+          {([state, words]) => (
+            <li class="flex items-center gap-2">
+              <svg width="40" height="16" aria-hidden="true">
+                <g
+                  class="wnode"
+                  data-state={state === "failed" ? "finished" : state}
+                  data-failed={state === "failed" ? "" : undefined}
+                >
+                  <rect class="wshape" x="4" y="2" width="32" height="12" rx="3" />
+                </g>
+              </svg>
+              {words}
+            </li>
+          )}
+        </For>
+        <For
+          each={
+            [
+              ["taken", "Taken: bold, “×3” when taken more than once"],
+              ["idle", "Never taken: faint"],
+              ["failure", "Failure port: dashed, “✕” before its name"],
+            ] as const
+          }
         >
-          <span aria-hidden="true">+</span>
-        </button>
-        <button
-          type="button"
-          class="btn bg-surface px-2.5"
-          title="Show the whole workflow (0)"
-          onClick={() => scene.fit()}
-        >
-          Fit
-        </button>
-        <button
-          type="button"
-          class="btn bg-surface px-2.5"
-          aria-expanded={legend() ? "true" : "false"}
-          aria-controls={legendId}
-          onClick={() => setLegend((open) => !open)}
-        >
-          Legend
-        </button>
-      </div>
-      <Show when={legend()}>
-        <div
-          id={legendId}
-          class="absolute top-14 right-2 z-10 max-w-[calc(100%-1rem)] rounded-md border border-line bg-surface p-2 text-xs shadow-md"
-        >
-          <ul aria-label="Legend" class="flex flex-col gap-1">
-            <For
-              each={
-                [
-                  ["active", "Running now: thick outline, “Running”"],
-                  ["finished", "Finished: “→ port” it left through, “×2” when it ran twice"],
-                  ["failed", "Left through a failure port: “✕ port”"],
-                  ["idle", "Not run yet: faint"],
-                ] as const
-              }
-            >
-              {([state, words]) => (
-                <li class="flex items-center gap-2">
-                  <svg width="40" height="16" aria-hidden="true">
-                    <g
-                      class="wnode"
-                      data-state={state === "failed" ? "finished" : state}
-                      data-failed={state === "failed" ? "" : undefined}
-                    >
-                      <rect class="wshape" x="4" y="2" width="32" height="12" rx="3" />
-                    </g>
-                  </svg>
-                  {words}
-                </li>
-              )}
-            </For>
-            <For
-              each={
-                [
-                  ["taken", "Taken: bold, “×3” when taken more than once"],
-                  ["idle", "Never taken: faint"],
-                  ["failure", "Failure port: dashed, “✕” before its name"],
-                ] as const
-              }
-            >
-              {([kind, words]) => (
-                <li class="flex items-center gap-2">
-                  <svg width="40" height="12" aria-hidden="true">
-                    <g
-                      class="wedge"
-                      data-taken={kind === "taken" ? "" : undefined}
-                      data-failure={kind === "failure" ? "" : undefined}
-                    >
-                      <path class="wline" d="M2,6H36" />
-                    </g>
-                  </svg>
-                  {words}
-                </li>
-              )}
-            </For>
-          </ul>
-        </div>
-      </Show>
+          {([kind, words]) => (
+            <li class="flex items-center gap-2">
+              <svg width="40" height="12" aria-hidden="true">
+                <g
+                  class="wedge"
+                  data-taken={kind === "taken" ? "" : undefined}
+                  data-failure={kind === "failure" ? "" : undefined}
+                >
+                  <path class="wline" d="M2,6H36" />
+                </g>
+              </svg>
+              {words}
+            </li>
+          )}
+        </For>
+      </CanvasControls>
     </div>
   );
 }

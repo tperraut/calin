@@ -27,6 +27,13 @@ import {
   type OutlineItem,
 } from "./model";
 import { routeOverlay, type RouteBox, type Routing } from "./routing";
+import {
+  CanvasControls,
+  createCanvasGestures,
+  observeCanvas,
+  onCanvasKey,
+  type KeyCommand,
+} from "./canvas";
 import { createScene, type Scene, type SceneLayout } from "./scene";
 
 /** What the reader picked in the graph. */
@@ -35,8 +42,6 @@ export type GraphSelection = { kind: "node"; id: string } | { kind: "edge"; id: 
 export const REDUCED_MOTION_QUERY = "(prefers-reduced-motion: reduce)";
 
 const ZOOM_STEP = 1.3;
-/** A pointer that moved less than this was a tap, not a drag. */
-const DRAG_SLOP = 4;
 
 const markPaths: Record<Tone, { d: string; filled: boolean }> = {
   active: { d: "M5,0.5a4.5,4.5 0 1,0 0.01,0z", filled: true },
@@ -183,6 +188,15 @@ function Outline(props: { items: readonly OutlineItem[] }) {
 }
 
 /** Where every card is, for the router. */
+/** Side arrows along the tree: Left goes up to the parent, Right down to the first child. */
+const alongTree =
+  (parent: Layout["parent"], children: Layout["children"]) =>
+  (key: string, at: string): KeyCommand | undefined => {
+    if (key === "ArrowLeft") return { kind: "focus", id: parent.get(at) };
+    if (key === "ArrowRight") return { kind: "focus", id: children.get(at)?.at(0) };
+    return undefined;
+  };
+
 function boxesOf(layout: Layout, model: GraphModel): Map<string, RouteBox> {
   const boxes = new Map<string, RouteBox>();
   for (const node of model.nodes) {
@@ -312,72 +326,7 @@ export function GraphView(props: {
   );
   createEffect(tabStop, (id) => scene.pin(id));
 
-  const [legend, setLegend] = createSignal(false);
-  const legendId = createUniqueId();
-
-  const pointers = new Map<number, { x: number; y: number }>();
-  let dragged = false;
-  let pinch: { distance: number } | undefined;
-  const [dragging, setDragging] = createSignal(false);
-
-  const local = (event: { clientX: number; clientY: number }): { x: number; y: number } => {
-    const bounds = canvas?.getBoundingClientRect();
-    return { x: event.clientX - (bounds?.left ?? 0), y: event.clientY - (bounds?.top ?? 0) };
-  };
-
-  function onPointerDown(event: PointerEvent): void {
-    if (event.pointerType === "mouse" && event.button !== 0) return;
-    pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
-    if (pointers.size === 1) dragged = false;
-    if (pointers.size === 2) {
-      const [a, b] = [...pointers.values()];
-      pinch = { distance: Math.hypot(a.x - b.x, a.y - b.y) };
-      dragged = true;
-    }
-  }
-
-  function onPointerMove(event: PointerEvent): void {
-    const last = pointers.get(event.pointerId);
-    if (!last) return;
-    const dx = event.clientX - last.x;
-    const dy = event.clientY - last.y;
-    if (pointers.size === 1) {
-      if (!dragged && Math.hypot(dx, dy) < DRAG_SLOP) return;
-      if (!dragged) {
-        dragged = true;
-        setDragging(true);
-        // From here the drag is the canvas's, wherever the pointer goes.
-        canvas?.setPointerCapture?.(event.pointerId);
-      }
-      pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
-      scene.panBy(dx, dy);
-      return;
-    }
-    pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
-    if (pointers.size === 2 && pinch) {
-      const [a, b] = [...pointers.values()];
-      const distance = Math.hypot(a.x - b.x, a.y - b.y);
-      const middle = local({ clientX: (a.x + b.x) / 2, clientY: (a.y + b.y) / 2 });
-      // Half of this pointer's move is the move of the midpoint.
-      scene.panBy(dx / 2, dy / 2);
-      if (pinch.distance > 0 && distance > 0)
-        scene.zoomAt(middle.x, middle.y, distance / pinch.distance);
-      pinch.distance = distance;
-    }
-  }
-
-  function onPointerEnd(event: PointerEvent): void {
-    pointers.delete(event.pointerId);
-    if (pointers.size < 2) pinch = undefined;
-    if (pointers.size === 0) setDragging(false);
-  }
-
-  /** A click that ends a drag selects nothing. */
-  function tapped(): boolean {
-    const was = dragged;
-    dragged = false;
-    return !was;
-  }
+  const gestures = createCanvasGestures(scene, () => canvas);
 
   function moveFocus(to: string | undefined): void {
     if (to === undefined) return;
@@ -388,60 +337,22 @@ export function GraphView(props: {
   }
 
   function onKeyDown(event: KeyboardEvent): void {
-    if (event.altKey || event.ctrlKey || event.metaKey) return;
     const { order, parent, children } = layout();
-    const target = event.target instanceof Element ? event.target.closest("[data-node]") : null;
-    const at = target?.getAttribute("data-node") ?? undefined;
-    const index = at === undefined ? -1 : order.indexOf(at);
-    switch (event.key) {
-      case "+":
-      case "=":
-        scene.zoomBy(ZOOM_STEP);
-        break;
-      case "-":
-      case "_":
-        scene.zoomBy(1 / ZOOM_STEP);
-        break;
-      case "0":
-        fit();
-        break;
-      case "Escape":
-        if (props.selection === undefined) return;
-        props.onSelect(undefined);
-        break;
-      case "ArrowDown":
-        if (index === -1) return;
-        moveFocus(order.at(Math.min(order.length - 1, index + 1)));
-        break;
-      case "ArrowUp":
-        if (index === -1) return;
-        moveFocus(order.at(Math.max(0, index - 1)));
-        break;
-      case "ArrowLeft":
-        if (at === undefined) return;
-        moveFocus(parent.get(at));
-        break;
-      case "ArrowRight":
-        if (at === undefined) return;
-        moveFocus(children.get(at)?.at(0));
-        break;
-      case "Home":
-        if (index === -1) return;
-        moveFocus(order.at(0));
-        break;
-      case "End":
-        if (index === -1) return;
-        moveFocus(order.at(-1));
-        break;
-      case "Enter":
-      case " ":
-        if (at === undefined) return;
-        props.onSelect({ kind: "node", id: at });
-        break;
-      default:
-        return;
-    }
-    event.preventDefault();
+    onCanvasKey(
+      event,
+      {
+        order,
+        selected: props.selection !== undefined,
+        step: ZOOM_STEP,
+        side: alongTree(parent, children),
+      },
+      {
+        zoomBy: (factor) => scene.zoomBy(factor),
+        fit,
+        select: (id) => props.onSelect(id === undefined ? undefined : { kind: "node", id }),
+        focus: moveFocus,
+      },
+    );
   }
 
   /** Shows the whole drawing, with the lanes packed again. */
@@ -454,26 +365,9 @@ export function GraphView(props: {
     props.onScene?.(scene);
     const element = canvas;
     if (!element) return () => scene.dispose();
-    const measure = (): void => {
-      const bounds = element.getBoundingClientRect();
-      if (bounds.width > 0 && bounds.height > 0) {
-        scene.setViewport({ w: bounds.width, h: bounds.height });
-      }
-    };
-    measure();
-    const observer = typeof ResizeObserver === "function" ? new ResizeObserver(measure) : undefined;
-    observer?.observe(element);
-    // Not passive: the wheel zooms the graph instead of scrolling the page.
-    const onWheel = (event: WheelEvent): void => {
-      event.preventDefault();
-      const point = local(event);
-      const scale = event.deltaMode === 1 ? 0.05 : 0.0015;
-      scene.zoomAt(point.x, point.y, Math.exp(-event.deltaY * scale));
-    };
-    element.addEventListener("wheel", onWheel, { passive: false });
+    const stop = observeCanvas(element, (size) => scene.setViewport(size), gestures.onWheel);
     return () => {
-      observer?.disconnect();
-      element.removeEventListener("wheel", onWheel);
+      stop();
       scene.dispose();
     };
   });
@@ -500,15 +394,15 @@ export function GraphView(props: {
         class="graph-canvas"
         role="group"
         aria-label="Session graph"
-        data-dragging={dragging() ? "" : undefined}
-        onPointerDown={onPointerDown}
-        onPointerMove={onPointerMove}
-        onPointerUp={onPointerEnd}
-        onPointerCancel={onPointerEnd}
+        data-dragging={gestures.dragging() ? "" : undefined}
+        onPointerDown={gestures.onPointerDown}
+        onPointerMove={gestures.onPointerMove}
+        onPointerUp={gestures.onPointerEnd}
+        onPointerCancel={gestures.onPointerEnd}
         onKeyDown={onKeyDown}
         onClick={(event) => {
           // A tap on the background lets go of the selection.
-          if (tapped() && event.target === event.currentTarget) props.onSelect(undefined);
+          if (gestures.tapped() && event.target === event.currentTarget) props.onSelect(undefined);
         }}
       >
         <defs>
@@ -570,7 +464,7 @@ export function GraphView(props: {
                       ref={(element) => scene.edgeRef(edge().id, "hit", element)}
                       onClick={(event) => {
                         event.stopPropagation();
-                        if (tapped()) props.onSelect({ kind: "edge", id: edge().id });
+                        if (gestures.tapped()) props.onSelect({ kind: "edge", id: edge().id });
                       }}
                     >
                       <title>{edgeSentence(edge(), model())}</title>
@@ -610,7 +504,7 @@ export function GraphView(props: {
                   onBlur={() => setFocused(undefined)}
                   onClick={(event) => {
                     event.stopPropagation();
-                    if (tapped()) props.onSelect({ kind: "node", id: node().id });
+                    if (gestures.tapped()) props.onSelect({ kind: "node", id: node().id });
                   }}
                 >
                   <NodeShape node={node()} />
@@ -627,82 +521,43 @@ export function GraphView(props: {
           </g>
         </g>
       </svg>
-      <div class="absolute top-2 right-2 flex gap-1">
-        <button
-          type="button"
-          class="btn bg-surface px-0 text-lg"
-          aria-label="Zoom out"
-          title="Zoom out (−)"
-          onClick={() => scene.zoomBy(1 / ZOOM_STEP)}
-        >
-          <span aria-hidden="true">−</span>
-        </button>
-        <button
-          type="button"
-          class="btn bg-surface px-0 text-lg"
-          aria-label="Zoom in"
-          title="Zoom in (+)"
-          onClick={() => scene.zoomBy(ZOOM_STEP)}
-        >
-          <span aria-hidden="true">+</span>
-        </button>
-        <button
-          type="button"
-          class="btn bg-surface px-2.5"
-          title="Show the whole graph (0)"
-          onClick={() => fit()}
-        >
-          Fit
-        </button>
-        <button
-          type="button"
-          class="btn bg-surface px-2.5"
-          aria-expanded={legend() ? "true" : "false"}
-          aria-controls={legendId}
-          onClick={() => setLegend((open) => !open)}
-        >
-          Legend
-        </button>
-      </div>
-      <Show when={legend()}>
-        <div
-          id={legendId}
-          class="absolute top-14 right-2 z-10 max-w-[calc(100%-1rem)] rounded-md border border-line bg-surface p-2 text-xs shadow-md"
-        >
-          <ul aria-label="Legend" class="flex flex-col gap-1">
-            <For each={edgeKinds}>
-              {(kind) => (
-                <li class="flex items-center gap-2">
-                  <svg width="40" height="12" aria-hidden="true">
-                    <g class="gedge" data-kind={kind}>
-                      <path class="gline" d="M2,6H36" marker-end={`url(#${markerBase}-${kind})`} />
-                    </g>
-                  </svg>
-                  {edgeKindWords(kind)}
-                </li>
-              )}
-            </For>
+      <CanvasControls
+        step={ZOOM_STEP}
+        zoomBy={(factor) => scene.zoomBy(factor)}
+        fit={fit}
+        fitTitle="Show the whole graph (0)"
+      >
+        <For each={edgeKinds}>
+          {(kind) => (
             <li class="flex items-center gap-2">
-              <svg width="40" height="14" aria-hidden="true">
-                <rect
-                  x="9"
-                  y="1"
-                  width="22"
-                  height="12"
-                  rx="3"
-                  fill="none"
-                  stroke="var(--accent)"
-                  stroke-width="2"
-                />
+              <svg width="40" height="12" aria-hidden="true">
+                <g class="gedge" data-kind={kind}>
+                  <path class="gline" d="M2,6H36" marker-end={`url(#${markerBase}-${kind})`} />
+                </g>
               </svg>
-              Agent of the open session
+              {edgeKindWords(kind)}
             </li>
-            <li class="max-w-56 text-muted">
-              Pick a card to bring out its notes, reports and changed files.
-            </li>
-          </ul>
-        </div>
-      </Show>
+          )}
+        </For>
+        <li class="flex items-center gap-2">
+          <svg width="40" height="14" aria-hidden="true">
+            <rect
+              x="9"
+              y="1"
+              width="22"
+              height="12"
+              rx="3"
+              fill="none"
+              stroke="var(--accent)"
+              stroke-width="2"
+            />
+          </svg>
+          Agent of the open session
+        </li>
+        <li class="max-w-56 text-muted">
+          Pick a card to bring out its notes, reports and changed files.
+        </li>
+      </CanvasControls>
       {/* The drawing, as text: who is under whom, the repos, and one sentence per edge. */}
       <div class="sr-only" data-part="graph-text">
         <h3>Session graph as text</h3>
