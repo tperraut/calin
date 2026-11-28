@@ -12,8 +12,10 @@ import {
 } from "solid-js";
 import { DayChart } from "../components/DayChart";
 import { LimitMeters } from "../components/LimitMeters";
+import { PageLoadFailure } from "../components/PageLoadFailure";
 import type { Usage } from "../gen/Usage";
 import type { UsageRow } from "../gen/UsageRow";
+import type { UsageTotals } from "../gen/UsageTotals";
 import { errorMessage } from "../lib/errors";
 import { compactCount, formatCost } from "../lib/format";
 import {
@@ -25,7 +27,7 @@ import {
   type UsageRange,
 } from "../lib/usage";
 import { sessionPath } from "../panels/registry";
-import { AppContext } from "../state/app";
+import { AppContext, type AppState } from "../state/app";
 
 /** integrations spec, section 1: `by=session` returns at most this many. */
 export const SESSION_CAP = 200;
@@ -38,6 +40,38 @@ type Load =
   | { status: "error"; message: string };
 
 const numberFormat = new Intl.NumberFormat();
+
+/** Asks for the four breakdowns of `days` at once, and settles on what came of it. */
+function fetchUsage(app: AppState, days: UsageRange, settle: (load: Load) => void): void {
+  const now = Date.now();
+  const bounds = rangeBounds(days, now);
+  // Every range offered ends now; one that does not has no today to mark.
+  const endsNow = bounds.to >= now;
+  const ask = (by: Usage["by"]) => app.usage({ ...bounds, by });
+  Promise.all([ask("day"), ask("session"), ask("repo"), ask("model")]).then(
+    ([day, session, repo, model]) =>
+      settle({ status: "ready", data: { day, session, repo, model }, endsNow }),
+    (error: unknown) => settle({ status: "error", message: errorMessage(error) }),
+  );
+}
+
+const loaded = (load: Load): Breakdowns | undefined =>
+  load.status === "ready" ? load.data : undefined;
+
+const failureOf = (load: Load): string | undefined =>
+  load.status === "error" ? load.message : undefined;
+
+const endsNow = (load: Load): boolean => load.status === "ready" && load.endsNow;
+
+const nothingUsed = (totals: UsageTotals): boolean =>
+  totals.cost_usd === 0 && totals.tokens_in === 0 && totals.tokens_out === 0;
+
+/** A row's name: its label, or its key when it has none. */
+const rowName = (row: UsageRow): string => row.label || row.key;
+
+/** The width of a row's share of the cost, in percent. */
+const sharePercent = (cost: number, total: number): number =>
+  total > 0 ? (cost / total) * 100 : 0;
 
 function Tokens(props: { count: number }) {
   return <span title={numberFormat.format(props.count)}>{compactCount(props.count)}</span>;
@@ -80,14 +114,12 @@ function ShareTable(props: {
                 <tr>
                   <th scope="row" class="w-full max-w-0 py-1.5 pr-2 text-left font-normal">
                     <span class="block truncate">
-                      {row().key === "" ? props.emptyLabel : row().label || row().key}
+                      {row().key === "" ? props.emptyLabel : rowName(row())}
                     </span>
                     <span aria-hidden="true" class="mt-1 block h-1 rounded-full bg-line">
                       <span
                         class="block h-full rounded-full bg-accent"
-                        style={{
-                          width: `${total() > 0 ? (row().totals.cost_usd / total()) * 100 : 0}%`,
-                        }}
+                        style={{ width: `${sharePercent(row().totals.cost_usd, total())}%` }}
                       />
                     </span>
                   </th>
@@ -108,6 +140,113 @@ function ShareTable(props: {
   );
 }
 
+function Totals(props: { totals: UsageTotals }) {
+  return (
+    <section aria-label="Totals" class="flex flex-col gap-2">
+      <dl class="grid grid-cols-2 gap-3 sm:grid-cols-4" data-part="totals">
+        <div class="rounded-md border border-line bg-surface p-3">
+          <dt class="text-xs text-muted">Cost</dt>
+          <dd class="font-mono text-xl font-semibold">{formatCost(props.totals.cost_usd)}</dd>
+        </div>
+        <div class="rounded-md border border-line bg-surface p-3">
+          <dt class="text-xs text-muted">Input tokens</dt>
+          <dd class="font-mono text-xl font-semibold">
+            <Tokens count={props.totals.tokens_in} />
+          </dd>
+        </div>
+        <div class="rounded-md border border-line bg-surface p-3">
+          <dt class="text-xs text-muted">Output tokens</dt>
+          <dd class="font-mono text-xl font-semibold">
+            <Tokens count={props.totals.tokens_out} />
+          </dd>
+        </div>
+        <div class="rounded-md border border-line bg-surface p-3">
+          <dt class="text-xs text-muted">Sessions</dt>
+          <dd class="font-mono text-xl font-semibold">{props.totals.sessions}</dd>
+        </div>
+      </dl>
+      <p class="text-xs text-muted">
+        As reported by the agent CLI. On a subscription plan this estimates the value used; it is
+        not a bill.
+      </p>
+    </section>
+  );
+}
+
+/** The most expensive sessions, each a link to its session. */
+function SessionTable(props: { rows: readonly UsageRow[] }) {
+  return (
+    <section class="flex flex-col gap-2">
+      <h2 class="font-semibold">By session</h2>
+      <Show when={props.rows.length >= SESSION_CAP}>
+        <p class="text-xs text-muted">
+          The {SESSION_CAP} most expensive sessions, the most the server lists.
+        </p>
+      </Show>
+      <div>
+        <table class="w-full text-sm" data-part="by-session">
+          <caption class="sr-only">Most expensive sessions</caption>
+          <thead class="text-left text-xs text-muted">
+            <tr>
+              <th scope="col" class="py-1 font-medium">
+                Session
+              </th>
+              <th scope="col" class="py-1 text-right font-medium">
+                Cost
+              </th>
+              <th scope="col" class="py-1 pl-2 text-right font-medium whitespace-nowrap">
+                Tokens in / out
+              </th>
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-line">
+            <For each={props.rows} keyed={(row) => row.key}>
+              {(row) => (
+                <tr>
+                  <th scope="row" class="w-full max-w-0 pr-2 text-left font-normal">
+                    <a
+                      href={sessionPath(row().key)}
+                      class="flex min-h-11 items-center text-accent underline"
+                    >
+                      <span class="truncate">{rowName(row())}</span>
+                    </a>
+                  </th>
+                  <td class="text-right font-mono whitespace-nowrap">
+                    {formatCost(row().totals.cost_usd)}
+                  </td>
+                  <td class="pl-2 text-right font-mono whitespace-nowrap">
+                    <Tokens count={row().totals.tokens_in} /> /{" "}
+                    <Tokens count={row().totals.tokens_out} />
+                  </td>
+                </tr>
+              )}
+            </For>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  );
+}
+
+function RangePicker(props: { range: UsageRange; onPick: (days: UsageRange) => void }) {
+  return (
+    <div role="group" aria-label="Range" class="flex gap-1">
+      <For each={USAGE_RANGES}>
+        {(days) => (
+          <button
+            type="button"
+            class="btn px-3 text-sm"
+            aria-pressed={props.range === days ? "true" : "false"}
+            onClick={() => props.onPick(days)}
+          >
+            {days} days
+          </button>
+        )}
+      </For>
+    </div>
+  );
+}
+
 /** `/usage`: what sessions cost over a range, and how close the plan's limits are. */
 export default function UsagePage() {
   const app = useContext(AppContext);
@@ -125,45 +264,14 @@ export default function UsagePage() {
       asked += 1;
       const mine = asked;
       setLoad({ status: "loading" });
-      const now = Date.now();
-      const bounds = rangeBounds(days, now);
-      // Every range offered ends now; one that does not has no today to mark.
-      const endsNow = bounds.to >= now;
-      const ask = (by: Usage["by"]) => app.usage({ ...bounds, by });
-      Promise.all([ask("day"), ask("session"), ask("repo"), ask("model")]).then(
-        ([day, session, repo, model]) => {
-          if (mine === asked)
-            setLoad({ status: "ready", data: { day, session, repo, model }, endsNow });
-        },
-        (error: unknown) => {
-          if (mine === asked) setLoad({ status: "error", message: errorMessage(error) });
-        },
-      );
+      // Only the answer to the last question is shown: an older one may arrive after it.
+      fetchUsage(app, days, (next) => {
+        if (mine === asked) setLoad(next);
+      });
     },
   );
 
-  const data = (): Breakdowns | undefined => {
-    const current = load();
-    return current.status === "ready" ? current.data : undefined;
-  };
-  const failure = (): string | undefined => {
-    const current = load();
-    return current.status === "error" ? current.message : undefined;
-  };
-  const days = createMemo(() => fillDays(data()?.day.rows ?? []));
-  const today = (): string | undefined => {
-    const current = load();
-    return todayKey(days(), current.status === "ready" && current.endsNow);
-  };
-  const empty = (): boolean => {
-    const totals = data()?.day.totals;
-    return (
-      totals !== undefined &&
-      totals.cost_usd === 0 &&
-      totals.tokens_in === 0 &&
-      totals.tokens_out === 0
-    );
-  };
+  const days = createMemo(() => fillDays(loaded(load())?.day.rows ?? []));
 
   return (
     <section class="min-h-0 flex-1 overflow-y-auto overscroll-contain">
@@ -173,145 +281,46 @@ export default function UsagePage() {
             <span aria-hidden="true">←</span>
           </a>
           <h1 class="flex-1 text-xl font-semibold">Usage</h1>
-          <div role="group" aria-label="Range" class="flex gap-1">
-            <For each={USAGE_RANGES}>
-              {(days) => (
-                <button
-                  type="button"
-                  class="btn px-3 text-sm"
-                  aria-pressed={range() === days ? "true" : "false"}
-                  onClick={() => setSearch({ days: String(days) })}
-                >
-                  {days} days
-                </button>
-              )}
-            </For>
-          </div>
+          <RangePicker range={range()} onPick={(picked) => setSearch({ days: String(picked) })} />
         </header>
 
         <Switch>
-          <Match when={failure()}>
+          <Match when={failureOf(load())}>
             {(message) => (
-              <div role="alert" class="flex flex-col items-start gap-2 text-sm">
-                <p class="wrap-break-word">The usage could not be loaded: {message()}</p>
-                <button type="button" class="btn" onClick={() => setAttempt((n) => n + 1)}>
-                  Try again
-                </button>
-              </div>
+              <PageLoadFailure
+                what="The usage"
+                message={message()}
+                onRetry={() => setAttempt((n) => n + 1)}
+              />
             )}
           </Match>
           <Match when={load().status === "loading"}>
             <p class="text-sm text-muted">Loading usage…</p>
           </Match>
-          <Match when={data()}>
-            {(loaded) => (
+          <Match when={loaded(load())}>
+            {(data) => (
               <>
-                <section aria-label="Totals" class="flex flex-col gap-2">
-                  <dl class="grid grid-cols-2 gap-3 sm:grid-cols-4" data-part="totals">
-                    <div class="rounded-md border border-line bg-surface p-3">
-                      <dt class="text-xs text-muted">Cost</dt>
-                      <dd class="font-mono text-xl font-semibold">
-                        {formatCost(loaded().day.totals.cost_usd)}
-                      </dd>
-                    </div>
-                    <div class="rounded-md border border-line bg-surface p-3">
-                      <dt class="text-xs text-muted">Input tokens</dt>
-                      <dd class="font-mono text-xl font-semibold">
-                        <Tokens count={loaded().day.totals.tokens_in} />
-                      </dd>
-                    </div>
-                    <div class="rounded-md border border-line bg-surface p-3">
-                      <dt class="text-xs text-muted">Output tokens</dt>
-                      <dd class="font-mono text-xl font-semibold">
-                        <Tokens count={loaded().day.totals.tokens_out} />
-                      </dd>
-                    </div>
-                    <div class="rounded-md border border-line bg-surface p-3">
-                      <dt class="text-xs text-muted">Sessions</dt>
-                      <dd class="font-mono text-xl font-semibold">
-                        {loaded().day.totals.sessions}
-                      </dd>
-                    </div>
-                  </dl>
-                  <p class="text-xs text-muted">
-                    As reported by the agent CLI. On a subscription plan this estimates the value
-                    used; it is not a bill.
-                  </p>
-                </section>
-
+                <Totals totals={data().day.totals} />
                 <Show
-                  when={!empty()}
+                  when={!nothingUsed(data().day.totals)}
                   fallback={<p class="text-sm">Nothing was used in this range.</p>}
                 >
                   <section class="flex flex-col gap-2">
                     <h2 class="font-semibold">By day</h2>
-                    <DayChart days={days()} today={today()} />
+                    <DayChart days={days()} today={todayKey(days(), endsNow(load()))} />
                   </section>
-
-                  <section class="flex flex-col gap-2">
-                    <h2 class="font-semibold">By session</h2>
-                    <Show when={loaded().session.rows.length >= SESSION_CAP}>
-                      <p class="text-xs text-muted">
-                        The {SESSION_CAP} most expensive sessions, the most the server lists.
-                      </p>
-                    </Show>
-                    <div>
-                      <table class="w-full text-sm" data-part="by-session">
-                        <caption class="sr-only">Most expensive sessions</caption>
-                        <thead class="text-left text-xs text-muted">
-                          <tr>
-                            <th scope="col" class="py-1 font-medium">
-                              Session
-                            </th>
-                            <th scope="col" class="py-1 text-right font-medium">
-                              Cost
-                            </th>
-                            <th
-                              scope="col"
-                              class="py-1 pl-2 text-right font-medium whitespace-nowrap"
-                            >
-                              Tokens in / out
-                            </th>
-                          </tr>
-                        </thead>
-                        <tbody class="divide-y divide-line">
-                          <For each={loaded().session.rows} keyed={(row) => row.key}>
-                            {(row) => (
-                              <tr>
-                                <th scope="row" class="w-full max-w-0 pr-2 text-left font-normal">
-                                  <a
-                                    href={sessionPath(row().key)}
-                                    class="flex min-h-11 items-center text-accent underline"
-                                  >
-                                    <span class="truncate">{row().label || row().key}</span>
-                                  </a>
-                                </th>
-                                <td class="text-right font-mono whitespace-nowrap">
-                                  {formatCost(row().totals.cost_usd)}
-                                </td>
-                                <td class="pl-2 text-right font-mono whitespace-nowrap">
-                                  <Tokens count={row().totals.tokens_in} /> /{" "}
-                                  <Tokens count={row().totals.tokens_out} />
-                                </td>
-                              </tr>
-                            )}
-                          </For>
-                        </tbody>
-                      </table>
-                    </div>
-                  </section>
-
+                  <SessionTable rows={data().session.rows} />
                   <div class="grid gap-6 lg:grid-cols-2">
                     <ShareTable
                       caption="By repo"
                       heading="Repo"
-                      rows={loaded().repo.rows}
+                      rows={data().repo.rows}
                       emptyLabel="No repo"
                     />
                     <ShareTable
                       caption="By model"
                       heading="Model"
-                      rows={loaded().model.rows}
+                      rows={data().model.rows}
                       emptyLabel="Unknown model"
                     />
                   </div>
