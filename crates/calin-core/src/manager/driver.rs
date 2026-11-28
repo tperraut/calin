@@ -6,6 +6,7 @@ mod run;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -21,6 +22,7 @@ use calin_proto::{
     Repo, RepoMode, SessionDetail, SessionRepo, SessionStatus, ToolKind,
 };
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::Sleep;
 use ulid::Ulid;
 
 use self::run::{Abort, Run, Worked, next_worked};
@@ -329,24 +331,29 @@ async fn next_output(handle: &mut Option<AgentHandle>) -> Option<RunnerOutput> {
     }
 }
 
-async fn next_prepared(preparation: &mut Option<Preparation>) -> Option<Prepared> {
-    match preparation {
-        Some(preparation) => preparation.results.recv().await,
+/// The next report of a background task; a task that is not there never reports.
+async fn next_result<T>(results: Option<&mut mpsc::Receiver<T>>) -> Option<T> {
+    match results {
+        Some(results) => results.recv().await,
         None => std::future::pending().await,
     }
 }
 
-async fn next_attached(attaching: &mut Option<Attaching>) -> Option<Prepared> {
-    match attaching {
-        Some(attaching) => attaching.results.recv().await,
-        None => std::future::pending().await,
-    }
-}
+/// The time work that was asked to stop still has to report: what it says
+/// before [`STOP_GRACE`] runs out is kept, the rest is dropped.
+struct Grace(Pin<Box<Sleep>>);
 
-async fn next_shipped(shipping: &mut Option<Shipping>) -> Option<Shipped> {
-    match shipping {
-        Some(shipping) => shipping.results.recv().await,
-        None => std::future::pending().await,
+impl Grace {
+    fn start() -> Self {
+        Self(Box::pin(tokio::time::sleep(STOP_GRACE)))
+    }
+
+    /// What `next` yields, or `None` once the grace ran out.
+    async fn within<T>(&mut self, next: impl Future<Output = Option<T>>) -> Option<T> {
+        tokio::select! {
+            item = next => item,
+            () = &mut self.0 => None,
+        }
     }
 }
 
@@ -493,9 +500,15 @@ impl Driver {
         let step = tokio::select! {
             command = self.commands.recv() => Step::Command(command?),
             output = next_output(&mut self.handle) => Step::Output(output),
-            prepared = next_prepared(&mut self.preparation) => Step::Prepared(prepared),
-            attached = next_attached(&mut self.attaching) => Step::Attached(attached),
-            shipped = next_shipped(&mut self.shipping) => Step::Shipped(shipped),
+            prepared = next_result(self.preparation.as_mut().map(|task| &mut task.results)) => {
+                Step::Prepared(prepared)
+            }
+            attached = next_result(self.attaching.as_mut().map(|task| &mut task.results)) => {
+                Step::Attached(attached)
+            }
+            shipped = next_result(self.shipping.as_mut().map(|task| &mut task.results)) => {
+                Step::Shipped(shipped)
+            }
             polled = next_polled(&mut self.polling) => Step::Polled(polled),
             granted = next_granted(&mut self.parked) => Step::Granted(granted),
             worked = next_worked(&mut self.run) => Step::Worked(worked),
@@ -1752,16 +1765,12 @@ impl Driver {
             return Ok(());
         };
         preparation.cancel.store(true, Ordering::Relaxed);
-        let grace = tokio::time::sleep(STOP_GRACE);
-        tokio::pin!(grace);
-        loop {
-            tokio::select! {
-                prepared = preparation.results.recv() => match prepared {
-                    Some(Prepared::Failed { .. }) | None => break,
-                    prepared => self.on_prepared(prepared).await?,
-                },
-                () = &mut grace => break,
+        let mut grace = Grace::start();
+        while let Some(prepared) = grace.within(preparation.results.recv()).await {
+            if matches!(prepared, Prepared::Failed { .. }) {
+                break;
             }
+            self.on_prepared(Some(prepared)).await?;
         }
         Ok(())
     }
@@ -1773,16 +1782,9 @@ impl Driver {
             return Ok(());
         };
         shipping.cancel.store(true, Ordering::Relaxed);
-        let grace = tokio::time::sleep(STOP_GRACE);
-        tokio::pin!(grace);
-        loop {
-            tokio::select! {
-                shipped = shipping.results.recv() => match shipped {
-                    Some(shipped) => self.record_shipped(shipped).await?,
-                    None => break,
-                },
-                () = &mut grace => break,
-            }
+        let mut grace = Grace::start();
+        while let Some(shipped) = grace.within(shipping.results.recv()).await {
+            self.record_shipped(shipped).await?;
         }
         Ok(())
     }
@@ -1796,27 +1798,31 @@ impl Driver {
         if handle.stop().is_err() {
             return Ok(());
         }
-        let grace = tokio::time::sleep(STOP_GRACE);
-        tokio::pin!(grace);
-        loop {
-            tokio::select! {
-                output = handle.next_output() => match output {
-                    Some(RunnerOutput::PermissionRequest(ask)) => {
-                        // Asked while stopping: nobody will answer it.
-                        let open = self
-                            .record_request(ask.request, ask.subagent.as_deref())
-                            .await?;
-                        self.expire(open).await?;
-                    }
-                    Some(RunnerOutput::TurnEnded) => {}
-                    Some(RunnerOutput::Exited(_)) | None => break,
-                    // Recorded as it is mid-turn.
-                    output => self.on_output(output).await?,
-                },
-                () = &mut grace => break,
+        let mut grace = Grace::start();
+        while let Some(output) = grace.within(handle.next_output()).await {
+            if !self.on_output_while_stopping(output).await? {
+                break;
             }
         }
         Ok(())
+    }
+
+    /// Keeps what a stopping agent says; `false` once it exited.
+    async fn on_output_while_stopping(&mut self, output: RunnerOutput) -> Result<bool> {
+        match output {
+            RunnerOutput::PermissionRequest(ask) => {
+                // Asked while stopping: nobody will answer it.
+                let open = self
+                    .record_request(ask.request, ask.subagent.as_deref())
+                    .await?;
+                self.expire(open).await?;
+            }
+            RunnerOutput::TurnEnded => {}
+            RunnerOutput::Exited(_) => return Ok(false),
+            // Recorded as it is mid-turn.
+            output => self.on_output(Some(output)).await?,
+        }
+        Ok(true)
     }
 
     /// Records that the session cannot go on and fails it.
