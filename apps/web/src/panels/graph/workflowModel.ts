@@ -1,5 +1,7 @@
+import type { NodeRunState } from "../../gen/NodeRunState";
 import type { WorkflowEdge } from "../../gen/WorkflowEdge";
 import type { WorkflowNodeInfo } from "../../gen/WorkflowNodeInfo";
+import type { WorkflowNodeRun } from "../../gen/WorkflowNodeRun";
 import type { WorkflowRun } from "../../gen/WorkflowRun";
 import { idleRun, isFailurePort, kindWord, loopProgress } from "../../lib/workflow";
 
@@ -39,29 +41,36 @@ export type RunOverlay = {
 const sameEdge = (a: WorkflowEdge, b: WorkflowEdge): boolean =>
   a.from === b.from && a.port === b.port && a.to === b.to;
 
+// Widened on purpose: a state from a newer server reads as not run.
+const shownState = (state: NodeRunState): NodeOverlay["state"] =>
+  state === "active" || state === "finished" ? state : "idle";
+
+/** "2 of 3" for a loop that has been entered; a run without iterations counts its runs. */
+function loopWords(info: WorkflowNodeInfo, known: WorkflowNodeRun): string | undefined {
+  if (info.kind !== "loop") return undefined;
+  const iteration = known.iteration ?? (known.runs > 0 ? known.runs : null);
+  return iteration !== null && iteration > 0 ? loopProgress(iteration, known.max) : undefined;
+}
+
+function nodeOverlay(info: WorkflowNodeInfo, known: WorkflowNodeRun): NodeOverlay {
+  return {
+    id: info.id,
+    info,
+    state: shownState(known.state),
+    runs: known.runs,
+    lastPort: known.last_port,
+    failed: known.last_port !== null && isFailurePort(info, known.last_port),
+    outcome: known.outcome,
+    loop: loopWords(info, known),
+  };
+}
+
 /** The run laid over its graph. Pure. */
 export function runOverlay(run: WorkflowRun): RunOverlay {
   const runs = new Map(run.nodes.map((node) => [node.id, node]));
-  const nodes = run.graph.nodes.map((info): NodeOverlay => {
-    const known = runs.get(info.id) ?? idleRun(info.id);
-    const iteration =
-      known.iteration ?? (info.kind === "loop" && known.runs > 0 ? known.runs : null);
-    return {
-      id: info.id,
-      info,
-      // Widened on purpose: a state from a newer server reads as not run.
-      state:
-        known.state === "active" || known.state === "finished" ? known.state : ("idle" as const),
-      runs: known.runs,
-      lastPort: known.last_port,
-      failed: known.last_port !== null && isFailurePort(info, known.last_port),
-      outcome: known.outcome,
-      loop:
-        info.kind === "loop" && iteration !== null && iteration > 0
-          ? loopProgress(iteration, known.max)
-          : undefined,
-    };
-  });
+  const nodes = run.graph.nodes.map((info) =>
+    nodeOverlay(info, runs.get(info.id) ?? idleRun(info.id)),
+  );
   const byInfo = new Map(run.graph.nodes.map((node) => [node.id, node]));
   const edges = run.graph.edges.map((edge, index): EdgeOverlay => ({
     index,
