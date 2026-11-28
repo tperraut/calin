@@ -8,8 +8,9 @@ use calin_proto::{Issue, IssueDetail, IssueState};
 use serde::Deserialize;
 
 use super::{GitHub, parse, unexpected};
-use crate::cmd::{Git, work_dir};
+use crate::cmd::work_dir;
 use crate::error::{Error, Result};
+use crate::repo::remote_url;
 
 /// The remote whose host decides whether a repository is on GitHub.
 const REMOTE: &str = "origin";
@@ -167,10 +168,7 @@ const PULL_REQUEST_VIEW: View = View {
 /// reason otherwise: nothing else can answer for its issues.
 pub fn on_github(dir: &Path) -> Result<std::path::PathBuf> {
     let dir = work_dir(dir)?;
-    let url = Git::read(&dir)
-        .args(["config", "--get", &format!("remote.{REMOTE}.url")])
-        .probe()?;
-    match url {
+    match remote_url(&dir, REMOTE)? {
         None => Err(Error::Conflict(format!(
             "the repository has no `{REMOTE}` remote, so it has no GitHub issues"
         ))),

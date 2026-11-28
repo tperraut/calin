@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use crate::cmd::{Done, Git, no_ssh_prompt, require_commit, resolve_commit, work_dir};
 use crate::error::{Error, Result};
+use crate::repo::{checked_out_branch, remote_head_branch, remote_url};
 use crate::worktree::main_branch;
 
 /// Makes git refuse to invent an identity from the user and host names: a
@@ -126,10 +127,7 @@ pub fn has_remote(dir: &Path, remote: &str) -> Result<bool> {
     if remote.is_empty() || remote.starts_with('-') || remote.contains(['.', '\n', ' ']) {
         return Ok(false);
     }
-    let url = Git::read(&dir)
-        .args(["config", "--get", &format!("remote.{remote}.url")])
-        .probe()?;
-    Ok(url.is_some())
+    Ok(remote_url(&dir, remote)?.is_some())
 }
 
 /// The branch pull requests of this repository go to: the one `remote`'s
@@ -138,12 +136,7 @@ pub fn has_remote(dir: &Path, remote: &str) -> Result<bool> {
 /// known.
 pub fn default_branch(dir: &Path, remote: &str) -> Result<Option<String>> {
     let dir = work_dir(dir)?;
-    let prefix = format!("refs/remotes/{remote}/");
-    let remote_head = Git::read(&dir)
-        .args(["symbolic-ref", "--quiet", &format!("{prefix}HEAD")])
-        .probe()?
-        .and_then(|name| name.strip_prefix(&prefix).map(str::to_owned));
-    match remote_head {
+    match remote_head_branch(&dir, remote)? {
         Some(branch) => Ok(Some(branch)),
         None => main_branch(&dir),
     }
@@ -151,11 +144,7 @@ pub fn default_branch(dir: &Path, remote: &str) -> Result<Option<String>> {
 
 /// The branch checked out in `dir`. `None` when `HEAD` is detached.
 pub fn current_branch(dir: &Path) -> Result<Option<String>> {
-    let dir = work_dir(dir)?;
-    Ok(Git::read(&dir)
-        .args(["symbolic-ref", "--quiet", "HEAD"])
-        .probe()?
-        .and_then(|name| name.strip_prefix("refs/heads/").map(str::to_owned)))
+    checked_out_branch(&work_dir(dir)?)
 }
 
 /// How many commits `branch` has that `base` does not.

@@ -27,6 +27,22 @@ pub struct CloneInfo {
 /// directory and a path that is not a directory are all
 /// [`Error::NotARepository`]. A linked worktree is accepted: it is a root too.
 pub fn inspect_clone(path: &Path) -> Result<CloneInfo> {
+    let root = work_tree_root(path)?;
+    let head = resolve_commit(&root, "HEAD")?;
+    let branch = checked_out_branch(&root)?;
+    let remote_head = remote_head_branch(&root, "origin")?;
+    let remote_url = remote_url(&root, "origin")?;
+    Ok(CloneInfo {
+        root,
+        head,
+        default_branch: remote_head.or_else(|| branch.clone()),
+        branch,
+        remote_url,
+    })
+}
+
+/// `path`, canonical, when it is the root of a git work tree.
+fn work_tree_root(path: &Path) -> Result<PathBuf> {
     let not_a_repo = |reason: String| Error::NotARepository {
         path: path.to_path_buf(),
         reason,
@@ -62,27 +78,31 @@ pub fn inspect_clone(path: &Path) -> Result<CloneInfo> {
             "it is a subdirectory of a work tree, not its root".into(),
         ));
     }
+    Ok(root)
+}
 
-    let head = resolve_commit(&root, "HEAD")?;
-    let branch = Git::read(&root)
+/// The branch checked out in the work tree `dir`. `None` when `HEAD` is detached.
+pub(crate) fn checked_out_branch(dir: &Path) -> Result<Option<String>> {
+    Ok(Git::read(dir)
         .args(["symbolic-ref", "--quiet", "HEAD"])
         .probe()?
-        .and_then(|name| name.strip_prefix("refs/heads/").map(str::to_owned));
-    let remote_head = Git::read(&root)
-        .args(["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"])
-        .probe()?
-        .and_then(|name| name.strip_prefix("refs/remotes/origin/").map(str::to_owned));
-    let remote_url = Git::read(&root)
-        .args(["config", "--get", "remote.origin.url"])
-        .probe()?;
+        .and_then(|name| name.strip_prefix("refs/heads/").map(str::to_owned)))
+}
 
-    Ok(CloneInfo {
-        root,
-        head,
-        default_branch: remote_head.or_else(|| branch.clone()),
-        branch,
-        remote_url,
-    })
+/// The branch `remote`'s `HEAD` pointed to when it was last fetched.
+pub(crate) fn remote_head_branch(dir: &Path, remote: &str) -> Result<Option<String>> {
+    let prefix = format!("refs/remotes/{remote}/");
+    Ok(Git::read(dir)
+        .args(["symbolic-ref", "--quiet", &format!("{prefix}HEAD")])
+        .probe()?
+        .and_then(|name| name.strip_prefix(&prefix).map(str::to_owned)))
+}
+
+/// The URL of `remote`, as configured. `None` when there is no such remote.
+pub(crate) fn remote_url(dir: &Path, remote: &str) -> Result<Option<String>> {
+    Git::read(dir)
+        .args(["config", "--get", &format!("remote.{remote}.url")])
+        .probe()
 }
 
 /// The commit `HEAD` of `dir` is at: the base for a repo edited in place.
