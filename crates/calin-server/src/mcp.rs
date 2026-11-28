@@ -11,7 +11,7 @@ use axum::http::request::Parts;
 use axum::http::{Extensions, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use calin_core::{AgentRef, AgentRepo, NoteOutcome};
-use calin_proto::RepoMode;
+use calin_proto::{RepoMode, SessionRepo};
 use serde_json::{Value, json};
 
 use crate::AppState;
@@ -90,26 +90,11 @@ pub(crate) async fn call(
         Ok(message) => message,
         Err(_) => return invalid(PARSE_ERROR, "the body is not JSON"),
     };
-    // Batches left the protocol in 2025-06-18; nothing sends them here.
-    let Some(method) = message.get("method").and_then(Value::as_str) else {
-        if message.is_object() && message.get("id").is_some() {
-            // A response to a request this server never makes.
-            return StatusCode::ACCEPTED.into_response();
-        }
-        return invalid(INVALID_REQUEST, "expected one JSON-RPC message");
+    let (id, method, params) = match parse_request(&message) {
+        Ok(request) => request,
+        Err(not_a_request) => return not_a_request.into_response(),
     };
-    let Some(id) = message.get("id").filter(|id| !id.is_null()) else {
-        // A notification: acknowledged, never answered.
-        return StatusCode::ACCEPTED.into_response();
-    };
-    let params = message.get("params").unwrap_or(&Value::Null);
-    let outcome = match method {
-        "initialize" => Ok(initialize(params)),
-        "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({ "tools": tools() })),
-        "tools/call" => call_tool(&state, &agent, params).await,
-        _ => Err((METHOD_NOT_FOUND, format!("method not found: {method}"))),
-    };
+    let outcome = run_method(&state, &agent, method, params).await;
     let reply = match outcome {
         Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
         Err((code, message)) => {
@@ -117,6 +102,54 @@ pub(crate) async fn call(
         }
     };
     Json(reply).into_response()
+}
+
+/// A JSON message that is not a request to answer.
+enum NotARequest {
+    /// A notification, or a response to a request this server never makes:
+    /// acknowledged, never answered.
+    Acknowledged,
+    /// Not one JSON-RPC message.
+    Invalid,
+}
+
+impl IntoResponse for NotARequest {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Acknowledged => StatusCode::ACCEPTED.into_response(),
+            Self::Invalid => invalid(INVALID_REQUEST, "expected one JSON-RPC message"),
+        }
+    }
+}
+
+/// The id, method and params of a request.
+fn parse_request(message: &Value) -> Result<(&Value, &str, &Value), NotARequest> {
+    // Batches left the protocol in 2025-06-18; nothing sends them here.
+    let Some(method) = message.get("method").and_then(Value::as_str) else {
+        if message.is_object() && message.get("id").is_some() {
+            return Err(NotARequest::Acknowledged);
+        }
+        return Err(NotARequest::Invalid);
+    };
+    let Some(id) = message.get("id").filter(|id| !id.is_null()) else {
+        return Err(NotARequest::Acknowledged);
+    };
+    Ok((id, method, message.get("params").unwrap_or(&Value::Null)))
+}
+
+async fn run_method(
+    state: &AppState,
+    agent: &AgentRef,
+    method: &str,
+    params: &Value,
+) -> Result<Value, (i64, String)> {
+    match method {
+        "initialize" => Ok(initialize(params)),
+        "ping" => Ok(json!({})),
+        "tools/list" => Ok(json!({ "tools": tools() })),
+        "tools/call" => call_tool(state, agent, params).await,
+        _ => Err((METHOD_NOT_FOUND, format!("method not found: {method}"))),
+    }
 }
 
 /// A message that cannot be answered by id: the transport says so.
@@ -315,11 +348,17 @@ async fn call_tool(
         ASK_USER => ask_user(state, agent, arguments).await,
         _ => return Err((INVALID_PARAMS, format!("unknown tool: {name}"))),
     };
+    Ok(tool_result(outcome))
+}
+
+/// A tool's answer as the protocol carries it: its text, and whether it
+/// is an error.
+fn tool_result(outcome: Result<String, String>) -> Value {
     let (text, is_error) = match outcome {
         Ok(text) => (text, false),
         Err(text) => (text, true),
     };
-    Ok(json!({ "content": [{ "type": "text", "text": text }], "isError": is_error }))
+    json!({ "content": [{ "type": "text", "text": text }], "isError": is_error })
 }
 
 /// What went wrong, for the model. A refusal says why in its own words;
@@ -376,16 +415,7 @@ async fn attach_repo(
     let Some(name) = name.filter(|name| !name.is_empty()) else {
         return Err("attach_repo needs the repository's name in `name`.".to_owned());
     };
-    let mode = match arguments.get("mode") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(mode)) if mode == "write" => Some(RepoMode::Write),
-        Some(Value::String(mode)) if mode == "read" => Some(RepoMode::Read),
-        Some(other) => {
-            return Err(format!(
-                "`mode` must be \"write\" or \"read\", not {other}."
-            ));
-        }
-    };
+    let mode = mode_argument(arguments)?;
     let attached = state.manager.agent_attach_repo(agent, name, mode).await;
     let repo = attached.map_err(|err| match err {
         calin_core::Error::Missing(_) => {
@@ -393,7 +423,24 @@ async fn attach_repo(
         }
         other => failure(other),
     })?;
-    Ok(match repo.mode {
+    Ok(attached_text(repo))
+}
+
+/// `attach_repo`'s optional `mode`: `write` or `read`.
+fn mode_argument(arguments: &Value) -> Result<Option<RepoMode>, String> {
+    match arguments.get("mode") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(mode)) if mode == "write" => Ok(Some(RepoMode::Write)),
+        Some(Value::String(mode)) if mode == "read" => Ok(Some(RepoMode::Read)),
+        Some(other) => Err(format!(
+            "`mode` must be \"write\" or \"read\", not {other}."
+        )),
+    }
+}
+
+/// Where the model works in a repository it just attached.
+fn attached_text(repo: SessionRepo) -> String {
+    match repo.mode {
         RepoMode::Read => format!(
             "Attached {} read-only. Read it at: {}\nEdits there are refused.",
             repo.name, repo.path
@@ -408,7 +455,7 @@ async fn attach_repo(
                 .map(|branch| format!(" ({branch})"))
                 .unwrap_or_default()
         ),
-    })
+    }
 }
 
 /// A required text argument: `Err` with what to tell the model when it is
