@@ -85,17 +85,8 @@ impl GitHub {
     /// Issue `number` of the repository `dir` is a clone of. `NotFound` when
     /// there is no such issue, or the number is a pull request's.
     pub fn issue(&self, dir: &Path, number: u32) -> Result<IssueDetail> {
-        let dir = on_github(dir)?;
-        let (reference, json) = (number.to_string(), format!("--json={ISSUE_FIELDS}"));
-        let ran = self
-            .gh(
-                &dir,
-                "issue view",
-                &["issue", "view", &reference, &json],
-                None,
-            )
-            .map_err(|err| not_found(err, "issue", number))?;
-        let raw: RawIssue = parse("issue view", &ran.stdout)?;
+        let stdout = self.view_item(dir, &ISSUE_VIEW, number)?;
+        let raw: RawIssue = parse("issue view", &stdout)?;
         let detail = raw.into_detail("issue view")?;
         if detail.issue.number != number || detail.issue.url.contains("/pull/") {
             return Err(Error::NotFound(format!("issue #{number}")));
@@ -123,19 +114,54 @@ impl GitHub {
     /// Pull request `number`, as an automation sees it. `NotFound` when
     /// there is none.
     pub fn pull_request_item(&self, dir: &Path, number: u32) -> Result<PullRequestItem> {
-        let dir = on_github(dir)?;
-        let (reference, json) = (number.to_string(), format!("--json={PULL_REQUEST_FIELDS}"));
-        let ran = self
-            .gh(&dir, "pr view", &["pr", "view", &reference, &json], None)
-            .map_err(|err| not_found(err, "pull request", number))?;
-        let raw: RawPullRequestItem = parse("pr view", &ran.stdout)?;
+        let stdout = self.view_item(dir, &PULL_REQUEST_VIEW, number)?;
+        let raw: RawPullRequestItem = parse("pr view", &stdout)?;
         let item = raw.into_item("pr view")?;
         if item.number != number {
             return Err(Error::NotFound(format!("pull request #{number}")));
         }
         Ok(item)
     }
+
+    /// What `gh` says of item `number` of the repository `dir` is a clone of.
+    /// `NotFound` when the number names nothing.
+    fn view_item(&self, dir: &Path, view: &View, number: u32) -> Result<String> {
+        let dir = on_github(dir)?;
+        let (reference, json) = (number.to_string(), format!("--json={}", view.fields));
+        let what = format!("{} view", view.command);
+        let ran = self
+            .gh(
+                &dir,
+                &what,
+                &[view.command, "view", &reference, &json],
+                None,
+            )
+            .map_err(|err| not_found(err, view.noun, number))?;
+        Ok(ran.stdout)
+    }
 }
+
+/// How to ask `gh` for one item by its number.
+struct View {
+    /// The `gh` command: `issue` or `pr`.
+    command: &'static str,
+    /// What is asked for, in its `--json` vocabulary.
+    fields: &'static str,
+    /// What the item is called in a `NotFound`.
+    noun: &'static str,
+}
+
+const ISSUE_VIEW: View = View {
+    command: "issue",
+    fields: ISSUE_FIELDS,
+    noun: "issue",
+};
+
+const PULL_REQUEST_VIEW: View = View {
+    command: "pr",
+    fields: PULL_REQUEST_FIELDS,
+    noun: "pull request",
+};
 
 /// `dir`, canonical, when its `origin` is on GitHub. `Conflict` with the
 /// reason otherwise: nothing else can answer for its issues.
@@ -158,27 +184,34 @@ pub fn on_github(dir: &Path) -> Result<std::path::PathBuf> {
 /// True for a remote URL on github.com or on a GitHub Enterprise host
 /// (`github.<company>` or `<name>.ghe.com`), in any of git's URL forms.
 pub(crate) fn is_github_url(url: &str) -> bool {
-    let url = url.trim();
+    url_host(url.trim()).is_some_and(|host| is_github_host(&host))
+}
+
+/// The host of a remote URL, lowercase. `None` for a local path and for a
+/// scheme that is not one of git's network ones.
+fn url_host(url: &str) -> Option<String> {
     let rest = match url.split_once("://") {
         Some((scheme, rest)) => {
-            if !matches!(scheme, "https" | "http" | "ssh" | "git" | "git+ssh") {
-                return false;
-            }
-            rest
+            matches!(scheme, "https" | "http" | "ssh" | "git" | "git+ssh").then_some(rest)?
         }
         // The scp-like form, `user@host:owner/repo`; a local path has no colon before a slash.
-        None => match url.split_once(':') {
-            Some((host, _)) if !host.contains('/') => host,
-            _ => return false,
-        },
+        None => url
+            .split_once(':')
+            .map(|(host, _)| host)
+            .filter(|host| !host.contains('/'))?,
     };
     let authority = rest.split('/').next().unwrap_or_default();
     let host = authority.rsplit('@').next().unwrap_or_default();
-    let host = host
-        .split(':')
-        .next()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
+    Some(
+        host.split(':')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase(),
+    )
+}
+
+/// github.com, or a GitHub Enterprise host: `github.<company>` or `<name>.ghe.com`.
+fn is_github_host(host: &str) -> bool {
     host == "github.com"
         || host == "www.github.com"
         || host.starts_with("github.")
