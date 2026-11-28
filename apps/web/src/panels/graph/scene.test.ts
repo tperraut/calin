@@ -287,4 +287,178 @@ describe("scene", () => {
     expect(2000 * view.k + view.y + 40 * view.k).toBeLessThanOrEqual(300);
     expect(2000 * view.k + view.y).toBeGreaterThanOrEqual(0);
   });
+
+  it("brings a node in from the right and from above, and leaves one already in view alone", () => {
+    const { scene } = setup();
+    const nodes = [node("a", 0, 0), node("right", 500, 0), node("mid", 100, 100)];
+    // Narrow enough to be homed at full size.
+    scene.setLayout({ ...layout(nodes), width: 200 }, false);
+    scene.setViewport({ w: 300, h: 300 });
+    expect(scene.view()).toEqual({ x: 16, y: 60, k: 1 });
+    // Its right edge lands 16 px inside the viewport's right edge.
+    scene.reveal("right");
+    expect(scene.view()).toEqual({ x: -316, y: 60, k: 1 });
+    scene.panBy(332, 0);
+    // Its top edge lands 16 px under the viewport's top edge.
+    scene.panBy(0, -200);
+    scene.reveal("a");
+    expect(scene.view()).toEqual({ x: 16, y: 16, k: 1 });
+    scene.reveal("mid");
+    expect(scene.view()).toEqual({ x: 16, y: 16, k: 1 });
+    // A node the scene does not hold moves nothing.
+    scene.reveal("nope");
+    expect(scene.view()).toEqual({ x: 16, y: 16, k: 1 });
+  });
+
+  it("fits the whole drawing, legibly under the floating buttons when asked, and not before the pane is measured", () => {
+    const { scene } = setup();
+    scene.setLayout(layout([node("a", 0, 0), node("b", 300, 360)]), false);
+    scene.fit();
+    expect(scene.view()).toEqual({ x: 0, y: 0, k: 1 });
+    scene.setViewport({ w: 200, h: 200 });
+    scene.fit(true);
+    expect(scene.view().k).toBe(0.5);
+    expect(scene.view().y).toBe(60);
+    // A drawing that fits is centred, but never under the buttons.
+    scene.setViewport({ w: 2000, h: 480 });
+    scene.fit(true);
+    expect(scene.view()).toEqual({ x: 800, y: 60, k: 1 });
+    scene.fit();
+    expect(scene.view()).toEqual({ x: 800, y: 40, k: 1 });
+  });
+
+  it("homes again when the pane changes size, until the reader pans or zooms", () => {
+    const { scene } = setup();
+    scene.setLayout({ ...layout([node("a", 0, 0)]), width: 1000, homeWidth: 500 }, false);
+    // Not measured yet: nothing to home on.
+    expect(scene.view()).toEqual({ x: 0, y: 0, k: 1 });
+    scene.setViewport({ w: 432, h: 300 });
+    // Readable across the home width, not the whole drawing.
+    expect(scene.view()).toEqual({ x: 16, y: 60, k: 0.8 });
+    scene.setViewport({ w: 282, h: 300 });
+    expect(scene.view()).toEqual({ x: 16, y: 60, k: 0.6 });
+    scene.panBy(5, 5);
+    scene.setViewport({ w: 532, h: 300 });
+    expect(scene.view()).toEqual({ x: 21, y: 65, k: 0.6 });
+  });
+
+  it("places a node's element that arrives after its layout, hidden when it is far outside", () => {
+    const { scene } = setup();
+    scene.setLayout(layout([node("a", 0, 0), node("far", 0, 3000)]), false);
+    scene.setViewport({ w: 300, h: 300 });
+    const near = g();
+    const far = g();
+    scene.nodeRef("a", near);
+    scene.nodeRef("far", far);
+    expect(near.getAttribute("transform")).toBe("translate(0,0)");
+    expect(near.style.display).toBe("");
+    expect(far.getAttribute("transform")).toBe("translate(0,3000)");
+    expect(far.style.display).toBe("none");
+  });
+
+  it("forgets the element of a node or an edge that left before a layout placed it", () => {
+    const { scene } = setup();
+    const gone = g();
+    const goneLine = path();
+    const kept = path();
+    scene.nodeRef("x", gone);
+    scene.edgeRef("ex", "path", goneLine);
+    scene.edgeRef("e1", "path", kept);
+    scene.setLayout(layout([node("a", 0, 0), node("b", 28, 64)], [treeEdge]), false);
+    scene.setLayout(
+      layout(
+        [node("a", 0, 0), node("b", 28, 64), node("x", 0, 128)],
+        [treeEdge, { id: "ex", from: "a", to: "x", route: "tree" }],
+      ),
+      false,
+    );
+    expect(kept.getAttribute("d")).toMatch(/H28$/);
+    expect(gone.getAttribute("transform")).toBeNull();
+    expect(goneLine.getAttribute("d")).toBeNull();
+  });
+
+  it("draws a curve with no corners straight between the right sides of its cards, its count halfway", () => {
+    const { scene } = setup();
+    const line = path();
+    const count = g();
+    scene.edgeRef("c", "path", line);
+    scene.edgeRef("c", "label", count);
+    scene.setLayout(
+      layout(
+        [node("a", 0, 0), node("b", 0, 64)],
+        [{ id: "c", from: "a", to: "b", route: "curve" }],
+      ),
+      false,
+    );
+    expect(line.getAttribute("d")).toBe("M100,20L100,84");
+    expect(count.getAttribute("transform")).toBe("translate(100,52)");
+  });
+
+  it("puts a curve's count at a fraction of its length", () => {
+    const { scene } = setup();
+    const count = g();
+    scene.edgeRef("o1", "label", count);
+    scene.setLayout(
+      layout([node("a", 0, 0), node("b", 0, 64)], [{ ...laneEdge(130), label: { fraction: 0.5 } }]),
+      false,
+    );
+    expect(count.getAttribute("transform")).toBe("translate(130,52)");
+  });
+
+  it("draws nothing for an edge to a node it does not hold, and its pulse ends at once", () => {
+    const { scene, frame, pulses } = setup();
+    const line = path();
+    scene.edgeRef("e1", "path", line);
+    scene.setLayout(layout([node("a", 0, 0)], [treeEdge]), false);
+    expect(line.getAttribute("d")).toBeNull();
+    scene.pulse("e1");
+    const dot = circle();
+    scene.pulseRef("pulse-1", dot);
+    expect(dot.getAttribute("transform")).toBeNull();
+    // A pulse that already ended takes no element.
+    frame(16);
+    expect(pulses).toHaveBeenLastCalledWith([]);
+    scene.pulseRef("pulse-1", circle());
+    expect(scene.busy()).toBe(false);
+    expect(scene.position("nope")).toBeUndefined();
+  });
+
+  it("runs one frame at a time, and nothing once disposed", () => {
+    const { scene, frame, pending } = setup();
+    const a = g();
+    scene.nodeRef("a", a);
+    scene.setLayout(layout([node("a", 0, 0), node("b", 0, 64)], [treeEdge]), false);
+    scene.setLayout(layout([node("a", 0, 64), node("b", 0, 64)], [treeEdge]), true);
+    scene.pulse("e1");
+    scene.panBy(1, 1);
+    expect(pending()).toBe(1);
+    scene.dispose();
+    frame(TWEEN_MS);
+    expect(a.getAttribute("transform")).toBe("translate(0,0)");
+    scene.panBy(1, 1);
+    expect(pending()).toBe(0);
+  });
+
+  it("cancels the frame it asked for when disposed", () => {
+    const cancel = vi.fn<(handle: number) => void>();
+    const scene = createScene({
+      reducedMotion: () => false,
+      onPulses: () => {},
+      requestFrame: () => 7,
+      cancelFrame: cancel,
+    });
+    scene.dispose();
+    expect(cancel).not.toHaveBeenCalled();
+    scene.panBy(1, 1);
+    expect(cancel).not.toHaveBeenCalled();
+    const live = createScene({
+      reducedMotion: () => false,
+      onPulses: () => {},
+      requestFrame: () => 7,
+      cancelFrame: cancel,
+    });
+    live.panBy(1, 1);
+    live.dispose();
+    expect(cancel).toHaveBeenCalledWith(7);
+  });
 });
