@@ -1,5 +1,14 @@
 import { describe, expect, it } from "vite-plus/test";
-import { loadComposerPrefs, saveComposerPrefs } from "./prefs";
+import {
+  loadComposerPrefs,
+  loadDiffLayout,
+  loadEditorWrap,
+  loadSidePaneWidth,
+  saveComposerPrefs,
+  saveDiffLayout,
+  saveEditorWrap,
+  saveSidePaneWidth,
+} from "./prefs";
 
 const store = (key: string, value: unknown): void =>
   localStorage.setItem(key, typeof value === "string" ? value : JSON.stringify(value));
@@ -83,5 +92,44 @@ describe("loadComposerPrefs", () => {
     store("calin.composer.v1", "42");
     // An array is an object: it is read as a record with no field that makes sense.
     expect(loadComposerPrefs()).toEqual({ permissionMode: "ask" });
+  });
+});
+
+describe("the side pane's width", () => {
+  it("is the reader's own once they resized it, to the pixel", () => {
+    expect(loadSidePaneWidth()).toBeUndefined();
+    saveSidePaneWidth(321.6);
+    expect(loadSidePaneWidth()).toBe(322);
+    store("calin.sidePane.v1", 1);
+    expect(loadSidePaneWidth()).toBe(1);
+  });
+
+  it("is the default for a width that cannot be one", () => {
+    for (const stored of ["0", "-40", "1e999", '"320"', "null"]) {
+      store("calin.sidePane.v1", stored);
+      expect(loadSidePaneWidth()).toBeUndefined();
+    }
+  });
+});
+
+describe("the diff layout and the editor's wrapping", () => {
+  it("are the reader's own choice once made, and nothing before", () => {
+    expect(loadDiffLayout()).toBeUndefined();
+    saveDiffLayout("split");
+    expect(loadDiffLayout()).toBe("split");
+    saveDiffLayout("unified");
+    expect(loadDiffLayout()).toBe("unified");
+    expect(loadEditorWrap()).toBeUndefined();
+    saveEditorWrap(false);
+    expect(loadEditorWrap()).toBe(false);
+    saveEditorWrap(true);
+    expect(loadEditorWrap()).toBe(true);
+  });
+
+  it("are no choice when what is stored is none of them", () => {
+    store("calin.diffLayout.v1", '"side-by-side"');
+    expect(loadDiffLayout()).toBeUndefined();
+    store("calin.editorWrap.v1", '"yes"');
+    expect(loadEditorWrap()).toBeUndefined();
   });
 });
