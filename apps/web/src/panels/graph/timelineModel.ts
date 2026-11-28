@@ -111,6 +111,74 @@ export function visibleSpans(
   });
 }
 
+/** Spans this far outside the viewport are still drawn, so a short scroll shows no gap. */
+const CULL_MARGIN = 240;
+
+/** The pixels of the axis whose spans and arrows are drawn: the viewport and a margin each side. */
+export type CullRange = { readonly x0: number; readonly x1: number };
+
+export const cullRange = (scrollX: number, room: number): CullRange => ({
+  x0: scrollX - CULL_MARGIN,
+  x1: scrollX + room + CULL_MARGIN,
+});
+
+/** A span as the chart holds it: its lane's row and its box on the axis. */
+export type DrawnSpan = {
+  readonly key: string;
+  readonly agentId: string;
+  readonly row: number;
+  readonly span: TimelineSpan;
+  readonly box: SpanBox;
+};
+
+/** A span's id on the chart: span ids are only unique within a lane. */
+export const spanKey = (agentId: string, spanId: string): string => `${agentId}/${spanId}`;
+
+// Turns under what lies inside them.
+const drawOrder: Record<string, number> = { turn: 0, waiting: 1, tool: 2 };
+
+/** The spans of every lane within `range`, turns first so that they lie under the rest. */
+export function drawnSpans(
+  lanes: readonly LaneView[],
+  scale: TimeScale,
+  now: number,
+  range: CullRange,
+): DrawnSpan[] {
+  const list = lanes.flatMap((view, row) =>
+    visibleSpans(view.lane.spans, scale, now, range.x0, range.x1).map((span) => ({
+      key: spanKey(view.id, span.id),
+      agentId: view.id,
+      row,
+      span,
+      box: spanBox(span, scale, now),
+    })),
+  );
+  return list.sort((a, b) => (drawOrder[a.span.kind] ?? 3) - (drawOrder[b.span.kind] ?? 3));
+}
+
+/** The arrows within `range`, in the server's order; one naming an agent with no lane is not drawn. */
+export function drawnArrows(
+  arrows: readonly TimelineArrow[],
+  laneIndex: ReadonlyMap<string, number>,
+  scale: TimeScale,
+  range: CullRange,
+): { arrow: TimelineArrow; box: ArrowBox }[] {
+  return arrows.flatMap((arrow) => {
+    const box = arrowBox(arrow, laneIndex, scale);
+    return box && box.x >= range.x0 && box.x <= range.x1 ? [{ arrow, box }] : [];
+  });
+}
+
+/** The key of the first span of the first lane that has one: the tab stop until a span takes the focus. */
+export function firstKey(lanes: readonly LaneView[]): string | undefined {
+  const lane = lanes.find((view) => view.lane.spans.length > 0);
+  return lane && spanKey(lane.id, lane.lane.spans[0].id);
+}
+
+/** Who an agent is, in sentences: the user has no lane. */
+export const laneName = (lanes: readonly LaneView[], agentId: string | null): string =>
+  agentId === null ? "you" : (lanes.find((lane) => lane.id === agentId)?.label ?? "an agent");
+
 /** A turn with the tool and waiting spans that lie inside it (graph.rs). */
 export type TurnGroup = { readonly turn: TimelineSpan | undefined; readonly inner: TimelineSpan[] };
 

@@ -63,13 +63,15 @@ export function createCalmScene(onPulses: (ids: readonly string[]) => void): Sce
 /** How far a pointer moves before a press becomes a drag, in pixels. */
 const DRAG_SLOP = 4;
 
-type Point = { x: number; y: number };
+export type Point = { x: number; y: number };
 
 /** The pointers down on a canvas, whether the press became a drag, and the fingers' spread during a pinch. */
 type Presses = { pointers: Map<number, Point>; dragged: boolean; pinch: number | undefined };
 
-const spread = (a: Point, b: Point): number => Math.hypot(a.x - b.x, a.y - b.y);
-const at = (event: { clientX: number; clientY: number }): Point => ({
+/** How far apart two fingers are. */
+export const spread = (a: Point, b: Point): number => Math.hypot(a.x - b.x, a.y - b.y);
+/** Where a pointer, a touch or a mouse event is on the page. */
+export const at = (event: { clientX: number; clientY: number }): Point => ({
   x: event.clientX,
   y: event.clientY,
 });
@@ -252,18 +254,32 @@ export type KeyNav = {
   side: (key: string, at: string) => KeyCommand | undefined;
 };
 
-/** The node a key was pressed on, if it was pressed on one. */
-const nodeAt = (target: EventTarget | null): string | undefined =>
-  (target instanceof Element ? target.closest("[data-node]") : null)?.getAttribute("data-node") ??
+/** The value of `attribute` on the element a key was pressed on, or on the nearest one around it that has it. */
+export const markedAt = (target: EventTarget | null, attribute: string): string | undefined =>
+  (target instanceof Element ? target.closest(`[${attribute}]`) : null)?.getAttribute(attribute) ??
   undefined;
 
-const zoomKeys: ReadonlyMap<string, (step: number) => KeyCommand> = new Map([
-  ["+", (step: number): KeyCommand => ({ kind: "zoom", factor: step })],
-  ["=", (step: number): KeyCommand => ({ kind: "zoom", factor: step })],
-  ["-", (step: number): KeyCommand => ({ kind: "zoom", factor: 1 / step })],
-  ["_", (step: number): KeyCommand => ({ kind: "zoom", factor: 1 / step })],
-  ["0", (): KeyCommand => ({ kind: "fit" })],
-]);
+/** True for a key held with Ctrl, Alt or Meta: those belong to the browser. */
+export const withModifier = (event: KeyboardEvent): boolean =>
+  event.altKey || event.ctrlKey || event.metaKey;
+
+/** True for the keys that pick what holds the focus. */
+export const choosing = (key: string): boolean => key === "Enter" || key === " ";
+
+const zoomIn: ReadonlySet<string> = new Set(["+", "="]);
+const zoomOut: ReadonlySet<string> = new Set(["-", "_"]);
+
+/** How much a zoom key zooms by one `step`: + and = in, - and _ out. */
+export function zoomKeyFactor(key: string, step: number): number | undefined {
+  if (zoomIn.has(key)) return step;
+  return zoomOut.has(key) ? 1 / step : undefined;
+}
+
+function zoomKey(key: string, step: number): KeyCommand | undefined {
+  if (key === "0") return { kind: "fit" };
+  const factor = zoomKeyFactor(key, step);
+  return factor === undefined ? undefined : { kind: "zoom", factor };
+}
 
 function choiceKey(
   key: string,
@@ -271,7 +287,7 @@ function choiceKey(
   selected: boolean,
 ): KeyCommand | undefined {
   if (key === "Escape") return selected ? { kind: "select", id: undefined } : undefined;
-  if ((key === "Enter" || key === " ") && node !== undefined) return { kind: "select", id: node };
+  if (choosing(key) && node !== undefined) return { kind: "select", id: node };
   return undefined;
 }
 
@@ -305,10 +321,10 @@ export const alongOrder =
 
 /** The command of a key pressed on a canvas; undefined leaves the key to the browser. */
 function canvasKey(event: KeyboardEvent, nav: KeyNav): KeyCommand | undefined {
-  if (event.altKey || event.ctrlKey || event.metaKey) return undefined;
-  const node = nodeAt(event.target);
+  if (withModifier(event)) return undefined;
+  const node = markedAt(event.target, "data-node");
   return (
-    zoomKeys.get(event.key)?.(nav.step) ??
+    zoomKey(event.key, nav.step) ??
     choiceKey(event.key, node, nav.selected) ??
     (node === undefined ? undefined : nav.side(event.key, node)) ??
     orderKey(event.key, node, nav.order)

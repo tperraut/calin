@@ -45,10 +45,18 @@ export function press(target: Element, key: string, init: KeyboardEventInit = {}
   return event.defaultPrevented;
 }
 
-/** A wheel event at (`x`, `y`) on the page: happy-dom's WheelEvent is no MouseEvent, so its position is set here. */
+/**
+ * A wheel event at (`x`, `y`) on the page: happy-dom's WheelEvent is no
+ * MouseEvent, so its position and its Ctrl and Meta keys are set here.
+ */
 export function wheel(target: Element, [x, y]: At, init: WheelEventInit = {}): WheelEvent {
   const event = new WheelEvent("wheel", { cancelable: true, ...init });
-  Object.defineProperties(event, { clientX: { value: x }, clientY: { value: y } });
+  Object.defineProperties(event, {
+    clientX: { value: x },
+    clientY: { value: y },
+    ctrlKey: { value: init.ctrlKey ?? false },
+    metaKey: { value: init.metaKey ?? false },
+  });
   target.dispatchEvent(event);
   return event;
 }

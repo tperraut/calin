@@ -1,7 +1,7 @@
 import { createSignal, flush } from "solid-js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import type { Timeline } from "../../gen/Timeline";
-import { press } from "../../test/canvas";
+import { press, wheel } from "../../test/canvas";
 import { makeSpan, makeTimeline, T0 } from "../../test/orchestration";
 import { find, mount, unmountAll } from "../../test/render";
 import { type TimelineSelection, TimelineView } from "./TimelineView";
@@ -99,23 +99,15 @@ describe("TimelineView: zoom", () => {
 
   it("zooms with Ctrl or Meta and the wheel, keeping the moment under the pointer; a wheel alone scrolls", () => {
     const { scroller, width, fit } = setup();
-    const wheel = (init: WheelEventInit): boolean => {
-      const event = new WheelEvent("wheel", { cancelable: true, ...init });
-      // happy-dom's WheelEvent is not a MouseEvent: it drops the pointer and the modifier keys.
-      Object.defineProperties(event, {
-        clientX: { value: init.clientX ?? 0 },
-        ctrlKey: { value: init.ctrlKey ?? false },
-        metaKey: { value: init.metaKey ?? false },
-      });
-      scroller.dispatchEvent(event);
+    const twice = (x: number, init: WheelEventInit = {}): boolean => {
+      const event = wheel(scroller, [x, 0], { deltaY: -100 * Math.log(2), ...init });
       flush();
       return event.defaultPrevented;
     };
-    const twice = -100 * Math.log(2);
-    expect(wheel({ deltaY: twice, clientX: LABELS + 100 })).toBe(false);
+    expect(twice(LABELS + 100)).toBe(false);
     expect(width()).toBe(widthAt(FIT_PX_PER_MS));
 
-    expect(wheel({ deltaY: twice, clientX: LABELS + 100, ctrlKey: true })).toBe(true);
+    expect(twice(LABELS + 100, { ctrlKey: true })).toBe(true);
     expect(width()).toBe(widthAt(FIT_PX_PER_MS * 2));
     expect(scroller.scrollLeft).toBeCloseTo(100);
 
@@ -125,7 +117,7 @@ describe("TimelineView: zoom", () => {
     expect(width()).toBe(widthAt(FIT_PX_PER_MS));
     expect(scroller.scrollLeft).toBeCloseTo(50);
     // Over the lane column, the zoom keeps the chart's left edge.
-    expect(wheel({ deltaY: twice, clientX: 40, metaKey: true })).toBe(true);
+    expect(twice(40, { metaKey: true })).toBe(true);
     expect(width()).toBe(widthAt(FIT_PX_PER_MS * 2));
     expect(scroller.scrollLeft).toBeCloseTo(100);
   });
@@ -277,6 +269,28 @@ describe("TimelineView: the keyboard", () => {
     press(arrow("ar3"), "ArrowRight");
     expect(document.activeElement).toBe(arrow("ar4"));
     expect(scroller.scrollLeft).toBeCloseTo(55_000 * pxPerMs - room / 3);
+  });
+});
+
+describe("TimelineView: the scroll", () => {
+  it("draws what a scroll brings near the viewport, once per frame", async () => {
+    const { chart, scroller, host } = setup();
+    for (let turn = 0; turn < 8; turn += 1) press(chart, "+");
+    const held = () =>
+      [...host.querySelectorAll("[data-span], [data-arrow]")].map(
+        (one) => one.getAttribute("data-span") ?? one.getAttribute("data-arrow"),
+      );
+    expect(held()).toContain("a1/turn-1");
+    expect(held()).not.toContain("ar4");
+    scroller.scrollLeft = 55_000 * FIT_PX_PER_MS * 1.5 ** 8 - 50;
+    scroller.dispatchEvent(new Event("scroll"));
+    scroller.dispatchEvent(new Event("scroll"));
+    await vi.waitFor(() => {
+      flush();
+      expect(held()).toContain("ar4");
+    });
+    expect(held()).not.toContain("a1/turn-1");
+    expect(held()).toContain("a2/c1");
   });
 });
 
