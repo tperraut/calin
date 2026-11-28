@@ -307,6 +307,121 @@ describe("orchestration data", () => {
     await vi.advanceTimersByTimeAsync(5000);
     expect(graph).toHaveBeenCalledTimes(1);
   });
+
+  it("drops what answers after it is disposed, failures included", async () => {
+    const graphAnswer = deferred<Graph>();
+    const timelineAnswer = deferred<Timeline>();
+    const graph = vi.fn(() => graphAnswer.promise);
+    const timeline = vi.fn(() => timelineAnswer.promise);
+    const data = createOrchestrationData({ graph, timeline });
+    data.setVisible(true);
+    data.setView("timeline");
+    await settle();
+    expect(data.refreshing()).toBe(true);
+    data.dispose();
+    graphAnswer.reject(conflict("too late"));
+    timelineAnswer.resolve(makeTimeline());
+    await settle();
+    expect(data.graphError()).toBeUndefined();
+    expect(data.timeline()).toBeUndefined();
+    expect(data.refreshing()).toBe(false);
+  });
+
+  it("says why the timeline could not be read, and reads it again on retry", async () => {
+    const answers = [() => Promise.reject<Timeline>(conflict("no timeline yet"))];
+    const timeline = vi.fn(() => (answers.shift() ?? (() => Promise.resolve(makeTimeline())))());
+    const data = createOrchestrationData({
+      graph: () => Promise.resolve(makeGraph()),
+      timeline,
+    });
+    data.setVisible(true);
+    data.setView("timeline");
+    await settle();
+    expect(data.timelineError()).toBe("no timeline yet");
+    data.retry();
+    await settle();
+    expect(timeline).toHaveBeenCalledTimes(2);
+    expect(data.timelineError()).toBeUndefined();
+    expect(data.timeline()?.lanes).toHaveLength(3);
+  });
+
+  it("shows no failure of a question that a newer one replaced", async () => {
+    const old = deferred<Graph>();
+    const { data } = setup((at) =>
+      at === T0 + 10_000 ? old.promise : Promise.resolve(makeGraph({ at: at ?? T0 + 60_000 })),
+    );
+    data.setVisible(true);
+    await settle();
+    data.scrub(T0 + 10_000);
+    await vi.advanceTimersByTimeAsync(SCRUB_DELAY_MS);
+    data.scrub(T0 + 40_000);
+    await vi.advanceTimersByTimeAsync(SCRUB_DELAY_MS);
+    old.reject(conflict("stale"));
+    await settle();
+    expect(data.graphError()).toBeUndefined();
+    expect(data.graph()?.at).toBe(T0 + 40_000);
+  });
+
+  it("on retry in the past, reads the moment on screen again", async () => {
+    const answers = [
+      () => Promise.resolve(makeGraph()),
+      () => Promise.reject<Graph>(conflict("busy")),
+    ];
+    const { data, graph } = setup((at) =>
+      (answers.shift() ?? (() => Promise.resolve(makeGraph({ at }))))(),
+    );
+    data.setVisible(true);
+    await settle();
+    data.scrub(T0 + 20_000);
+    await vi.advanceTimersByTimeAsync(SCRUB_DELAY_MS);
+    await settle();
+    expect(data.graphError()).toBe("busy");
+    data.retry();
+    await settle();
+    expect(graph.mock.calls.at(-1)).toEqual([T0 + 20_000]);
+    expect(data.graphError()).toBeUndefined();
+    expect(data.live()).toBe(false);
+  });
+
+  it("reads nothing for a slider that rests while the panel is hidden", async () => {
+    const { data, graph } = setup();
+    data.setVisible(true);
+    await settle();
+    data.scrub(T0 + 20_000);
+    data.setVisible(false);
+    await vi.advanceTimersByTimeAsync(SCRUB_DELAY_MS * 2);
+    expect(graph).toHaveBeenCalledTimes(1);
+    expect(data.at()).toBe(T0 + 20_000);
+  });
+
+  it("freezes at the present before any graph came, and only once", () => {
+    vi.setSystemTime(T0 + 99_000);
+    const { data } = setup(() => new Promise<Graph>(() => {}));
+    data.setLive(false);
+    flush();
+    expect(data.live()).toBe(false);
+    expect(data.at()).toBe(T0 + 99_000);
+    vi.setSystemTime(T0 + 120_000);
+    data.setLive(false);
+    flush();
+    expect(data.at()).toBe(T0 + 99_000);
+  });
+
+  it("has nothing to replay before any graph came, and starts one replay at a time", async () => {
+    const { data, graph } = setup();
+    data.play();
+    flush();
+    expect(data.playing()).toBe(false);
+    data.setVisible(true);
+    await settle();
+    data.play();
+    await settle();
+    const calls = graph.mock.calls.length;
+    data.play();
+    await settle();
+    expect(graph).toHaveBeenCalledTimes(calls);
+    expect(data.at()).toBe(T0);
+  });
 });
 
 describe("playStep", () => {
