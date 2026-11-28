@@ -1501,6 +1501,11 @@ async fn the_provider_down_at_startup_does_not_prevent_construction() {
     for _ in 0..8 {
         let before = harness.clock.now();
         loop {
+            // Bounded, so a client that never retries fails here at once.
+            assert!(
+                harness.clock.now() - before <= MAX_BACKOFF_SECS,
+                "no new attempt within the longest backoff, after {waits:?}"
+            );
             harness.clock.advance(1);
             let connections = harness.provider.state().hits.connections;
             assert!(harness.client.begin_login(address(1), None).await.is_err());
