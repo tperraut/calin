@@ -44,6 +44,7 @@ import {
 import { errorMessage } from "../lib/errors";
 import { absoluteTime, listInWords, relativeTime } from "../lib/format";
 import type { RepoChoice } from "../lib/prefs";
+import { onFormSubmit } from "../lib/submit";
 import { sentWorkflow } from "../lib/workflow";
 import { sessionPath } from "../panels/registry";
 import {
@@ -679,10 +680,7 @@ function AutomationEditor(props: {
       aria-label={stored ? `Edit ${stored.name}` : "New automation"}
       class="flex flex-col gap-5"
       novalidate
-      onSubmit={(event) => {
-        event.preventDefault();
-        void save();
-      }}
+      onSubmit={onFormSubmit(save)}
       onInput={() => setSaved(false)}
     >
       <NameField form={form} />

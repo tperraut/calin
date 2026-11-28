@@ -9,13 +9,16 @@ import {
   Switch,
   useContext,
 } from "solid-js";
+import type { JSX } from "@solidjs/web";
 import { HttpError } from "../api/http";
-import { AccessSettings } from "../components/AccessSettings";
+import { AccessSettings, LoadFailure } from "../components/AccessSettings";
 import { InstallHint, NotificationSettings } from "../components/NotificationSettings";
 import type { RepoSet } from "../gen/RepoSet";
 import type { Settings } from "../gen/Settings";
 import { errorMessage } from "../lib/errors";
+import { counted } from "../lib/format";
 import { createRequest } from "../lib/request";
+import { onFormSubmit } from "../lib/submit";
 import { themeChoices, themeState } from "../lib/theme";
 import { blameSettingsField, settingsFromForm, type SettingsBlame } from "../lib/settings";
 import { problemLines, stepCount } from "../lib/workflow";
@@ -34,6 +37,227 @@ const fieldError = "text-sm wrap-break-word text-tone-danger";
 
 type Failure = { message: string; blame: SettingsBlame | undefined };
 
+/** The refusal shown at `field`; `undefined` for the one by the Save button. */
+const errorAt = (
+  failure: Failure | undefined,
+  field: SettingsBlame["field"] | undefined,
+): string | undefined => (failure && failure.blame?.field === field ? failure.message : undefined);
+
+/** What a failed save says, and the field it is about. */
+function failureOf(error: unknown, sent: Settings): Failure {
+  const message = errorMessage(error);
+  // Only a 400 is about what was typed (api.rs); anything else is about the request.
+  const invalid = error instanceof HttpError && error.status === 400;
+  return { message, blame: invalid ? blameSettingsField(message, sent) : undefined };
+}
+
+/** The scan root a refusal names, if any. */
+const blamedRoot = (failure: Failure | undefined): string | undefined => failure?.blame?.scanRoot;
+
+const withRoot = (roots: readonly string[], path: string): readonly string[] =>
+  roots.includes(path) ? roots : [...roots, path];
+
+/** The limit as the field shows it: empty for the server's default. */
+const typedParallel = (value: number | null | undefined): string => value?.toString() ?? "";
+
+const invalidIf = (error: string | undefined): "true" | undefined =>
+  error === undefined ? undefined : "true";
+
+/** The id of the alert a field points at, while it shows one. */
+const describedIf = (error: string | undefined, id: string): string | undefined =>
+  error === undefined ? undefined : id;
+
+/** The refusal of one field, under it, named so the field can point at it. */
+function FieldError(props: { id: string; message: string | undefined }) {
+  return (
+    <Show when={props.message}>
+      {(message) => (
+        <p id={props.id} role="alert" class={fieldError}>
+          {message()}
+        </p>
+      )}
+    </Show>
+  );
+}
+
+/** A path on the server, typed in full, with its refusal and its hint. */
+function PathField(props: {
+  id: string;
+  errorId: string;
+  label: string;
+  placeholder: string;
+  value: string;
+  error: string | undefined;
+  onInput: (value: string) => void;
+  children: JSX.Element;
+}) {
+  return (
+    <div class="flex flex-col gap-1.5">
+      <label for={props.id} class="text-sm font-medium">
+        {props.label}
+      </label>
+      <input
+        id={props.id}
+        type="text"
+        class="field h-11 px-3 font-mono"
+        placeholder={props.placeholder}
+        autocomplete="off"
+        autocapitalize="off"
+        spellcheck={false}
+        value={props.value}
+        aria-invalid={invalidIf(props.error)}
+        aria-describedby={describedIf(props.error, props.errorId)}
+        onInput={(event) => props.onInput(event.currentTarget.value)}
+      />
+      <FieldError id={props.errorId} message={props.error} />
+      <p class={hint}>{props.children}</p>
+    </div>
+  );
+}
+
+/** The scan roots: the list, each with its Remove button, and the field that adds one. */
+function ScanRoots(props: {
+  roots: readonly string[];
+  /** The root a refusal names, marked in the list. */
+  blamed: string | undefined;
+  newRoot: string;
+  error: string | undefined;
+  inputId: string;
+  errorId: string;
+  onNewRoot: (value: string) => void;
+  onAdd: () => void;
+  onRemove: (root: string) => void;
+}) {
+  return (
+    <fieldset class="flex flex-col gap-1.5">
+      <legend class="mb-1.5 text-sm font-medium">Scan roots</legend>
+      <Show
+        when={props.roots.length > 0}
+        fallback={<p class="text-sm text-muted">No scan root yet.</p>}
+      >
+        <ul aria-label="Scan roots" class="divide-y divide-line rounded-md border border-line">
+          <For each={props.roots}>
+            {(root) => (
+              <li class="flex items-center gap-2 pl-3">
+                <span
+                  class={[
+                    "min-w-0 flex-1 truncate font-mono text-sm",
+                    { "text-tone-danger": props.blamed === root },
+                  ]}
+                  title={root}
+                >
+                  {root}
+                </span>
+                <button
+                  type="button"
+                  class="btn btn-ghost px-2 text-sm"
+                  aria-label={`Remove ${root}`}
+                  onClick={() => props.onRemove(root)}
+                >
+                  Remove
+                </button>
+              </li>
+            )}
+          </For>
+        </ul>
+      </Show>
+      <div class="flex gap-2">
+        <label for={props.inputId} class="sr-only">
+          Add a scan root
+        </label>
+        <input
+          id={props.inputId}
+          type="text"
+          class="field h-11 min-w-0 flex-1 px-3 font-mono"
+          placeholder="/home/you/code"
+          autocomplete="off"
+          autocapitalize="off"
+          spellcheck={false}
+          value={props.newRoot}
+          aria-invalid={invalidIf(props.error)}
+          aria-describedby={describedIf(props.error, props.errorId)}
+          onInput={(event) => props.onNewRoot(event.currentTarget.value)}
+          onKeyDown={(event) => {
+            // Enter adds the path; saving is the button's job.
+            if (event.key !== "Enter" || props.newRoot.trim() === "") return;
+            event.preventDefault();
+            props.onAdd();
+          }}
+        />
+        <button
+          type="button"
+          class="btn"
+          disabled={props.newRoot.trim() === ""}
+          onClick={() => props.onAdd()}
+        >
+          Add
+        </button>
+      </div>
+      <FieldError id={props.errorId} message={props.error} />
+      <p class={hint}>
+        Folders searched for local clones of the repos the home repo declares, matched by their git
+        URL.
+      </p>
+    </fieldset>
+  );
+}
+
+function ParallelField(props: {
+  id: string;
+  errorId: string;
+  value: string;
+  error: string | undefined;
+  onInput: (value: string) => void;
+}) {
+  const hintId = (): string => `${props.errorId}-hint`;
+  return (
+    <div class="flex flex-col gap-1.5">
+      <label for={props.id} class="text-sm font-medium">
+        Sessions running at once
+      </label>
+      <input
+        id={props.id}
+        type="number"
+        inputmode="numeric"
+        class="field h-11 w-32 px-3"
+        placeholder="Default"
+        value={props.value}
+        aria-invalid={invalidIf(props.error)}
+        aria-describedby={describedIf(props.error, `${props.errorId} ${hintId()}`) ?? hintId()}
+        onInput={(event) => props.onInput(event.currentTarget.value)}
+      />
+      <FieldError id={props.errorId} message={props.error} />
+      <p id={hintId()} class={hint}>
+        How many sessions may prepare or run at the same time; the others wait, queued, for a free
+        slot. Child sessions do not count. Empty for the server's default.
+      </p>
+    </div>
+  );
+}
+
+/** Save, with the refusal about no field before it, or the word that it went through. */
+function SaveRow(props: { error: string | undefined; saved: boolean; busy: boolean }) {
+  return (
+    <div class="flex flex-wrap items-center justify-end gap-3">
+      <Show when={props.error}>
+        {(message) => (
+          <p role="alert" class={["min-w-0 flex-1 basis-48", fieldError]}>
+            {message()}
+          </p>
+        )}
+      </Show>
+      <Show when={props.saved}>
+        <p role="status" class="min-w-0 flex-1 text-sm text-tone-success">
+          Saved.
+        </p>
+      </Show>
+      <button type="submit" class="btn btn-primary" disabled={props.busy}>
+        {props.busy ? "Saving…" : "Save"}
+      </button>
+    </div>
+  );
+}
+
 /**
  * The three settings, edited as a draft of what the server stores. A refusal
  * is shown at the field it is about (see `blameSettingsField`), or by the
@@ -45,9 +269,7 @@ function SettingsForm(props: { stored: Settings; onSave: (next: Settings) => Pro
   const [scanRoots, setScanRoots] = createSignal<readonly string[]>(() => props.stored.scan_roots);
   const [cloneRoot, setCloneRoot] = createSignal(() => props.stored.clone_root ?? "");
   const [maxParallel, setMaxParallel] = createSignal(() =>
-    props.stored.max_parallel === null || props.stored.max_parallel === undefined
-      ? ""
-      : String(props.stored.max_parallel),
+    typedParallel(props.stored.max_parallel),
   );
   const [newRoot, setNewRoot] = createSignal("");
   const [busy, setBusy] = createSignal(false);
@@ -59,10 +281,8 @@ function SettingsForm(props: { stored: Settings; onSave: (next: Settings) => Pro
   const parallelId = createUniqueId();
   const errorId = createUniqueId();
 
-  const errorAt = (field: SettingsBlame["field"] | undefined): string | undefined => {
-    const failed = failure();
-    return failed && failed.blame?.field === field ? failed.message : undefined;
-  };
+  const errorOf = (field: SettingsBlame["field"] | undefined): string | undefined =>
+    errorAt(failure(), field);
 
   function edited(): void {
     setSaved(false);
@@ -71,7 +291,7 @@ function SettingsForm(props: { stored: Settings; onSave: (next: Settings) => Pro
   function addRoot(): void {
     const path = newRoot().trim();
     if (path === "") return;
-    if (!scanRoots().includes(path)) setScanRoots([...scanRoots(), path]);
+    setScanRoots(withRoot(scanRoots(), path));
     setNewRoot("");
     edited();
   }
@@ -93,10 +313,7 @@ function SettingsForm(props: { stored: Settings; onSave: (next: Settings) => Pro
       setNewRoot("");
       setSaved(true);
     } catch (error) {
-      const message = errorMessage(error);
-      // Only a 400 is about what was typed (api.rs); anything else is about the request.
-      const invalid = error instanceof HttpError && error.status === 400;
-      setFailure({ message, blame: invalid ? blameSettingsField(message, next) : undefined });
+      setFailure(failureOf(error, next));
     } finally {
       setBusy(false);
     }
@@ -108,210 +325,71 @@ function SettingsForm(props: { stored: Settings; onSave: (next: Settings) => Pro
       // The server says what it accepts (api.rs); the browser's own checks would hide its words.
       novalidate
       class="flex flex-col gap-5"
-      onSubmit={(event) => {
-        event.preventDefault();
-        void save();
-      }}
+      onSubmit={onFormSubmit(save)}
     >
-      <div class="flex flex-col gap-1.5">
-        <label for={homeId} class="text-sm font-medium">
-          Home repo
-        </label>
-        <input
-          id={homeId}
-          type="text"
-          class="field h-11 px-3 font-mono"
-          placeholder="/home/you/code/home"
-          autocomplete="off"
-          autocapitalize="off"
-          spellcheck={false}
-          value={homeRepo()}
-          aria-invalid={errorAt("home_repo") === undefined ? undefined : "true"}
-          aria-describedby={errorAt("home_repo") === undefined ? undefined : `${errorId}-home`}
-          onInput={(event) => {
-            setHomeRepo(event.currentTarget.value);
-            edited();
-          }}
-        />
-        <Show when={errorAt("home_repo")}>
-          {(message) => (
-            <p id={`${errorId}-home`} role="alert" class={fieldError}>
-              {message()}
-            </p>
-          )}
-        </Show>
-        <p class={hint}>
-          Path, on the server, of the git repo every session is launched from. Empty for none.
-        </p>
-      </div>
+      <PathField
+        id={homeId}
+        errorId={`${errorId}-home`}
+        label="Home repo"
+        placeholder="/home/you/code/home"
+        value={homeRepo()}
+        error={errorOf("home_repo")}
+        onInput={(value) => {
+          setHomeRepo(value);
+          edited();
+        }}
+      >
+        Path, on the server, of the git repo every session is launched from. Empty for none.
+      </PathField>
 
-      <fieldset class="flex flex-col gap-1.5">
-        <legend class="mb-1.5 text-sm font-medium">Scan roots</legend>
-        <Show
-          when={scanRoots().length > 0}
-          fallback={<p class="text-sm text-muted">No scan root yet.</p>}
-        >
-          <ul aria-label="Scan roots" class="divide-y divide-line rounded-md border border-line">
-            <For each={scanRoots()}>
-              {(root) => (
-                <li class="flex items-center gap-2 pl-3">
-                  <span
-                    class={[
-                      "min-w-0 flex-1 truncate font-mono text-sm",
-                      { "text-tone-danger": failure()?.blame?.scanRoot === root },
-                    ]}
-                    title={root}
-                  >
-                    {root}
-                  </span>
-                  <button
-                    type="button"
-                    class="btn btn-ghost px-2 text-sm"
-                    aria-label={`Remove ${root}`}
-                    onClick={() => {
-                      setScanRoots(scanRoots().filter((one) => one !== root));
-                      edited();
-                    }}
-                  >
-                    Remove
-                  </button>
-                </li>
-              )}
-            </For>
-          </ul>
-        </Show>
-        <div class="flex gap-2">
-          <label for={rootId} class="sr-only">
-            Add a scan root
-          </label>
-          <input
-            id={rootId}
-            type="text"
-            class="field h-11 min-w-0 flex-1 px-3 font-mono"
-            placeholder="/home/you/code"
-            autocomplete="off"
-            autocapitalize="off"
-            spellcheck={false}
-            value={newRoot()}
-            aria-invalid={errorAt("scan_roots") === undefined ? undefined : "true"}
-            aria-describedby={errorAt("scan_roots") === undefined ? undefined : `${errorId}-scan`}
-            onInput={(event) => {
-              setNewRoot(event.currentTarget.value);
-              edited();
-            }}
-            onKeyDown={(event) => {
-              // Enter adds the path; saving is the button's job.
-              if (event.key !== "Enter" || newRoot().trim() === "") return;
-              event.preventDefault();
-              addRoot();
-            }}
-          />
-          <button type="button" class="btn" disabled={newRoot().trim() === ""} onClick={addRoot}>
-            Add
-          </button>
-        </div>
-        <Show when={errorAt("scan_roots")}>
-          {(message) => (
-            <p id={`${errorId}-scan`} role="alert" class={fieldError}>
-              {message()}
-            </p>
-          )}
-        </Show>
-        <p class={hint}>
-          Folders searched for local clones of the repos the home repo declares, matched by their
-          git URL.
-        </p>
-      </fieldset>
+      <ScanRoots
+        roots={scanRoots()}
+        blamed={blamedRoot(failure())}
+        newRoot={newRoot()}
+        error={errorOf("scan_roots")}
+        inputId={rootId}
+        errorId={`${errorId}-scan`}
+        onNewRoot={(value) => {
+          setNewRoot(value);
+          edited();
+        }}
+        onAdd={addRoot}
+        onRemove={(root) => {
+          setScanRoots(scanRoots().filter((one) => one !== root));
+          edited();
+        }}
+      />
 
-      <div class="flex flex-col gap-1.5">
-        <label for={cloneId} class="text-sm font-medium">
-          Clone root
-        </label>
-        <input
-          id={cloneId}
-          type="text"
-          class="field h-11 px-3 font-mono"
-          placeholder="Server default: <data dir>/repos"
-          autocomplete="off"
-          autocapitalize="off"
-          spellcheck={false}
-          value={cloneRoot()}
-          aria-invalid={errorAt("clone_root") === undefined ? undefined : "true"}
-          aria-describedby={errorAt("clone_root") === undefined ? undefined : `${errorId}-clone`}
-          onInput={(event) => {
-            setCloneRoot(event.currentTarget.value);
-            edited();
-          }}
-        />
-        <Show when={errorAt("clone_root")}>
-          {(message) => (
-            <p id={`${errorId}-clone`} role="alert" class={fieldError}>
-              {message()}
-            </p>
-          )}
-        </Show>
-        <p class={hint}>
-          Where a declared repo with no local clone is cloned to. Empty for the server's default.
-        </p>
-      </div>
+      <PathField
+        id={cloneId}
+        errorId={`${errorId}-clone`}
+        label="Clone root"
+        placeholder="Server default: <data dir>/repos"
+        value={cloneRoot()}
+        error={errorOf("clone_root")}
+        onInput={(value) => {
+          setCloneRoot(value);
+          edited();
+        }}
+      >
+        Where a declared repo with no local clone is cloned to. Empty for the server's default.
+      </PathField>
 
-      <div class="flex flex-col gap-1.5">
-        <label for={parallelId} class="text-sm font-medium">
-          Sessions running at once
-        </label>
-        <input
-          id={parallelId}
-          type="number"
-          inputmode="numeric"
-          class="field h-11 w-32 px-3"
-          placeholder="Default"
-          value={maxParallel()}
-          aria-invalid={errorAt("max_parallel") === undefined ? undefined : "true"}
-          aria-describedby={
-            errorAt("max_parallel") === undefined
-              ? `${errorId}-parallel-hint`
-              : `${errorId}-parallel ${errorId}-parallel-hint`
-          }
-          onInput={(event) => {
-            setMaxParallel(event.currentTarget.value);
-            edited();
-          }}
-        />
-        <Show when={errorAt("max_parallel")}>
-          {(message) => (
-            <p id={`${errorId}-parallel`} role="alert" class={fieldError}>
-              {message()}
-            </p>
-          )}
-        </Show>
-        <p id={`${errorId}-parallel-hint`} class={hint}>
-          How many sessions may prepare or run at the same time; the others wait, queued, for a free
-          slot. Child sessions do not count. Empty for the server's default.
-        </p>
-      </div>
+      <ParallelField
+        id={parallelId}
+        errorId={`${errorId}-parallel`}
+        value={maxParallel()}
+        error={errorOf("max_parallel")}
+        onInput={(value) => {
+          setMaxParallel(value);
+          edited();
+        }}
+      />
 
-      <div class="flex flex-wrap items-center justify-end gap-3">
-        <Show when={errorAt(undefined)}>
-          {(message) => (
-            <p role="alert" class={["min-w-0 flex-1 basis-48", fieldError]}>
-              {message()}
-            </p>
-          )}
-        </Show>
-        <Show when={saved()}>
-          <p role="status" class="min-w-0 flex-1 text-sm text-tone-success">
-            Saved.
-          </p>
-        </Show>
-        <button type="submit" class="btn btn-primary" disabled={busy()}>
-          {busy() ? "Saving…" : "Save"}
-        </button>
-      </div>
+      <SaveRow error={errorOf(undefined)} saved={saved()} busy={busy()} />
     </form>
   );
 }
-
-const count = (n: number, one: string, many: string): string => `${n} ${n === 1 ? one : many}`;
 
 /** What the home repo declares, as the repo list and the sets report it. Read-only. */
 function HomeRepoSummary(props: {
@@ -360,12 +438,11 @@ function HomeRepoSummary(props: {
         </Match>
         <Match when={loadError()}>
           {(failure) => (
-            <p role="alert" class="flex items-center justify-between gap-2 text-sm">
-              <span class="min-w-0">The repo list could not be loaded: {failure().message}</span>
-              <button type="button" class="btn" onClick={() => props.onRetry()}>
-                Retry
-              </button>
-            </p>
+            <LoadFailure
+              what="The repo list"
+              message={failure().message}
+              onRetry={() => props.onRetry()}
+            />
           )}
         </Match>
         <Match when={true}>
@@ -381,7 +458,7 @@ function HomeRepoSummary(props: {
           </Show>
           <dl class="grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-1 text-sm">
             <dt class="text-muted">Declared</dt>
-            <dd>{count(totals().declared, "repo", "repos")}</dd>
+            <dd>{counted(totals().declared, "repo", "repos")}</dd>
             <dt class="text-muted">Found locally</dt>
             <dd>{totals().found}</dd>
             <dt class="text-muted">Not cloned</dt>
@@ -395,7 +472,7 @@ function HomeRepoSummary(props: {
                       <li>
                         <span class="font-medium">{set().name}</span>{" "}
                         <span class="text-muted">
-                          ({count(set().repo_ids.length, "repo", "repos")})
+                          ({counted(set().repo_ids.length, "repo", "repos")})
                         </span>
                       </li>
                     )}
@@ -419,12 +496,11 @@ function WorkflowList(props: { catalog: WorkflowCatalog; onRetry: () => void }) 
       </Match>
       <Match when={props.catalog.status === "error" ? props.catalog : undefined}>
         {(failure) => (
-          <p role="alert" class="flex items-center justify-between gap-2 text-sm">
-            <span class="min-w-0">The workflows could not be loaded: {failure().message}</span>
-            <button type="button" class="btn" onClick={() => props.onRetry()}>
-              Retry
-            </button>
-          </p>
+          <LoadFailure
+            what="The workflows"
+            message={failure().message}
+            onRetry={() => props.onRetry()}
+          />
         )}
       </Match>
       <Match when={props.catalog.status === "ready" ? props.catalog.workflows : undefined}>
@@ -446,7 +522,7 @@ function WorkflowList(props: { catalog: WorkflowCatalog; onRetry: () => void }) 
                           when={one().graph}
                           fallback={<span class="font-medium text-tone-danger">Has errors</span>}
                         >
-                          {(graph) => <span>{count(stepCount(graph()), "step", "steps")}</span>}
+                          {(graph) => <span>{counted(stepCount(graph()), "step", "steps")}</span>}
                         </Show>
                       </span>
                     </div>
