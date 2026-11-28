@@ -137,6 +137,19 @@ impl Wait {
             | Self::Ship { node } => Some(node),
         }
     }
+
+    /// The result of the active node when its background work ended
+    /// without its last word. A check leaves through `fail`, the rest
+    /// through `failed`.
+    fn died(&self) -> Option<Done> {
+        let port = if matches!(self, Self::Check { .. }) {
+            "fail"
+        } else {
+            "failed"
+        };
+        self.node()
+            .map(|node| Done::new(node, port, "the work ended unexpectedly"))
+    }
 }
 
 /// A child session a node waits for.
@@ -1080,16 +1093,7 @@ impl Driver {
             return;
         };
         run.work = None;
-        if run.done.is_some() {
-            return;
-        }
-        let port = match &run.wait {
-            Wait::Check { .. } => "fail",
-            _ => "failed",
-        };
-        if let Some(node) = run.wait.node() {
-            run.done = Some(Done::new(node, port, "the work ended unexpectedly"));
-        }
+        run.done = run.done.take().or_else(|| run.wait.died());
     }
 
     /// The engine says the run is over.
