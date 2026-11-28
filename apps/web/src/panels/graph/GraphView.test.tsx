@@ -1,4 +1,4 @@
-import { createSignal } from "solid-js";
+import { createSignal, flush } from "solid-js";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import { canvasView, describeCanvasMoves, nextFrame } from "../../test/canvas";
 import { makeGraph } from "../../test/orchestration";
@@ -50,5 +50,33 @@ describe("GraphView: its scene", () => {
       y: 5,
       k: 1,
     });
+  });
+});
+
+describe("GraphView: the tab stop", () => {
+  it("goes back to the first node when the focused one leaves the graph", () => {
+    const whole = makeGraph();
+    const [graph, setGraph] = createSignal(whole);
+    const host = mount(() => (
+      <GraphView
+        graph={graph()}
+        openSessionId="s1"
+        mode="columns"
+        selection={undefined}
+        onSelect={() => {}}
+      />
+    ));
+    const stop = () => host.querySelector('g.gnode[tabindex="0"]')?.getAttribute("data-node");
+    const first = stop();
+    find(host, 'g.gnode[data-node="agent:sub1"]').dispatchEvent(new FocusEvent("focus"));
+    flush();
+    expect(stop()).toBe("agent:sub1");
+    setGraph({
+      ...whole,
+      nodes: whole.nodes.filter((node) => node.id !== "agent:sub1"),
+      edges: whole.edges.filter((edge) => edge.from !== "agent:sub1" && edge.to !== "agent:sub1"),
+    });
+    flush();
+    expect(stop()).toBe(first);
   });
 });
