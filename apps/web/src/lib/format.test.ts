@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vite-plus/test";
 import {
+  clockTime,
   compactCount,
   filesLabel,
   formatCost,
@@ -106,5 +107,12 @@ describe("counts and costs", () => {
     expect(formatCost(0.0421)).toBe("$0.0421");
     expect(formatCost(1)).toBe("$1.00");
     expect(formatCost(12.345)).toBe("$12.35");
+  });
+});
+
+describe("clockTime", () => {
+  it("says the time of day to the second on a 24-hour clock", () => {
+    const afternoon = new Date(2026, 10, 28, 14, 3, 27).getTime();
+    expect(clockTime(afternoon)).toMatch(/^14\D03\D27$/);
   });
 });
