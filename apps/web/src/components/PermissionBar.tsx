@@ -1,8 +1,13 @@
 import { createMemo, createSignal, createUniqueId, Show } from "solid-js";
 import type { PermissionDecision } from "../gen/PermissionDecision";
 import { announceNewest, type Announcement } from "../lib/announcement";
-import { createPermissionAnswers, type PermissionAnswers } from "../state/permissionAnswers";
+import {
+  answerState,
+  createPermissionAnswers,
+  type PermissionAnswers,
+} from "../state/permissionAnswers";
 import type { PendingPermission } from "../state/sessionReducer";
+import { ErrorNote } from "./ErrorNote";
 import { WaitingNote } from "./WaitingNote";
 
 /** Where the request the reader picked is in the list; the oldest when it is not there (any more). */
@@ -11,12 +16,6 @@ function pickedIndex(pending: readonly PendingPermission[], picked: string | und
     0,
     pending.findIndex((one) => one.request.id === picked),
   );
-}
-
-/** What the answers say of one request; nothing while there is none. */
-function answerState(answers: PermissionAnswers, id: string | undefined) {
-  if (id === undefined) return { waiting: false, sending: false, error: undefined };
-  return { waiting: answers.waiting(id), sending: answers.sending(id), error: answers.error(id) };
 }
 
 /** What goes to the agent with an answer: a denial's reason, when one was typed. */
@@ -102,13 +101,7 @@ export function PermissionBar(props: {
               </Show>
             </div>
             <RequestDetails pending={pending()} />
-            <Show when={state().error}>
-              {(message) => (
-                <p role="alert" class="text-sm text-tone-danger">
-                  {message()}
-                </p>
-              )}
-            </Show>
+            <ErrorNote message={state().error} />
             <Show
               when={denying() === pending().request.id}
               fallback={

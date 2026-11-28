@@ -156,6 +156,51 @@ describe("QuestionBar", () => {
     await click(button("Footer"));
     expect(bar()?.textContent).toContain("Sent, waiting for the agent…");
   });
+
+  it("folds the compact bar to the question's first line, and again for the next question", async () => {
+    const { host, bar, button, arrive } = setup(
+      [asked("q1", 1), asked("q2", 2, ["Blue"])],
+      undefined,
+      true,
+    );
+    const line = () => bar()?.querySelector(".truncate");
+    expect(line()?.textContent).toBe(
+      "The badge can go in the **header** or the footer (q1). Which one?",
+    );
+    // Folded, the bar is one line: the count waits until it is opened.
+    expect(bar()?.textContent).not.toContain("more waiting");
+    expect(button("Answer").classList.contains("ml-auto")).toBe(false);
+
+    await click(button("Answer"));
+    expect(line()).toBeNull();
+    expect(bar()?.textContent).toContain("1 more waiting");
+    expect(button("Hide").classList.contains("ml-auto")).toBe(true);
+    await click(button("Hide"));
+    expect(host.querySelector("form")).toBeNull();
+    expect(button("Answer").getAttribute("aria-expanded")).toBe("false");
+
+    await click(button("Answer"));
+    arrive([asked("q2", 2, ["Blue"])]);
+    expect(host.querySelector("form")).toBeNull();
+    expect(line()?.textContent).toContain("(q2)");
+  });
+
+  it("marks only a gate's bar as a gate", () => {
+    const { bar } = setup([asked("q1", 1)]);
+    expect(bar()?.hasAttribute("data-gate")).toBe(false);
+  });
+
+  it("keeps a refusal with its question: the next one shows none", async () => {
+    const { host, bar, button, arrive } = setup([asked("q1", 1), asked("q2", 2, ["Blue"])], () =>
+      Promise.reject(conflict("question was already answered")),
+    );
+    await click(button("Header"));
+    expect(find(bar() as HTMLElement, '[role="alert"]').textContent).toBe(
+      "question was already answered",
+    );
+    arrive([asked("q2", 2, ["Blue"])]);
+    expect(host.querySelector('[role="alert"]')).toBeNull();
+  });
 });
 
 describe("QuestionBar: a workflow gate", () => {
@@ -181,6 +226,7 @@ describe("QuestionBar: a workflow gate", () => {
   it("is the workflow's, with Approve, Reject and a comment instead of answers", () => {
     const { host, bar, button, comment } = setupGate(() => Promise.resolve());
     expect(bar().textContent).toContain("Workflow gate");
+    expect(bar().getAttribute("data-gate")).toBe("");
     expect(bar().textContent).not.toContain("The agent asks");
     expect(bar().textContent).toContain("Open pull requests?");
     expect(button("Approve").disabled).toBe(false);

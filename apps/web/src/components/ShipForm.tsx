@@ -4,6 +4,7 @@ import { skippedLine, stepLine, type ShipPlan } from "../lib/delivery";
 import { errorMessage } from "../lib/errors";
 import { onFormSubmit, onSubmitChord } from "../lib/submit";
 import type { Delivery, SessionStore } from "../state/sessionStore";
+import { ErrorNote } from "./ErrorNote";
 
 /** What the reader filled in, as a request: a blank field is left to the server's default. */
 function shipRequest(
@@ -193,13 +194,7 @@ function ShipProblems(props: {
           </p>
         )}
       </Show>
-      <Show when={props.error}>
-        {(message) => (
-          <p id={props.errorId} role="alert" class="text-sm text-tone-danger">
-            {message()}
-          </p>
-        )}
-      </Show>
+      <ErrorNote message={props.error} id={props.errorId} />
     </>
   );
 }
