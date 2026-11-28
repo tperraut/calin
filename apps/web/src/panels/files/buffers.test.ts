@@ -524,16 +524,22 @@ describe("buffers", () => {
       expect(look(buffer)).toMatchObject({ text: "mine\n", dirty: true, notice: "deleted" });
     });
 
-    it("when a save starts while a change on disk is being read: the save's answer wins", async () => {
+    it("when a read asked before a save answers after it: the older version is dropped", async () => {
       const { buffers, buffer, look, read, disk } = await edited();
       const slow = deferred<FileContent>();
       read.mockReturnValueOnce(slow.promise);
       const changed = buffers.changedOnDisk(main, false);
-      const saving = buffers.save(buffer.key);
-      slow.resolve(content(main, "the agent's\n"));
-      await Promise.all([changed, saving]);
+      await buffers.save(buffer.key);
       expect(disk.get(buffer.key)).toBe("mine\n");
-      expect(look(buffer)).toMatchObject({ text: "mine\n", dirty: false, notice: undefined });
+      // The server read the file before the save wrote it.
+      slow.resolve(content(main, "fn main() {}\n"));
+      await changed;
+      expect(look(buffer)).toMatchObject({
+        text: "mine\n",
+        dirty: false,
+        notice: undefined,
+        revision: 1,
+      });
     });
 
     it("when a change event arrives while a save is in flight: it is left to the save", async () => {

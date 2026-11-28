@@ -243,6 +243,8 @@ export function createBuffers(deps: BuffersDeps): Buffers {
   }
 
   async function write(entry: Entry): Promise<void> {
+    // A read asked before the save may answer after it, with the version the save replaces.
+    entry.reads += 1;
     const text = entry.text;
     const body: WriteFileRequest = { text };
     if (entry.hash !== undefined) body.expected_hash = entry.hash;
