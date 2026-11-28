@@ -121,6 +121,14 @@ describe("inline Markdown", () => {
     ["<javascript:alert(1)>", "<javascript:alert(1)>"],
     ["xhttps://example.com", "xhttps://example.com"],
     ["[x] (https://example.com)", "[x] (<a https://example.com/>https://example.com</a>)"],
+    ["[a]xhttps://y.example)", "[a]xhttps://y.example)"],
+    ["[a](https://x.example y)", "[a](<a https://x.example/>https://x.example</a> y)"],
+    // What comes before the link plays no part in it.
+    ["[](https://x.example) first", "<a https://x.example/></a> first"],
+    ["][b](https://x.example)", "]<a https://x.example/>b</a>"],
+    ["(https://y.example '[z')", "(<a https://y.example/>https://y.example</a> '[z')"],
+    ["'[t](<https://a.example/ ')", "'[t](<<a https://a.example/>https://a.example/</a> ')"],
+    [') [a](https://x.example "t)', ') [a](<a https://x.example/>https://x.example</a> "t)'],
     // HTML is text.
     ["<script>alert(1)</script>", "<script>alert(1)</script>"],
     ['<img src=x onerror="alert(1)">', '<img src=x onerror="alert(1)">'],
@@ -171,6 +179,38 @@ describe("inline Markdown", () => {
     ]) {
       expect(safeHref(address), address).toBeUndefined();
     }
+  });
+
+  it("follows a link target or an address only within 2048 characters", () => {
+    const address = (length: number, middle = ""): string => {
+      const head = `https://x.example/${middle}`;
+      return head + "a".repeat(length - head.length);
+    };
+    const link = (href: string, label = href): Inline => ({
+      kind: "link",
+      href,
+      children: [{ kind: "text", text: label }],
+    });
+    const text = (written: string): Inline => ({ kind: "text", text: written });
+    const first = (source: string): Inline | undefined => parseInline(source)[0];
+
+    // A destination: its `)` may sit right past the reach; a pair of parentheses inside does not stretch it.
+    expect(first(`[a](${address(2048)})`)).toEqual(link(address(2048), "a"));
+    expect(first(`[a](${address(2049, "()")})`)).toEqual(text("[a]("));
+    expect(first(`[a](<${address(2047, "()")}>)`)).toEqual(link(address(2047, "()"), "a"));
+    expect(first(`[a](<${address(2048, "()")}>)`)).toEqual(text("[a](<"));
+    // A title counts towards the reach, and has a reach of its own.
+    expect(first(`[a](https://x.example "${"t".repeat(2040)}")`)).toEqual(text("[a]("));
+    expect(first(`[a](https://x.example ")${"t".repeat(2046)}")`)).toEqual(
+      link("https://x.example/", "a"),
+    );
+    expect(first(`[a](https://x.example ")${"t".repeat(2047)}")`)).toEqual(text("[a]("));
+    // An address in angle brackets.
+    expect(first(`<${address(2047)}>`)).toEqual(link(address(2047)));
+    expect(first(`<${address(2048)}>`)).toEqual(text("<"));
+    // A bare address is cut at the reach, and an unmatched bracket at its end still goes.
+    expect(parseInline(`${address(2047)})(`)).toEqual([link(address(2047)), text(")(")]);
+    expect(parseInline(`${address(2047)}][`)).toEqual([link(address(2047)), text("][")]);
   });
 
   it("stops nesting at a fixed depth instead of following the text all the way down", () => {
