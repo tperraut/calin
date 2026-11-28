@@ -23,7 +23,7 @@ import {
 } from "../test/fakes";
 import type { WorkflowRun } from "../gen/WorkflowRun";
 import { specGraph } from "../test/workflows";
-import { createSessionStore, SHIP_QUIET_MS } from "./sessionStore";
+import { createSessionStore, namedRepo, SHIP_QUIET_MS } from "./sessionStore";
 
 const TOPIC = "session:s1";
 
@@ -562,6 +562,26 @@ describe("session store", () => {
     expect(onEnd.mock.calls).toEqual([
       [{ kind: "error", message: "Terminals are not available here." }],
     ]);
+  });
+});
+
+describe("namedRepo", () => {
+  const covered = new Map([
+    ["r1", "web"],
+    ["r2", "web-admin"],
+    ["r3", "api.v2"],
+  ]);
+
+  it.each([
+    ["web: the push was rejected", "r1"],
+    ["could not push web-admin: protected branch", "r2"],
+    ["api.v2 has no remote", "r3"],
+    // A name inside a longer word is not that repo.
+    ["webhook failed", undefined],
+    ["apixv2 has no remote", undefined],
+    ["GitHub answered 502", undefined],
+  ])("reads %j as naming %s", (message, id) => {
+    expect(namedRepo(covered, message)).toBe(id);
   });
 });
 
