@@ -1,15 +1,22 @@
 import { describe, expect, it } from "vite-plus/test";
-import { makeSpan, makeTimeline, T0 } from "../../test/orchestration";
+import { makeSpan, makeSubagent, makeTimeline, T0 } from "../../test/orchestration";
 import {
   arrowBox,
   arrowMarker,
+  arrowSentence,
   axisTicks,
+  cullRange,
   describeTimeline,
+  drawnArrows,
+  drawnSpans,
+  firstKey,
   fitScale,
   LANE_HEIGHT,
+  laneName,
   laneViews,
   nestSpans,
   spanBox,
+  spanDuration,
   spanLabel,
   spanStatus,
   timelineEnd,
@@ -35,6 +42,8 @@ describe("time to pixels", () => {
     const scale = fitScale(T0, T0 + 60_000, 300);
     expect(timeToX(scale, T0 + 60_000)).toBeCloseTo(300);
     expect(Number.isFinite(fitScale(T0, T0, 300).pxPerMs)).toBe(true);
+    // Before the chart is measured it is a pixel wide, never zero.
+    expect(fitScale(T0, T0 + 2000, 0).pxPerMs).toBe(1 / 2000);
   });
 
   it("ends the axis at the newest event, or at now while a span is open", () => {
@@ -52,6 +61,21 @@ describe("time to pixels", () => {
       0, 10_000, 20_000, 30_000, 40_000, 50_000, 60_000,
     ]);
     expect(ticks[1].x).toBe(100);
+  });
+
+  it("takes a step that is exactly 90 px", () => {
+    const ticks = axisTicks({ from: T0, pxPerMs: 0.09 }, 0, 200);
+    expect(ticks.map((tick) => tick.ts - T0)).toEqual([0, 1000, 2000]);
+  });
+
+  it("puts a tick a day apart past the longest step, and never more than 200", () => {
+    const zoomedOut = axisTicks({ from: 0, pxPerMs: 90 / 100_000_000 }, 0, 160);
+    expect(zoomedOut.map((tick) => tick.ts)).toEqual([0, 86_400_000, 172_800_000]);
+    expect(axisTicks({ from: T0, pxPerMs: 0.9 }, 0, 1_000_000)).toHaveLength(200);
+  });
+
+  it("draws a margin of 240 px on each side of the viewport", () => {
+    expect(cullRange(1000, 500)).toEqual({ x0: 760, x1: 1740 });
   });
 });
 
@@ -98,6 +122,42 @@ describe("spans", () => {
     ]);
   });
 
+  it("nests a span that starts on a turn's first or last moment in that turn", () => {
+    const spans = [
+      makeSpan("turn-1", { start: T0, end: T0 + 10_000 }),
+      makeSpan("at-start", { kind: "tool", start: T0 }),
+      makeSpan("at-end", { kind: "tool", start: T0 + 10_000 }),
+    ];
+    expect(nestSpans(spans).map((group) => group.inner.map((span) => span.id))).toEqual([
+      ["at-start", "at-end"],
+    ]);
+  });
+
+  it("lists the drawn spans of every lane, turns under the rest", () => {
+    const drawn = drawnSpans(lanes(), scale, T0 + 60_000, { x0: 0, x1: 10_000 });
+    expect(drawn.map((one) => [one.key, one.row])).toEqual([
+      ["a1/turn-1", 0],
+      ["sub1/turn-sub1", 1],
+      ["a2/turn-a2", 2],
+      ["a1/wait-1", 0],
+      ["a1/t1", 0],
+      ["a2/c1", 2],
+    ]);
+    expect(drawn[4].box).toEqual({ x: 50, w: 120, open: false });
+  });
+
+  it("keeps a span that ends exactly at the left edge of the range", () => {
+    const span = makeSpan("a", { start: T0, end: T0 + 10_000 });
+    expect(visibleSpans([span], scale, T0, 100, 200)).toEqual([span]);
+  });
+
+  it("measures how long a span lasted, or has lasted so far, never below zero", () => {
+    expect(spanDuration(makeSpan("a", { start: T0, end: T0 + 3000 }), T0 + 9000)).toBe(3000);
+    expect(spanDuration(makeSpan("a", { start: T0, end: null }), T0 + 9000)).toBe(9000);
+    expect(spanDuration(makeSpan("a", { start: T0, end: T0 }), T0)).toBe(0);
+    expect(spanDuration(makeSpan("a", { start: T0, end: null }), T0 - 5000)).toBe(0);
+  });
+
   it("culls the spans outside the viewport, keeping those that cross its edges", () => {
     const spans = [
       makeSpan("before", { start: T0, end: T0 + 5000 }),
@@ -120,6 +180,10 @@ describe("spans", () => {
     expect(spanLabel("cargo test", 30)).toBeUndefined();
     expect(spanLabel("cargo test", 200)).toBe("cargo test");
     expect(spanLabel("cargo test --workspace --all-features", 80)).toBe("cargo test -…");
+    // 40 px is wide enough, and holds six letters uncut.
+    expect(spanLabel("cargo", 39)).toBeUndefined();
+    expect(spanLabel("abcdef", 40)).toBe("abcdef");
+    expect(spanLabel("abcdefg", 40)).toBe("abcde…");
   });
 
   it("folds tool kinds into a few series, and words a span's status", () => {
@@ -152,6 +216,51 @@ describe("lanes and arrows", () => {
     expect(long.label).toBe("lead · Ship the health check: part B");
   });
 
+  it("counts the depth of every level of the spawn tree", () => {
+    const [lead, sub] = makeTimeline().lanes;
+    const grandchild = { ...sub, agent: makeSubagent("sub2", "reader"), parent_id: "agent:sub1" };
+    const timeline = makeTimeline({ lanes: [lead, sub, grandchild] });
+    expect(laneViews(timeline, "s1", () => undefined).map((lane) => lane.depth)).toEqual([0, 1, 2]);
+  });
+
+  it("starts the tab stop at the first span of the first lane that has one", () => {
+    const [lead, sub, child] = lanes();
+    const empty = { ...lead, lane: { ...lead.lane, spans: [] } };
+    expect(firstKey([empty, child, sub])).toBe("a2/turn-a2");
+    expect(firstKey([empty])).toBeUndefined();
+  });
+
+  it("names an agent by its lane's label, the user as you, any other as an agent", () => {
+    expect(laneName(lanes(), "sub1")).toBe("explorer");
+    expect(laneName(lanes(), null)).toBe("you");
+    expect(laneName(lanes(), "gone")).toBe("an agent");
+  });
+
+  it("draws the arrows within the range, edges included, and none naming an agent with no lane", () => {
+    const index = new Map(lanes().map((lane, at) => [lane.id, at]));
+    const scale = { from: T0, pxPerMs: 0.01 };
+    const arrows = makeTimeline().arrows;
+    // At 0, 20, 100 and 550 px.
+    const drawn = (x0: number, x1: number) =>
+      drawnArrows(arrows, index, scale, { x0, x1 }).map((one) => one.arrow.id);
+    expect(drawn(20, 100)).toEqual(["ar2", "ar3"]);
+    expect(drawn(-100, 1000)).toEqual(arrows.map((arrow) => arrow.id));
+    const lost = [{ ...arrows[1], to_agent_id: "nobody" }];
+    expect(drawnArrows(lost, index, scale, { x0: -100, x1: 1000 })).toEqual([]);
+  });
+
+  it("words an arrow with its label, or without one when it has none", () => {
+    const [fromUser, spawn] = makeTimeline().arrows;
+    const nameOf = (agentId: string | null) => agentId ?? "you";
+    expect(arrowSentence(fromUser, nameOf)).toMatch(
+      /^\d\d:\d\d:\d\d, Note from you to a1: Ship it$/,
+    );
+    expect(arrowSentence({ ...spawn, label: null }, nameOf)).toMatch(
+      /, Spawned subagent from a1 to sub1$/,
+    );
+    expect(arrowSentence({ ...spawn, label: "" }, nameOf)).toMatch(/to sub1$/);
+  });
+
   it("draws an arrow at its moment from the sender's lane to the recipient's", () => {
     const index = new Map(lanes().map((lane, at) => [lane.id, at]));
     const scale = { from: T0, pxPerMs: 0.01 };
@@ -180,5 +289,16 @@ describe("lanes and arrows", () => {
       "Waiting for you: Question: header or footer?, T, 10 s",
     ]);
     expect(child.turns[0].text).toMatch(/50 s so far$/);
+  });
+
+  it("describes the spans outside every turn after the turns", () => {
+    const [lead] = lanes();
+    const stray = makeSpan("stray", { kind: "tool", start: T0 + 50_000, end: T0 + 51_000 });
+    const withStray = { ...lead, lane: { ...lead.lane, spans: [...lead.lane.spans, stray] } };
+    const [outline] = describeTimeline([withStray], T0 + 60_000);
+    expect(outline.turns.map((turn) => [turn.id, turn.text])).toEqual([
+      ["turn-1", expect.stringMatching(/^Ship the health check/)],
+      ["loose-1", "Outside any turn"],
+    ]);
   });
 });
