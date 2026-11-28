@@ -421,6 +421,41 @@ mod tests {
     }
 
     #[test]
+    fn the_note_says_what_was_kept_of_how_much_and_only_when_something_was_cut() {
+        let sandbox = Sandbox::new();
+        let dir = sandbox.dir("work");
+        let bytes = |n: usize| format!("head -c {n} /dev/zero | tr '\\0' a");
+
+        let ran = run(&dir, &bytes(OUTPUT_CAP));
+        assert_eq!(ran.output, "a".repeat(OUTPUT_CAP));
+
+        let ran = run(&dir, &bytes(OUTPUT_CAP + 5));
+        let (note, kept) = ran.output.split_once('\n').unwrap();
+        assert_eq!(
+            note,
+            format!(
+                "[output truncated: last {OUTPUT_CAP} of {} bytes]",
+                OUTPUT_CAP + 5
+            )
+        );
+        assert_eq!(kept, "a".repeat(OUTPUT_CAP));
+    }
+
+    #[test]
+    fn the_drain_says_when_the_stream_has_ended() {
+        use std::io::Write as _;
+
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        let tail = Arc::new(Mutex::new(Tail::new(OUTPUT_CAP)));
+        let drained = drain(reader, Arc::clone(&tail));
+        writer.write_all(b"all of it").unwrap();
+        drop(writer);
+        // Far more than the end of a closed pipe takes to arrive.
+        drained.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(lock(&tail).text(true), "all of it");
+    }
+
+    #[test]
     fn a_check_reports_its_exit_code_and_the_last_16_kib_of_its_output() {
         let sandbox = Sandbox::new();
         let dir = sandbox.dir("work");
